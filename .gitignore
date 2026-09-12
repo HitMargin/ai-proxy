@@ -1,0 +1,29 @@
+# --- secrets / credentials (do not commit) ---
+cookies.txt
+.env
+.env.*
+*.pem
+*.key
+
+# --- local tool state ---
+.wrangler/
+.cloudflared/
+
+# --- big local binaries ---
+cloudflared.exe
+
+# --- captured page snapshots / scratch ---
+page.html
+
+# --- backups ---
+*.bak
+*.bak-*
+*.orig
+*.tmp
+
+# --- OS / editor ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

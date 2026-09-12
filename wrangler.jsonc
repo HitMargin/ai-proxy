@@ -1,0 +1,9 @@
+{
+  // Cloudflare Workers 部署配置
+  "name": "ai-api",
+  "main": "worker.ts",
+  "compatibility_date": "2025-06-01",
+  "workers_dev": true,
+  "observability": { "enabled": true }
+  // 需要鉴权时加："vars": { "API_KEYS": "your-key" }
+}
