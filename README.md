@@ -38,7 +38,7 @@ cloudflared 快速隧道  https://xxx.trycloudflare.com      ← restart.ps1
 **为什么要这么绕？** Cloudflare Workers / Deno Deploy 都有 CPU 时间与配额限制，而 cnb 的协议解析（数百行正则 + 流式标记过滤）很吃 CPU。
 用 `ENV.BACKEND_URL` 一个开关把计算挪回本机、边缘只做字节转发，就绕开了限制，同时保留一个稳定的公网域名。
 
-`main.ts` 的入口逻辑只有一行（`main.ts:2122`）：
+`main.ts` 的入口逻辑只有一行（`main.ts:2186`）：
 
 ```ts
 if (ENV.BACKEND_URL) return await proxyToBackend(request);  // 反向代理模式
@@ -52,7 +52,7 @@ if (ENV.BACKEND_URL) return await proxyToBackend(request);  // 反向代理模�
 ### 方式 A：本地 Deno 直跑
 
 ```bash
-deno run -A main.ts        # 监听 http://localhost:8000
+deno run -A main.ts        # 监听 http://localhost:8000（PORT 环境变量可改端口）
 ```
 
 ### 方式 B：Deno Deploy
@@ -72,6 +72,20 @@ pwsh .\restart.ps1
 
 > 脚本会自动探测本机 Clash 的 `127.0.0.1:7897` 并设置 `HTTPS_PROXY`（wrangler 访问 npm/API 需要）。
 > 停止全部：`Get-Process deno,cloudflared | Stop-Process`
+> 服务日志：`%TEMP%ai-proxy.log`（stderr，`[cnb-gate]` 诊断流水在这里）与 `%TEMP%ai-proxy-out.log`（stdout）。
+
+### 方式 D：纯本地模式（不碰隧道与 Worker）
+
+```powershell
+pwsh .estart.ps1 -Local
+```
+
+只做三件事：杀掉旧的 `deno main.ts` → 启动新服务（8000）→ 健康检查。**完全不触碰** cloudflared（不杀也不建）、
+Cloudflare Worker（不跑 wrangler、不动 `BACKEND_URL`）、网络代理（连 Clash 探测都跳过）——全程唯一的网络流量是对
+`127.0.0.1:8000` 的健康检查。客户端直连 `http://localhost:8000/cnb/v1`。
+
+本地与完整模式共用同一个 8000 端口，可随时互相补位：本地模式跑着时再执行一次完整模式，隧道会接到重启后的新服务上；
+反之，完整模式的隧道在跑时执行 `-Local` 只重启本地服务，远端链路自动恢复。
 
 ---
 
@@ -86,7 +100,7 @@ pwsh .\restart.ps1
 | `GEMINI_API_KEY` | 否 | `/gemini/v1` 使用 |
 | `OPENROUTER_API_KEY` | 否 | `/openrouter/v1` 使用 |
 
-鉴权逻辑见 `checkAuth`（`main.ts:2069`）：接受 `Authorization: Bearer <key>` 或 `x-api-key: <key>`；根路径 `/` 豁免（用于列出 provider）。
+鉴权逻辑见 `checkAuth`（`main.ts:2133`）：接受 `Authorization: Bearer <key>` 或 `x-api-key: <key>`；根路径 `/` 豁免（用于列出 provider）。
 
 ---
 
@@ -163,20 +177,36 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 
 ### 3. Responses API
 
-`handleCnbResponses`（`main.ts:1620`）把新版 `/v1/responses` 请求降级成 chat 格式跑一遍，再重组为 Responses 的 output items（`reasoning` / `message` / `function_call`），流式与非流式均支持。
+`handleCnbResponses`（`main.ts:1693`）把新版 `/v1/responses` 请求降级成 chat 格式跑一遍，再重组为 Responses 的 output items（`reasoning` / `message` / `function_call`），流式与非流式均支持。
 
 ### 4. 可靠性
 
-- `cnbCallUpstream`（`main.ts:1487`）按 `[0, 500, 1500, 3500, 8000, 20000]` ms 退避重试；
+- `cnbCallUpstream`（`main.ts:1522`）按 `[0, 500, 1500, 3500, 8000, 20000]` ms 退避重试；
 - 网络层失败会刷新 CSRF 会话再试；4xx（429 除外）视为确定性错误直接透传；
-- `deepseek-v4-flash` 连续 5xx 时**自动降级到 `deepseek-v4-pro`**（`main.ts:1507`）。
+- `deepseek-v4-flash` 连续 5xx 时**自动降级到 `deepseek-v4-pro`**；
+- `cnbCall`（`main.ts:1436`）带 **30 秒无响应头超时**——cnb 偶发无限挂起，中止后交给退避重试（只罩到响应头返回，不限流式生成总时长）；
+- **串行闸**（`main.ts:1492`）：cnb 网页会话按 cookie 归属，多客户端并发共用一个 cookie 会互踩（曾观测到跨会话内容泄漏）。所有 cnb 上游调用同一时刻只放行一个，锁持有到**响应流真正消费完**（流结束/出错/消费方取消/2 分钟无数据/10 分钟硬安全阀任一条件释放），日志以 `[cnb-gate] fp=...` 记录排队与释放（fp 为会话指纹，重叠且 fp 不同即跨会话并发）；
+- **1 MiB 请求体预检**：cnb 网关（nginx）硬性拒绝超过 1 MiB 的请求体，超过则毫秒级本地返回 413，不浪费隧道往返。
 
 ### 5. 其它
 
 - **可用模型**：`deepseek-v4-flash`、`deepseek-v4-pro`；
 - **视觉**：`user` / `system` 消息中的 `image_url` 块会被保留为多模态数组，而不是被折叠成纯文本（`main.ts:1317` 的注释记录了这次修复的原因）；
 - **思考强度**：`enable_thinking` 恒为 `true`，`reasoning_effort` 取客户端值（`low` / `medium` / `high` / `max`），默认 `high`；
-- **输出上限**：cnb 通道 `max_tokens` 默认 60000。
+- **输出上限**：cnb 通道 `max_tokens` 默认 `flash: 120000` / `pro: 60000`（预算含思考 token；实测 flash 思考最多吃掉约一半，故单独调大）；
+
+### 6. 实测能力与上限（2026-09，直连本地服务实测）
+
+| 指标 | 实测值 |
+|---|---|
+| 输入上下文 | ≥ 271,000 token 无截断（首尾暗号均可召回，服务端 `prompt_tokens` 实读） |
+| 硬上限 | **请求体 ≤ 1 MiB**（cnb 网关 nginx 限制，超限 413 `BODY_TOO_LARGE`；英文 ≈ 26.2 万 token，UTF-8 中文 ≈ 35 万字） |
+| 输出 | flash 单次 59,884 token 全量吐完（其中思考 30,883）；pro 同任务 31,590（思考仅 2,589） |
+| 吞吐 | ≈ 400–440 token/s |
+| Prompt cache | 跨请求生效（相同前缀命中，`usage.prompt_cache_hit_tokens` 可见），连续对话 prefill 显著加速 |
+
+> **排障口诀**：客户端看到 5xx/502 先看本地日志与请求体大小——中转层（共享订阅网关等）常把上游的 413/5xx
+> 统一包装成「Upstream service temporarily unavailable」，报错文案不能按字面理解。
 
 ---
 
@@ -188,7 +218,7 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 | `worker.ts` | Cloudflare Workers 入口 shim（把 `vars`/secrets 注入 `main.ts` 的模块级 `ENV`） |
 | `wrangler.jsonc` | Worker 配置（`name: ai-api`，`main: worker.ts`） |
 | `deno.jsonc` | Deno Deploy 配置（`org: hitmargin`，`app: ai-api`） |
-| `restart.ps1` | 一键：本地服务 + 隧道 + 更新 Worker 的 `BACKEND_URL` 密钥 |
+| `restart.ps1` | 一键：本地服务 + 隧道 + 更新 Worker 的 `BACKEND_URL` 密钥；`-Local` 只启动本地服务，不碰隧道/Worker/代理 |
 | `deno.lock` | 依赖锁定 |
 
 本地开发还会出现（已在 `.gitignore` 中排除）：`cookies.txt`（抓包得到的 cookie）、`.wrangler/`（Cloudflare 账号缓存）、

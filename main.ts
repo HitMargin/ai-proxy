@@ -1419,7 +1419,8 @@ function cnbBuildUpstream(openaiBody: any) {
     model,
     messages: msgs,
     stream: true,
-    maxTokens: openaiBody.max_tokens || 60000,
+    // flash 思考 token 波动大（实测最多吃掉一半输出预算），默认给 120000；pro 思考量小维持 60000
+    maxTokens: openaiBody.max_tokens || (model === "deepseek-v4-flash" ? 120000 : 60000),
   };
   if (openaiBody.temperature != null) up.temperature = openaiBody.temperature;
   if (openaiBody.top_p != null) up.top_p = openaiBody.top_p;
@@ -1434,7 +1435,12 @@ function cnbBuildUpstream(openaiBody: any) {
 
 async function cnbCall(body: any) {
   const st = await cnbEnsure();
-  return fetch(CNB_CHAT, {
+  // 30 秒无响应头视为 cnb 挂死：中止抛错交给上层退避重试（实测 cnb 偶发无限挂起）。
+  // 只罩到响应头返回为止，不限制流式生成的总时长。
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error("cnb: no response headers in 30s")), 30_000);
+  try {
+  return await fetch(CNB_CHAT, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -1446,7 +1452,9 @@ async function cnbCall(body: any) {
       "User-Agent": CNB_UA,
     },
     body: JSON.stringify(body),
+    signal: ac.signal,
   });
+  } finally { clearTimeout(timer); }
 }
 
 async function* cnbIter(upstream: Response) {
@@ -1472,7 +1480,8 @@ async function* cnbIter(upstream: Response) {
       if (d !== "[DONE]") { try { yield JSON.parse(d); } catch {} }
     }
   } finally {
-    try { reader.releaseLock(); } catch {}
+    // cancel 而非仅 releaseLock：[DONE] 提前 return 时也要把流关掉（闸依赖流结束/取消信号）
+    try { await reader.cancel(); } catch {}
   }
 }
 
@@ -1483,8 +1492,72 @@ function cnbErr(status: number, msg: string, detail?: string) {
   });
 }
 
-// cnb 上游调用：瞬时 502/网络抖动时退避重试（境外出口 IP 偶发被 cnb 拒）
+// ★ 串行闸：cnb 网页会话按 cookie 归属，并发疑似互踩（串台）；同一 cookie 同时只放行一个请求，
+//   锁持有到响应流读完（fetch 返回 ≠ 完成），流结束/出错/取消/10 分钟兜底才释放。
+//   fp 是会话指纹（模型+消息数+首尾消息前缀的 djb2 hash），
+//   日志里"waited ... for previous stream"且 fp 不同 = 跨会话并发（串台实锤）。
+let cnbGate: Promise<void> = Promise.resolve();
+function cnbFingerprint(body: any): string {
+  const msgs: any[] = Array.isArray(body?.messages) ? body.messages : [];
+  const pick = (m: any) => (typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? ""));
+  const src = `${body?.model ?? "?"}|${msgs.length}|${pick(msgs[0]).slice(0, 256)}|${pick(msgs[msgs.length - 1]).slice(0, 256)}`;
+  let h = 5381;
+  for (let i = 0; i < src.length; i++) h = ((h * 33) ^ src.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+function cnbGatedResponse(resp: Response, done: () => void): Response {
+  if (!resp.body) { done(); return resp; }
+  // 逐块透传并刷新空闲计时。释放条件（任一）：流正常结束、出错、消费方取消（cancel 会传导回来）、2 分钟无数据。
+  // （消费方读到 [DONE] 提前 return 且不 cancel 时，靠空闲计时兜底，闸不会吊死）
+  let idle: ReturnType<typeof setTimeout> = setTimeout(() => { console.warn("[cnb-gate] idle 2min, releasing"); done(); }, 120_000);
+  const touch = () => { clearTimeout(idle); idle = setTimeout(() => { console.warn("[cnb-gate] idle 2min, releasing"); done(); }, 120_000); };
+  const finish = () => { clearTimeout(idle); done(); };
+  const t = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) { touch(); controller.enqueue(chunk); },
+    flush() { finish(); },
+  });
+  resp.body.pipeTo(t.writable).then(() => finish(), () => finish());
+  return new Response(t.readable, { status: resp.status, headers: resp.headers });
+}
 async function cnbCallUpstream(upBody: any): Promise<Response> {
+  // 字节预检：cnb 网关（nginx）拒绝 >1MiB 请求体；直接快速失败，不占用隧道往返和串行闸
+  const bodyBytes = new TextEncoder().encode(JSON.stringify(upBody)).length;
+  if (bodyBytes > 1048576) {
+    console.warn(`[cnb-gate] rejected pre-flight: body ${bodyBytes}B > 1MiB (fp=${cnbFingerprint(upBody)})`);
+    return cnbErr(413, "Request body too large",
+      `cnb gateway rejects bodies over 1 MiB (this request ${bodyBytes} bytes = ${(bodyBytes / 1048576).toFixed(2)} MiB); reduce context size`);
+  }
+  const fp = cnbFingerprint(upBody);
+  const prev = cnbGate;
+  let release!: () => void;
+  cnbGate = new Promise<void>((r) => (release = r));
+  let released = false;
+  const t0 = Date.now();
+  let safety: ReturnType<typeof setTimeout>;
+  const done = () => {
+    if (released) return;
+    released = true;
+    clearTimeout(safety);
+    console.warn(`[cnb-gate] fp=${fp} released +${Date.now() - t0}ms`);
+    release();
+  };
+  // 安全阀：流挂死时 10 分钟强制放行，避免闸被永久占死（正常释放时清除，不留误报日志）
+  safety = setTimeout(() => { console.warn(`[cnb-gate] fp=${fp} safety release after 10min`); done(); }, 10 * 60 * 1000);
+  const queuedAt = Date.now();
+  await prev;
+  const waited = Date.now() - queuedAt;
+  if (waited > 200) console.warn(`[cnb-gate] fp=${fp} waited ${waited}ms for previous stream`);
+  try {
+    const resp = await cnbCallUpstreamInner(upBody);
+    return cnbGatedResponse(resp, done);
+  } catch (e) {
+    done();
+    throw e;
+  }
+}
+
+// cnb 上游调用：瞬时 502/网络抖动时退避重试（境外出口 IP 偶发被 cnb 拒）
+async function cnbCallUpstreamInner(upBody: any): Promise<Response> {
   const waits = [0, 500, 1500, 3500, 8000, 20000];
   let last: Response | null = null;
   for (let i = 0; i < waits.length; i++) {
@@ -1862,24 +1935,15 @@ async function handleCnb(path: string, request: Request, url: URL) {
     const { upstream: upBody, hasTools } = built;
     const wantStream = !!(p.data && p.data.stream);
 
+    // 统一走 cnbCallUpstream：串行闸 + 1MiB 预检 + 退避重试 + flash→pro 兜底
+    // （替代原先手写的"网络错重试一次/非 200 刷新 csrf 再试一次"）
     let upstreamResp: Response | null = null;
-    try {
-      upstreamResp = await cnbCall(upBody);
-    } catch (e: any) {
-      cnbState.ts = 0;
-      try { upstreamResp = await cnbCall(upBody); }
-      catch (e2: any) { return cnbErr(502, "Upstream error", e2.message); }
-    }
+    try { upstreamResp = await cnbCallUpstream(upBody); }
+    catch (e: any) { return cnbErr(502, "Upstream error", e.message); }
     if (upstreamResp.status !== 200) {
-      try { await upstreamResp.text(); } catch {}
-      cnbState.ts = 0;
-      try { upstreamResp = await cnbCall(upBody); }
-      catch (e: any) { return cnbErr(502, "Upstream error after refresh", e.message); }
-      if (upstreamResp.status !== 200) {
-        let errBody = "";
-        try { errBody = await upstreamResp.text(); } catch {}
-        return cnbErr(upstreamResp.status, "Upstream error", errBody.slice(0, 500));
-      }
+      let errBody = "";
+      try { errBody = await upstreamResp.text(); } catch {}
+      return cnbErr(upstreamResp.status, "Upstream error", errBody.slice(0, 500));
     }
 
     // ─── 非流式 ───
@@ -2364,4 +2428,4 @@ export async function handler(request: Request): Promise<Response> {
 }
 
 // 本地 Deno 直跑入口（Workers 里 Deno 未定义，自动跳过；Workers 入口见 worker.ts）
-if (typeof Deno !== "undefined") Deno.serve(handler);
+if (typeof Deno !== "undefined") Deno.serve({ port: Number(Deno.env.get("PORT") ?? 8000) }, handler);
