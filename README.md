@@ -72,12 +72,12 @@ pwsh .\restart.ps1
 
 > 脚本会自动探测本机 Clash 的 `127.0.0.1:7897` 并设置 `HTTPS_PROXY`（wrangler 访问 npm/API 需要）。
 > 停止全部：`Get-Process deno,cloudflared | Stop-Process`
-> 服务日志：`%TEMP%ai-proxy.log`（stderr，`[cnb-gate]` 诊断流水在这里）与 `%TEMP%ai-proxy-out.log`（stdout）。
+> 服务日志：`%TEMP%\ai-proxy.log`（stderr，`[cnb-gate]` 诊断流水在这里）与 `%TEMP%\ai-proxy-out.log`（stdout）。
 
 ### 方式 D：纯本地模式（不碰隧道与 Worker）
 
 ```powershell
-pwsh .estart.ps1 -Local
+pwsh .\restart.ps1 -Local
 ```
 
 只做三件事：杀掉旧的 `deno main.ts` → 启动新服务（8000）→ 健康检查。**完全不触碰** cloudflared（不杀也不建）、
