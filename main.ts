@@ -221,10 +221,10 @@ const adapters: Record<string, any> = {
 // ---------- Providers 配置 ----------
 const providers: Record<string, any> = {
   kilo: {
-    prefix: "/v1",
+    prefix: "/kilo/v1",
     baseUrl: "https://api.kilo.ai/api/gateway",
     auth: { type: "none" },
-    pathRewrite: (path: string) => path.replace(/^\/v1/, ""),
+    pathRewrite: (path: string) => path.replace(/^\/kilo\/v1/, ""),
     endpoints: { models: "/models", chat: "/chat/completions" },
     adapter: adapters.passthrough,
     filterModels: (data: any) => {
@@ -2181,6 +2181,106 @@ async function proxyToBackend(request: Request): Promise<Response> {
   throw new Error("unreachable");
 }
 
+// ---------- /v1 聚合端点：一个入口用多个上游（kilo / zen / cnb） ----------
+// 模型 id 带命名空间前缀（如 "cnb/deepseek-v4-flash"），GET /v1/models 聚合列出全部成员模型；
+// POST 按 model 前缀重写成成员自己的路由前缀后递归走 handler，完整复用各成员的处理链
+// （cnb 的串行闸/预检/重试、zen/kilo 的透传与鉴权）。裸 id（无前缀）按 [kilo, zen, cnb]
+// 顺序解析以保持旧行为，但列表冷启动时需要先 GET 一次 /v1/models 暖缓存。
+const V1_AGGREGATE_MEMBERS = ["kilo", "zen", "cnb"];
+
+function v1MemberModelIds(key: string): string[] {
+  if (key === "cnb") return CNB_MODELS.map((m: any) => m.id);
+  return (cache.data[key]?.data?.data || []).map((m: any) => m.id);
+}
+
+function v1ResolveModel(model: string): { key: string; raw: string } | null {
+  const slash = model.indexOf("/");
+  if (slash > 0) {
+    const key = model.slice(0, slash);
+    if (V1_AGGREGATE_MEMBERS.includes(key)) return { key, raw: model.slice(slash + 1) };
+    return null;
+  }
+  for (const key of V1_AGGREGATE_MEMBERS) {
+    if (v1MemberModelIds(key).includes(model)) return { key, raw: model };
+  }
+  return null;
+}
+
+async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
+  const out: Record<string, any[]> = {};
+  const now = Date.now();
+  // 无鉴权的干净请求：让各成员用自家默认凭据（zen 的 public 等），不被客户端 token 污染
+  const shimReq = new Request("http://internal/", { headers: { "content-type": "application/json" } });
+  await Promise.allSettled(V1_AGGREGATE_MEMBERS.map(async (key) => {
+    if (key === "cnb") { out[key] = CNB_MODELS; return; }
+    const fresh = cache.data[key];
+    if (fresh && now - fresh.timestamp < cache.TTL) { out[key] = fresh.data?.data || []; return; }
+    const p: any = (providers as any)[key];
+    let modelsPath = p.endpoints.models;
+    if (p.pathRewrite) modelsPath = p.pathRewrite(p.prefix + "/models");
+    const headers = cloneHeadersForUpstream(shimReq, p, ENV);
+    if (p.extraHeaders) for (const [k, v] of Object.entries(p.extraHeaders)) headers.set(k, v as string);
+    const resp = await fetch(p.baseUrl + modelsPath, { headers });
+    const parsed = await tryParseResponse(resp);
+    if (parsed.error || !parsed.data) return;
+    let filtered = parsed.data;
+    if (p.filterModels) filtered = p.filterModels(parsed.data);
+    const arr = filtered?.data || [];
+    if (arr.length) cache.data[key] = { timestamp: now, data: filtered }; // 顺手暖成员缓存（裸 id 解析要用）
+    out[key] = arr;
+  }));
+  return out;
+}
+
+async function handleAggregateV1(path: string, request: Request, url: URL): Promise<Response> {
+  const json = (obj: any, status = 200) =>
+    new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+
+  if (path.endsWith("/models") && request.method === "GET") {
+    const now = Date.now();
+    if (!cache.data["v1-aggregate"] || now - cache.data["v1-aggregate"].timestamp >= cache.TTL) {
+      const members = await v1FetchMemberModels();
+      const data: any[] = [];
+      for (const key of V1_AGGREGATE_MEMBERS) {
+        for (const m of members[key] || []) data.push({ ...m, id: `${key}/${m.id}`, owned_by: key });
+      }
+      cache.data["v1-aggregate"] = { timestamp: now, data: { object: "list", data } };
+    }
+    return json(cache.data["v1-aggregate"].data);
+  }
+
+  if (request.method === "POST") {
+    const parsed = safeJsonParse(await request.text());
+    if (parsed.error) return json({ error: "Invalid JSON body", detail: parsed.error.message }, 400);
+    const openaiBody = parsed.data || {};
+    const model = String(openaiBody.model || "");
+    const resolved = model ? v1ResolveModel(model) : null;
+    if (!resolved) {
+      return json({
+        error: `Unknown model: ${model || "(empty)"}`,
+        hint: 'use "kilo/<id>" / "zen/<id>" / "cnb/<id>" (see GET /v1/models); bare ids resolve kilo→zen→cnb after the list is warm',
+      }, 400);
+    }
+    const rest = path.slice("/v1".length) || "/";
+    const target = new URL((providers as any)[resolved.key].prefix + rest, url.origin);
+    const h = new Headers();
+    h.set("content-type", request.headers.get("content-type") || "application/json");
+    const accept = request.headers.get("accept");
+    if (accept) h.set("accept", accept);
+    // 成员上游各有默认凭据（kilo 无、zen public、cnb 自建 CSRF），剥掉客户端 token 防污染；
+    // 仅当本代理自身开了 API_KEYS 才透传（供递归时的 checkAuth 通过）
+    if (ENV.API_KEYS) {
+      for (const name of ["authorization", "x-api-key"]) {
+        const v = request.headers.get(name);
+        if (v) h.set(name, v);
+      }
+    }
+    return await handler(new Request(target, { method: "POST", headers: h, body: JSON.stringify({ ...openaiBody, model: resolved.raw }) }));
+  }
+
+  return json({ error: "Not found", hint: "GET /v1/models | POST /v1/chat/completions | POST /v1/responses" }, 404);
+}
+
 export async function handler(request: Request): Promise<Response> {
   try {
     if (ENV.BACKEND_URL) return await proxyToBackend(request);
@@ -2216,6 +2316,9 @@ export async function handler(request: Request): Promise<Response> {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
       });
     }
+
+    // /v1 聚合端点（kilo/zen/cnb 多上游一个入口）
+    if (path === "/v1" || path.startsWith("/v1/")) return await handleAggregateV1(path, request, url);
 
     // 匹配 provider
     let matchedProvider: any = null;

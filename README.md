@@ -110,7 +110,8 @@ Cloudflare Worker（不跑 wrangler、不动 `BACKEND_URL`）、网络代理（�
 
 | 路径前缀 | 上游 | 适配方式 |
 |---|---|---|
-| `/v1` | api.kilo.ai | 透传，仅保留 `isFree: true` 的模型 |
+| `/v1` | **聚合入口** | kilo / zen / cnb 一个入口：模型加 `kilo/`、`zen/`、`cnb/` 前缀统一列出与分发（见下） |
+| `/kilo/v1` | api.kilo.ai | 透传，仅保留 `isFree: true` 的模型（kilo 的直连前缀，聚合成员之一） |
 | `/zen/v1` | opencode.ai/zen | 透传，默认 token `public`，仅保留 `-free` 模型 |
 | `/anthropic/v1` | api.anthropic.com | `toAnthropic` 双向翻译 |
 | `/gemini/v1` | generativelanguage.googleapis.com | `toGemini` 双向翻译 |
@@ -120,6 +121,12 @@ Cloudflare Worker（不跑 wrangler、不动 `BACKEND_URL`）、网络代理（�
 | `/cnb/v1` | cnb.cool | **自定义处理器**（见下节） |
 
 `GET /` 会返回所有可用 provider 列表。
+
+**聚合端点 `/v1`**：`GET /v1/models` 返回 kilo + zen + cnb 全部模型的并集（id 加 `kilo/`、`zen/`、`cnb/` 前缀防冲突）；
+POST 时 model 写带前缀的 id（如 `cnb/deepseek-v4-pro`、`kilo/kilo-auto/free`）即自动分发到对应上游，完整复用该上游的
+处理链（cnb 的串行闸/预检/重试、各成员自己的鉴权与透传）。不带前缀的裸 id 按 kilo→zen→cnb 顺序解析（保持旧行为），
+冷启动后需先 GET 一次 `/v1/models` 暖缓存。分发时会剥掉客户端 token，让各成员用自家默认凭据（kilo 无鉴权、zen 的
+`public`、cnb 的自建 CSRF）；仅当本代理设置 `API_KEYS` 时才透传客户端鉴权头。
 
 **模型列表**有 5 分钟内存缓存，并会在后台异步做健康探测（`testModel`，3 秒超时，200/429 视为可用），
 在 Deno Deploy 上用 `EdgeRuntime.waitUntil` 挂起，不阻塞响应；加 `?health=true` 可强制同步探测。
