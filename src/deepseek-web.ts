@@ -110,9 +110,10 @@ export function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
   const errorText = String(data?.biz_msg ?? data?.msg ?? event?.msg ?? event?.error?.message ?? "").trim();
   const contentText = String(event?.content ?? event?.toast?.content ?? event?.toast?.message ?? "").trim();
   const message = errorText || contentText;
-  const hasErrorSignal = bizCode !== 0 || event?.type === "error" || event?.type === "toast" || Boolean(event?.error || event?.toast) || Boolean(errorText);
+  const hasErrorSignal = bizCode !== 0 || event?.type === "error" || event?.type === "toast" || Boolean(event?.error || event?.toast) || Boolean(errorText) || /invalid chat session/i.test(message);
   if (bizCode === 0 && !message && !hasErrorSignal) return null;
   if (bizCode === 0 && data?.code === 0 && !hasErrorSignal) return null;
+  if (/invalid chat session/i.test(message)) return new DeepSeekWebError(message, 502, 0, "invalid_session");
   if (bizCode === 40001 || bizCode === 40003) return new DeepSeekWebError(errorText || "DeepSeek authentication rejected", 403, 0, "auth");
   if (bizCode === 429) return new DeepSeekWebError(errorText || "DeepSeek rate limited", 429, 30 * 60_000, "rate_limit_exceeded");
   if (bizCode === 5 || /user is muted|account is muted|用户.*禁言|账号.*禁言/i.test(message)) {
@@ -973,7 +974,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       releaseGate?.();
       return deepseekWebErrorResponse(e);
     }
-    const chatSessionId = sessionLease.id;
+    let chatSessionId = sessionLease.id;
 
     let cleanedUp = false;
     const cleanup = async (force = false) => {
@@ -989,9 +990,23 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     try {
       upstream = await deepseekWebChat(cookies, auth, chatSessionId, prompt, model, reasoningEffort !== "off", refFileIds);
     } catch (e: any) {
-      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
-      await cleanup(true);
-      return deepseekWebErrorResponse(e);
+      if (e instanceof DeepSeekWebError && e.kind === "invalid_session") {
+        deepseekWebRetireSession(chatSessionId);
+        await deepseekWebDeleteSession(cookies, auth, chatSessionId);
+        try {
+          sessionLease = await deepseekWebLeaseSession(cookies, auth);
+          chatSessionId = sessionLease.id;
+          upstream = await deepseekWebChat(cookies, auth, chatSessionId, prompt, model, reasoningEffort !== "off", refFileIds);
+        } catch (retryError: any) {
+          if (retryError instanceof DeepSeekWebError) deepseekWebTripCircuit(retryError.message, retryError.retryAfterMs, retryError.kind);
+          await cleanup(true);
+          return deepseekWebErrorResponse(retryError);
+        }
+      } else {
+        if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+        await cleanup(true);
+        return deepseekWebErrorResponse(e);
+      }
     }
 
     if (openaiBody.stream === true) {

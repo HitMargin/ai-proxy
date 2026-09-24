@@ -21,6 +21,13 @@ Deno.test("prefers a non-zero outer code over inner zero", () => {
   }
 });
 
+Deno.test("classifies invalid chat sessions separately", () => {
+  const error = deepseekWebBusinessError({ code: 0, msg: "invalid chat session id", data: null });
+  if (!error || error.kind !== "invalid_session") {
+    throw new Error(`unexpected error: ${JSON.stringify(error)}`);
+  }
+});
+
 Deno.test("does not classify ordinary content keywords as errors", () => {
   const error = deepseekWebBusinessError({ content: "The server looks busy right now" });
   if (error !== null) throw new Error(`ordinary content was misclassified: ${JSON.stringify(error)}`);
