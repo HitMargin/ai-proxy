@@ -96,9 +96,11 @@ function deepseekWebHttpError(response: Response, text: string): DeepSeekWebErro
   return new DeepSeekWebError(`DeepSeek HTTP ${status}: ${text.slice(0, 200)}`, status, retry, kind);
 }
 
-function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
+export function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
   const data = event?.data && typeof event.data === "object" ? event.data : event;
-  const bizCode = Number(data?.biz_code ?? event?.biz_code ?? data?.code ?? event?.code ?? 0);
+  const outerCode = Number(event?.code ?? 0);
+  const innerCode = Number(data?.biz_code ?? event?.biz_code ?? 0);
+  const bizCode = outerCode !== 0 ? outerCode : innerCode;
   const errorText = String(data?.biz_msg ?? data?.msg ?? event?.msg ?? event?.error?.message ?? "").trim();
   const contentText = String(event?.content ?? event?.toast?.content ?? event?.toast?.message ?? "").trim();
   const message = errorText || contentText;
@@ -286,7 +288,7 @@ async function deepseekWebUploadImage(cookies: string, auth: string, image: Deep
   if (!r.ok) throw deepseekWebHttpError(r, text);
   const json = safeJsonParse(text);
   if (json.error) throw new Error(`image upload returned invalid JSON: ${json.error.message}`);
-  const businessError = deepseekWebBusinessError(json.data);
+  const businessError = deepseekWebBusinessError(json);
   if (businessError) throw businessError;
   const id = json.data?.data?.biz_data?.id ?? json.data?.data?.id ?? json.data?.biz_data?.id ?? json.data?.id;
   if (typeof id !== "string" || !id) throw new Error(`image upload did not return file id: ${text.slice(0, 300)}`);
