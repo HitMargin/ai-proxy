@@ -81,31 +81,32 @@ class DeepSeekWebError extends Error {
   }
 }
 
+function deepseekWebRetryAfterMs(value: string | null): number {
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds * 1000);
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : 0;
+}
+
 function deepseekWebHttpError(response: Response, text: string): DeepSeekWebError {
-  const retry = Number(response.headers.get("retry-after") || 0);
+  const retry = deepseekWebRetryAfterMs(response.headers.get("retry-after"));
   const status = response.status;
   const kind = status === 429 ? "rate_limit_exceeded" : (status === 401 || status === 403) ? "auth" : "upstream_error";
-  return new DeepSeekWebError(`DeepSeek HTTP ${status}: ${text.slice(0, 200)}`, status, retry > 0 ? retry * 1000 : 0, kind);
+  return new DeepSeekWebError(`DeepSeek HTTP ${status}: ${text.slice(0, 200)}`, status, retry, kind);
 }
 
 function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
   const data = event?.data && typeof event.data === "object" ? event.data : event;
-  const bizCode = Number(data?.biz_code ?? event?.biz_code ?? 0);
-  const message = String(
-    data?.biz_msg ??
-    data?.message ??
-    event?.content ??
-    event?.msg ??
-    event?.toast?.content ??
-    event?.toast?.message ??
-    event?.error?.message ??
-    "",
-  ).trim();
-  const hasErrorSignal = bizCode !== 0 || event?.type === "error" || event?.type === "toast" || Boolean(event?.error || event?.toast) || /user is muted|account is muted|用户.*禁言|账号.*禁言|quota|busy|throttl|频繁|too frequent|too many/i.test(message);
+  const bizCode = Number(data?.biz_code ?? event?.biz_code ?? data?.code ?? event?.code ?? 0);
+  const errorText = String(data?.biz_msg ?? data?.msg ?? event?.msg ?? event?.error?.message ?? "").trim();
+  const contentText = String(event?.content ?? event?.toast?.content ?? event?.toast?.message ?? "").trim();
+  const message = errorText || contentText;
+  const hasErrorSignal = bizCode !== 0 || event?.type === "error" || event?.type === "toast" || Boolean(event?.error || event?.toast) || Boolean(errorText);
   if (bizCode === 0 && !message && !hasErrorSignal) return null;
   if (bizCode === 0 && data?.code === 0 && !hasErrorSignal) return null;
-  if (bizCode === 40001 || bizCode === 40003) return new DeepSeekWebError(message || "DeepSeek authentication rejected", 403, 0, "auth");
-  if (bizCode === 429) return new DeepSeekWebError(message || "DeepSeek rate limited", 429, 30 * 60_000, "rate_limit_exceeded");
+  if (bizCode === 40001 || bizCode === 40003) return new DeepSeekWebError(errorText || "DeepSeek authentication rejected", 403, 0, "auth");
+  if (bizCode === 429) return new DeepSeekWebError(errorText || "DeepSeek rate limited", 429, 30 * 60_000, "rate_limit_exceeded");
   if (bizCode === 5 || /user is muted|account is muted|用户.*禁言|账号.*禁言/i.test(message)) {
     const muteUntil = Number(data?.biz_data?.mute_until ?? data?.mute_until ?? 0);
     const retryAfterMs = Number.isFinite(muteUntil) && muteUntil > Date.now() / 1000
@@ -113,8 +114,9 @@ function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
       : 2 * 60 * 60_000;
     return new DeepSeekWebError(message || "DeepSeek account is muted", 429, retryAfterMs, "rate_limit_exceeded");
   }
-  if (/being generated|busy/i.test(message)) return new DeepSeekWebError(message, 429, 5_000, "busy");
-  if (/too frequent|too many|throttl|频繁/i.test(message)) return new DeepSeekWebError(message, 429, 30_000, "rate_limit_exceeded");
+  const classificationText = event?.type === "error" || event?.type === "toast" ? message : errorText;
+  if (/being generated|busy/i.test(classificationText)) return new DeepSeekWebError(classificationText, 429, 5_000, "busy");
+  if (/too frequent|too many|throttl|频繁|quota/i.test(classificationText)) return new DeepSeekWebError(classificationText, 429, 30_000, "rate_limit_exceeded");
   if (hasErrorSignal) return new DeepSeekWebError(message || "DeepSeek stream error", 502, 0, "upstream_error");
   return null;
 }
@@ -206,9 +208,10 @@ async function deepseekWebCreatePow(cookies: string, auth: string, targetPath: s
   const text = await r.text();
   if (!r.ok) throw deepseekWebHttpError(r, text);
   const json = safeJsonParse(text);
-  if (json.error || !json.data) throw new DeepSeekWebError("create PoW challenge failed: " + text.slice(0, 300), 502, 0, "upstream_error");
+  if (json.error) throw new DeepSeekWebError("create PoW challenge failed: " + text.slice(0, 300), 502, 0, "upstream_error");
   const businessError = deepseekWebBusinessError(json);
   if (businessError) throw businessError;
+  if (!json.data) throw new DeepSeekWebError("create PoW challenge failed: " + text.slice(0, 300), 502, 0, "upstream_error");
   const challenge = json.data.data?.biz_data?.challenge as DeepSeekPowChallenge | undefined;
   if (!challenge || challenge.algorithm !== "DeepSeekHashV1") {
     throw new Error("unsupported DeepSeek PoW challenge: " + text.slice(0, 300));
@@ -716,7 +719,7 @@ function deepseekWebErrorResponse(error: any): Response {
   const status = Number(error?.status) || 502;
   const cooldownMs = Math.max(0, deepseekWebLoadCooldown() - Date.now());
   const rawRetryAfterMs = Number(error?.retryAfterMs) > 0 ? Number(error.retryAfterMs) : 0;
-  const retryAfterMs = status === 429 || status === 403 ? Math.max(rawRetryAfterMs, cooldownMs) : rawRetryAfterMs;
+  const retryAfterMs = status === 401 || status === 403 || status === 429 ? Math.max(rawRetryAfterMs, cooldownMs) : rawRetryAfterMs;
   const headers: Record<string, string> = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
   if (retryAfterMs > 0) headers["Retry-After"] = String(Math.ceil(retryAfterMs / 1000));
   return new Response(JSON.stringify({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }), { status, headers });
