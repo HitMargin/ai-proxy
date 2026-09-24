@@ -11,7 +11,7 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
 - **可用通道**：`/v1` 聚合入口的 kilo 系模型（含 `kilo/deepseek/deepseek-v4-flash-0731:free`，实测正常）。
 - **不可用**：zen 全部（区域锁 / 仅限 OpenCode 客户端）；ss2a 自营模型 502；ss2a 免费档间歇 403/502。
 - **DSH 配置**：活动 Web profile 的模型注册文件是 `C:\Users\22282\.dsh\profiles\web\cordis.patch.yml`；其中 `deepseek-web` 已注册 1,048,576 context、16,384/32,768 maxTokens、text/image 输入和 off/low/high/max 思考档位。HTTP `/models` 不能替代这份 DSH 配置。
-- **业务错误/冷却**：DeepSeek HTTP 200 `biz_code`、SSE error、muted/mute_until 会被识别；限流期返回 429 + Retry-After，`deepseek-web-cooldown.json` 持久化冷却状态，进程重启不丢失。
+- **业务错误/冷却**：DeepSeek HTTP 200 `biz_code`、SSE `error/toast`、`content/msg` 错误正文、muted/mute_until、非 SSE completion 错误会被识别；限流期返回 429 + Retry-After，`deepseek-web-cooldown.json` 持久化冷却状态，进程重启不丢失；Responses 流错误转换为 `response.failed`。
 - **请求指纹**：DeepSeek 的 PoW、建会话、删除会话、图片上传和 completion 共用 `deepseek-headers.json` 的浏览器头集合；不再发送重复版本头或 `X-Deepseek-Harness`。
 - **源码结构**：`main.ts` 为入口/路由；`src/core.ts` 为通用核心；`src/cnb.ts` 与 `src/deepseek-web.ts` 为上游适配模块；`third_party/dsh-deepseek-web-login` 为保留 Apache-2.0 许可的 DeepSeek 工具协议派生代码。
 - git 已于今日 init（身份 HitMargin），`.gitignore` 已排除 cookies.txt / cnb-login.txt / deepseek-auth.txt / deepseek-cookies.txt / *.bak 等。

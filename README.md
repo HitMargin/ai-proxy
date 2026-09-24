@@ -133,7 +133,7 @@ Cloudflare Worker（不跑 wrangler、不动 `BACKEND_URL`）、网络代理（�
 
 > **注意**：DeepSeek 网页端接口为私有接口，随时可能改版；当前实现已包含网页端 `DeepSeekHashV1` PoW（使用本地 `deepseek-sha3.wasm` 自动求解），每轮使用独立临时 `chat_session` 并在结束后清理，完整序列化 OpenAI `messages`（上限 20 万字符）。响应会按上游 SSE 实时转发：`THINK` 片段输出为 `delta.reasoning_content`，`RESPONSE` 片段输出为 `delta.content`，工具调用输出为 `delta.tool_calls`；请求支持 `reasoning_effort`（`off` / `low` / `high` / `max`）。网页端本身只有 `thinking_enabled` 开关，`low/high/max` 都只表示开启思考，等级会作为模型指令注入。工具协议源码及许可证见 [`third_party/dsh-deepseek-web-login`](third_party/dsh-deepseek-web-login)。
 >
-> **业务错误与冷却**：代理会解析 HTTP 200 中的 `biz_code/biz_msg`、SSE error 事件和 `mute_until`；限流/封禁期间返回 HTTP 429、`Retry-After` 和 `type: rate_limit_exceeded`，冷却状态持久化在 `deepseek-web-cooldown.json`，进程重启不会丢失。401/403/账号受限后不会自动重试或切换账号。
+> **业务错误与冷却**：代理会解析 HTTP 200 中的 `biz_code/biz_msg`、SSE `error/toast` 事件、`content/msg` 错误正文和 `mute_until`；completion 会区分 SSE 与非 SSE 响应；限流/封禁期间返回 HTTP 429、`Retry-After` 和 `type: rate_limit_exceeded`，冷却状态持久化在 `deepseek-web-cooldown.json`，进程重启不会丢失。401/403/账号受限后不会自动重试或切换账号。Responses 流会把上游错误转换为 `response.failed`。
 >
 > **安全阀**：同一账号请求严格串行，两次请求结束之间随机等待 2～4 秒；连续 15 次后随机长休 1～3 分钟；单 prompt 上限 20 万字符；收到 429 后至少冷却 30 分钟，收到 401/403 后至少冷却 2 小时。暂停期间不会自动重试或切换账号。这些措施只能降低风险，不能保证不触发平台限制。
 >

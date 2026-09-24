@@ -84,9 +84,19 @@ class DeepSeekWebError extends Error {
 function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
   const data = event?.data && typeof event.data === "object" ? event.data : event;
   const bizCode = Number(data?.biz_code ?? event?.biz_code ?? 0);
-  const message = String(data?.biz_msg ?? data?.message ?? event?.message ?? event?.error?.message ?? "").trim();
-  if (bizCode === 0 && !message) return null;
-  if (bizCode === 0 && data?.code === 0) return null;
+  const message = String(
+    data?.biz_msg ??
+    data?.message ??
+    event?.content ??
+    event?.msg ??
+    event?.toast?.content ??
+    event?.toast?.message ??
+    event?.error?.message ??
+    "",
+  ).trim();
+  const hasErrorSignal = bizCode !== 0 || event?.type === "error" || event?.type === "toast" || Boolean(event?.error || event?.toast) || /muted|mute|限制|封禁|受限|busy|throttl|频繁|too frequent|too many/i.test(message);
+  if (bizCode === 0 && !message && !hasErrorSignal) return null;
+  if (bizCode === 0 && data?.code === 0 && !hasErrorSignal) return null;
   if (bizCode === 5 || /muted|mute|限制|封禁|受限/i.test(message)) {
     const muteUntil = Number(data?.biz_data?.mute_until ?? data?.mute_until ?? 0);
     const retryAfterMs = Number.isFinite(muteUntil) && muteUntil > Date.now() / 1000
@@ -96,8 +106,7 @@ function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
   }
   if (/being generated|busy/i.test(message)) return new DeepSeekWebError(message, 429, 5_000, "busy");
   if (/too frequent|too many|throttl|频繁/i.test(message)) return new DeepSeekWebError(message, 429, 30_000, "rate_limit_exceeded");
-  if (event?.type === "error" || event?.error) return new DeepSeekWebError(message || "DeepSeek stream error", 502, 0, "upstream_error");
-  if (bizCode !== 0) return new DeepSeekWebError(message || `DeepSeek business error ${bizCode}`, 502, 0, "upstream_error");
+  if (hasErrorSignal) return new DeepSeekWebError(message || "DeepSeek stream error", 502, 0, "upstream_error");
   return null;
 }
 
@@ -618,11 +627,28 @@ async function deepseekWebChat(cookies: string, auth: string, chatSessionId: str
     const retry = Number(r.headers.get("retry-after") || 0);
     throw new DeepSeekWebError(`DeepSeek HTTP ${r.status}: ${text.slice(0, 200)}`, r.status === 429 ? 429 : r.status, retry > 0 ? retry * 1000 : 0, r.status === 429 ? "rate_limit_exceeded" : "upstream_error");
   }
+  const contentType = r.headers.get("content-type") || "";
+  if (contentType && !contentType.toLowerCase().includes("text/event-stream")) {
+    const text = await r.text();
+    const parsed = safeJsonParse(text);
+    if (parsed.error) throw new DeepSeekWebError(`DeepSeek non-SSE response: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
+    const envelope = parsed.data?.data ? parsed.data : parsed;
+    const businessError = deepseekWebBusinessError(envelope);
+    if (businessError) throw businessError;
+    const content = String(envelope?.data?.biz_data?.content ?? envelope?.biz_data?.content ?? "");
+    if (!content) throw new DeepSeekWebError(`DeepSeek non-SSE response did not contain content: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
+    const sse = [
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })}\n\n`,
+      "data: [DONE]\n\n",
+    ].join("");
+    return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  }
   return r;
 }
 
 function deepseekWebRiskHeaders(): Record<string, string> {
-  const risk = getDeepSeekRiskSnapshot();
+  const risk = deepseekWebCurrentRisk();
   return {
     "X-DeepSeek-Risk-Level": risk.riskLevel,
     "X-DeepSeek-Risk-Score": String(risk.riskScore),
@@ -632,14 +658,15 @@ function deepseekWebRiskHeaders(): Record<string, string> {
 let deepseekWebBlockedUntil = 0;
 
 function deepseekWebLoadCooldown(): number {
-  if (deepseekWebBlockedUntil > 0) return deepseekWebBlockedUntil;
+  if (deepseekWebBlockedUntil > Date.now()) return deepseekWebBlockedUntil;
+  if (deepseekWebBlockedUntil > 0) deepseekWebBlockedUntil = 0;
   try {
     const parsed = safeJsonParse(Deno.readTextFileSync(DEEPSEEK_WEB_COOLDOWN_FILE));
     const until = Number(parsed.data?.blockedUntil || 0);
     if (Number.isFinite(until) && until > Date.now()) deepseekWebBlockedUntil = until;
     else if (until) Deno.removeSync(DEEPSEEK_WEB_COOLDOWN_FILE);
   } catch {}
-  return deepseekWebBlockedUntil;
+  return deepseekWebBlockedUntil > Date.now() ? deepseekWebBlockedUntil : 0;
 }
 
 function deepseekWebSaveCooldown(reason: string): void {
@@ -650,7 +677,13 @@ function deepseekWebSaveCooldown(reason: string): void {
 
 function deepseekWebTripCircuit(message: string, durationMs?: number): void {
   const text = String(message || "");
-  const duration = durationMs ?? (/\b429\b/.test(text) ? 30 * 60_000 : 2 * 60 * 60_000);
+  if (/being generated|busy/i.test(text)) return;
+  const isRateLimit = /\b429\b|muted|mute|throttl|too frequent|too many|频繁|限制|封禁|受限/i.test(text);
+  const isAuthFailure = /\b401\b|\b403\b/i.test(text);
+  if (!isRateLimit && !isAuthFailure && !(Number(durationMs) > 0)) return;
+  const fallback = isAuthFailure ? 2 * 60 * 60_000 : 30 * 60_000;
+  const requested = Number(durationMs);
+  const duration = Math.max(Number.isFinite(requested) && requested > 0 ? requested : fallback, fallback);
   deepseekWebBlockedUntil = Math.max(deepseekWebLoadCooldown(), Date.now() + duration);
   deepseekWebSaveCooldown(text.slice(0, 160));
   noteDeepSeekRestriction(text.slice(0, 120), duration);
@@ -659,10 +692,23 @@ function deepseekWebTripCircuit(message: string, durationMs?: number): void {
 
 function deepseekWebErrorResponse(error: any): Response {
   const status = Number(error?.status) || 502;
-  const retryAfterMs = Number(error?.retryAfterMs) || 0;
+  const cooldownMs = Math.max(0, deepseekWebLoadCooldown() - Date.now());
+  const retryAfterMs = Number(error?.retryAfterMs) > 0 ? Number(error.retryAfterMs) : ((status === 429 || status === 403) ? cooldownMs : 0);
   const headers: Record<string, string> = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
   if (retryAfterMs > 0) headers["Retry-After"] = String(Math.ceil(retryAfterMs / 1000));
   return new Response(JSON.stringify({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }), { status, headers });
+}
+
+function deepseekWebCurrentRisk(): any {
+  const risk: any = { ...getDeepSeekRiskSnapshot() };
+  const remaining = Math.max(0, deepseekWebLoadCooldown() - Date.now());
+  if (remaining > 0) {
+    risk.cooldownRemainingMs = remaining;
+    risk.riskLevel = "high";
+    risk.riskScore = Math.max(Number(risk.riskScore || 0), 80);
+    risk.factors = [...(risk.factors || []), "persistent cooldown active"];
+  }
+  return risk;
 }
 
 function deepseekWebReasoningEffort(body: any, model: string): string {
@@ -692,7 +738,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     });
   }
   if (path.endsWith("/risk.txt") && request.method === "GET") {
-    const risk = getDeepSeekRiskSnapshot();
+    const risk = deepseekWebCurrentRisk();
     const text = [
       `DeepSeek risk: ${risk.riskLevel} (${risk.riskScore}/100)`,
       `requests_last_5m=${risk.requestsLast5m}`,
@@ -706,7 +752,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     });
   }
   if (path.endsWith("/risk") && request.method === "GET") {
-    return new Response(JSON.stringify(getDeepSeekRiskSnapshot()), {
+    return new Response(JSON.stringify(deepseekWebCurrentRisk()), {
       headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...deepseekWebRiskHeaders() },
     });
   }
@@ -812,6 +858,14 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       return new Response(JSON.stringify({ error: "DeepSeek gate unavailable", detail: e.message }), {
         status: 503,
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    const postGateCooldownMs = deepseekWebLoadCooldown() - Date.now();
+    if (postGateCooldownMs > 0) {
+      releaseGate?.();
+      return new Response(JSON.stringify({ error: { message: "DeepSeek cooling down", type: "rate_limit_exceeded" }, retry_after_ms: postGateCooldownMs }), {
+        status: 429,
+        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Retry-After": String(Math.ceil(postGateCooldownMs / 1000)) },
       });
     }
 

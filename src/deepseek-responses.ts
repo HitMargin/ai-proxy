@@ -144,11 +144,25 @@ export function chatStreamToResponsesStream(chatResponse: Response, model: strin
       const id = responseId();
       const created = Math.floor(Date.now() / 1000);
       let text = "";
+      let reasoning = "";
       let textItemId = "";
+      let reasoningItemId = "";
+      let textOutputIndex: number | null = null;
+      let reasoningOutputIndex: number | null = null;
+      let nextOutputIndex = 0;
       const toolItems = new Map<number, { itemId: string; callId: string; name: string; args: string }>();
       const toolOutputIndices = new Map<number, number>();
+      const allocateOutputIndex = (): number => nextOutputIndex++;
+      const textIndex = (): number => {
+        if (textOutputIndex === null) textOutputIndex = allocateOutputIndex();
+        return textOutputIndex;
+      };
+      const reasoningIndex = (): number => {
+        if (reasoningOutputIndex === null) reasoningOutputIndex = allocateOutputIndex();
+        return reasoningOutputIndex;
+      };
       const toolOutputIndex = (index: number): number => {
-        if (!toolOutputIndices.has(index)) toolOutputIndices.set(index, toolOutputIndices.size + (textItemId ? 1 : 0));
+        if (!toolOutputIndices.has(index)) toolOutputIndices.set(index, allocateOutputIndex());
         return toolOutputIndices.get(index)!;
       };
       let usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
@@ -177,18 +191,36 @@ export function chatStreamToResponsesStream(chatResponse: Response, model: strin
         if (!raw || raw === "[DONE]") return;
         let chunk: any;
         try { chunk = JSON.parse(raw); } catch { return; }
+        if (chunk.error || chunk.type === "error") {
+          const message = String(chunk.error?.message || chunk.error || chunk.message || "DeepSeek stream error");
+          throw new Error(message);
+        }
         if (chunk.usage) usage = usageFromChat(chunk);
         const delta = chunk.choices?.[0]?.delta || {};
+        if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
+          if (!reasoningItemId) {
+            reasoningItemId = responseId("rs");
+            send("response.output_item.added", {
+              output_index: reasoningIndex(),
+              item: { id: reasoningItemId, type: "reasoning", summary: [], content: [], status: "in_progress" },
+            });
+          }
+          reasoning += delta.reasoning_content;
+          send("response.reasoning_summary_text.delta", {
+            output_index: reasoningOutputIndex,
+            delta: delta.reasoning_content,
+          });
+        }
         if (typeof delta.content === "string" && delta.content) {
           if (!textItemId) {
             textItemId = responseId("msg");
             send("response.output_item.added", {
-              output_index: 0,
+              output_index: textIndex(),
               item: { id: textItemId, type: "message", status: "in_progress", role: "assistant", content: [] },
             });
             send("response.content_part.added", {
               item_id: textItemId,
-              output_index: 0,
+              output_index: textOutputIndex,
               content_index: 0,
               part: { type: "output_text", text: "" },
             });
@@ -196,7 +228,7 @@ export function chatStreamToResponsesStream(chatResponse: Response, model: strin
           text += delta.content;
           send("response.output_text.delta", {
             item_id: textItemId,
-            output_index: 0,
+            output_index: textOutputIndex,
             content_index: 0,
             delta: delta.content,
           });
@@ -241,18 +273,25 @@ export function chatStreamToResponsesStream(chatResponse: Response, model: strin
         }
         buffer += decoder.decode();
         if (buffer.startsWith("data:")) handleData(buffer.slice(5).trim());
-        const output: any[] = [];
+        const finalItems: any[] = [];
+        if (reasoningItemId) {
+          finalItems[reasoningOutputIndex!] = { id: reasoningItemId, type: "reasoning", summary: [], content: [], status: "completed" };
+        }
         if (text) {
-          if (!textItemId) textItemId = responseId("msg");
-          send("response.output_text.done", { item_id: textItemId, output_index: 0, content_index: 0, text });
-          send("response.content_part.done", { item_id: textItemId, output_index: 0, content_index: 0, part: { type: "output_text", text } });
-          output.push({ id: textItemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] });
+          if (!textItemId) {
+            textItemId = responseId("msg");
+            textIndex();
+          }
+          send("response.output_text.done", { item_id: textItemId, output_index: textOutputIndex, content_index: 0, text });
+          send("response.content_part.done", { item_id: textItemId, output_index: textOutputIndex, content_index: 0, part: { type: "output_text", text } });
+          finalItems[textOutputIndex!] = { id: textItemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text, annotations: [] }] };
         }
         for (const [index, item] of toolItems) {
           const outputIndex = toolOutputIndex(index);
           send("response.function_call_arguments.done", { item_id: item.itemId, output_index: outputIndex, arguments: item.args });
-          output.push({ id: item.itemId, type: "function_call", call_id: item.callId, name: item.name, arguments: item.args, status: "completed" });
+          finalItems[outputIndex] = { id: item.itemId, type: "function_call", call_id: item.callId, name: item.name, arguments: item.args, status: "completed" };
         }
+        const output = Array.from({ length: nextOutputIndex }, (_, index) => finalItems[index]).filter(Boolean);
         const response = { ...base("completed", output), output_text: text, reasoning: { effort: null, summary: null }, parallel_tool_calls: true, store: false, metadata: {} };
         send("response.completed", { response });
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
