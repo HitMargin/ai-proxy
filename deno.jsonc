@@ -2,6 +2,10 @@
   "deploy": {
     "org": "hitmargin",
     "app": "ai-api"
+  },
+  "tasks": {
+    "check": "deno check main.ts worker.ts",
+    "test": "deno test --allow-env src/"
   }
 }
 

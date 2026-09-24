@@ -101,6 +101,15 @@ Cloudflare Worker（不跑 wrangler、不动 `BACKEND_URL`）、网络代理（�
 本地与完整模式共用同一个 8000 端口，可随时互相补位：本地模式跑着时再执行一次完整模式，隧道会接到重启后的新服务上；
 反之，完整模式的隧道在跑时执行 `-Local` 只重启本地服务，远端链路自动恢复。
 
+### 开发检查
+
+```powershell
+deno task check
+deno task test
+```
+
+`deno task test` 使用 `--allow-env`，因为测试导入的运行时会读取 `API_KEYS` 等环境变量；不会读取或打印凭据文件。
+
 ---
 
 ## 环境变量
