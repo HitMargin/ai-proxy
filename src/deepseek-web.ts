@@ -27,6 +27,12 @@ const DEEPSEEK_WEB_HEADERS_FILE = "./deepseek-headers.json";
 const DEEPSEEK_WEB_COOLDOWN_FILE = "./deepseek-web-cooldown.json";
 const DEEPSEEK_MAX_PROMPT_CHARS = 200_000;
 const DEEPSEEK_MAX_REF_IMAGES = 24;
+const DEEPSEEK_SESSION_REUSE_TURNS = (() => {
+  const raw = Number(Deno.env.get("DEEPSEEK_SESSION_REUSE_TURNS") ?? "20");
+  return Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 20;
+})();
+type DeepSeekSessionSlot = { key: string; id: string; turns: number; cookies: string; auth: string };
+let deepseekWebSessionSlot: DeepSeekSessionSlot | undefined;
 const deepseekWebState: any = { chatSessionId: null, cookies: "", mtime: null, auth: "", authMtime: null, headers: {}, headersMtime: null };
 
 function deepseekWebLoadCookies(): string {
@@ -244,6 +250,40 @@ async function deepseekWebDeleteSession(cookies: string, auth: string, chatSessi
   } catch {
     // 清理失败不应覆盖已经生成的模型回复。
   }
+}
+
+function deepseekWebAccountKey(cookies: string, auth: string): string {
+  const raw = `${auth}|${cookies}`;
+  let hash = 2166136261;
+  for (let index = 0; index < raw.length; index++) {
+    hash ^= raw.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function deepseekWebRetireSession(sessionId?: string): void {
+  if (!sessionId || deepseekWebSessionSlot?.id === sessionId) deepseekWebSessionSlot = undefined;
+}
+
+async function deepseekWebLeaseSession(cookies: string, auth: string): Promise<{ id: string; reused: boolean }> {
+  const key = deepseekWebAccountKey(cookies, auth);
+  if (DEEPSEEK_SESSION_REUSE_TURNS > 0 && deepseekWebSessionSlot?.key === key && deepseekWebSessionSlot.turns < DEEPSEEK_SESSION_REUSE_TURNS) {
+    deepseekWebSessionSlot.turns += 1;
+    return { id: deepseekWebSessionSlot.id, reused: true };
+  }
+  const previous = deepseekWebSessionSlot;
+  const id = await deepseekWebCreateSession(cookies, auth);
+  if (DEEPSEEK_SESSION_REUSE_TURNS > 0) {
+    deepseekWebSessionSlot = { key, id, turns: 1, cookies, auth };
+    if (previous) {
+      const delay = 60_000 + Math.floor(Math.random() * 60_000);
+      setTimeout(() => { void deepseekWebDeleteSession(previous.cookies, previous.auth, previous.id); }, delay);
+    }
+  } else {
+    deepseekWebSessionSlot = undefined;
+  }
+  return { id, reused: false };
 }
 
 type DeepSeekWebImage = { data: Uint8Array; mediaType: string; name: string };
@@ -573,7 +613,7 @@ function deepseekWebOpenAIStream(
   model: string,
   tools: any,
   prompt: string,
-  cleanup: () => Promise<void>,
+  cleanup: (force?: boolean) => Promise<void>,
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
   return new ReadableStream<Uint8Array>({
@@ -612,12 +652,13 @@ function deepseekWebOpenAIStream(
         };
         send({}, finish, { usage });
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        await cleanup(false);
       } catch (error: any) {
         if (error instanceof DeepSeekWebError) deepseekWebTripCircuit(error.message, error.retryAfterMs, error.kind);
         send({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }, "error");
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        await cleanup(true);
       } finally {
-        await cleanup();
         controller.close();
       }
     },
@@ -917,19 +958,23 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       return deepseekWebErrorResponse(e);
     }
 
-    let chatSessionId: string;
-    try { chatSessionId = await deepseekWebCreateSession(cookies, auth); }
+    let sessionLease: { id: string; reused: boolean };
+    try { sessionLease = await deepseekWebLeaseSession(cookies, auth); }
     catch (e: any) {
       if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
       releaseGate?.();
       return deepseekWebErrorResponse(e);
     }
+    const chatSessionId = sessionLease.id;
 
     let cleanedUp = false;
-    const cleanup = async () => {
+    const cleanup = async (force = false) => {
       if (cleanedUp) return;
       cleanedUp = true;
-      await deepseekWebDeleteSession(cookies, auth, chatSessionId);
+      if (force) deepseekWebRetireSession(chatSessionId);
+      if (force || !sessionLease.reused || DEEPSEEK_SESSION_REUSE_TURNS === 0) {
+        await deepseekWebDeleteSession(cookies, auth, chatSessionId);
+      }
       releaseGate?.();
     };
     let upstream: Response;
@@ -937,7 +982,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       upstream = await deepseekWebChat(cookies, auth, chatSessionId, prompt, model, reasoningEffort !== "off", refFileIds);
     } catch (e: any) {
       if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
-      await cleanup();
+      await cleanup(true);
       return deepseekWebErrorResponse(e);
     }
 
@@ -960,7 +1005,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       result = await deepseekWebProcess(upstream, openaiBody.tools);
     } catch (e: any) {
       if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
-      await cleanup();
+      await cleanup(true);
       return deepseekWebErrorResponse(e);
     } finally {
       await cleanup();

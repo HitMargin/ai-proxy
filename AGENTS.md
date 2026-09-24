@@ -7,7 +7,7 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
 ## 当前状态（2026-09-24 核实，改动此节请更新日期）
 - **cnb 匿名通道已死**：上游 401 `[NOT_LOGIN]`，需登录。已实现登录态支持：登录 Cookie 粘到
   `cnb-login.txt`（热加载，剔除 csrfkey，见 README 1.5 节）。用户暂无 cnb 账户，通道 dormant。
-- **DeepSeek 网页端**：`/deepseek-web/v1` 已支持自动登录凭证、PoW WASM、THINK/RESPONSE SSE 解析、OpenAI SSE、工具调用、图片 data URL 上传到 `ref_file_ids`、Chat Completions、Responses API 和 `off/low/high/max` 思考档位；由于 DSH OpenAI 兼容列表不读取自定义 reasoning 元数据，额外暴露 `deepseek-reasoner-off/low/high/max` 模型变体；同一账号请求串行，随机间隔 2～4 秒，连续 15 次长休，429/403 会暂停自动重试。图片首次使用前需重新运行登录捕获脚本生成 `deepseek-headers.json`。
+- **DeepSeek 网页端**：`/deepseek-web/v1` 已支持自动登录凭证、PoW WASM、THINK/RESPONSE SSE 解析、OpenAI SSE、工具调用、图片 data URL 上传到 `ref_file_ids`、Chat Completions、Responses API 和 `off/low/high/max` 思考档位；由于 DSH OpenAI 兼容列表不读取自定义 reasoning 元数据，额外暴露 `deepseek-reasoner-off/low/high/max` 模型变体；同一账号请求串行，随机间隔 2～4 秒，连续 15 次长休，429/403 会暂停自动重试。默认同一账号复用 chat_session 20 轮，`DEEPSEEK_SESSION_REUSE_TURNS=0` 可关闭复用。图片首次使用前需重新运行登录捕获脚本生成 `deepseek-headers.json`。
 - **可用通道**：`/v1` 聚合入口的 kilo 系模型（含 `kilo/deepseek/deepseek-v4-flash-0731:free`，实测正常）。
 - **不可用**：zen 全部（区域锁 / 仅限 OpenCode 客户端）；ss2a 自营模型 502；ss2a 免费档间歇 403/502。
 - **DSH 配置**：活动 Web profile 的模型注册文件是 `C:\Users\22282\.dsh\profiles\web\cordis.patch.yml`；其中 `deepseek-web` 已注册 1,048,576 context、16,384/32,768 maxTokens、text/image 输入和 off/low/high/max 思考档位。HTTP `/models` 不能替代这份 DSH 配置。
