@@ -4,7 +4,7 @@
 Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + Cloudflare Worker 远端链。
 为 dsh 提供免费模型入口。
 
-## 当前状态（2026-09-24 核实，改动此节请更新日期）
+## 当前状态（2026-09-25 核实，改动此节请更新日期）
 - **cnb 匿名通道已死**：上游 401 `[NOT_LOGIN]`，需登录。已实现登录态支持：登录 Cookie 粘到
   `cnb-login.txt`（热加载，剔除 csrfkey，见 README 1.5 节）。用户暂无 cnb 账户，通道 dormant。
 - **DeepSeek 网页端**：`/deepseek-web/v1` 已支持自动登录凭证、PoW WASM、THINK/RESPONSE SSE 解析、OpenAI SSE、工具调用、图片 data URL 上传到 `ref_file_ids`、Chat Completions、Responses API 和 `off/low/high/max` 思考档位；由于 DSH OpenAI 兼容列表不读取自定义 reasoning 元数据，额外暴露 `deepseek-reasoner-off/low/high/max` 模型变体；同一账号请求串行，随机间隔 2～4 秒，连续 15 次长休，429/403 会暂停自动重试。默认同一账号复用 chat_session 20 轮，`DEEPSEEK_SESSION_REUSE_TURNS=0` 可关闭复用。图片首次使用前需重新运行登录捕获脚本生成 `deepseek-headers.json`。
@@ -15,7 +15,7 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
 - **请求指纹**：DeepSeek 的 PoW、建会话、删除会话、图片上传和 completion 共用 `deepseek-headers.json` 的浏览器头集合；不再发送重复版本头或 `X-Deepseek-Harness`。
 - **源码结构**：`main.ts` 为入口/路由；`src/core.ts` 为通用核心；`src/cnb.ts` 与 `src/deepseek-web.ts` 为上游适配模块；`third_party/dsh-deepseek-web-login` 为保留 Apache-2.0 许可的 DeepSeek 工具协议派生代码。
 - git 已于今日 init（身份 HitMargin），`.gitignore` 已排除 cookies.txt / cnb-login.txt / deepseek-auth.txt / deepseek-cookies.txt / *.bak 等。
-- **未决事项**：是否参考 https://github.com/jieapi/AiCode issue #23 在后续模块中实现「自动上下文压缩」——仅参考，未决定。
+- **未决事项**：是否参考 https://github.com/jieapi/AiCode issue #23 在后续模块中实现「自动上下文压缩」——仅参考，未决定；session journal/启动补删、request.signal/取消超时仍未完成。
 
 ## 行为规则
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。

@@ -28,7 +28,7 @@ const DEEPSEEK_WEB_COOLDOWN_FILE = "./deepseek-web-cooldown.json";
 const DEEPSEEK_MAX_PROMPT_CHARS = 200_000;
 const DEEPSEEK_MAX_REF_IMAGES = 24;
 const DEEPSEEK_SESSION_REUSE_TURNS = (() => {
-  const raw = Number(Deno.env.get("DEEPSEEK_SESSION_REUSE_TURNS") ?? "20");
+  const raw = typeof Deno !== "undefined" ? Number(Deno.env.get("DEEPSEEK_SESSION_REUSE_TURNS") ?? "20") : 20;
   return Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 20;
 })();
 type DeepSeekSessionSlot = { key: string; id: string; turns: number; cookies: string; auth: string };
@@ -625,6 +625,7 @@ function deepseekWebOpenAIStream(
         const payload = { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: finish }], ...extra };
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
       };
+      let completed = false;
       try {
         const result = await deepseekWebProcess(response, tools, {
           onThinking: (content) => {
@@ -652,14 +653,21 @@ function deepseekWebOpenAIStream(
         };
         send({}, finish, { usage });
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        await cleanup(false);
+        completed = true;
       } catch (error: any) {
         if (error instanceof DeepSeekWebError) deepseekWebTripCircuit(error.message, error.retryAfterMs, error.kind);
-        send({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }, "error");
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-        await cleanup(true);
+        try {
+          send({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }, "error");
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        } catch {
+          // 客户端可能已经取消；清理必须继续执行。
+        }
       } finally {
-        controller.close();
+        try {
+          await cleanup(!completed);
+        } finally {
+          try { controller.close(); } catch { /* 客户端已取消 */ }
+        }
       }
     },
   });
