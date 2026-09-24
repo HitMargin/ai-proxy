@@ -1,0 +1,461 @@
+// ============================================
+// 可扩展 AI API 代理框架（Deno Deploy 版）
+// 原 Cloudflare Workers 逻辑保持不变
+// ============================================
+
+// ---------- 环境变量（模块级，启动时读一次；Workers 由 fetch 入口注入） ----------
+function getEnv(name: string): string {
+  if (typeof Deno !== "undefined") return Deno.env.get(name) || "";
+  try {
+    return ((globalThis as any).process?.env?.[name]) || "";
+  } catch {
+    return "";
+  }
+}
+
+export const ENV: Record<string, string> = {
+  API_KEYS: getEnv("API_KEYS"),
+  DEFAULT_BEARER_TOKEN: getEnv("DEFAULT_BEARER_TOKEN"),
+  // 其它 provider 可能用到的 key，按需添加
+  ANTHROPIC_API_KEY: getEnv("ANTHROPIC_API_KEY"),
+  GEMINI_API_KEY: getEnv("GEMINI_API_KEY"),
+  OPENROUTER_API_KEY: getEnv("OPENROUTER_API_KEY"),
+  // 反向代理模式：指向本地隧道等后端时，Worker 只做字节转发（CPU 趋近于零）
+  BACKEND_URL: getEnv("BACKEND_URL"),
+};
+
+// ---------- 工具函数 ----------
+export function safeJsonParse(text: string) {
+  try {
+    return { data: JSON.parse(text), error: null as any };
+  } catch (e) {
+    return { data: null, error: e as any };
+  }
+}
+
+export function cloneHeadersForUpstream(request: Request, provider: any, env: any) {
+  const headers = new Headers();
+
+  const allowedHeaders = ["accept", "accept-language", "content-type", "user-agent"];
+  for (const name of allowedHeaders) {
+    const value = request.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+
+  const auth = provider.auth;
+  if (auth.type === "bearer") {
+    const userToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+    const token = userToken || auth.defaultToken || env.DEFAULT_BEARER_TOKEN;
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+  } else if (auth.type === "api-key") {
+    const headerName = auth.header || "x-api-key";
+    const userKey = request.headers.get(headerName);
+    const key =
+      userKey ||
+      auth.defaultToken ||
+      env[headerName.toUpperCase().replace(/-/g, "_")];
+    if (key) headers.set(headerName, key);
+  }
+
+  headers.delete("content-length");
+  headers.delete("host");
+  headers.delete("connection");
+  headers.delete("accept-encoding");
+
+  try {
+    headers.set("Host", new URL(provider.baseUrl).host);
+  } catch (_) {}
+
+  return headers;
+}
+
+// ---------- Adapters ----------
+const adapters: Record<string, any> = {
+  passthrough: {
+    request: (body: any) => body,
+    response: (body: any) => body,
+    stream: (chunk: any) => chunk,
+    isIdentity: true,
+  },
+  toAnthropic: {
+    request: (openaiBody: any) => {
+      const systemMessages = openaiBody.messages.filter((m: any) => m.role === "system");
+      const system = systemMessages.map((m: any) => m.content).join("\n");
+      const userMessages = openaiBody.messages.filter((m: any) => m.role !== "system");
+
+      const anthropicMessages = userMessages.map((m: any) => {
+        const role = m.role === "assistant" ? "assistant" : "user";
+        let content;
+        if (Array.isArray(m.content)) {
+          content = m.content.map((block: any) => {
+            if (typeof block === "string") return { type: "text", text: block };
+            if (block.type === "text") return { type: "text", text: block.text || "" };
+            if (block.type === "image_url") {
+              const url =
+                typeof block.image_url === "string"
+                  ? block.image_url
+                  : block.image_url?.url || "";
+              const match = url.match(/^data:(image\/\w+);base64,(.+)$/);
+              if (match) {
+                return { type: "image", source: { type: "base64", media_type: match[1], data: match[2] } };
+              }
+              return { type: "text", text: `[Image URL: ${url}]` };
+            }
+            return { type: "text", text: "[unsupported block]" };
+          });
+        } else {
+          content = m.content;
+        }
+        return { role, content };
+      });
+
+      const result: any = {
+        model: openaiBody.model,
+        messages: anthropicMessages,
+        max_tokens: openaiBody.max_tokens || openaiBody.max_completion_tokens || 1024,
+        temperature: openaiBody.temperature ?? 1.0,
+        top_k: openaiBody.top_k,
+        stop_sequences: Array.isArray(openaiBody.stop)
+          ? openaiBody.stop
+          : openaiBody.stop ? [openaiBody.stop] : undefined,
+        stream: openaiBody.stream || false,
+      };
+      if (system) result.system = system;
+      return result;
+    },
+    response: (anthropicBody: any) => {
+      let content = "";
+      if (Array.isArray(anthropicBody.content)) {
+        content = anthropicBody.content
+          .filter((block: any) => block.type === "text")
+          .map((block: any) => block.text || "")
+          .join("");
+      } else if (typeof anthropicBody.content === "string") {
+        content = anthropicBody.content;
+      }
+      const stopReason = anthropicBody.stop_reason || "stop";
+      const map: any = { end_turn: "stop", max_tokens: "length", stop_sequence: "stop", tool_use: "tool_calls" };
+      const finishReason = map[stopReason] || stopReason;
+      return {
+        id: anthropicBody.id || `msg_${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: anthropicBody.model || "unknown",
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: finishReason }],
+        usage: anthropicBody.usage
+          ? {
+              prompt_tokens: anthropicBody.usage.input_tokens || 0,
+              completion_tokens: anthropicBody.usage.output_tokens || 0,
+              total_tokens: (anthropicBody.usage.input_tokens || 0) + (anthropicBody.usage.output_tokens || 0),
+            }
+          : undefined,
+      };
+    },
+    stream: (chunk: any) => chunk,
+    isIdentity: false,
+  },
+  toGemini: {
+    request: (openaiBody: any) => {
+      const systemMessages = openaiBody.messages.filter((m: any) => m.role === "system");
+      const systemText = systemMessages.map((m: any) => m.content).join("\n");
+      const contents = openaiBody.messages
+        .filter((m: any) => m.role !== "system")
+        .map((m: any) => ({
+          role: m.role === "assistant" ? "model" : "user",
+          parts: Array.isArray(m.content)
+            ? m.content.map((block: any) => {
+                if (typeof block === "string") return { text: block };
+                if (block.type === "text") return { text: block.text || "" };
+                if (block.type === "image_url") {
+                  const url = typeof block.image_url === "string" ? block.image_url : block.image_url?.url || "";
+                  const match = url.match(/^data:(image\/\w+);base64,(.+)$/);
+                  if (match) return { inlineData: { mimeType: match[1], data: match[2] } };
+                  return { text: `[Image URL: ${url}]` };
+                }
+                return { text: "[unsupported block]" };
+              })
+            : [{ text: m.content }],
+        }));
+      const result: any = {
+        contents,
+        generationConfig: {
+          temperature: openaiBody.temperature ?? 1.0,
+          maxOutputTokens: openaiBody.max_tokens || openaiBody.max_completion_tokens || 1024,
+          topP: openaiBody.top_p,
+          stopSequences: openaiBody.stop,
+        },
+      };
+      if (systemText) result.systemInstruction = { parts: [{ text: systemText }] };
+      if (openaiBody.stream) result.stream = true;
+      return result;
+    },
+    response: (geminiBody: any) => {
+      const candidate = geminiBody.candidates?.[0];
+      const content = candidate?.content?.parts?.[0]?.text || "";
+      const finishReason = candidate?.finishReason || "STOP";
+      const map: any = { STOP: "stop", MAX_TOKENS: "length", SAFETY: "content_filter", RECITATION: "content_filter" };
+      return {
+        id: `gemini-${Date.now()}`,
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: geminiBody.model || "gemini-pro",
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: map[finishReason] || finishReason.toLowerCase(),
+        }],
+        usage: geminiBody.usageMetadata
+          ? {
+              prompt_tokens: geminiBody.usageMetadata.promptTokenCount || 0,
+              completion_tokens: geminiBody.usageMetadata.candidatesTokenCount || 0,
+              total_tokens: geminiBody.usageMetadata.totalTokenCount || 0,
+            }
+          : undefined,
+      };
+    },
+    stream: (chunk: any) => chunk,
+    isIdentity: false,
+  },
+};
+
+// ---------- Providers 配置 ----------
+export const providers: Record<string, any> = {
+  kilo: {
+    prefix: "/kilo/v1",
+    baseUrl: "https://api.kilo.ai/api/gateway",
+    auth: { type: "none" },
+    pathRewrite: (path: string) => path.replace(/^\/kilo\/v1/, ""),
+    endpoints: { models: "/models", chat: "/chat/completions" },
+    adapter: adapters.passthrough,
+    filterModels: (data: any) => {
+      if (!data?.data) return data;
+      return { ...data, data: data.data.filter((m: any) => m.isFree === true) };
+    },
+  },
+  zen: {
+    prefix: "/zen/v1",
+    baseUrl: "https://opencode.ai/zen",
+    auth: { type: "bearer", defaultToken: "public" },
+    pathRewrite: (path: string) => path.replace(/^\/zen/, ""),
+    endpoints: { models: "/models", chat: "/chat/completions" },
+    adapter: adapters.passthrough,
+    filterModels: (data: any) => {
+      if (!data?.data) return data;
+      return { ...data, data: data.data.filter((m: any) => m.id && m.id.endsWith("-free")) };
+    },
+  },
+  anthropic: {
+    prefix: "/anthropic/v1",
+    baseUrl: "https://api.anthropic.com",
+    auth: { type: "api-key", header: "x-api-key" },
+    pathRewrite: (path: string) => path.replace(/^\/anthropic\/v1/, "/v1"),
+    endpoints: { models: "/v1/models", chat: "/v1/messages" },
+    adapter: adapters.toAnthropic,
+    filterModels: null,
+    extraHeaders: { "anthropic-version": "2023-06-01" },
+  },
+  gemini: {
+    prefix: "/gemini/v1",
+    baseUrl: "https://generativelanguage.googleapis.com",
+    auth: { type: "api-key", header: "x-goog-api-key" },
+    pathRewrite: (path: string) => path.replace(/^\/gemini\/v1/, "/v1beta"),
+    endpoints: { models: "/v1beta/models", chat: "/v1beta/models/gemini-pro:generateContent" },
+    adapter: adapters.toGemini,
+    filterModels: null,
+  },
+  openrouter_responses: {
+    prefix: "/openrouter/v1/responses",
+    baseUrl: "https://openrouter.ai/api/v1",
+    auth: { type: "bearer", defaultToken: "" },
+    pathRewrite: (path: string) => path.replace(/^\/openrouter\/v1\/responses/, "/responses"),
+    endpoints: { chat: "/responses" },
+    adapter: adapters.passthrough,
+    filterModels: null,
+  },
+  openrouter: {
+    prefix: "/openrouter/v1",
+    baseUrl: "https://openrouter.ai/api/v1",
+    auth: { type: "bearer", defaultToken: "" },
+    pathRewrite: (path: string) => path.replace(/^\/openrouter\/v1/, ""),
+    endpoints: { models: "/models", chat: "/chat/completions" },
+    adapter: adapters.passthrough,
+    filterModels: null,
+  },
+  cnb: {
+    prefix: "/cnb/v1",
+    baseUrl: "https://cnb.cool",
+    auth: { type: "none" },
+    pathRewrite: (p: string) => p.replace(/^\/cnb\/v1/, ""),
+    endpoints: { models: "/v1/models", chat: "/v1/chat/completions", responses: "/v1/responses" },
+    adapter: adapters.passthrough,
+    filterModels: null,
+    customHandler: "cnb",
+  },
+  "deepseek-web": {
+    prefix: "/deepseek-web/v1",
+    baseUrl: "https://chat.deepseek.com",
+    auth: { type: "none" },
+    pathRewrite: (path: string) => path.replace(/^\/deepseek-web\/v1/, "/api/v0"),
+    endpoints: { models: "/api/v0/models", chat: "/api/v0/chat/completion" },
+    adapter: adapters.passthrough,
+    filterModels: null,
+    customHandler: "deepseek-web",
+  },
+  tokenharbor: {
+    prefix: "/tokenharbor/v1",
+    baseUrl: "https://tokenharbor.ai/v1",
+    auth: { type: "bearer", defaultToken: "" },
+    pathRewrite: (path: string) => path.replace(/^\/tokenharbor\/v1/, ""),
+    endpoints: { models: "/models", chat: "/chat/completions" },
+    adapter: adapters.passthrough,
+    filterModels: (data: any) => {
+      if (!data?.data) return data;
+      return { ...data, data: data.data.filter((m: any) => m.id && m.id.endsWith(":free")) };
+    },
+  },
+};
+
+// ---------- 健康检查 ----------
+async function testModel(baseUrl: string, modelId: string, providerKey: string) {
+  const provider = providers[providerKey];
+  const url = `${baseUrl}${provider.endpoints.chat}`;
+  const auth = provider.auth;
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (auth.type === "bearer") {
+    headers.set("Authorization", `Bearer ${auth.defaultToken || ""}`);
+  } else if (auth.type === "api-key") {
+    const headerName = auth.header || "x-api-key";
+    if (auth.defaultToken) headers.set(headerName, auth.defaultToken);
+  }
+  const testBody = { model: modelId, messages: [{ role: "user", content: "Hi" }], max_tokens: 1 };
+  const finalBody = provider.adapter.request ? provider.adapter.request(testBody) : testBody;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const resp = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(finalBody),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    return resp.status === 200 || resp.status === 429;
+  } catch {
+    return false;
+  }
+}
+
+export async function filterHealthyModels(models: any[], providerKey: string, baseUrl: string) {
+  if (!models || !models.length) return models;
+  const concurrency = 5;
+  const results = [];
+  for (let i = 0; i < models.length; i += concurrency) {
+    const chunk = models.slice(i, i + concurrency);
+    const statuses = await Promise.all(chunk.map((m) => testModel(baseUrl, m.id, providerKey)));
+    for (let j = 0; j < chunk.length; j++) if (statuses[j]) results.push(chunk[j]);
+  }
+  return results;
+}
+
+// ---------- 响应解析 ----------
+export async function tryParseResponse(response: Response) {
+  const ct = response.headers.get("content-type") || "";
+  if (ct.includes("application/json")) {
+    try {
+      return { data: await response.json(), error: null as any };
+    } catch (e) {
+      return { data: null, error: e as any };
+    }
+  }
+  const text = await response.text();
+  return { data: null, error: new Error(`Non-JSON response: ${text.slice(0, 200)}`) };
+}
+
+// ---------- 流式转换 ----------
+export function createStreamTransformer(adapter: any, requestBody: any) {
+  if (adapter.isIdentity) return null;
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let messageId = `chatcmpl-${Date.now()}`;
+  let model = requestBody.model || "";
+  let created = Math.floor(Date.now() / 1000);
+
+  function processSseData(dataStr: string) {
+    if (!dataStr || dataStr === "[DONE]") return "data: [DONE]\n\n";
+    let data;
+    try { data = JSON.parse(dataStr); } catch { return ""; }
+    let openAiChunk: any = null;
+
+    if (adapter === adapters.toAnthropic) {
+      const type = data.type;
+      if (type === "message_start") {
+        messageId = data.message?.id || `msg_${Date.now()}`;
+        model = data.message?.model || model;
+        openAiChunk = {
+          id: messageId, object: "chat.completion.chunk", created, model,
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        };
+      } else if (type === "content_block_delta") {
+        const text = data.delta?.text || "";
+        if (text) {
+          openAiChunk = {
+            id: messageId, object: "chat.completion.chunk", created, model,
+            choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+          };
+        }
+      } else if (type === "message_delta") {
+        const stopReason = data.delta?.stop_reason || "stop";
+        const map: any = { end_turn: "stop", max_tokens: "length", stop_sequence: "stop", tool_use: "tool_calls" };
+        openAiChunk = {
+          id: messageId, object: "chat.completion.chunk", created, model,
+          choices: [{ index: 0, delta: {}, finish_reason: map[stopReason] || stopReason }],
+        };
+      }
+    } else if (adapter === adapters.toGemini) {
+      if (data.candidates && data.candidates.length > 0) {
+        const c = data.candidates[0];
+        const text = c.content?.parts?.[0]?.text || "";
+        if (text) {
+          openAiChunk = {
+            id: messageId, object: "chat.completion.chunk", created, model,
+            choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+          };
+        }
+        if (c.finishReason) {
+          const map: any = { STOP: "stop", MAX_TOKENS: "length", SAFETY: "content_filter", RECITATION: "content_filter" };
+          openAiChunk = {
+            id: messageId, object: "chat.completion.chunk", created, model,
+            choices: [{ index: 0, delta: {}, finish_reason: map[c.finishReason] || c.finishReason.toLowerCase() }],
+          };
+        }
+      }
+    }
+    return openAiChunk ? `data: ${JSON.stringify(openAiChunk)}\n\n` : "";
+  }
+
+  return new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (line.startsWith("data:")) {
+          const output = processSseData(line.slice(5).trim());
+          if (output) controller.enqueue(encoder.encode(output));
+        }
+      }
+    },
+    flush(controller) {
+      if (buffer.trim()) {
+        const line = buffer.trim();
+        if (line.startsWith("data:")) {
+          const output = processSseData(line.slice(5).trim());
+          if (output) controller.enqueue(encoder.encode(output));
+        }
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    },
+  });
+}
+

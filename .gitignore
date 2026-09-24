@@ -1,5 +1,9 @@
 # --- secrets / credentials (do not commit) ---
 cookies.txt
+deepseek-cookies.txt
+deepseek-auth.txt
+deepseek-headers.json
+deepseek-web-cooldown.json
 .env
 .env.*
 *.pem
@@ -27,3 +31,4 @@ desktop.ini
 .DS_Store
 .vscode/
 .idea/
+cnb-login.txt

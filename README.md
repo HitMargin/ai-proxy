@@ -45,6 +45,20 @@ if (ENV.BACKEND_URL) return await proxyToBackend(request);  // 反向代理模�
 // 否则：本地解析 + 适配 + 调用上游
 ```
 
+## 源码结构
+
+项目已从单文件拆分为以下模块：
+
+```text
+main.ts                    入口、鉴权、Provider 路由、/v1 聚合、本地 Deno 启动
+src/core.ts                环境变量、Provider 配置、协议适配器、通用 HTTP/流式工具
+src/cnb.ts                 cnb.cool CSRF、登录态、工具调用、Responses 转换
+src/deepseek-web.ts        DeepSeek 网页登录态、PoW WASM、SSE 解析、OpenAI 转换
+deepseek-sha3.wasm         DeepSeek PoW 原生求解器
+```
+
+`worker.ts` 仍然从 `main.ts` 导入 `handler`，部署入口保持不变。
+
 ---
 
 ## 快速开始
@@ -100,6 +114,37 @@ Cloudflare Worker（不跑 wrangler、不动 `BACKEND_URL`）、网络代理（�
 | `GEMINI_API_KEY` | 否 | `/gemini/v1` 使用 |
 | `OPENROUTER_API_KEY` | 否 | `/openrouter/v1` 使用 |
 
+### DeepSeek 网页端反代（`/deepseek-web/v1`）
+1. 运行自动登录与凭证捕获脚本：
+   ```powershell
+   deno run -A .tmp-extract-deepseek-cookies.ts
+   ```
+2. 脚本会打开系统 Edge 的 DeepSeek 登录页；在页面中完成扫码/登录后，无需按回车，脚本会自动捕获 Cookie、Bearer Token 和网页请求指纹头，分别保存到 `deepseek-cookies.txt`、`deepseek-auth.txt` 和 `deepseek-headers.json`。图片上传依赖这些真实请求头。
+3. 三个凭证文件均已加入 `.gitignore`，不要上传或分享。
+4. 调用：
+   ```bash
+   curl http://localhost:8000/deepseek-web/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "deepseek-chat",
+       "messages": [{"role": "user", "content": "你好"}]
+     }'
+   ```
+
+> **注意**：DeepSeek 网页端接口为私有接口，随时可能改版；当前实现已包含网页端 `DeepSeekHashV1` PoW（使用本地 `deepseek-sha3.wasm` 自动求解），每轮使用独立临时 `chat_session` 并在结束后清理，完整序列化 OpenAI `messages`（上限 20 万字符）。响应会按上游 SSE 实时转发：`THINK` 片段输出为 `delta.reasoning_content`，`RESPONSE` 片段输出为 `delta.content`，工具调用输出为 `delta.tool_calls`；请求支持 `reasoning_effort`（`off` / `low` / `high` / `max`）。网页端本身只有 `thinking_enabled` 开关，`low/high/max` 都只表示开启思考，等级会作为模型指令注入。工具协议源码及许可证见 [`third_party/dsh-deepseek-web-login`](third_party/dsh-deepseek-web-login)。
+>
+> **业务错误与冷却**：代理会解析 HTTP 200 中的 `biz_code/biz_msg`、SSE error 事件和 `mute_until`；限流/封禁期间返回 HTTP 429、`Retry-After` 和 `type: rate_limit_exceeded`，冷却状态持久化在 `deepseek-web-cooldown.json`，进程重启不会丢失。401/403/账号受限后不会自动重试或切换账号。
+>
+> **安全阀**：同一账号请求严格串行，两次请求结束之间随机等待 2～4 秒；连续 15 次后随机长休 1～3 分钟；单 prompt 上限 20 万字符；收到 429 后至少冷却 30 分钟，收到 401/403 后至少冷却 2 小时。暂停期间不会自动重试或切换账号。这些措施只能降低风险，不能保证不触发平台限制。
+>
+> **Responses API**：`/deepseek-web/v1/responses` 现已支持非流式和 SSE 流式 Responses；输入会转换为网页端 prompt，工具调用会输出为 `function_call` / `response.function_call_arguments.delta`。
+>
+> **DSH 思考档位**：由于 DSH 的 OpenAI 兼容模型列表不会读取自定义 `reasoning_efforts` 字段，HTTP 代理同时暴露了 `deepseek-reasoner-off/low/high/max` 等模型变体；在 DSH 中选择这些模型即可切换档位。若要显示原生下拉控件，需要把 `dsh-deepseek-web-login` 作为 DSH 插件安装，让它通过 `ctx.llm` 注册模型元数据。
+>
+> **请求指纹**：DeepSeek 网页请求统一使用 `deepseek-headers.json` 中捕获的浏览器请求头，避免 Deno 默认 UA、重复版本头和非官方 Harness 标记；未捕获时使用单一 fallback，不会把同名头拼成 `a, b`。
+>
+> **风险提示**：`GET /deepseek-web/v1/risk` 返回本地启发式风险分数，`GET /deepseek-web/v1/risk.txt` 适合命令行查看；聊天响应也会带 `X-DeepSeek-Risk-Level` 和 `X-DeepSeek-Risk-Score`。分数只反映本地请求频率、连续请求、prompt 大小和 429/403 冷却，不是 DeepSeek 官方封号概率。
+
 鉴权逻辑见 `checkAuth`（`main.ts:2133`）：接受 `Authorization: Bearer <key>` 或 `x-api-key: <key>`；根路径 `/` 豁免（用于列出 provider）。
 
 ---
@@ -113,6 +158,7 @@ Cloudflare Worker（不跑 wrangler、不动 `BACKEND_URL`）、网络代理（�
 | `/v1` | **聚合入口** | kilo / zen / cnb 一个入口：模型加 `kilo/`、`zen/`、`cnb/` 前缀统一列出与分发（见下） |
 | `/kilo/v1` | api.kilo.ai | 透传，仅保留 `isFree: true` 的模型（kilo 的直连前缀，聚合成员之一） |
 | `/zen/v1` | opencode.ai/zen | 透传，默认 token `public`，仅保留 `-free` 模型 |
+| `/deepseek-web/v1` | chat.deepseek.com 网页聊天端 | 需要登录 Cookie，支持 Chat Completions 与 Responses |
 | `/anthropic/v1` | api.anthropic.com | `toAnthropic` 双向翻译 |
 | `/gemini/v1` | generativelanguage.googleapis.com | `toGemini` 双向翻译 |
 | `/openrouter/v1` | openrouter.ai | 透传 |
@@ -173,6 +219,19 @@ cnb 的网页端接口需要 CSRF 双因子（token + cookie）：
 - 缓存 25 分钟（`CNB_TTL`），并用 `cnbState.pending` 做**单飞（single-flight）**，防止并发请求重复握手；
 - `cnbCall`（`main.ts:1435`）请求时带上 `Csrftoken` 头、`csrfkey` cookie、移动端 UA、`Origin` / `Referer`。
 
+### 1.5 登录态（cnb-login.txt）
+
+cnb.cool 已要求登录才能调用推理接口（匿名会话 401 [NOT_LOGIN]）。登录态通过项目根目录的
+`cnb-login.txt` 提供（已在 .gitignore 排除）：
+
+1. 浏览器登录 cnb.cool；
+2. F12 → Network → 刷新页面 → 点任一 cnb.cool 请求 → Request Headers 里复制完整 `Cookie:` 头的值；
+3. 单行粘贴进 `cnb-login.txt` 保存（也支持 Netscape cookies.txt 导出格式）。
+
+行为：按 mtime 热加载，刷新 Cookie 无需重启代理；`csrfkey` 会自动从登录串剔除
+（CSRF token+cookie 对仍由代理匿名抓取配对）；文件不存在 = 退回匿名模式（当前上游会 401，
+错误信息里带粘贴指引）。
+
 ### 2. 工具调用的「文本协议」模拟
 
 cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
@@ -221,7 +280,11 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 
 | 文件 | 作用 |
 |---|---|
-| `main.ts` | 全部逻辑：路由、适配器、cnb 模块、Responses 适配、鉴权、反向代理 |
+| `main.ts` | 入口、鉴权、Provider 路由、/v1 聚合、本地 Deno 启动 |
+| `src/core.ts` | 环境变量、Provider 配置、协议适配器、通用 HTTP/流式工具 |
+| `src/cnb.ts` | cnb.cool CSRF、登录态、工具调用、Responses API |
+| `src/deepseek-web.ts` | DeepSeek 登录态、PoW、完整上下文、SSE、思考和工具调用 |
+| `third_party/dsh-deepseek-web-login/` | Apache-2.0 工具协议派生代码及许可证 |
 | `worker.ts` | Cloudflare Workers 入口 shim（把 `vars`/secrets 注入 `main.ts` 的模块级 `ENV`） |
 | `wrangler.jsonc` | Worker 配置（`name: ai-api`，`main: worker.ts`） |
 | `deno.jsonc` | Deno Deploy 配置（`org: hitmargin`，`app: ai-api`） |
