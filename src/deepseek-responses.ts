@@ -197,6 +197,9 @@ export function chatStreamToResponsesStream(chatResponse: Response, model: strin
         }
         if (chunk.usage) usage = usageFromChat(chunk);
         const delta = chunk.choices?.[0]?.delta || {};
+        if (delta.error || chunk.choices?.[0]?.finish_reason === "error") {
+          throw new Error(String(delta.error?.message || delta.error || "DeepSeek stream error"));
+        }
         if (typeof delta.reasoning_content === "string" && delta.reasoning_content) {
           if (!reasoningItemId) {
             reasoningItemId = responseId("rs");

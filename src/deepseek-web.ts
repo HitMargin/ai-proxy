@@ -81,6 +81,13 @@ class DeepSeekWebError extends Error {
   }
 }
 
+function deepseekWebHttpError(response: Response, text: string): DeepSeekWebError {
+  const retry = Number(response.headers.get("retry-after") || 0);
+  const status = response.status;
+  const kind = status === 429 ? "rate_limit_exceeded" : (status === 401 || status === 403) ? "auth" : "upstream_error";
+  return new DeepSeekWebError(`DeepSeek HTTP ${status}: ${text.slice(0, 200)}`, status, retry > 0 ? retry * 1000 : 0, kind);
+}
+
 function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
   const data = event?.data && typeof event.data === "object" ? event.data : event;
   const bizCode = Number(data?.biz_code ?? event?.biz_code ?? 0);
@@ -94,10 +101,12 @@ function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
     event?.error?.message ??
     "",
   ).trim();
-  const hasErrorSignal = bizCode !== 0 || event?.type === "error" || event?.type === "toast" || Boolean(event?.error || event?.toast) || /muted|mute|限制|封禁|受限|busy|throttl|频繁|too frequent|too many/i.test(message);
+  const hasErrorSignal = bizCode !== 0 || event?.type === "error" || event?.type === "toast" || Boolean(event?.error || event?.toast) || /user is muted|account is muted|用户.*禁言|账号.*禁言|quota|busy|throttl|频繁|too frequent|too many/i.test(message);
   if (bizCode === 0 && !message && !hasErrorSignal) return null;
   if (bizCode === 0 && data?.code === 0 && !hasErrorSignal) return null;
-  if (bizCode === 5 || /muted|mute|限制|封禁|受限/i.test(message)) {
+  if (bizCode === 40001 || bizCode === 40003) return new DeepSeekWebError(message || "DeepSeek authentication rejected", 403, 0, "auth");
+  if (bizCode === 429) return new DeepSeekWebError(message || "DeepSeek rate limited", 429, 30 * 60_000, "rate_limit_exceeded");
+  if (bizCode === 5 || /user is muted|account is muted|用户.*禁言|账号.*禁言/i.test(message)) {
     const muteUntil = Number(data?.biz_data?.mute_until ?? data?.mute_until ?? 0);
     const retryAfterMs = Number.isFinite(muteUntil) && muteUntil > Date.now() / 1000
       ? Math.max(60_000, Math.ceil((muteUntil * 1000) - Date.now()))
@@ -195,8 +204,11 @@ async function deepseekWebCreatePow(cookies: string, auth: string, targetPath: s
     body: JSON.stringify({ target_path: targetPath }),
   });
   const text = await r.text();
+  if (!r.ok) throw deepseekWebHttpError(r, text);
   const json = safeJsonParse(text);
-  if (json.error || !json.data) throw new Error("create PoW challenge failed: " + text.slice(0, 300));
+  if (json.error || !json.data) throw new DeepSeekWebError("create PoW challenge failed: " + text.slice(0, 300), 502, 0, "upstream_error");
+  const businessError = deepseekWebBusinessError(json);
+  if (businessError) throw businessError;
   const challenge = json.data.data?.biz_data?.challenge as DeepSeekPowChallenge | undefined;
   if (!challenge || challenge.algorithm !== "DeepSeekHashV1") {
     throw new Error("unsupported DeepSeek PoW challenge: " + text.slice(0, 300));
@@ -268,7 +280,7 @@ async function deepseekWebUploadImage(cookies: string, auth: string, image: Deep
     body: form,
   });
   const text = await r.text();
-  if (!r.ok) throw new DeepSeekWebError(`image upload failed: ${r.status} ${text.slice(0, 200)}`, r.status === 429 ? 429 : r.status, 0, r.status === 429 ? "rate_limit_exceeded" : "upstream_error");
+  if (!r.ok) throw deepseekWebHttpError(r, text);
   const json = safeJsonParse(text);
   if (json.error) throw new Error(`image upload returned invalid JSON: ${json.error.message}`);
   const businessError = deepseekWebBusinessError(json.data);
@@ -333,7 +345,7 @@ async function deepseekWebCreateSession(cookies: string, auth: string): Promise<
     body: "{}",
   });
   const text = await r.text();
-  if (!r.ok) throw new DeepSeekWebError(`create session failed: ${r.status} ${text.slice(0, 200)}`, r.status === 429 ? 429 : r.status, 0, r.status === 429 ? "rate_limit_exceeded" : "upstream_error");
+  if (!r.ok) throw deepseekWebHttpError(r, text);
   const json = JSON.parse(text);
   const businessError = deepseekWebBusinessError(json);
   if (businessError) throw businessError;
@@ -418,6 +430,7 @@ async function* deepseekWebReadEvents(response: Response): AsyncGenerator<DeepSe
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let eventName = "";
   let sink: "thinking" | "text" | null = null;
   let thinkingText = "";
   let responseText = "";
@@ -436,12 +449,19 @@ async function* deepseekWebReadEvents(response: Response): AsyncGenerator<DeepSe
     return snapshot.startsWith(current) ? snapshot.slice(current.length) : "";
   };
   const handleLine = (line: string): DeepSeekStreamEvent[] => {
+    if (line.startsWith("event:")) {
+      eventName = line.slice(6).trim();
+      return [];
+    }
     if (!line.startsWith("data:")) return [];
     const raw = line.slice(5).trim();
     if (!raw || raw === "[DONE]") return [];
     const parsed = safeJsonParse(raw);
     if (parsed.error || !parsed.data) return [];
-    const event = parsed.data;
+    const event = parsed.data && typeof parsed.data === "object" && eventName && !parsed.data.type
+      ? { ...parsed.data, type: eventName }
+      : parsed.data;
+    eventName = "";
     const businessError = deepseekWebBusinessError(event);
     if (businessError) throw businessError;
     const out: DeepSeekStreamEvent[] = [];
@@ -588,7 +608,7 @@ function deepseekWebOpenAIStream(
         send({}, finish, { usage });
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       } catch (error: any) {
-        if (error instanceof DeepSeekWebError) deepseekWebTripCircuit(error.message, error.retryAfterMs);
+        if (error instanceof DeepSeekWebError) deepseekWebTripCircuit(error.message, error.retryAfterMs, error.kind);
         send({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }, "error");
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       } finally {
@@ -624,12 +644,14 @@ async function deepseekWebChat(cookies: string, auth: string, chatSessionId: str
   });
   if (!r.ok) {
     const text = await r.text();
-    const retry = Number(r.headers.get("retry-after") || 0);
-    throw new DeepSeekWebError(`DeepSeek HTTP ${r.status}: ${text.slice(0, 200)}`, r.status === 429 ? 429 : r.status, retry > 0 ? retry * 1000 : 0, r.status === 429 ? "rate_limit_exceeded" : "upstream_error");
+    throw deepseekWebHttpError(r, text);
   }
   const contentType = r.headers.get("content-type") || "";
-  if (contentType && !contentType.toLowerCase().includes("text/event-stream")) {
+  if (!contentType.toLowerCase().includes("text/event-stream")) {
     const text = await r.text();
+    if (/^\s*(?:event:|data:)/m.test(text)) {
+      return new Response(text, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }
     const parsed = safeJsonParse(text);
     if (parsed.error) throw new DeepSeekWebError(`DeepSeek non-SSE response: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
     const envelope = parsed.data?.data ? parsed.data : parsed;
@@ -675,11 +697,11 @@ function deepseekWebSaveCooldown(reason: string): void {
   } catch {}
 }
 
-function deepseekWebTripCircuit(message: string, durationMs?: number): void {
+function deepseekWebTripCircuit(message: string, durationMs?: number, kind = ""): void {
   const text = String(message || "");
-  if (/being generated|busy/i.test(text)) return;
-  const isRateLimit = /\b429\b|muted|mute|throttl|too frequent|too many|频繁|限制|封禁|受限/i.test(text);
-  const isAuthFailure = /\b401\b|\b403\b/i.test(text);
+  if (/being generated|busy/i.test(text) || kind === "busy") return;
+  const isRateLimit = kind === "rate_limit_exceeded" || /\b429\b|muted|mute|throttl|too frequent|too many|频繁|quota/i.test(text);
+  const isAuthFailure = kind === "auth" || /\b401\b|\b403\b/i.test(text);
   if (!isRateLimit && !isAuthFailure && !(Number(durationMs) > 0)) return;
   const fallback = isAuthFailure ? 2 * 60 * 60_000 : 30 * 60_000;
   const requested = Number(durationMs);
@@ -693,7 +715,8 @@ function deepseekWebTripCircuit(message: string, durationMs?: number): void {
 function deepseekWebErrorResponse(error: any): Response {
   const status = Number(error?.status) || 502;
   const cooldownMs = Math.max(0, deepseekWebLoadCooldown() - Date.now());
-  const retryAfterMs = Number(error?.retryAfterMs) > 0 ? Number(error.retryAfterMs) : ((status === 429 || status === 403) ? cooldownMs : 0);
+  const rawRetryAfterMs = Number(error?.retryAfterMs) > 0 ? Number(error.retryAfterMs) : 0;
+  const retryAfterMs = status === 429 || status === 403 ? Math.max(rawRetryAfterMs, cooldownMs) : rawRetryAfterMs;
   const headers: Record<string, string> = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
   if (retryAfterMs > 0) headers["Retry-After"] = String(Math.ceil(retryAfterMs / 1000));
   return new Response(JSON.stringify({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }), { status, headers });
@@ -884,7 +907,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     try {
       for (const image of images) refFileIds.push(await deepseekWebUploadImage(cookies, auth, image));
     } catch (e: any) {
-      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs);
+      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
       releaseGate?.();
       return deepseekWebErrorResponse(e);
     }
@@ -892,7 +915,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     let chatSessionId: string;
     try { chatSessionId = await deepseekWebCreateSession(cookies, auth); }
     catch (e: any) {
-      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs);
+      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
       releaseGate?.();
       return deepseekWebErrorResponse(e);
     }
@@ -908,7 +931,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     try {
       upstream = await deepseekWebChat(cookies, auth, chatSessionId, prompt, model, reasoningEffort !== "off", refFileIds);
     } catch (e: any) {
-      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs);
+      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
       await cleanup();
       return deepseekWebErrorResponse(e);
     }
@@ -931,7 +954,7 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     try {
       result = await deepseekWebProcess(upstream, openaiBody.tools);
     } catch (e: any) {
-      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs);
+      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
       await cleanup();
       return deepseekWebErrorResponse(e);
     } finally {
