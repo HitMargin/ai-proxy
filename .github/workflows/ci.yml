@@ -29,6 +29,22 @@ jobs:
         with:
           deno-version: v2.9.6
 
+      - name: Validate model sync script syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "./scripts/sync-commandcode-models.ps1",
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
+          Write-Host "PowerShell syntax ok"
+
       - name: Check formatting
         run: deno fmt --check main.ts worker.ts src/core.ts src/deepseek-responses.ts src/commandcode
 

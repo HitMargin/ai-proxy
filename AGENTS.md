@@ -16,7 +16,7 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
 - **请求指纹**：DeepSeek 的 PoW、建会话、删除会话、图片上传和 completion 共用 `deepseek-headers.json` 的浏览器头集合；不再发送重复版本头或 `X-Deepseek-Harness`。
 - **源码结构**：`main.ts` 为入口/路由；`src/core.ts` 为通用核心；`src/cnb.ts`、`src/deepseek-web.ts` 与 `src/commandcode/` 为上游适配模块；`third_party/dsh-deepseek-web-login` 与 `third_party/dsh-cmdgo-provider` 分别保留 Apache-2.0 / MIT 派生代码的许可与说明。
 - git 已于今日 init（身份 HitMargin），`.gitignore` 已排除 cookies.txt / cnb-login.txt / deepseek-auth.txt / deepseek-cookies.txt / commandcode-accounts.json / *.bak 等。
-- **未决事项**：是否参考 https://github.com/jieapi/AiCode issue #23 在后续模块中实现「自动上下文压缩」——仅参考，未决定；session journal/启动补删仍未完成。CommandCode `pause_turn` continuation 尚未实现，当前会明确拒绝而不重放请求。
+- **未决事项**：是否参考 https://github.com/jieapi/AiCode issue #23 在后续模块中实现「自动上下文压缩」——仅参考，未决定；session journal/启动补删仍未完成。CommandCode `pause_turn` 目前仅支持尚未产生客户端输出时的有限同会话续写，输出开始后仍明确拒绝重放。
 
 ## 行为规则
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。

@@ -47,6 +47,7 @@ const MODEL_TTL_MS = 15 * 60_000;
 const MODALITY_TTL_MS = 6 * 60 * 60_000;
 const MAX_FAILOVER_ATTEMPTS = 4;
 const MAX_REPAIR_ATTEMPTS = 4;
+const DEFAULT_MAX_PAUSE_TURNS = 2;
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_MAX_TOKENS = 64_000;
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
@@ -599,6 +600,7 @@ async function* generateEvents(
   const dropped = new Set<string>();
   const declared = declaredToolIds(body);
   let repairs = 0;
+  let pauseTurns = 0;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     const account = await accountPool.pick(excluded);
@@ -690,11 +692,21 @@ async function* generateEvents(
               throw new CommandCodeError(item.message, 502, "upstream_error");
             }
             if (item.type === "continue") {
-              throw new CommandCodeError(
-                "Command Code pause_turn continuation is not supported by this stateless proxy",
-                502,
-                "unsupported_pause_turn",
-              );
+              if (
+                yielded ||
+                pauseTurns >= numberSetting(
+                    "COMMANDCODE_MAX_PAUSE_TURNS",
+                    DEFAULT_MAX_PAUSE_TURNS,
+                  )
+              ) {
+                throw new CommandCodeError(
+                  "Command Code pause_turn continuation is not safe after output has started or the limit was reached",
+                  502,
+                  "unsupported_pause_turn",
+                );
+              }
+              pauseTurns++;
+              continue;
             }
             if (item.type === "finish" && item.usage) {
               requestStats.record({
@@ -721,6 +733,22 @@ async function* generateEvents(
             await accountPool.reportSuccess(account);
             return;
           }
+        }
+        if (state.pauseTurn) {
+          if (
+            !yielded &&
+            pauseTurns < numberSetting(
+                "COMMANDCODE_MAX_PAUSE_TURNS",
+                DEFAULT_MAX_PAUSE_TURNS,
+              )
+          ) {
+            continue exchangeLoop;
+          }
+          throw new CommandCodeError(
+            "Command Code pause_turn continuation reached its safety limit",
+            502,
+            "unsupported_pause_turn",
+          );
         }
         throw new CommandCodeError(
           `Command Code stream ended without finish-step or finish (${eventCount} event(s) received)`,

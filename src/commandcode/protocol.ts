@@ -742,6 +742,7 @@ export interface CcStreamState {
   toolIndexes: Map<number, number>;
   toolSchemas: Map<string, unknown>;
   providerUsage?: CcUsage;
+  pauseTurn?: boolean;
 }
 
 export function newStreamState(
@@ -881,6 +882,7 @@ export function normalizeEvent(
     const rawReason = String(event.rawFinishReason ?? event.finishReason ?? "")
       .toLowerCase();
     if (rawReason === "pause_turn" || rawReason === "pause-turn") {
+      state.pauseTurn = true;
       return [{ type: "continue" }];
     }
     const knownReasons = new Set([

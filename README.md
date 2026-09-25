@@ -135,6 +135,7 @@ deno task test
 | `COMMANDCODE_ACCOUNTS_FILE` | 否 | OAuth 多账号清单，默认 `./commandcode-accounts.json` |
 | `COMMANDCODE_MAX_TOKENS` | 否 | `/models` 声明和实际上游请求的输出 token 上限，默认 `64000` |
 | `COMMANDCODE_MAX_BODY_BYTES` | 否 | 直接 CommandCode Chat/Responses 请求体上限，默认 `12582912`（12 MiB）；聚合/反代请用 `MAX_REQUEST_BODY_BYTES` |
+| `COMMANDCODE_MAX_PAUSE_TURNS` | 否 | `pause_turn` 在尚未产生输出时的同会话安全续写次数，默认 `2`；输出开始后仍会拒绝重放 |
 | `COMMANDCODE_TIMEOUT_MS` | 否 | 单次 CommandCode 请求总超时，默认 `600000` |
 | `COMMANDCODE_SESSION_SALT` | 否 | 显式会话头哈希的服务端盐；不设时每进程随机，重启后亲和性改变 |
 | `COMMANDCODE_ALLOW_REMOTE_IMAGES` | 否 | 设为 `1/true/yes` 才允许代理下载 HTTP(S) 图片；默认关闭以避免 SSRF |
@@ -219,6 +220,38 @@ commandcode:
 
 若使用远端 Worker/tunnel，只需把 `baseURL` 改为对应 Worker 地址。示例中的 `AI_PROXY_API_KEY` 是 **DSH 客户端访问本代理**所用的 key，其值应已列入代理的 `API_KEYS` 白名单；它与代理进程读取的 CommandCode 上游 `COMMANDCODE_API_KEY` 是两个不同用途。若 `API_KEYS` 留空，DSH 仍可配置一个占位 key，但请求不会鉴权。
 
+### 同步 DSH 模型配置
+
+不要手工维护几十个模型。运行：
+
+```powershell
+pwsh -File .\scripts\sync-commandcode-models.ps1 -Mode Output
+```
+
+脚本会从本地 `/commandcode/v1/models` 生成：
+
+```text
+.\commandcode-models.generated.yml
+```
+
+默认只生成文件，不修改 DSH profile。确认内容后，可以显式应用：
+
+```powershell
+pwsh -File .\scripts\sync-commandcode-models.ps1 `
+  -Mode Apply `
+  -ProfilePath "C:\Users\22282\.dsh\profiles\web\cordis.patch.yml"
+```
+
+只检查是否同步：
+
+```powershell
+pwsh -File .\scripts\sync-commandcode-models.ps1 `
+  -Mode Check `
+  -ProfilePath "C:\Users\22282\.dsh\profiles\web\cordis.patch.yml"
+```
+
+脚本只使用 `AI_PROXY_API_KEY` 或 `API_KEYS` 中的代理客户端 key，不读取 `COMMANDCODE_API_KEY`、OAuth 文件或 ChatGPT 会话文件。默认输出文件已加入 `.gitignore`。
+
 **调用**：
 
 ```bash
@@ -233,7 +266,7 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 ```
 
 - `/commandcode/v1/responses` 支持非流式和 SSE 流式 Responses；输入会转换为同一套 CLI 网关请求。`previous_response_id`、`conversation`、后台/存储模式等无法在无状态代理中兑现的字段会明确返回 400，不会静默丢弃。
-- 网关 NDJSON 的文本、思考、工具调用、usage、finish/error 事件会分别转换成 OpenAI `content`、`reasoning_content`、`tool_calls` 和 `usage`。官方 `pause_turn` 需要 CLI continuation 状态，本无状态代理会明确报 `unsupported_pause_turn`，不会重放同一请求。
+- 网关 NDJSON 的文本、思考、工具调用、usage、finish/error 事件会分别转换成 OpenAI `content`、`reasoning_content`、`tool_calls` 和 `usage`。`pause_turn` 在尚未产生客户端输出时会使用同一 session 做有限次数续写；一旦已经输出内容则返回 `unsupported_pause_turn`，避免重复生成。
 - 客户端显式发送 `x-session-id` / `x-conversation-id` 时，代理会按“客户端鉴权凭据 + 服务端盐 + 会话头”派生稳定的 `sess_<16 hex>`；未发送时每个 one-shot 请求使用独立随机 ID，避免不同用户共用上游会话。隧道与 `/v1` 聚合入口会透传这两个头。
 - 图片默认支持 data URL；只有显式设置 `COMMANDCODE_ALLOW_REMOTE_IMAGES=1` 才会下载 HTTP(S) 图片并转为 data URL（远程下载有 SSRF 风险，默认关闭）。工具调用会在发出前保证 call/result 严格配对，网关点名缺结果时最多自愈重试 4 次。
 

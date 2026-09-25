@@ -148,6 +148,74 @@ Deno.test("CommandCode handler translates Chat and Responses through a fake gate
   }
 });
 
+Deno.test("CommandCode safely continues pause_turn before output", async () => {
+  const previous = {
+    key: ENV.COMMANDCODE_API_KEY,
+    baseURL: ENV.COMMANDCODE_BASE_URL,
+    accountsFile: ENV.COMMANDCODE_ACCOUNTS_FILE,
+    maxPauseTurns: ENV.COMMANDCODE_MAX_PAUSE_TURNS,
+  };
+  const previousFetch = globalThis.fetch;
+  const previousDeployment = Deno.env.get("DENO_DEPLOYMENT_ID");
+  ENV.COMMANDCODE_API_KEY = "pause-test-key";
+  ENV.COMMANDCODE_BASE_URL = "https://fake.commandcode.test";
+  ENV.COMMANDCODE_ACCOUNTS_FILE = "disabled-in-deploy-test";
+  ENV.COMMANDCODE_MAX_PAUSE_TURNS = "2";
+  Deno.env.set("DENO_DEPLOYMENT_ID", "pause-test");
+  let calls = 0;
+  const sessions: string[] = [];
+  globalThis.fetch = ((_input: URL | RequestInfo, init?: RequestInit) => {
+    calls++;
+    const headers = new Headers(init?.headers);
+    sessions.push(headers.get("x-session-id") || "");
+    const events = calls === 1
+      ? [{ type: "finish-step", rawFinishReason: "pause_turn" }]
+      : [
+        { type: "text-delta", text: "continued" },
+        { type: "finish-step", finishReason: "stop" },
+      ];
+    return Promise.resolve(
+      new Response(
+        events.map((event) => JSON.stringify(event)).join("\n") + "\n",
+        { status: 200 },
+      ),
+    );
+  }) as unknown as typeof fetch;
+
+  try {
+    const { handleCommandCode } = await import("./handler.ts?pause-test");
+    const request = new Request(
+      "http://local/commandcode/v1/chat/completions",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/model",
+          messages: [{ role: "user", content: "pause" }],
+        }),
+      },
+    );
+    const response = await handleCommandCode(
+      "/commandcode/v1/chat/completions",
+      request,
+      new URL(request.url),
+    );
+    const body = await response.json();
+    equal(response.status, 200);
+    equal(body.choices?.[0]?.message?.content, "continued");
+    equal(calls, 2);
+    equal(sessions[0], sessions[1]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    ENV.COMMANDCODE_API_KEY = previous.key;
+    ENV.COMMANDCODE_BASE_URL = previous.baseURL;
+    ENV.COMMANDCODE_ACCOUNTS_FILE = previous.accountsFile;
+    ENV.COMMANDCODE_MAX_PAUSE_TURNS = previous.maxPauseTurns;
+    if (previousDeployment === undefined) Deno.env.delete("DENO_DEPLOYMENT_ID");
+    else Deno.env.set("DENO_DEPLOYMENT_ID", previousDeployment);
+  }
+});
+
 Deno.test("CommandCode request keeps only tool calls with matching results", async () => {
   const envelope = await buildRequest({
     model: "openai/model",
