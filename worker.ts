@@ -1,5 +1,5 @@
 // Cloudflare Workers 入口（wrangler main）；vars 绑定注入到 ENV
-import { handler, ENV } from "./main.ts";
+import { ENV, handler } from "./main.ts";
 
 export default {
   fetch(request: Request, env: any): Promise<Response> {

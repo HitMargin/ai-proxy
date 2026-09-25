@@ -4,6 +4,7 @@ deepseek-cookies.txt
 deepseek-auth.txt
 deepseek-headers.json
 deepseek-web-cooldown.json
+commandcode-accounts.json
 .env
 .env.*
 *.pem

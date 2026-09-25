@@ -2,11 +2,12 @@
 
 多上游 AI API 聚合代理：对外暴露**统一的 OpenAI 兼容接口**，对内把请求翻译/伪装成各个上游能接受的形态。
 
-支持两类上游：
+支持以下上游：
 
 1. **标准 OpenAI 兼容上游**（透传）：kilo.ai、opencode.ai/zen、openrouter.ai、tokenharbor.ai
 2. **协议转换上游**：Anthropic、Gemini（OpenAI 格式 ⇄ 各自原生格式双向翻译）
-3. **cnb.cool 网页聊天**（本项目核心）：cnb.cool 自带一个免费 AI 聊天但**没有开放 API**，本项目通过会话自举 + 提示词协议模拟，把它包装成标准的 `/v1/chat/completions` 与 `/v1/responses`。
+3. **cnb.cool 网页聊天**：通过会话自举 + 提示词协议模拟，包装成标准 Chat Completions / Responses。
+4. **CommandCode Go 私有网关**：移植 `dsh-cmdgo-provider` 的模型筛选、CLI 网关协议、多账号池与额度读取，提供 `/commandcode/v1`。
 
 > 同一份 `main.ts` 可以跑在 **Deno Deploy**、**本地 Deno**、**Cloudflare Workers** 三种环境。
 
@@ -54,6 +55,7 @@ main.ts                    入口、鉴权、Provider 路由、/v1 聚合、本�
 src/core.ts                环境变量、Provider 配置、协议适配器、通用 HTTP/流式工具
 src/cnb.ts                 cnb.cool CSRF、登录态、工具调用、Responses 转换
 src/deepseek-web.ts        DeepSeek 网页登录态、PoW WASM、SSE 解析、OpenAI 转换
+src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度与路由
 deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 ```
 
@@ -117,11 +119,25 @@ deno task test
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `API_KEYS` | 否 | 访问本代理的白名单，逗号分隔。**留空 = 完全开放**，任何人都能用 |
+| `MAX_REQUEST_BODY_BYTES` | 否 | 通用 `/v1` 与反向代理请求体上限，默认 `12582912`（12 MiB） |
 | `BACKEND_URL` | 否 | 有值即进入**反向代理模式**，全部请求原样转发到该地址（如隧道 URL） |
 | `DEFAULT_BEARER_TOKEN` | 否 | 透传类上游的兜底 Bearer token |
 | `ANTHROPIC_API_KEY` | 否 | `/anthropic/v1` 使用 |
 | `GEMINI_API_KEY` | 否 | `/gemini/v1` 使用 |
 | `OPENROUTER_API_KEY` | 否 | `/openrouter/v1` 使用 |
+| `COMMANDCODE_ADMIN_KEY` | 否 | CommandCode 管理接口独立密钥；设置后需通过 `X-CommandCode-Admin-Key` 发送 |
+| `COMMANDCODE_API_KEY` | 否 | CommandCode Go 账号 key；账号池为空时作为单账号兜底 |
+| `COMMANDCODE_BASE_URL` | 否 | CommandCode 网关地址，默认 `https://api.commandcode.ai`；非 loopback 必须 HTTPS |
+| `COMMANDCODE_VERSION` | 否 | CLI 兼容版本头，默认 `1.31.0`；真实网关升级后需按协议调整 |
+| `COMMANDCODE_MODELS_URL` | 否 | 模型目录覆盖地址；默认 `${COMMANDCODE_BASE_URL}/provider/v1/models`；自定义地址要求 HTTPS/loopback |
+| `COMMANDCODE_CATALOG_URL` | 否 | CLI `models.md` effort/档位目录覆盖地址；自定义地址要求 HTTPS/loopback |
+| `COMMANDCODE_REGISTRY_URL` | 否 | CLI bundle 模态注册表覆盖地址（仅本地 Deno 默认下载；自定义 URL 同样要求 HTTPS/loopback） |
+| `COMMANDCODE_ACCOUNTS_FILE` | 否 | OAuth 多账号清单，默认 `./commandcode-accounts.json` |
+| `COMMANDCODE_MAX_TOKENS` | 否 | `/models` 声明和实际上游请求的输出 token 上限，默认 `64000` |
+| `COMMANDCODE_MAX_BODY_BYTES` | 否 | 直接 CommandCode Chat/Responses 请求体上限，默认 `12582912`（12 MiB）；聚合/反代请用 `MAX_REQUEST_BODY_BYTES` |
+| `COMMANDCODE_TIMEOUT_MS` | 否 | 单次 CommandCode 请求总超时，默认 `600000` |
+| `COMMANDCODE_SESSION_SALT` | 否 | 显式会话头哈希的服务端盐；不设时每进程随机，重启后亲和性改变 |
+| `COMMANDCODE_ALLOW_REMOTE_IMAGES` | 否 | 设为 `1/true/yes` 才允许代理下载 HTTP(S) 图片；默认关闭以避免 SSRF |
 
 ### DeepSeek 网页端反代（`/deepseek-web/v1`）
 1. 运行自动登录与凭证捕获脚本：
@@ -155,20 +171,104 @@ deno task test
 >
 > **风险提示**：`GET /deepseek-web/v1/risk` 返回本地启发式风险分数，`GET /deepseek-web/v1/risk.txt` 适合命令行查看；聊天响应也会带 `X-DeepSeek-Risk-Level` 和 `X-DeepSeek-Risk-Score`。分数只反映本地请求频率、连续请求、prompt 大小和 429/403 冷却，不是 DeepSeek 官方封号概率。
 
-鉴权逻辑见 `checkAuth`（`main.ts:2133`）：接受 `Authorization: Bearer <key>` 或 `x-api-key: <key>`；根路径 `/` 豁免（用于列出 provider）。
+### CommandCode Go（`/commandcode/v1`）
+
+此模块把 CommandCode Go 套餐使用的 CLI 私有网关 `POST /alpha/generate` 转换成 OpenAI Chat Completions 与 Responses API。核心实现移植自 MIT 许可的 [`Ajwyunsx/dsh-cmdgo-provider`](https://github.com/Ajwyunsx/dsh-cmdgo-provider)，许可证与修改说明见 [`third_party/dsh-cmdgo-provider/NOTICE.md`](third_party/dsh-cmdgo-provider/NOTICE.md)。
+
+**配置凭据（二选一）**：
+
+> 当前仓库测试使用 fake gateway 验证协议和转换；没有在真实 CommandCode 账号上执行推理。上线前请用专用测试 key 验证 Chat/Responses、工具调用、usage、429 冷却和 OAuth，再用于生产会话。
+
+1. 环境变量单账号模式：
+   ```powershell
+   $env:COMMANDCODE_API_KEY='user_xxx'
+   pwsh .\restart.ps1 -Local
+   ```
+2. 本机 OAuth 多账号模式：
+   ```powershell
+   $login = Invoke-RestMethod -Method Post http://localhost:8000/commandcode/v1/login
+   Start-Process $login.authUrl
+   Invoke-RestMethod http://localhost:8000/commandcode/v1/status | ConvertTo-Json -Depth 8
+   ```
+   浏览器授权后，key 自动写入 `commandcode-accounts.json`。该文件已加入 `.gitignore`，并尽可能设置为仅当前用户可读写；它仍包含明文 key，请勿上传或分享。每次 OAuth 登录新增一个账号，请求按 round-robin 调度。401/403/429/5xx 或传输错误会令该账号指数冷却，并在首字节前切换下一个账号。`COMMANDCODE_API_KEY` 只在账号池为空时作为兜底。
+
+**模型目录**：`GET /commandcode/v1/models` 从公开目录拉取模型，先用静态 Go 档位规则快速发布，再用官方 CLI `models.md` 的 `Min plan` 列双向覆盖，同时合并 reasoning effort 与图像模态。目录缓存 15 分钟；`?refresh=true` 可强制刷新。
+
+DSH 的 OpenAI 兼容 provider 不会自动把 HTTP `/models` 的自定义元数据写入模型选择器，因此需要在活动 profile 的 `llm-pi-ai.providers` 中静态注册所需模型，例如：
+
+```yaml
+commandcode:
+  apiKeyEnv: AI_PROXY_API_KEY
+  api: openai-completions
+  baseURL: http://localhost:8000/commandcode/v1/
+  models:
+    - id: deepseek/deepseek-v4-flash
+      name: DeepSeek V4 Flash (CommandCode Go)
+      contextWindow: 1000000
+      maxTokens: 64000
+      input: [text]
+      reasoningEfforts:
+        low: low
+        medium: medium
+        high: high
+        xhigh: xhigh
+        max: max
+        off: null
+  reasoning: high
+```
+
+若使用远端 Worker/tunnel，只需把 `baseURL` 改为对应 Worker 地址。示例中的 `AI_PROXY_API_KEY` 是 **DSH 客户端访问本代理**所用的 key，其值应已列入代理的 `API_KEYS` 白名单；它与代理进程读取的 CommandCode 上游 `COMMANDCODE_API_KEY` 是两个不同用途。若 `API_KEYS` 留空，DSH 仍可配置一个占位 key，但请求不会鉴权。
+
+**调用**：
+
+```bash
+curl http://localhost:8000/commandcode/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek/deepseek-v4-flash",
+    "messages": [{"role":"user","content":"你好"}],
+    "reasoning_effort": "high",
+    "stream": true
+  }'
+```
+
+- `/commandcode/v1/responses` 支持非流式和 SSE 流式 Responses；输入会转换为同一套 CLI 网关请求。`previous_response_id`、`conversation`、后台/存储模式等无法在无状态代理中兑现的字段会明确返回 400，不会静默丢弃。
+- 网关 NDJSON 的文本、思考、工具调用、usage、finish/error 事件会分别转换成 OpenAI `content`、`reasoning_content`、`tool_calls` 和 `usage`。官方 `pause_turn` 需要 CLI continuation 状态，本无状态代理会明确报 `unsupported_pause_turn`，不会重放同一请求。
+- 客户端显式发送 `x-session-id` / `x-conversation-id` 时，代理会按“客户端鉴权凭据 + 服务端盐 + 会话头”派生稳定的 `sess_<16 hex>`；未发送时每个 one-shot 请求使用独立随机 ID，避免不同用户共用上游会话。隧道与 `/v1` 聚合入口会透传这两个头。
+- 图片默认支持 data URL；只有显式设置 `COMMANDCODE_ALLOW_REMOTE_IMAGES=1` 才会下载 HTTP(S) 图片并转为 data URL（远程下载有 SSRF 风险，默认关闭）。工具调用会在发出前保证 call/result 严格配对，网关点名缺结果时最多自愈重试 4 次。
+
+**账号与额度接口**：
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /commandcode/v1/status` | 账号池、冷却、登录、额度与缓存统计；不会返回 key |
+| `GET /commandcode/v1/usage` | `status` 的额度兼容别名 |
+| `POST /commandcode/v1/usage/refresh` | 强制刷新全部账号，或正文 `{ "id": "账号 id" }` |
+| `POST /commandcode/v1/login` | 启动本机 OAuth 回调并返回授权地址 |
+| `POST /commandcode/v1/login/cancel` | 取消 OAuth |
+| `POST /commandcode/v1/account/toggle` | 正文 `{ "id": "账号 id", "enabled": false }` |
+| `POST /commandcode/v1/account/remove` | 删除文件账号及其 key |
+| `POST /commandcode/v1/logout` | 清空文件账号池；环境变量 key 无法由 HTTP 修改 |
+
+> **管理面安全**：`/status`、`/usage/refresh`、`/login`、`/account/*`、`/logout` 以及 `GET /models?refresh=true` 在未配置 `API_KEYS` 时只接受 loopback 请求；公网 Worker/隧道应同时设置 `API_KEYS` 与 `COMMANDCODE_ADMIN_KEY`，并通过 `X-CommandCode-Admin-Key` 发送管理密钥。`COMMANDCODE_BASE_URL` 仅允许 HTTPS（HTTP 只允许 loopback 测试），并禁止带凭据的重定向。
+>
+> CommandCode `/alpha/*` 是私有接口，上游改版、套餐策略和风控均可能使它失效。本项目仅供个人学习研究，请遵守上游服务条款。
+
+鉴权逻辑见 `checkAuth`：接受 `Authorization: Bearer <key>` 或 `x-api-key: <key>`；根路径 `/` 豁免（用于列出 provider）。
 
 ---
 
 ## 路由表
 
-每个上游是一份配置（`main.ts:221` 的 `providers`），包含 `prefix` / `baseUrl` / `auth` / `pathRewrite` / `endpoints` / `adapter` / `filterModels`。
+每个上游是一份配置（见 `src/core.ts` 的 `providers`），包含 `prefix` / `baseUrl` / `auth` / `pathRewrite` / `endpoints` / `adapter` / `filterModels`。
 
 | 路径前缀 | 上游 | 适配方式 |
 |---|---|---|
-| `/v1` | **聚合入口** | kilo / zen / cnb 一个入口：模型加 `kilo/`、`zen/`、`cnb/` 前缀统一列出与分发（见下） |
+| `/v1` | **聚合入口** | kilo / zen / cnb / commandcode：模型加 `kilo/`、`zen/`、`cnb/`、`commandcode/` 前缀统一列出与分发 |
 | `/kilo/v1` | api.kilo.ai | 透传，仅保留 `isFree: true` 的模型（kilo 的直连前缀，聚合成员之一） |
 | `/zen/v1` | opencode.ai/zen | 透传，默认 token `public`，仅保留 `-free` 模型 |
 | `/deepseek-web/v1` | chat.deepseek.com 网页聊天端 | 需要登录 Cookie，支持 Chat Completions 与 Responses |
+| `/commandcode/v1` | CommandCode Go CLI 网关 | 模型发现、私有协议转换、多账号池、额度、Chat Completions 与 Responses |
 | `/anthropic/v1` | api.anthropic.com | `toAnthropic` 双向翻译 |
 | `/gemini/v1` | generativelanguage.googleapis.com | `toGemini` 双向翻译 |
 | `/openrouter/v1` | openrouter.ai | 透传 |
@@ -178,11 +278,9 @@ deno task test
 
 `GET /` 会返回所有可用 provider 列表。
 
-**聚合端点 `/v1`**：`GET /v1/models` 返回 kilo + zen + cnb 全部模型的并集（id 加 `kilo/`、`zen/`、`cnb/` 前缀防冲突）；
-POST 时 model 写带前缀的 id（如 `cnb/deepseek-v4-pro`、`kilo/kilo-auto/free`）即自动分发到对应上游，完整复用该上游的
-处理链（cnb 的串行闸/预检/重试、各成员自己的鉴权与透传）。不带前缀的裸 id 按 kilo→zen→cnb 顺序解析（保持旧行为），
-冷启动后需先 GET 一次 `/v1/models` 暖缓存。分发时会剥掉客户端 token，让各成员用自家默认凭据（kilo 无鉴权、zen 的
-`public`、cnb 的自建 CSRF）；仅当本代理设置 `API_KEYS` 时才透传客户端鉴权头。
+**聚合端点 `/v1`**：`GET /v1/models` 返回 kilo + zen + cnb + commandcode 全部模型的并集（id 分别加 `kilo/`、`zen/`、`cnb/`、`commandcode/` 前缀防冲突）；
+POST 时 model 写带前缀的 id（如 `cnb/deepseek-v4-pro`、`commandcode/deepseek/deepseek-v4-flash`）即自动分发到对应上游，完整复用该上游的
+处理链。不带前缀的裸 id 按 kilo→zen→cnb→commandcode 顺序解析（保持旧行为），冷启动后需先 GET 一次 `/v1/models` 暖缓存。分发时会剥掉客户端 token，让各成员用自家默认凭据；仅当本代理设置 `API_KEYS` 时才透传客户端鉴权头。
 
 **模型列表**有 5 分钟内存缓存，并会在后台异步做健康探测（`testModel`，3 秒超时，200/429 视为可用），
 在 Deno Deploy 上用 `EdgeRuntime.waitUntil` 挂起，不阻塞响应；加 `?health=true` 可强制同步探测。
@@ -294,14 +392,16 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 | `src/core.ts` | 环境变量、Provider 配置、协议适配器、通用 HTTP/流式工具 |
 | `src/cnb.ts` | cnb.cool CSRF、登录态、工具调用、Responses API |
 | `src/deepseek-web.ts` | DeepSeek 登录态、PoW、完整上下文、SSE、思考和工具调用 |
+| `src/commandcode/` | CommandCode Go 模型发现、私有协议、多账号池、OAuth、额度与 OpenAI 转换 |
 | `third_party/dsh-deepseek-web-login/` | Apache-2.0 工具协议派生代码及许可证 |
+| `third_party/dsh-cmdgo-provider/` | dsh-cmdgo-provider 的 MIT 许可证与移植说明 |
 | `worker.ts` | Cloudflare Workers 入口 shim（把 `vars`/secrets 注入 `main.ts` 的模块级 `ENV`） |
 | `wrangler.jsonc` | Worker 配置（`name: ai-api`，`main: worker.ts`） |
 | `deno.jsonc` | Deno Deploy 配置（`org: hitmargin`，`app: ai-api`） |
 | `restart.ps1` | 一键：本地服务 + 隧道 + 更新 Worker 的 `BACKEND_URL` 密钥；`-Local` 只启动本地服务，不碰隧道/Worker/代理 |
 | `deno.lock` | 依赖锁定 |
 
-本地开发还会出现（已在 `.gitignore` 中排除）：`cookies.txt`（抓包得到的 cookie）、`.wrangler/`（Cloudflare 账号缓存）、
+本地开发还会出现（已在 `.gitignore` 中排除）：`cookies.txt`（抓包得到的 cookie）、`commandcode-accounts.json`（CommandCode OAuth 多账号 key）、`.wrangler/`（Cloudflare 账号缓存）、
 `cloudflared.exe`、`page.html`（页面快照）、`main.ts.bak-*`（历史备份）。
 
 ---
@@ -309,6 +409,7 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 ## 已知限制
 
 - cnb 通道完全依赖网页端私有接口，**上游改版即失效**；
+- CommandCode Go 同样依赖 `/alpha/*` 私有 CLI 网关，模型档位、指纹要求或 OAuth 回调发生变化时需要更新；
 - 免费上游的模型清单随时变化，且常见限流（429）与容量窗口（5xx）；
 - `trycloudflare` 快速隧道的 URL 每次重启都会变（由 `restart.ps1` 自动回写 `BACKEND_URL`），且约有 10% 的连接抖动（`proxyToBackend` 已做一次重试）；
 - 内存缓存（模型列表 5 分钟、CSRF 25 分钟）在边缘多实例下不共享。
@@ -318,6 +419,9 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 ## 许可证
 
 本项目采用 **GNU General Public License v3.0** 许可，全文见 [LICENSE](LICENSE)。
+
+本项目包含来自 `dsh-cmdgo-provider` 的派生代码；该部分按 MIT 许可使用，原始版权与许可证见
+[`third_party/dsh-cmdgo-provider/LICENSE`](third_party/dsh-cmdgo-provider/LICENSE) 和 [`NOTICE.md`](third_party/dsh-cmdgo-provider/NOTICE.md)。
 
 ```
 Copyright (C) 2026 adofaiex

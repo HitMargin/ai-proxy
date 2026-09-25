@@ -15,11 +15,25 @@ function getEnv(name: string): string {
 
 export const ENV: Record<string, string> = {
   API_KEYS: getEnv("API_KEYS"),
+  COMMANDCODE_ADMIN_KEY: getEnv("COMMANDCODE_ADMIN_KEY"),
+  MAX_REQUEST_BODY_BYTES: getEnv("MAX_REQUEST_BODY_BYTES"),
   DEFAULT_BEARER_TOKEN: getEnv("DEFAULT_BEARER_TOKEN"),
   // 其它 provider 可能用到的 key，按需添加
   ANTHROPIC_API_KEY: getEnv("ANTHROPIC_API_KEY"),
   GEMINI_API_KEY: getEnv("GEMINI_API_KEY"),
   OPENROUTER_API_KEY: getEnv("OPENROUTER_API_KEY"),
+  COMMANDCODE_API_KEY: getEnv("COMMANDCODE_API_KEY"),
+  COMMANDCODE_BASE_URL: getEnv("COMMANDCODE_BASE_URL"),
+  COMMANDCODE_VERSION: getEnv("COMMANDCODE_VERSION"),
+  COMMANDCODE_MODELS_URL: getEnv("COMMANDCODE_MODELS_URL"),
+  COMMANDCODE_CATALOG_URL: getEnv("COMMANDCODE_CATALOG_URL"),
+  COMMANDCODE_REGISTRY_URL: getEnv("COMMANDCODE_REGISTRY_URL"),
+  COMMANDCODE_ACCOUNTS_FILE: getEnv("COMMANDCODE_ACCOUNTS_FILE"),
+  COMMANDCODE_MAX_TOKENS: getEnv("COMMANDCODE_MAX_TOKENS"),
+  COMMANDCODE_MAX_BODY_BYTES: getEnv("COMMANDCODE_MAX_BODY_BYTES"),
+  COMMANDCODE_TIMEOUT_MS: getEnv("COMMANDCODE_TIMEOUT_MS"),
+  COMMANDCODE_SESSION_SALT: getEnv("COMMANDCODE_SESSION_SALT"),
+  COMMANDCODE_ALLOW_REMOTE_IMAGES: getEnv("COMMANDCODE_ALLOW_REMOTE_IMAGES"),
   // 反向代理模式：指向本地隧道等后端时，Worker 只做字节转发（CPU 趋近于零）
   BACKEND_URL: getEnv("BACKEND_URL"),
 };
@@ -33,10 +47,19 @@ export function safeJsonParse(text: string) {
   }
 }
 
-export function cloneHeadersForUpstream(request: Request, provider: any, env: any) {
+export function cloneHeadersForUpstream(
+  request: Request,
+  provider: any,
+  env: any,
+) {
   const headers = new Headers();
 
-  const allowedHeaders = ["accept", "accept-language", "content-type", "user-agent"];
+  const allowedHeaders = [
+    "accept",
+    "accept-language",
+    "content-type",
+    "user-agent",
+  ];
   for (const name of allowedHeaders) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
@@ -44,14 +67,16 @@ export function cloneHeadersForUpstream(request: Request, provider: any, env: an
 
   const auth = provider.auth;
   if (auth.type === "bearer") {
-    const userToken = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+    const userToken = request.headers.get("authorization")?.replace(
+      /^Bearer\s+/i,
+      "",
+    );
     const token = userToken || auth.defaultToken || env.DEFAULT_BEARER_TOKEN;
     if (token) headers.set("Authorization", `Bearer ${token}`);
   } else if (auth.type === "api-key") {
     const headerName = auth.header || "x-api-key";
     const userKey = request.headers.get(headerName);
-    const key =
-      userKey ||
+    const key = userKey ||
       auth.defaultToken ||
       env[headerName.toUpperCase().replace(/-/g, "_")];
     if (key) headers.set(headerName, key);
@@ -79,9 +104,13 @@ const adapters: Record<string, any> = {
   },
   toAnthropic: {
     request: (openaiBody: any) => {
-      const systemMessages = openaiBody.messages.filter((m: any) => m.role === "system");
+      const systemMessages = openaiBody.messages.filter((m: any) =>
+        m.role === "system"
+      );
       const system = systemMessages.map((m: any) => m.content).join("\n");
-      const userMessages = openaiBody.messages.filter((m: any) => m.role !== "system");
+      const userMessages = openaiBody.messages.filter((m: any) =>
+        m.role !== "system"
+      );
 
       const anthropicMessages = userMessages.map((m: any) => {
         const role = m.role === "assistant" ? "assistant" : "user";
@@ -89,15 +118,23 @@ const adapters: Record<string, any> = {
         if (Array.isArray(m.content)) {
           content = m.content.map((block: any) => {
             if (typeof block === "string") return { type: "text", text: block };
-            if (block.type === "text") return { type: "text", text: block.text || "" };
+            if (block.type === "text") {
+              return { type: "text", text: block.text || "" };
+            }
             if (block.type === "image_url") {
-              const url =
-                typeof block.image_url === "string"
-                  ? block.image_url
-                  : block.image_url?.url || "";
+              const url = typeof block.image_url === "string"
+                ? block.image_url
+                : block.image_url?.url || "";
               const match = url.match(/^data:(image\/\w+);base64,(.+)$/);
               if (match) {
-                return { type: "image", source: { type: "base64", media_type: match[1], data: match[2] } };
+                return {
+                  type: "image",
+                  source: {
+                    type: "base64",
+                    media_type: match[1],
+                    data: match[2],
+                  },
+                };
               }
               return { type: "text", text: `[Image URL: ${url}]` };
             }
@@ -112,12 +149,15 @@ const adapters: Record<string, any> = {
       const result: any = {
         model: openaiBody.model,
         messages: anthropicMessages,
-        max_tokens: openaiBody.max_tokens || openaiBody.max_completion_tokens || 1024,
+        max_tokens: openaiBody.max_tokens || openaiBody.max_completion_tokens ||
+          1024,
         temperature: openaiBody.temperature ?? 1.0,
         top_k: openaiBody.top_k,
         stop_sequences: Array.isArray(openaiBody.stop)
           ? openaiBody.stop
-          : openaiBody.stop ? [openaiBody.stop] : undefined,
+          : openaiBody.stop
+          ? [openaiBody.stop]
+          : undefined,
         stream: openaiBody.stream || false,
       };
       if (system) result.system = system;
@@ -134,20 +174,30 @@ const adapters: Record<string, any> = {
         content = anthropicBody.content;
       }
       const stopReason = anthropicBody.stop_reason || "stop";
-      const map: any = { end_turn: "stop", max_tokens: "length", stop_sequence: "stop", tool_use: "tool_calls" };
+      const map: any = {
+        end_turn: "stop",
+        max_tokens: "length",
+        stop_sequence: "stop",
+        tool_use: "tool_calls",
+      };
       const finishReason = map[stopReason] || stopReason;
       return {
         id: anthropicBody.id || `msg_${Date.now()}`,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: anthropicBody.model || "unknown",
-        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: finishReason }],
+        choices: [{
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: finishReason,
+        }],
         usage: anthropicBody.usage
           ? {
-              prompt_tokens: anthropicBody.usage.input_tokens || 0,
-              completion_tokens: anthropicBody.usage.output_tokens || 0,
-              total_tokens: (anthropicBody.usage.input_tokens || 0) + (anthropicBody.usage.output_tokens || 0),
-            }
+            prompt_tokens: anthropicBody.usage.input_tokens || 0,
+            completion_tokens: anthropicBody.usage.output_tokens || 0,
+            total_tokens: (anthropicBody.usage.input_tokens || 0) +
+              (anthropicBody.usage.output_tokens || 0),
+          }
           : undefined,
       };
     },
@@ -156,7 +206,9 @@ const adapters: Record<string, any> = {
   },
   toGemini: {
     request: (openaiBody: any) => {
-      const systemMessages = openaiBody.messages.filter((m: any) => m.role === "system");
+      const systemMessages = openaiBody.messages.filter((m: any) =>
+        m.role === "system"
+      );
       const systemText = systemMessages.map((m: any) => m.content).join("\n");
       const contents = openaiBody.messages
         .filter((m: any) => m.role !== "system")
@@ -164,28 +216,35 @@ const adapters: Record<string, any> = {
           role: m.role === "assistant" ? "model" : "user",
           parts: Array.isArray(m.content)
             ? m.content.map((block: any) => {
-                if (typeof block === "string") return { text: block };
-                if (block.type === "text") return { text: block.text || "" };
-                if (block.type === "image_url") {
-                  const url = typeof block.image_url === "string" ? block.image_url : block.image_url?.url || "";
-                  const match = url.match(/^data:(image\/\w+);base64,(.+)$/);
-                  if (match) return { inlineData: { mimeType: match[1], data: match[2] } };
-                  return { text: `[Image URL: ${url}]` };
+              if (typeof block === "string") return { text: block };
+              if (block.type === "text") return { text: block.text || "" };
+              if (block.type === "image_url") {
+                const url = typeof block.image_url === "string"
+                  ? block.image_url
+                  : block.image_url?.url || "";
+                const match = url.match(/^data:(image\/\w+);base64,(.+)$/);
+                if (match) {
+                  return { inlineData: { mimeType: match[1], data: match[2] } };
                 }
-                return { text: "[unsupported block]" };
-              })
+                return { text: `[Image URL: ${url}]` };
+              }
+              return { text: "[unsupported block]" };
+            })
             : [{ text: m.content }],
         }));
       const result: any = {
         contents,
         generationConfig: {
           temperature: openaiBody.temperature ?? 1.0,
-          maxOutputTokens: openaiBody.max_tokens || openaiBody.max_completion_tokens || 1024,
+          maxOutputTokens: openaiBody.max_tokens ||
+            openaiBody.max_completion_tokens || 1024,
           topP: openaiBody.top_p,
           stopSequences: openaiBody.stop,
         },
       };
-      if (systemText) result.systemInstruction = { parts: [{ text: systemText }] };
+      if (systemText) {
+        result.systemInstruction = { parts: [{ text: systemText }] };
+      }
       if (openaiBody.stream) result.stream = true;
       return result;
     },
@@ -193,7 +252,12 @@ const adapters: Record<string, any> = {
       const candidate = geminiBody.candidates?.[0];
       const content = candidate?.content?.parts?.[0]?.text || "";
       const finishReason = candidate?.finishReason || "STOP";
-      const map: any = { STOP: "stop", MAX_TOKENS: "length", SAFETY: "content_filter", RECITATION: "content_filter" };
+      const map: any = {
+        STOP: "stop",
+        MAX_TOKENS: "length",
+        SAFETY: "content_filter",
+        RECITATION: "content_filter",
+      };
       return {
         id: `gemini-${Date.now()}`,
         object: "chat.completion",
@@ -206,10 +270,11 @@ const adapters: Record<string, any> = {
         }],
         usage: geminiBody.usageMetadata
           ? {
-              prompt_tokens: geminiBody.usageMetadata.promptTokenCount || 0,
-              completion_tokens: geminiBody.usageMetadata.candidatesTokenCount || 0,
-              total_tokens: geminiBody.usageMetadata.totalTokenCount || 0,
-            }
+            prompt_tokens: geminiBody.usageMetadata.promptTokenCount || 0,
+            completion_tokens: geminiBody.usageMetadata.candidatesTokenCount ||
+              0,
+            total_tokens: geminiBody.usageMetadata.totalTokenCount || 0,
+          }
           : undefined,
       };
     },
@@ -241,7 +306,10 @@ export const providers: Record<string, any> = {
     adapter: adapters.passthrough,
     filterModels: (data: any) => {
       if (!data?.data) return data;
-      return { ...data, data: data.data.filter((m: any) => m.id && m.id.endsWith("-free")) };
+      return {
+        ...data,
+        data: data.data.filter((m: any) => m.id && m.id.endsWith("-free")),
+      };
     },
   },
   anthropic: {
@@ -259,7 +327,10 @@ export const providers: Record<string, any> = {
     baseUrl: "https://generativelanguage.googleapis.com",
     auth: { type: "api-key", header: "x-goog-api-key" },
     pathRewrite: (path: string) => path.replace(/^\/gemini\/v1/, "/v1beta"),
-    endpoints: { models: "/v1beta/models", chat: "/v1beta/models/gemini-pro:generateContent" },
+    endpoints: {
+      models: "/v1beta/models",
+      chat: "/v1beta/models/gemini-pro:generateContent",
+    },
     adapter: adapters.toGemini,
     filterModels: null,
   },
@@ -267,7 +338,8 @@ export const providers: Record<string, any> = {
     prefix: "/openrouter/v1/responses",
     baseUrl: "https://openrouter.ai/api/v1",
     auth: { type: "bearer", defaultToken: "" },
-    pathRewrite: (path: string) => path.replace(/^\/openrouter\/v1\/responses/, "/responses"),
+    pathRewrite: (path: string) =>
+      path.replace(/^\/openrouter\/v1\/responses/, "/responses"),
     endpoints: { chat: "/responses" },
     adapter: adapters.passthrough,
     filterModels: null,
@@ -286,16 +358,35 @@ export const providers: Record<string, any> = {
     baseUrl: "https://cnb.cool",
     auth: { type: "none" },
     pathRewrite: (p: string) => p.replace(/^\/cnb\/v1/, ""),
-    endpoints: { models: "/v1/models", chat: "/v1/chat/completions", responses: "/v1/responses" },
+    endpoints: {
+      models: "/v1/models",
+      chat: "/v1/chat/completions",
+      responses: "/v1/responses",
+    },
     adapter: adapters.passthrough,
     filterModels: null,
     customHandler: "cnb",
+  },
+  commandcode: {
+    prefix: "/commandcode/v1",
+    baseUrl: "https://api.commandcode.ai",
+    auth: { type: "none" },
+    pathRewrite: (path: string) => path.replace(/^\/commandcode\/v1/, ""),
+    endpoints: {
+      models: "/provider/v1/models",
+      chat: "/alpha/generate",
+      responses: "/alpha/generate",
+    },
+    adapter: adapters.passthrough,
+    filterModels: null,
+    customHandler: "commandcode",
   },
   "deepseek-web": {
     prefix: "/deepseek-web/v1",
     baseUrl: "https://chat.deepseek.com",
     auth: { type: "none" },
-    pathRewrite: (path: string) => path.replace(/^\/deepseek-web\/v1/, "/api/v0"),
+    pathRewrite: (path: string) =>
+      path.replace(/^\/deepseek-web\/v1/, "/api/v0"),
     endpoints: { models: "/api/v0/models", chat: "/api/v0/chat/completion" },
     adapter: adapters.passthrough,
     filterModels: null,
@@ -310,13 +401,20 @@ export const providers: Record<string, any> = {
     adapter: adapters.passthrough,
     filterModels: (data: any) => {
       if (!data?.data) return data;
-      return { ...data, data: data.data.filter((m: any) => m.id && m.id.endsWith(":free")) };
+      return {
+        ...data,
+        data: data.data.filter((m: any) => m.id && m.id.endsWith(":free")),
+      };
     },
   },
 };
 
 // ---------- 健康检查 ----------
-async function testModel(baseUrl: string, modelId: string, providerKey: string) {
+async function testModel(
+  baseUrl: string,
+  modelId: string,
+  providerKey: string,
+) {
   const provider = providers[providerKey];
   const url = `${baseUrl}${provider.endpoints.chat}`;
   const auth = provider.auth;
@@ -327,8 +425,14 @@ async function testModel(baseUrl: string, modelId: string, providerKey: string) 
     const headerName = auth.header || "x-api-key";
     if (auth.defaultToken) headers.set(headerName, auth.defaultToken);
   }
-  const testBody = { model: modelId, messages: [{ role: "user", content: "Hi" }], max_tokens: 1 };
-  const finalBody = provider.adapter.request ? provider.adapter.request(testBody) : testBody;
+  const testBody = {
+    model: modelId,
+    messages: [{ role: "user", content: "Hi" }],
+    max_tokens: 1,
+  };
+  const finalBody = provider.adapter.request
+    ? provider.adapter.request(testBody)
+    : testBody;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3000);
@@ -345,14 +449,22 @@ async function testModel(baseUrl: string, modelId: string, providerKey: string) 
   }
 }
 
-export async function filterHealthyModels(models: any[], providerKey: string, baseUrl: string) {
+export async function filterHealthyModels(
+  models: any[],
+  providerKey: string,
+  baseUrl: string,
+) {
   if (!models || !models.length) return models;
   const concurrency = 5;
   const results = [];
   for (let i = 0; i < models.length; i += concurrency) {
     const chunk = models.slice(i, i + concurrency);
-    const statuses = await Promise.all(chunk.map((m) => testModel(baseUrl, m.id, providerKey)));
-    for (let j = 0; j < chunk.length; j++) if (statuses[j]) results.push(chunk[j]);
+    const statuses = await Promise.all(
+      chunk.map((m) => testModel(baseUrl, m.id, providerKey)),
+    );
+    for (let j = 0; j < chunk.length; j++) {
+      if (statuses[j]) results.push(chunk[j]);
+    }
   }
   return results;
 }
@@ -368,7 +480,10 @@ export async function tryParseResponse(response: Response) {
     }
   }
   const text = await response.text();
-  return { data: null, error: new Error(`Non-JSON response: ${text.slice(0, 200)}`) };
+  return {
+    data: null,
+    error: new Error(`Non-JSON response: ${text.slice(0, 200)}`),
+  };
 }
 
 // ---------- 流式转换 ----------
@@ -384,7 +499,11 @@ export function createStreamTransformer(adapter: any, requestBody: any) {
   function processSseData(dataStr: string) {
     if (!dataStr || dataStr === "[DONE]") return "data: [DONE]\n\n";
     let data;
-    try { data = JSON.parse(dataStr); } catch { return ""; }
+    try {
+      data = JSON.parse(dataStr);
+    } catch {
+      return "";
+    }
     let openAiChunk: any = null;
 
     if (adapter === adapters.toAnthropic) {
@@ -393,23 +512,49 @@ export function createStreamTransformer(adapter: any, requestBody: any) {
         messageId = data.message?.id || `msg_${Date.now()}`;
         model = data.message?.model || model;
         openAiChunk = {
-          id: messageId, object: "chat.completion.chunk", created, model,
-          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+          id: messageId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{
+            index: 0,
+            delta: { role: "assistant" },
+            finish_reason: null,
+          }],
         };
       } else if (type === "content_block_delta") {
         const text = data.delta?.text || "";
         if (text) {
           openAiChunk = {
-            id: messageId, object: "chat.completion.chunk", created, model,
-            choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+            id: messageId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{
+              index: 0,
+              delta: { content: text },
+              finish_reason: null,
+            }],
           };
         }
       } else if (type === "message_delta") {
         const stopReason = data.delta?.stop_reason || "stop";
-        const map: any = { end_turn: "stop", max_tokens: "length", stop_sequence: "stop", tool_use: "tool_calls" };
+        const map: any = {
+          end_turn: "stop",
+          max_tokens: "length",
+          stop_sequence: "stop",
+          tool_use: "tool_calls",
+        };
         openAiChunk = {
-          id: messageId, object: "chat.completion.chunk", created, model,
-          choices: [{ index: 0, delta: {}, finish_reason: map[stopReason] || stopReason }],
+          id: messageId,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: map[stopReason] || stopReason,
+          }],
         };
       }
     } else if (adapter === adapters.toGemini) {
@@ -418,15 +563,35 @@ export function createStreamTransformer(adapter: any, requestBody: any) {
         const text = c.content?.parts?.[0]?.text || "";
         if (text) {
           openAiChunk = {
-            id: messageId, object: "chat.completion.chunk", created, model,
-            choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+            id: messageId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{
+              index: 0,
+              delta: { content: text },
+              finish_reason: null,
+            }],
           };
         }
         if (c.finishReason) {
-          const map: any = { STOP: "stop", MAX_TOKENS: "length", SAFETY: "content_filter", RECITATION: "content_filter" };
+          const map: any = {
+            STOP: "stop",
+            MAX_TOKENS: "length",
+            SAFETY: "content_filter",
+            RECITATION: "content_filter",
+          };
           openAiChunk = {
-            id: messageId, object: "chat.completion.chunk", created, model,
-            choices: [{ index: 0, delta: {}, finish_reason: map[c.finishReason] || c.finishReason.toLowerCase() }],
+            id: messageId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: map[c.finishReason] ||
+                c.finishReason.toLowerCase(),
+            }],
           };
         }
       }
@@ -458,4 +623,3 @@ export function createStreamTransformer(adapter: any, requestBody: any) {
     },
   });
 }
-
