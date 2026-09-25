@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Deno check, compile, lint, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.6
+
+      - name: Check formatting
+        run: deno fmt --check main.ts worker.ts src/core.ts src/deepseek-responses.ts src/commandcode
+
+      - name: Type-check and build-check
+        run: deno task check
+
+      - name: Compile executable
+        run: deno compile --allow-env --allow-net --output ./ai-proxy-ci main.ts
+
+      - name: Lint CommandCode and Responses modules
+        run: deno lint src/commandcode src/deepseek-responses.ts
+
+      - name: Run tests
+        run: deno task test
