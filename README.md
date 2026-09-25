@@ -29,7 +29,7 @@
       │  /cnb/v1/chat/completions  /v1/...  /anthropic/v1/...
       ▼
 Cloudflare Worker  https://<worker>.workers.dev          ← worker.ts
-      │  ENV.BACKEND_URL 有值 → 纯字节转发（流式、失败重试 1 次、零解析 CPU）
+      │  ENV.BACKEND_URL 有值 → 纯字节转发（流式；仅幂等请求最多重试一次，非幂等 POST 不自动重放）
       ▼
 cloudflared 快速隧道  https://xxx.trycloudflare.com      ← restart.ps1
       ▼
@@ -39,7 +39,7 @@ cloudflared 快速隧道  https://xxx.trycloudflare.com      ← restart.ps1
 **为什么要这么绕？** Cloudflare Workers / Deno Deploy 都有 CPU 时间与配额限制，而 cnb 的协议解析（数百行正则 + 流式标记过滤）很吃 CPU。
 用 `ENV.BACKEND_URL` 一个开关把计算挪回本机、边缘只做字节转发，就绕开了限制，同时保留一个稳定的公网域名。
 
-`main.ts` 的入口逻辑只有一行（`main.ts:2186`）：
+`main.ts` 的 `handler` 会先完成入口鉴权，再根据 `BACKEND_URL` 选择纯转发或本地 Provider 处理：
 
 ```ts
 if (ENV.BACKEND_URL) return await proxyToBackend(request);  // 反向代理模式
@@ -317,15 +317,15 @@ print(resp.choices[0].message.content)
 
 ## cnb.cool 模块
 
-`main.ts:452` 起是 cnb 集成，也是全项目最复杂的部分。
+`src/cnb.ts` 是 cnb 集成模块，也是全项目最复杂的部分。
 
 ### 1. 会话自举
 
 cnb 的网页端接口需要 CSRF 双因子（token + cookie）：
 
-- `cnbFetchCsrf`（`main.ts:468`）GET `https://cnb.cool/`，从 HTML 正则抓 `window.csrftoken`，从 `Set-Cookie` 抓 `csrfkey`；
+- `cnbFetchCsrf` GET `https://cnb.cool/`，从 HTML 正则抓 `window.csrftoken`，从 `Set-Cookie` 抓 `csrfkey`；
 - 缓存 25 分钟（`CNB_TTL`），并用 `cnbState.pending` 做**单飞（single-flight）**，防止并发请求重复握手；
-- `cnbCall`（`main.ts:1435`）请求时带上 `Csrftoken` 头、`csrfkey` cookie、移动端 UA、`Origin` / `Referer`。
+- `cnbCall` 请求时带上 `Csrftoken` 头、`csrfkey` cookie、移动端 UA、`Origin` / `Referer`。
 
 ### 1.5 登录态（cnb-login.txt）
 
@@ -344,28 +344,28 @@ cnb.cool 已要求登录才能调用推理接口（匿名会话 401 [NOT_LOGIN]�
 
 cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 
-- `cnbBuildToolPrompt`（`main.ts:743`）把所有工具定义拼成系统提示词，要求模型输出 `` 包裹的 JSON；
-- 历史里的 assistant `tool_calls` 会转回同样的文本（`main.ts:1355`），工具结果转成 `[Tool Result id=...]` 的 user 消息（`main.ts:1378`）——让模型「看到自己的历史就是正确示范」；
-- `cnbParseToolCalls`（`main.ts:995`）是**极其宽容**的反向解析器：兼容 `XYML` / `QNML` / DeepSeek 原生 `DSML` / `` 等多种变体，能修复被截断的 JSON、按 JSON Schema 强制类型、拆解嵌套 arguments、归一化形近字、检测「一字符一行的退化输出」、参数名反猜工具等；
-- `createLiveFilter`（`main.ts:1254`）在**流式输出**时扣住「可能是标记开头」的前缀，保证协议标记不会泄漏到用户可见正文。
+- `cnbBuildToolPrompt` 把所有工具定义拼成系统提示词，要求模型输出 `` 包裹的 JSON；
+- 历史里的 assistant `tool_calls` 会转回同样的文本，工具结果转成 `[Tool Result id=...]` 的 user 消息——让模型「看到自己的历史就是正确示范」；
+- `cnbParseToolCalls` 是**极其宽容**的反向解析器：兼容 `XYML` / `QNML` / DeepSeek 原生 `DSML` / `` 等多种变体，能修复被截断的 JSON、按 JSON Schema 强制类型、拆解嵌套 arguments、归一化形近字、检测「一字符一行的退化输出」、参数名反猜工具等；
+- `createLiveFilter` 在**流式输出**时扣住「可能是标记开头」的前缀，保证协议标记不会泄漏到用户可见正文。
 
 ### 3. Responses API
 
-`handleCnbResponses`（`main.ts:1693`）把新版 `/v1/responses` 请求降级成 chat 格式跑一遍，再重组为 Responses 的 output items（`reasoning` / `message` / `function_call`），流式与非流式均支持。
+`handleCnbResponses` 把新版 `/v1/responses` 请求降级成 chat 格式跑一遍，再重组为 Responses 的 output items（`reasoning` / `message` / `function_call`），流式与非流式均支持。
 
 ### 4. 可靠性
 
-- `cnbCallUpstream`（`main.ts:1522`）按 `[0, 500, 1500, 3500, 8000, 20000]` ms 退避重试；
+- `cnbCallUpstream` 按 `[0, 500, 1500, 3500, 8000, 20000]` ms 退避重试；
 - 网络层失败会刷新 CSRF 会话再试；4xx（429 除外）视为确定性错误直接透传；
 - `deepseek-v4-flash` 连续 5xx 时**自动降级到 `deepseek-v4-pro`**；
-- `cnbCall`（`main.ts:1436`）带 **30 秒无响应头超时**——cnb 偶发无限挂起，中止后交给退避重试（只罩到响应头返回，不限流式生成总时长）；
-- **串行闸**（`main.ts:1492`）：cnb 网页会话按 cookie 归属，多客户端并发共用一个 cookie 会互踩（曾观测到跨会话内容泄漏）。所有 cnb 上游调用同一时刻只放行一个，锁持有到**响应流真正消费完**（流结束/出错/消费方取消/2 分钟无数据/10 分钟硬安全阀任一条件释放），日志以 `[cnb-gate] fp=...` 记录排队与释放（fp 为会话指纹，重叠且 fp 不同即跨会话并发）；
+- `cnbCall` 带 **30 秒无响应头超时**——cnb 偶发无限挂起，中止后交给退避重试（只罩到响应头返回，不限流式生成总时长）；
+- **串行闸**：cnb 网页会话按 cookie 归属，多客户端并发共用一个 cookie 会互踩（曾观测到跨会话内容泄漏）。所有 cnb 上游调用同一时刻只放行一个，锁持有到**响应流真正消费完**（流结束/出错/消费方取消/2 分钟无数据/10 分钟硬安全阀任一条件释放），日志以 `[cnb-gate] fp=...` 记录排队与释放（fp 为会话指纹，重叠且 fp 不同即跨会话并发）；
 - **1 MiB 请求体预检**：cnb 网关（nginx）硬性拒绝超过 1 MiB 的请求体，超过则毫秒级本地返回 413，不浪费隧道往返。
 
 ### 5. 其它
 
 - **可用模型**：`deepseek-v4-flash`、`deepseek-v4-pro`；
-- **视觉**：`user` / `system` 消息中的 `image_url` 块会被保留为多模态数组，而不是被折叠成纯文本（`main.ts:1317` 的注释记录了这次修复的原因）；
+- **视觉**：`user` / `system` 消息中的 `image_url` 块会被保留为多模态数组，而不是被折叠成纯文本（`src/cnb.ts` 中保留了这次修复的注释）；
 - **思考强度**：`enable_thinking` 恒为 `true`，`reasoning_effort` 取客户端值（`low` / `medium` / `high` / `max`），默认 `high`；
 - **输出上限**：cnb 通道 `max_tokens` 默认 `flash: 120000` / `pro: 60000`（预算含思考 token；实测 flash 思考最多吃掉约一半，故单独调大）；
 
@@ -411,7 +411,7 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 - cnb 通道完全依赖网页端私有接口，**上游改版即失效**；
 - CommandCode Go 同样依赖 `/alpha/*` 私有 CLI 网关，模型档位、指纹要求或 OAuth 回调发生变化时需要更新；
 - 免费上游的模型清单随时变化，且常见限流（429）与容量窗口（5xx）；
-- `trycloudflare` 快速隧道的 URL 每次重启都会变（由 `restart.ps1` 自动回写 `BACKEND_URL`），且约有 10% 的连接抖动（`proxyToBackend` 已做一次重试）；
+- `trycloudflare` 快速隧道的 URL 每次重启都会变（由 `restart.ps1` 自动回写 `BACKEND_URL`），且可能有连接抖动；`proxyToBackend` 仅对幂等请求最多重试一次，非幂等 POST 不自动重放以避免重复计费；
 - 内存缓存（模型列表 5 分钟、CSRF 25 分钟）在边缘多实例下不共享。
 
 ---
