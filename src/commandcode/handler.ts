@@ -6,6 +6,7 @@
  */
 
 import { ENV } from "../core.ts";
+import { classifyStreamFailure } from "../runtime/stream-normalizer.ts";
 import {
   handleDeepseekResponses,
   readJsonBodyLimited,
@@ -632,21 +633,18 @@ async function* generateEvents(
             signal: upstreamSignal,
           });
         } catch (error) {
-          if (localAbort.signal.aborted) {
+          const failure = classifyStreamFailure(error, {
+            abortedSignals: [localAbort.signal, request.signal],
+            timeoutSignal,
+          });
+          if (failure === "aborted") {
             throw new CommandCodeError(
               "Command Code request cancelled by client",
               499,
               "aborted",
             );
           }
-          if (request.signal.aborted) {
-            throw new CommandCodeError(
-              "Command Code request aborted by caller",
-              499,
-              "aborted",
-            );
-          }
-          if (timeoutSignal.aborted) {
+          if (failure === "timeout") {
             throw new CommandCodeError(
               "Command Code request timed out",
               504,
@@ -756,21 +754,19 @@ async function* generateEvents(
           "upstream_error",
         );
       } catch (caught) {
-        if (localAbort.signal.aborted) {
+        const failure = classifyStreamFailure(caught, {
+          abortedSignals: [localAbort.signal, request.signal],
+          timeoutSignal,
+          deliveredOutput: yielded,
+        });
+        if (failure === "aborted") {
           throw new CommandCodeError(
             "Command Code request cancelled by client",
             499,
             "aborted",
           );
         }
-        if (request.signal.aborted) {
-          throw new CommandCodeError(
-            "Command Code request aborted by caller",
-            499,
-            "aborted",
-          );
-        }
-        if (timeoutSignal.aborted) {
+        if (failure === "timeout") {
           throw new CommandCodeError(
             "Command Code request timed out",
             504,

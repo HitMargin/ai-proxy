@@ -56,10 +56,23 @@ src/core.ts                环境变量、Provider 配置、协议适配器、�
 src/cnb.ts                 cnb.cool CSRF、登录态、工具调用、Responses 转换
 src/deepseek-web.ts        DeepSeek 网页登录态、PoW WASM、SSE 解析、OpenAI 转换
 src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度与路由
+src/runtime/               响应体形状嗅探、流回放与 abort/截断分类
 deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 ```
 
 `worker.ts` 仍然从 `main.ts` 导入 `handler`，部署入口保持不变。
+
+### 流式响应可靠性
+
+`src/runtime/stream-normalizer.ts` 提供跨 Provider 的基础能力：
+
+- 按响应体前 4 KiB 判断 `SSE/JSON/空/未知`，不完全依赖 `Content-Type`；
+- 检查后把已读字节回放到新的 `ReadableStream`，不丢首帧；
+- 等待首个响应体字节有 15 秒上限，避免上游只回 headers 后长期挂起；
+- 区分 `aborted`、`timeout`、`stream_cut` 和 `transport`，客户端取消不会被当成可重试错误；
+- 已经向客户端输出后发生截断时不会重放请求。
+
+CommandCode 已接入 abort/timeout 分类；DeepSeek 网页端和 cnb 已接入响应体嗅探。
 
 ---
 

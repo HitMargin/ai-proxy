@@ -1,4 +1,9 @@
 import { safeJsonParse } from "./core.ts";
+import {
+  inspectResponseBody,
+  readInspectedText,
+  replayResponse,
+} from "./runtime/stream-normalizer.ts";
 import { acquireDeepseekGate } from "./deepseek-gate.ts";
 import {
   getDeepSeekRiskSnapshot,
@@ -701,27 +706,32 @@ async function deepseekWebChat(cookies: string, auth: string, chatSessionId: str
     const text = await r.text();
     throw deepseekWebHttpError(r, text);
   }
-  const contentType = r.headers.get("content-type") || "";
-  if (!contentType.toLowerCase().includes("text/event-stream")) {
-    const text = await r.text();
-    if (/^\s*(?:event:|data:)/m.test(text)) {
-      return new Response(text, { status: 200, headers: { "Content-Type": "text/event-stream" } });
-    }
-    const parsed = safeJsonParse(text);
-    if (parsed.error) throw new DeepSeekWebError(`DeepSeek non-SSE response: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
-    const envelope = parsed.data?.data ? parsed.data : parsed;
-    const businessError = deepseekWebBusinessError(envelope);
-    if (businessError) throw businessError;
-    const content = String(envelope?.data?.biz_data?.content ?? envelope?.biz_data?.content ?? "");
-    if (!content) throw new DeepSeekWebError(`DeepSeek non-SSE response did not contain content: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
-    const sse = [
-      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`,
-      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })}\n\n`,
-      "data: [DONE]\n\n",
-    ].join("");
-    return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  const inspected = await inspectResponseBody(r);
+  if (inspected.timedOut) {
+    throw new DeepSeekWebError(
+      "DeepSeek returned headers but no response body before the sniff deadline",
+      504,
+      0,
+      "timeout",
+    );
   }
-  return r;
+  if (inspected.shape === "sse") {
+    return replayResponse(r, inspected, "text/event-stream");
+  }
+  const text = await readInspectedText(inspected);
+  const parsed = safeJsonParse(text);
+  if (parsed.error) throw new DeepSeekWebError(`DeepSeek non-SSE response: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
+  const envelope = parsed.data?.data ? parsed.data : parsed;
+  const businessError = deepseekWebBusinessError(envelope);
+  if (businessError) throw businessError;
+  const content = String(envelope?.data?.biz_data?.content ?? envelope?.biz_data?.content ?? "");
+  if (!content) throw new DeepSeekWebError(`DeepSeek non-SSE response did not contain content: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
+  const sse = [
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`,
+    `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })}\n\n`,
+    "data: [DONE]\n\n",
+  ].join("");
+  return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
 }
 
 function deepseekWebRiskHeaders(): Record<string, string> {

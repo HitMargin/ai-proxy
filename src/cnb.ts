@@ -1,4 +1,9 @@
 import { safeJsonParse } from "./core.ts";
+import {
+  inspectResponseBody,
+  readInspectedText,
+  replayResponse,
+} from "./runtime/stream-normalizer.ts";
 
 // ============================================
 // cnb.cool 集成模块
@@ -1158,7 +1163,17 @@ async function cnbCallUpstreamInner(upBody: any): Promise<Response> {
     if (waits[i]) await new Promise((r) => setTimeout(r, waits[i]));
     try {
       const resp = await cnbCall(upBody);
-      if (resp.status === 200) return resp;
+      if (resp.status === 200) {
+        const inspected = await inspectResponseBody(resp);
+        if (inspected.timedOut) {
+          return cnbErr(504, "cnb returned headers but no response body", "response sniff deadline reached");
+        }
+        if (inspected.shape === "sse") {
+          return replayResponse(resp, inspected, "text/event-stream");
+        }
+        const text = await readInspectedText(inspected);
+        return cnbErr(502, "cnb returned a non-SSE response", text.slice(0, 500) || "empty response body");
+      }
       last = resp;
       // 4xx（除 429）是确定性的，重试无意义，直接透传
       if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) return resp;
