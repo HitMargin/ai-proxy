@@ -598,13 +598,12 @@ function cleanSettings(values) {
 
 async function panelSnapshot(adapter) {
   try {
-    const response = await adapter.request('/panel');
+    const response = await adapter.request('/panel', { signal: AbortSignal.timeout(5000) });
     return await response.json();
   } catch (error) {
-    if (!/HTTP 404/.test(error instanceof Error ? error.message : String(error))) throw error;
     const [statusResponse, modelsResponse] = await Promise.all([
-      adapter.request('/status'),
-      adapter.request('/models'),
+      adapter.request('/status', { signal: AbortSignal.timeout(5000) }),
+      adapter.request('/models', { signal: AbortSignal.timeout(5000) }),
     ]);
     const status = await statusResponse.json();
     const catalog = await modelsResponse.json();
