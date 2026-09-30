@@ -64,18 +64,73 @@ function pickEfforts(published) {
   return EFFORT_ORDER.filter((effort) => seen.has(effort));
 }
 
-function normalizeModel(provider, row) {
-  const modalities = Array.isArray(row.inputModalities)
-    ? row.inputModalities
-    : Array.isArray(row.input_modalities)
-    ? row.input_modalities
-    : ['text'];
+const MODALITY_WORDS = ['text', 'image', 'video', 'audio'];
+
+// Zen publishes only `id`, so the display name used to collapse to the raw
+// prefixed id (`zen/jev-1.13-free`). Recover a readable label from the id's
+// last segment; `owned_by: opencode` also means the model is anonymous and has
+// no vendor name to show, so the id is the only honest source.
+function readName(row) {
+  if (typeof row.name === 'string' && row.name.trim() !== '') return row.name;
+  const id = String(row.id ?? '');
+  const segment = id.split('/').pop() ?? id;
+  return segment
+    .split('-')
+    .filter((word) => word !== '' && word !== 'free')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ') || segment;
+}
+
+// Kilo publishes models.models.dev shape, where modalities live under
+// `architecture.input_modalities` and context under a nested `top_provider`.
+// Reading only the flat OpenAI keys silently downgraded every Kilo model to
+// `['text']` and to the default context, so `text+image+video` models such as
+// space-bunny-alpha were reported as text-only. Walk all three shapes.
+function readModalities(row) {
+  const architecture = isRecord(row.architecture) ? row.architecture : {};
+  const nested = [row.input_modalities, architecture.input_modalities]
+    .find((value) => Array.isArray(value) && value.length > 0);
+  if (nested) {
+    return [...new Set(nested.filter((value) => typeof value === 'string'))];
+  }
+  // `modality` is "text+image+video->text"; the left side is what we accept.
+  const shorthand = typeof architecture.modality === 'string'
+    ? architecture.modality.split('->')[0]
+    : '';
+  const parsed = MODALITY_WORDS.filter((word) =>
+    shorthand.split('+').includes(word)
+  );
+  return parsed.length > 0 ? parsed : ['text'];
+}
+
+function readNumber(row, keys, fallback) {
+  for (const key of keys) {
+    const value = Number(row[key]);
+    if (Number.isFinite(value) && value > 0) return value;
+  }
+  return fallback;
+}
+
+export function normalizeModel(provider, row) {
+  const architecture = isRecord(row.architecture) ? row.architecture : {};
+  const upstream = isRecord(row.top_provider) ? row.top_provider : {};
+  const modalities = Array.isArray(row.inputModalities) && row.inputModalities.length > 0
+    ? [...new Set(row.inputModalities)]
+    : readModalities(row);
   return {
     provider,
     id: row.id,
-    name: typeof row.name === 'string' ? row.name : row.id,
-    contextWindow: Number(row.contextWindow ?? row.context_window ?? 1000000),
-    maxTokens: Number(row.maxTokens ?? row.max_tokens ?? DEFAULT_MAX_TOKENS),
+    name: readName(row),
+    contextWindow: readNumber(
+      row,
+      ['contextWindow', 'context_window', 'context_length'],
+      readNumber(upstream, ['context_window', 'context_length'], 1000000),
+    ),
+    maxTokens: readNumber(
+      row,
+      ['maxTokens', 'max_tokens', 'max_output_tokens', 'max_completion_tokens'],
+      readNumber(upstream, ['max_output_tokens', 'max_completion_tokens'], DEFAULT_MAX_TOKENS),
+    ),
     inputModalities: modalities,
     reasoningEfforts: Array.isArray(row.reasoningEfforts)
       ? row.reasoningEfforts
@@ -530,11 +585,17 @@ export class AiProxyAdapter {
         const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
         const payload = await response.json();
         const rows = Array.isArray(payload?.data) ? payload.data : [];
-        return rows.filter(isRecord).map((row) => ({
-          ...normalizeModel(this.provider, row),
-          id: `${route.prefix}/${row.id}`,
-          name: typeof row.name === 'string' ? row.name : `${route.prefix}/${row.id}`,
-        }));
+        return rows.filter(isRecord).map((row) => {
+          const normalized = normalizeModel(this.provider, row);
+          return {
+            ...normalized,
+            id: `${route.prefix}/${row.id}`,
+            // normalizeModel already derived a readable name from the bare id;
+            // re-deriving it here would prefix the channel and land back on the
+            // raw `prefix/id` string this fallback is meant to avoid.
+            name: normalized.name || `${route.prefix}/${row.id}`,
+          };
+        });
       } catch {
         // Optional channels stay absent when their credentials or upstream are unavailable.
         return [];

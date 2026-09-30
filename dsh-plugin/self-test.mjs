@@ -52,8 +52,44 @@ globalThis.fetch = async (input, init = {}) => {
             input_modalities: ['text', 'image'],
             reasoning_efforts: ['off', 'high', 'max'],
           },
+          {
+            // Kilo publishes the models.models.dev shape, not the flat OpenAI
+            // one: modalities nest under `architecture` and context under
+            // `top_provider`. Reading only flat keys turned this into text-only.
+            id: 'kilo/stealth/space-bunny-alpha',
+            name: 'Space Bunny Alpha',
+            architecture: {
+              modality: 'text+image+video->text',
+              input_modalities: ['text', 'image', 'video'],
+              output_modalities: ['text'],
+            },
+            context_length: 1000000,
+            top_provider: { context_length: 1000000, max_completion_tokens: 524288 },
+          },
+          {
+            // No modality list at all: the `modality` shorthand is the only
+            // signal, so it has to be parsed rather than defaulted to text.
+            id: 'kilo/shorthand-only',
+            name: 'Shorthand Only',
+            architecture: { modality: 'text+image->text' },
+            context_length: 256000,
+          },
+          {
+            // Zen publishes only `id`; the display name used to collapse to the
+            // raw prefixed id, which is what made the roster read as
+            // `zen/jev-1.13-free` instead of a readable label.
+            id: 'zen/jev-1.13-free',
+            object: 'model',
+            owned_by: 'opencode',
+          },
         ],
       }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/zen/')) {
+      return new Response(JSON.stringify({ data: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
     }
     return new Response(JSON.stringify({
       data: [{
@@ -112,6 +148,19 @@ try {
   assert.equal(listed.contextWindow, 1000000);
   assert.equal(listed.maxTokens, 64000);
   assert.deepEqual(listed.inputModalities, ['text', 'image']);
+  // Kilo nests modalities and context; reading only flat keys made 18 models
+  // text-only with a default context.
+  const kilo = models.find((model) => model.id === 'kilo/stealth/space-bunny-alpha');
+  assert.deepEqual(kilo.inputModalities, ['text', 'image', 'video']);
+  assert.equal(kilo.contextWindow, 1000000);
+  assert.equal(kilo.maxTokens, 524288);
+  const shorthand = models.find((model) => model.id === 'kilo/shorthand-only');
+  assert.deepEqual(shorthand.inputModalities, ['text', 'image']);
+  assert.equal(shorthand.contextWindow, 256000);
+  // A channel that publishes only `id` must still get a readable display name.
+  const zenModel = models.find((model) => model.id === 'zen/jev-1.13-free');
+  assert.equal(zenModel.name, 'Jev 1.13');
+  assert.equal(zenModel.name.startsWith('zen/'), false);
   const blockedEvents = [];
   const blockedResolved = await adapter.resolveModel('ai-proxy', 'openrouter/paid/model');
   for await (const event of adapter.stream({
