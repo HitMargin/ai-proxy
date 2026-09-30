@@ -16,10 +16,19 @@ globalThis.fetch = async (input, init = {}) => {
     });
   }
   if (url.endsWith('/panel')) {
-    return new Response(JSON.stringify({ provider: 'commandcode', state: 'available', models: [] }), {
-      status: 200,
+    return new Response(JSON.stringify({ error: 'Command Code route not found' }), {
+      status: 404,
       headers: { 'content-type': 'application/json' },
     });
+  }
+  if (url.endsWith('/status')) {
+    return new Response(JSON.stringify({
+      provider: 'commandcode',
+      modelCount: 1,
+      activeAccounts: 1,
+      accounts: [{ id: 'test', enabled: true, cooling: false, keyName: 'must-not-leak' }],
+      cache: { total: 1, sessions: 0 },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
   if (url.endsWith('/models')) {
     modelCalls++;
@@ -93,7 +102,10 @@ try {
     end(body) { panelBody = body; },
   });
   assert.equal(panelStatus, 200);
-  assert.equal(JSON.parse(panelBody).provider, 'commandcode');
+  const panel = JSON.parse(panelBody);
+  assert.equal(panel.provider, 'commandcode');
+  assert.equal(panel.panelSource, 'status-fallback');
+  assert.equal(panel.accounts[0].keyName, undefined);
 
   const invoke = async (method, path) => {
     let status = 0;

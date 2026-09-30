@@ -596,6 +596,49 @@ function cleanSettings(values) {
   return next;
 }
 
+async function panelSnapshot(adapter) {
+  try {
+    const response = await adapter.request('/panel');
+    return await response.json();
+  } catch (error) {
+    if (!/HTTP 404/.test(error instanceof Error ? error.message : String(error))) throw error;
+    const [statusResponse, modelsResponse] = await Promise.all([
+      adapter.request('/status'),
+      adapter.request('/models'),
+    ]);
+    const status = await statusResponse.json();
+    const catalog = await modelsResponse.json();
+    const rows = Array.isArray(catalog?.data) ? catalog.data : [];
+    const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
+    return {
+      provider: 'commandcode',
+      state: Number(status?.activeAccounts ?? 0) > 0 ? 'available' : 'degraded',
+      modelCount: Number(status?.modelCount ?? rows.length),
+      models: rows.filter(isRecord).map((row) => ({
+        id: String(row.id ?? ''),
+        name: String(row.name ?? row.id ?? ''),
+        contextWindow: Number(row.contextWindow ?? row.context_window ?? 0),
+        maxTokens: Number(row.maxTokens ?? row.max_tokens ?? 0),
+        inputModalities: Array.isArray(row.inputModalities) ? row.inputModalities
+          : Array.isArray(row.input_modalities) ? row.input_modalities : ['text'],
+      })),
+      accounts: accounts.filter(isRecord).map((account) => ({
+        id: String(account.id ?? ''),
+        enabled: account.enabled === true,
+        cooling: account.cooling === true,
+        failCount: Number(account.failCount ?? 0),
+        cooldownUntil: Number(account.cooldownUntil ?? 0),
+        lastError: typeof account.lastError === 'string' ? account.lastError : '',
+        lastUsedAt: Number(account.lastUsedAt ?? 0),
+        source: typeof account.source === 'string' ? account.source : '',
+      })),
+      cache: isRecord(status?.cache) ? status.cache : {},
+      generatedAt: new Date().toISOString(),
+      panelSource: 'status-fallback',
+    };
+  }
+}
+
 function apiHandler(adapter, runtime) {
   return async (req, res) => {
     const method = String(req.method || 'GET').toUpperCase();
@@ -604,8 +647,7 @@ function apiHandler(adapter, runtime) {
     if (!sameOrigin(req)) return sendJson(res, 403, { error: 'forbidden' });
     try {
       if (method === 'GET' && (route === '/' || route === '/panel')) {
-        const response = await adapter.request('/panel');
-        const panel = await response.json();
+        const panel = await panelSnapshot(adapter);
         return sendJson(res, 200, { ...panel, runtime: runtime.snapshot() });
       }
       if (method === 'GET' && route === '/settings') {
