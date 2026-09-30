@@ -1,5 +1,12 @@
 // deno-lint-ignore-file no-explicit-any
 import { ENV } from "./core.ts";
+import { compactIfNeeded, fallbackTruncate } from "./zen-compaction.ts";
+import {
+  DEFAULT_EGRESS_COOLDOWN_MS,
+  EgressPool,
+  parseProxyList,
+  type ProxyStrategy,
+} from "./zen-egress.ts";
 
 // OpenCode Zen free-tier compatibility layer.
 //
@@ -83,6 +90,144 @@ function combinedUserAgent(incoming: string | null): string {
   const value = String(incoming || "").trim();
   if (!value) return CLIENT_UA;
   return value.includes("opencode/") ? value : `${value} ${CLIENT_UA}`;
+}
+
+// ---------- egress pool ----------
+//
+// Zen meters its anonymous quota per egress address, so one IP runs out long
+// before the models do. An optional pool spreads that quota across addresses.
+const zenEgressPool = new EgressPool({
+  proxies: parseProxyList(ENV.ZEN_PROXIES),
+  strategy: zenProxyStrategy(),
+  cooldownMs: zenProxyCooldownMs() ?? DEFAULT_EGRESS_COOLDOWN_MS,
+});
+
+function zenProxyStrategy(): ProxyStrategy {
+  const value = String(ENV.ZEN_PROXY_STRATEGY || "round_robin");
+  return value === "random" || value === "fill" ? value : "round_robin";
+}
+
+function zenProxyCooldownMs(): number | undefined {
+  const value = Number(ENV.ZEN_PROXY_COOLDOWN_MS);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * A client bound to one exit.
+ *
+ * Created per request on purpose: a cached client would keep a keep-alive
+ * connection to the same address, which is exactly what the rotation is meant
+ * to avoid. Zen is the only consumer, so the cost is one client per turn.
+ */
+function zenEgressClient(proxy: URL): Deno.HttpClient {
+  return Deno.createHttpClient({ proxy: { url: proxy.toString() } });
+}
+
+export function zenEgressStatus(): {
+  size: number;
+  strategy: string;
+  proxies: string[];
+  cooldowns: { url: string; until: number; failures: number }[];
+} {
+  return {
+    size: zenEgressPool.size,
+    strategy: zenEgressPool.strategy,
+    proxies: zenEgressPool.describe(),
+    cooldowns: zenEgressPool.cooldowns(),
+  };
+}
+
+// ---------- session compaction ----------
+
+const ZEN_MODEL_LIMITS: Record<string, { context: number; output: number }> =
+  {};
+
+function zenModelLimits(model: string): { context: number; output: number } {
+  return ZEN_MODEL_LIMITS[model] ?? { context: 1_000_000, output: 64_000 };
+}
+
+/**
+ * Compact an oversized transcript, degrading to truncation if it fails.
+ *
+ * The summary call reuses this proxy's own Zen route so it carries the same
+ * fingerprint as a real turn; a summary generated without it would be refused
+ * exactly when the session is already too long to get help.
+ */
+async function maybeCompactZen(
+  body: Json,
+  model: string,
+  session: string,
+): Promise<void> {
+  const messages = body?.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return;
+  const limits = zenModelLimits(model);
+  const result = await compactIfNeeded({
+    messages,
+    body,
+    contextWindow: limits.context,
+    maxOutputTokens: limits.output,
+    sessionId: session,
+    config: {
+      enabled: ENV.ZEN_COMPACTION !== "off",
+      keepTokens: zenIntSetting("ZEN_COMPACTION_KEEP_TOKENS", 8000),
+      buffer: zenIntSetting("ZEN_COMPACTION_BUFFER", 20000),
+      maxSummaryTokens: zenIntSetting("ZEN_COMPACTION_MAX_SUMMARY", 4096),
+      summaryModel: String(ENV.ZEN_COMPACTION_SUMMARY_MODEL || ""),
+    },
+    writeSummary: (prompt, summaryModel, maxTokens) =>
+      writeZenSummary(prompt, summaryModel || model, maxTokens),
+  });
+  if (result.changed) {
+    body.messages = result.messages;
+    console.log(
+      `[zen] ${result.note} session=${session} cost≈${result.compactTokens}`,
+    );
+  } else if (result.note === "summary-failed") {
+    const truncated = fallbackTruncate(messages, limits.context);
+    body.messages = truncated.messages;
+    console.warn(
+      `[zen] ${truncated.note} session=${session} (summary generation failed)`,
+    );
+  }
+}
+
+function zenIntSetting(name: string, fallback: number): number {
+  const value = Number((ENV as Record<string, string | undefined>)[name]);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
+async function writeZenSummary(
+  prompt: string,
+  model: string,
+  maxTokens: number,
+): Promise<string> {
+  const session = await zenSessionId(`zen-summary:${Date.now()}`);
+  const response = await fetch(`${baseUrl()}/chat/completions`, {
+    method: "POST",
+    headers: zenGatewayHeaders(
+      new Request("http://zen.local/"),
+      session,
+      mintZenRequestId(),
+      false,
+    ),
+    body: JSON.stringify({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+      stream: false,
+    }),
+    redirect: "error",
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!response.ok) {
+    throw new Error(`summary request returned HTTP ${response.status}`);
+  }
+  const payload = await response.json();
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content !== "string" || content.trim() === "") {
+    throw new Error("summary response carried no content");
+  }
+  return content;
 }
 
 export function zenGatewayHeaders(
@@ -834,13 +979,19 @@ export async function handleZen(
       error: `Model ${model} is served by Zen /${wire}, not /${incomingWire}`,
     }, 400);
   }
-  const upstreamBody = upstreamBodyForChat(body, wire);
-  const renameMap = applyZenFingerprint(upstreamBody, wire === "responses");
   const session = await zenSessionId(
     request.headers.get("x-session-id") ||
       request.headers.get("x-conversation-id") ||
       request.headers.get("x-opencode-session") || "global",
   );
+
+  // Compact before the body is derived: compaction rewrites `messages`, and
+  // upstreamBodyForChat copies them, so compressing afterwards would send the
+  // original oversized transcript. The fingerprint is applied after, because
+  // the summary is written from the plain conversation.
+  await maybeCompactZen(body, model, session);
+  const upstreamBody = upstreamBodyForChat(body, wire);
+  const renameMap = applyZenFingerprint(upstreamBody, wire === "responses");
   const incomingRequestId = request.headers.get("x-opencode-request") ||
     request.headers.get("x-request-id") || "";
   const requestId = REQUEST_RE.test(incomingRequestId)
@@ -849,6 +1000,9 @@ export async function handleZen(
   const upstreamPath = `/${wire === "chat" ? "chat/completions" : wire}`;
   const target = `${baseUrl()}${upstreamPath}`;
 
+  // Compact before fingerprinting: the fingerprint rewrites tools, and the
+  // summary is written from the conversation, so the order matters.
+  const egress = zenEgressPool.pick();
   let response: Response;
   try {
     response = await fetch(target, {
@@ -862,12 +1016,19 @@ export async function handleZen(
       body: JSON.stringify(upstreamBody),
       redirect: "error",
       signal: request.signal,
+      ...(egress ? { client: zenEgressClient(egress.proxy) } : {}),
     });
   } catch (error) {
+    // A transport error is usually the exit's fault, not the model's, so the
+    // address is skipped rather than blamed on the roster.
+    if (egress) zenEgressPool.coolDown(egress.index);
     return jsonResponse({
       error: "Zen transport failed",
       detail: error instanceof Error ? error.message : String(error),
     }, 502);
+  }
+  if (egress && (response.status === 429 || response.status >= 500)) {
+    zenEgressPool.coolDown(egress.index);
   }
   if (!response.ok) {
     return zenFailure(

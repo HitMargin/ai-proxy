@@ -31,6 +31,17 @@ export const ENV: Record<string, string> = {
   OPENROUTER_API_KEY: getEnv("OPENROUTER_API_KEY"),
   ZEN_BASE_URL: getEnv("ZEN_BASE_URL"),
   ZEN_BEARER_TOKEN: getEnv("ZEN_BEARER_TOKEN"),
+  // Egress rotation: Zen meters anonymous quota per address, so a pool of
+  // http/https/socks5 proxies spreads it. Empty means a direct connection.
+  ZEN_PROXIES: getEnv("ZEN_PROXIES"),
+  ZEN_PROXY_STRATEGY: getEnv("ZEN_PROXY_STRATEGY"),
+  ZEN_PROXY_COOLDOWN_MS: getEnv("ZEN_PROXY_COOLDOWN_MS"),
+  // Session compaction, ported from OpenCode's official mechanism.
+  ZEN_COMPACTION: getEnv("ZEN_COMPACTION"),
+  ZEN_COMPACTION_KEEP_TOKENS: getEnv("ZEN_COMPACTION_KEEP_TOKENS"),
+  ZEN_COMPACTION_BUFFER: getEnv("ZEN_COMPACTION_BUFFER"),
+  ZEN_COMPACTION_MAX_SUMMARY: getEnv("ZEN_COMPACTION_MAX_SUMMARY"),
+  ZEN_COMPACTION_SUMMARY_MODEL: getEnv("ZEN_COMPACTION_SUMMARY_MODEL"),
   COMMANDCODE_API_KEY: getEnv("COMMANDCODE_API_KEY"),
   COMMANDCODE_BASE_URL: getEnv("COMMANDCODE_BASE_URL"),
   COMMANDCODE_VERSION: getEnv("COMMANDCODE_VERSION"),
