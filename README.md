@@ -57,6 +57,7 @@ src/cnb.ts                 cnb.cool CSRF、登录态、工具调用、Responses 
 src/deepseek-web.ts        DeepSeek 网页登录态、PoW WASM、SSE 解析、OpenAI 转换
 src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度、Messages 转换与路由
 src/runtime/               响应体形状嗅探、流回放与 abort/截断分类
+dsh-plugin/               可选 DSH Host Provider 桥接插件
 deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 ```
 
@@ -235,6 +236,18 @@ commandcode:
 ```
 
 若使用远端 Worker/tunnel，只需把 `baseURL` 改为对应 Worker 地址。示例中的 `AI_PROXY_API_KEY` 是 **DSH 客户端访问本代理**所用的 key，其值应已列入代理的 `API_KEYS` 白名单；它与代理进程读取的 CommandCode 上游 `COMMANDCODE_API_KEY` 是两个不同用途。若 `API_KEYS` 留空，DSH 仍可配置一个占位 key，但请求不会鉴权。
+
+### 可选 DSH Provider 桥接插件
+
+`dsh-plugin/` 提供一个不保存凭据的 DSH Host 插件：它只从本地代理读取模型目录并转发聊天请求，账号池、额度、协议转换仍由 `ai-proxy` 负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
+
+```powershell
+node dsh-plugin/self-test.mjs
+```
+
+插件不会自动安装，也不会修改当前 DSH profile；需要手动复制到目标 profile 后再启用。
+
+---
 
 ### 手动真实上游 smoke
 

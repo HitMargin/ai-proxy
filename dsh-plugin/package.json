@@ -1,0 +1,28 @@
+{
+  "name": "ai-proxy-dsh-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional DSH provider bridge for the local ai-proxy CommandCode endpoint.",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": false,
+      "inject": []
+    }
+  },
+  "scripts": {
+    "self-test": "node self-test.mjs"
+  },
+  "license": "GPL-3.0"
+}

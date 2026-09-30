@@ -54,6 +54,9 @@ jobs:
       - name: Check manual smoke probe
         run: deno check scripts/probes/commandcode-smoke.ts
 
+      - name: Check DSH bridge self-test
+        run: node dsh-plugin/self-test.mjs
+
       - name: Compile executable
         run: deno compile --allow-env --allow-net --output ./ai-proxy-ci main.ts
 
