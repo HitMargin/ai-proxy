@@ -3,7 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Optional DSH provider bridge for the local ai-proxy CommandCode endpoint.",
+  "description": "在 DeepSeek Harness 内接入本机 ai-proxy：自动发现 kilo、zen、cnb、commandcode、deepseek-web 等渠道的模型，按前缀把请求路由回原始代理，并管理本地 Deno 服务的启动与停止。插件不保存任何上游凭据，协议转换与账号池仍由 ai-proxy 负责。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "ai-proxy",
+    "llm-provider",
+    "commandcode"
+  ],
   "main": "./index.js",
   "exports": {
     ".": "./index.js",

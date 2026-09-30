@@ -8,6 +8,13 @@ window.__ModuleLoader__.load({
     const DICT = {
       zh: {
         nav: 'ai-proxy', tagline: '本地多 Provider 代理的运行面板',
+        about: '这个插件做什么',
+        aboutText: '把 DSH 接到本机的 ai-proxy Deno 项目上。插件本身不保存任何上游凭据，只负责三件事：把 DSH 的模型选择器接到代理的模型目录、把对话请求转发到正确的上游渠道、在设置里管理代理的启动与停止。',
+        aboutList: '自动发现 kilo、zen、cnb、commandcode、deepseek-web、tokenharbor 等渠道的模型',
+        aboutList2: '按模型前缀把请求路由回原始代理，保持协议转换、工具调用与账号池逻辑不变',
+        aboutList3: '自动启动或复用本地 Deno 服务，只停止自己启动的进程',
+        aboutList4: '不读取、不显示任何上游 key、OAuth 文件或 Cookie',
+        aboutNone: '不需要 per-user key 的渠道（openrouter、anthropic、gemini）不会出现在模型列表里',
         refresh: '刷新', applying: '处理中…', loading: '正在连接本地代理…', failed: '无法连接本地代理',
         overview: '总览', models: '模型', channels: '渠道', runtime: '运行', settings: '设置',
         mode: '模式', local: '本地 Deno', external: '已有代理',
@@ -17,6 +24,13 @@ window.__ModuleLoader__.load({
       },
       en: {
         nav: 'ai-proxy', tagline: 'Runtime panel for the local multi-provider proxy',
+        about: 'What this plugin does',
+        aboutText: 'Connects DSH to your local ai-proxy Deno project. The plugin never stores upstream credentials; it only does three things: publishes the proxy model catalog to the DSH picker, forwards each conversation to the right upstream channel, and lets you start or stop the proxy from settings.',
+        aboutList: 'Auto-discovers models across kilo, zen, cnb, commandcode, deepseek-web and tokenharbor',
+        aboutList2: 'Routes each model by its prefix back to the original proxy, leaving protocol conversion, tool calls and account pooling untouched',
+        aboutList3: 'Starts or reuses the local Deno service, and only stops the process it started itself',
+        aboutList4: 'Never reads or displays any upstream key, OAuth file or cookie',
+        aboutNone: 'Channels that need a per-user key (openrouter, anthropic, gemini) are left out of the model list',
         refresh: 'Refresh', applying: 'Working…', loading: 'Connecting to the local proxy…', failed: 'Cannot reach the local proxy',
         overview: 'Overview', models: 'Models', channels: 'Channels', runtime: 'Runtime', settings: 'Settings',
         mode: 'Mode', local: 'Local Deno', external: 'Existing proxy',
@@ -47,6 +61,9 @@ window.__ModuleLoader__.load({
 .apx_sechead{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;padding-bottom:4px;border-bottom:1px solid var(--dsw-alias-border-l1)}
 .apx_sechead h3{margin:0;font-size:13px;font-weight:640}
 .apx_sechead em{margin-left:auto;font-style:normal;font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
+.apx_text{margin:0;font-size:12.5px;line-height:1.75;color:var(--dsw-alias-label-secondary)}
+.apx_list{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px;font-size:12.5px;line-height:1.65;color:var(--dsw-alias-label-secondary)}
+.apx_list li::marker{color:var(--dsw-alias-state-business-primary)}
 .apx_grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
 .apx_field{display:flex;flex-direction:column;gap:5px}
 .apx_field>span{font-size:11px;color:var(--dsw-alias-label-tertiary)}
@@ -213,6 +230,18 @@ window.__ModuleLoader__.load({
         stats,
       )
 
+      // What this plugin is and is not, stated before any number: the panel
+      // shows a plugin that owns no credentials and no protocol logic, which is
+      // the only thing that makes it safe to leave running.
+      const aboutCard = h('div', { className: 'apx_card' },
+        h('div', { className: 'apx_sechead' }, h('h3', null, t('about'))),
+        h('p', { className: 'apx_text' }, t('aboutText')),
+        h('ul', { className: 'apx_list' },
+          ['aboutList', 'aboutList2', 'aboutList3', 'aboutList4'].map((key) =>
+            h('li', { key }, t(key)))),
+        h('div', { className: 'apx_callout warn' }, t('aboutNone')),
+      )
+
       const tabs = h('div', { className: 'apx_tabs', role: 'tablist' },
         ['overview', 'models', 'channels', 'runtime', 'settings'].map((key) =>
           h('button', {
@@ -299,6 +328,7 @@ window.__ModuleLoader__.load({
 
       const body = {
         overview: h(React.Fragment, null,
+          aboutCard,
           error ? h('div', { className: 'apx_callout' }, `${t('failed')}: ${error}`) : null,
           data?.panelError || data?.projectError ? h('div', { className: 'apx_callout warn' }, data.panelError || data.projectError) : null,
           runtime.lastError ? h('div', { className: 'apx_callout' }, runtime.lastError) : null,
