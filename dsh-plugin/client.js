@@ -22,6 +22,8 @@ window.__ModuleLoader__.load({
         start: '启动', stop: '停止', restart: '重启', save: '保存', logs: '运行日志', empty: '暂无模型',
         search: '搜索模型…', uptime: '已运行', state: '状态', excluded: '已按渠道策略隐藏',
         available: '可用', throttled: '限流', unavailable: '不可用', unprobed: '未探测',
+        check: '检查状态', checking: '检查中…', checkAll: '全部渠道', checkDone: '已检查 {0} 个模型',
+        checkFailed: '检查失败', checkHint: '每个模型会发一次最小请求，占用对应渠道的免费额度。',
       },
       en: {
         nav: 'ai-proxy', tagline: 'Runtime panel for the local multi-provider proxy',
@@ -39,6 +41,8 @@ window.__ModuleLoader__.load({
         start: 'Start', stop: 'Stop', restart: 'Restart', save: 'Save', logs: 'Logs', empty: 'No models',
         search: 'Search models…', uptime: 'Uptime', state: 'State', excluded: 'Hidden by channel policy',
         available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
+        check: 'Check status', checking: 'Checking…', checkAll: 'All channels', checkDone: 'Checked {0} models',
+        checkFailed: 'Check failed', checkHint: 'Each model sends one minimal request and uses that channel’s free quota.',
       },
     }
 
@@ -153,6 +157,12 @@ window.__ModuleLoader__.load({
       return entry ? entry.cls : 'idle'
     }
 
+    function countProbed(payload) {
+      const models = payload && typeof payload.models === 'object' ? payload.models : {}
+      return Object.values(models)
+        .reduce((total, rows) => total + (rows && typeof rows === 'object' ? Object.keys(rows).length : 0), 0)
+    }
+
     function formatUptime(startedAt, now) {
       const started = Number(startedAt || 0)
       if (!Number.isFinite(started) || started <= 0) return '—'
@@ -168,7 +178,9 @@ window.__ModuleLoader__.load({
       const [data, setData] = useState(null)
       const [settings, setSettings] = useState(null)
       const [error, setError] = useState('')
+      const [notice, setNotice] = useState('')
       const [busy, setBusy] = useState(false)
+      const [checking, setChecking] = useState(false)
       const [query, setQuery] = useState('')
       const [tick, setTick] = useState(() => Date.now())
       // A ref keeps one stable timer for the panel's lifetime; a state-held
@@ -186,6 +198,22 @@ window.__ModuleLoader__.load({
       loadRef.current = load
 
       const refresh = () => { setBusy(true); load() }
+
+      // Probing is user-initiated and metered: every model answers with one
+      // minimal request, so this never runs on a timer. An empty channel list
+      // means "every channel", and the panel reloads once the verdicts land.
+      const runProbe = (channels) => {
+        setChecking(true)
+        setBusy(true)
+        api('/probe', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ channels, limit: 0 }),
+        })
+          .then((next) => { setNotice(t('checkDone').replace('{0}', String(countProbed(next)))) })
+          .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
+          .finally(() => { setChecking(false); setBusy(false); loadRef.current() })
+      }
 
       // Runtime facts (uptime, in-flight, cooling) are per-second data, so the
       // clock is re-rendered every second and the snapshot is re-read on a
@@ -234,6 +262,13 @@ window.__ModuleLoader__.load({
       )
       const accounts = useMemo(() => (Array.isArray(data?.accounts) ? data.accounts : []), [data])
       const channels = data?.channels && typeof data.channels === 'object' ? data.channels : {}
+      // Only offer a per-channel button for a channel the roster actually has;
+      // probing a channel with no models would report success having checked
+      // nothing, which is worse than not offering the button.
+      const probeChannelOptions = useMemo(
+        () => Object.keys(channels).filter((key) => (channels[key] ?? 0) > 0).slice(0, 8),
+        [channels],
+      )
       const runtime = data?.runtime || settings || {}
       const tone = toneOf(runtime.state)
       const filtered = useMemo(() => {
@@ -323,6 +358,22 @@ window.__ModuleLoader__.load({
         h('div', { className: 'apx_sechead' },
           h('h3', null, t('models')),
           h('em', null, `${filtered.length} / ${projectRows.length}`)),
+        h('div', { className: 'apx_row' },
+          h('button', {
+            className: 'apx_btn primary',
+            type: 'button',
+            onClick: () => runProbe([]),
+            disabled: checking,
+            title: t('checkHint'),
+          }, checking ? t('checking') : t('checkAll')),
+          probeChannelOptions.map((channel) => h('button', {
+            key: channel,
+            className: 'apx_btn',
+            type: 'button',
+            onClick: () => runProbe([channel]),
+            disabled: checking,
+          }, channel)),
+          h('em', { className: 'apx_lat' }, t('checkHint'))),
         h('input', {
           className: 'apx_input',
           type: 'search',
@@ -355,7 +406,8 @@ window.__ModuleLoader__.load({
             h('span', null, `${healthCounts.degraded} ${t('throttled')}`),
             h('span', null, `${healthCounts.unavailable} ${t('unavailable')}`),
             h('span', null, `${healthCounts.unknown} ${t('unprobed')}`))
-          : null,
+          : h('div', { className: 'apx_legend' }, t('unprobed')),
+        notice ? h('div', { className: 'apx_callout' }, notice) : null,
       )
 
       const channelsCard = h('div', { className: 'apx_card' },

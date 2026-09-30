@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { apply, AiProxyAdapter } from './index.js';
+import { apply, AiProxyAdapter, healthIndex } from './index.js';
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -25,7 +25,21 @@ globalThis.fetch = async (input, init = {}) => {
           'stealth/space-bunny-alpha': { state: 'available', latencyMs: 1247 },
           'kilo-auto/free': { state: 'degraded', latencyMs: 300, reason: 'HTTP 429' },
         },
-      },    }), {
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+  if (url.includes('/health/probe')) {
+    // The explicit probe endpoint answers with routed ids, so the panel has
+    // to accept both spellings when joining back onto the roster.
+    const channel = new URL(url).searchParams.get('provider') || 'unknown';
+    return new Response(JSON.stringify({
+      provider: channel,
+      probed: 1,
+      models: { [`${channel}/probed-model`]: { state: 'available', latencyMs: 900 } },
+    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -275,6 +289,64 @@ try {
   const stopped = await invoke('POST', '/api/ai-proxy-commandcode/stop');
   assert.equal(stopped.status, 200);
   assert.equal(stopped.body.state, 'stopped');
+
+  // Status checking must be something the user can start on demand.
+  const originalFetchForProbe = globalThis.fetch;
+  const probeCalls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes('/health/probe')) {
+      probeCalls.push({ url, body: init.body });
+      const channel = new URL(url).searchParams.get('provider') || 'unknown';
+      return new Response(JSON.stringify({
+        provider: channel,
+        probed: 1,
+        models: { [`${channel}/probed-model`]: { state: 'available', latencyMs: 820 } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return originalFetchForProbe(input, init);
+  };
+  let probeStatus = 0;
+  let probePayload = '';
+  // readBody listens for stream events, so the fake request has to emit them
+  // the way a real one would.
+  const probeReq = {
+    method: 'POST',
+    url: '/api/ai-proxy/probe',
+    headers: { host: 'dsh.local' },
+    listeners: {},
+    on(event, handler) { this.listeners[event] = handler; return this; },
+    emit(event, value) { this.listeners[event]?.(value); },
+  };
+  const probeDone = panelRoute.handler(probeReq, {
+    writeHead(value) { probeStatus = value; },
+    end(value) { probePayload = value; },
+  });
+  probeReq.emit('data', Buffer.from(JSON.stringify({ channels: ['kilo'], limit: 0 })));
+  probeReq.emit('end');
+  await probeDone;
+  globalThis.fetch = originalFetchForProbe;
+  const probeOne = { status: probeStatus, body: JSON.parse(probePayload) };
+  assert.equal(probeOne.status, 200);
+  assert.deepEqual(probeOne.body.probed, ['kilo']);
+  assert.equal(probeOne.body.models.kilo['kilo/probed-model'].state, 'available');
+  // A single-channel request must not fan out to the whole roster.
+  assert.equal(probeCalls.length, 1);
+  assert.match(probeCalls[0].url, /provider=kilo/);
+
+  // A routed id and a bare id must both resolve to the same roster row.
+  const both = healthIndex({
+    models: {
+      kilo: {
+        'kilo-auto/free': { state: 'degraded', latencyMs: 300 },
+        'kilo/kilo-auto/free': { state: 'degraded', latencyMs: 300 },
+        'stealth/space-bunny-alpha': { state: 'available', latencyMs: 900 },
+      },
+    },
+  });
+  assert.equal(both.get('kilo/kilo-auto/free').state, 'degraded');
+  assert.equal(both.get('kilo/stealth/space-bunny-alpha').state, 'available');
+
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;

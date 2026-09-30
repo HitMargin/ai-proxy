@@ -848,6 +848,22 @@ function cleanSettings(values) {
   return next;
 }
 
+const PROBE_CHANNELS = ['kilo', 'zen', 'cnb', 'commandcode', 'deepseek-web', 'tokenharbor'];
+
+function cleanProbeRequest(values) {
+  const requested = Array.isArray(values?.channels) ? values.channels : [];
+  const channels = requested
+    .filter((value) => typeof value === 'string' && PROBE_CHANNELS.includes(value))
+    .slice(0, PROBE_CHANNELS.length);
+  const limit = Number(values?.limit);
+  return {
+    // An empty selection means "every channel"; a typo must not silently
+    // degrade into probing nothing and reporting success.
+    channels: channels.length > 0 ? channels : [...PROBE_CHANNELS],
+    limit: Number.isInteger(limit) && limit > 0 ? Math.min(limit, 60) : 0,
+  };
+}
+
 async function panelSnapshot(adapter) {
   try {
     const response = await adapter.request('/panel', { signal: AbortSignal.timeout(5000) });
@@ -926,23 +942,28 @@ async function healthSnapshot(adapter) {
 // row can be labelled from the sample that was already paid for, instead of
 // probing again from the browser.
 //
-// The provider prefix must always be added. A kilo id like `kilo-auto/free`
-// already contains a slash yet is still a *relative* id under `kilo`, so
-// `includes('/')` as a test for "already prefixed" drops the prefix and makes
-// the lookup miss.
-function healthIndex(payload) {
+// Both key spellings occur: the generic catalog probe stores the bare upstream
+// id (`kilo-auto/free`), while the explicit `/health/probe` call stores the
+// routed id it actually sent (`kilo/kilo-auto/free`). A kilo id such as
+// `kilo-auto/free` contains a slash yet is still *relative* to `kilo`, so the
+// channel is matched by prefix rather than by testing for a slash.
+export function healthIndex(payload) {
   const index = new Map();
   const models = isRecord(payload?.models) ? payload.models : {};
   for (const [provider, samples] of Object.entries(models)) {
     if (!isRecord(samples)) continue;
     for (const [modelId, sample] of Object.entries(samples)) {
       if (!isRecord(sample)) continue;
-      const prefixed = `${provider}/${modelId}`;
-      index.set(prefixed, {
+      const bare = modelId.startsWith(`${provider}/`)
+        ? modelId.slice(provider.length + 1)
+        : modelId;
+      const verdict = {
         state: String(sample.state ?? 'unknown'),
         latencyMs: Number(sample.latencyMs ?? 0),
         reason: typeof sample.reason === 'string' ? sample.reason : '',
-      });
+      };
+      index.set(`${provider}/${bare}`, verdict);
+      index.set(modelId, verdict);
     }
   }
   return index;
@@ -1013,6 +1034,24 @@ function apiHandler(adapter, runtime, projectAdapter) {
       }
       if (method === 'GET' && route === '/logs') {
         return sendJson(res, 200, { logs: runtime.snapshot().logs });
+      }
+      if (method === 'POST' && route === '/probe') {
+        // Status checking is an explicit user action, not a side effect of
+        // listing models: every channel here is a metered free tier, so the
+        // probe has to be something the user starts and can limit.
+        const body = cleanProbeRequest(await readBody(req));
+        const results = {};
+        for (const channel of body.channels) {
+          const params = new URLSearchParams({ provider: channel });
+          if (body.limit) params.set('limit', String(body.limit));
+          const response = await adapter.requestAt('/', `/health/probe?${params}`, {
+            method: 'POST',
+            signal: AbortSignal.timeout(Math.max(30_000, body.limit * 30_000)),
+          });
+          const payload = await response.json();
+          results[channel] = payload?.models ?? {};
+        }
+        return sendJson(res, 200, { probed: Object.keys(results), models: results });
       }
       if (method === 'POST' && route === '/settings') {
         const body = cleanSettings(await readBody(req));

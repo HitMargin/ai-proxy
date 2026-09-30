@@ -5,6 +5,7 @@ import {
   filterHealthyModels,
   getModelHealth,
   getProviderHealth,
+  probeChannel,
   providers,
   safeJsonParse,
   tryParseResponse,
@@ -413,6 +414,84 @@ export async function handler(request: Request): Promise<Response> {
           // refused, so the individual verdicts travel with the snapshot. A
           // picker labels each row from these instead of re-probing.
           models: modelHealth,
+        }),
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
+    }
+
+    // 逐渠道主动探测。放在这里而不是复用模型列表的 ?health=true，是因为
+    // Zen / DeepSeek 网页端 / CommandCode 都有自己的 handler，永远走不到通用
+    // 探测分支；没有这个接口，它们的模型会一直停在「未探测」。
+    if (path === "/health/probe" && request.method === "POST") {
+      const provider = url.searchParams.get("provider")?.trim() ?? "";
+      const channelPrefixes: Record<string, string> = {
+        kilo: "kilo",
+        zen: "zen",
+        cnb: "cnb",
+        commandcode: "commandcode",
+        "deepseek-web": "deepseek-web",
+        tokenharbor: "tokenharbor",
+      };
+      const prefix = channelPrefixes[provider];
+      if (!prefix) {
+        return new Response(
+          JSON.stringify({
+            error: "unknown channel",
+            channels: Object.keys(channelPrefixes),
+          }),
+          {
+            status: 400,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+      }
+
+      // 实时拉取而不是读 v1MemberModelIds：后者依赖此前是否有人访问过
+      // /v1/models 暖过缓存，冷启动时会是空列表，用户点「检查状态」就得到 0 个。
+      const members = await v1FetchMemberModels();
+      const rows = members[provider] ?? [];
+      const listing = rows
+        .map((row: any) => (typeof row?.id === "string" ? row.id : ""))
+        .filter((value: string) => value !== "");
+      if (!Array.isArray(listing) || listing.length === 0) {
+        return new Response(
+          JSON.stringify({ provider, probed: 0, models: {} }),
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+      }
+
+      const apiKey = url.searchParams.get("key") ?? "";
+      const limitParam = Number(url.searchParams.get("limit"));
+      const limit = Number.isInteger(limitParam) && limitParam > 0
+        ? Math.min(limitParam, listing.length)
+        : listing.length;
+      const results = await probeChannel(
+        provider,
+        listing.slice(0, limit).map((id: string) => `${provider}/${id}`),
+        {
+          origin: new URL("/", url).href.replace(/\/$/, ""),
+          apiKey,
+        },
+      );
+      return new Response(
+        JSON.stringify({
+          provider,
+          probed: Object.keys(results).length,
+          models: results,
         }),
         {
           headers: {

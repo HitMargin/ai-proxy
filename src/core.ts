@@ -459,6 +459,159 @@ export function getModelHealth(
   return result;
 }
 
+/**
+ * Record one verdict per model for a provider, keyed by the upstream model id.
+ *
+ * Exposed separately from {@link filterHealthyModels} because the channels with
+ * their own handlers (Zen, DeepSeek Web, CommandCode) never reach the generic
+ * probe branch in `main.ts`, so without this their models stay permanently
+ * unprobed no matter how often the user asks for a check.
+ */
+export function recordModelHealth(
+  provider: string,
+  samples: ReadonlyMap<string, ProbeSample>,
+): void {
+  modelHealthRegistry.set(provider, new Map(samples));
+  healthRegistry.record(provider, [...samples.values()]);
+}
+
+/**
+ * Probe one model through this proxy's own aggregate route.
+ *
+ * Asking the channel's upstream directly would bypass the request rewriting
+ * that channel needs (the Zen fingerprint, the CLI gateway protocol, the web
+ * session headers), and a model that works in the panel would then be reported
+ * as broken. Going back through `/v1` tests the same path a real turn takes.
+ */
+async function testModelThroughProxy(
+  origin: string,
+  modelId: string,
+  apiKey: string,
+  timeoutMs: number,
+): Promise<ProbeSample> {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const headers = new Headers({
+      "Content-Type": "application/json",
+      accept: "text/event-stream",
+    });
+    if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
+    const response = await fetch(`${origin}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: modelId,
+        messages: [{ role: "user", content: "Hi" }],
+        stream: true,
+        max_tokens: 1,
+      }),
+      signal: controller.signal,
+    });
+    if (response.ok) {
+      // A 2xx only proves the model accepted the turn; a stream that then dies
+      // before any token is a real failure the user would hit, so the body is
+      // read far enough to notice an immediate error frame.
+      const text = await response.text().catch(() => "");
+      if (isUpstreamErrorFrame(text)) {
+        return {
+          state: "unavailable",
+          status: response.status,
+          reason: firstErrorMessage(text),
+          latencyMs: Date.now() - startedAt,
+          checkedAt: Date.now(),
+        };
+      }
+      return {
+        state: "available",
+        status: response.status,
+        latencyMs: Date.now() - startedAt,
+        checkedAt: Date.now(),
+      };
+    }
+    return {
+      ...classifyProbeStatus(response.status),
+      latencyMs: Date.now() - startedAt,
+      checkedAt: Date.now(),
+    };
+  } catch (error) {
+    return {
+      state: "unknown",
+      latencyMs: Date.now() - startedAt,
+      reason: error instanceof Error ? error.message : String(error),
+      checkedAt: Date.now(),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function isUpstreamErrorFrame(text: string): boolean {
+  if (text === "") return false;
+  return /"error"\s*:|"code"\s*:\s*"?(FreeUsageLimitError|RegionError|rate_limit|quota|insufficient)/i
+    .test(text);
+}
+
+function firstErrorMessage(text: string): string {
+  try {
+    const payload = JSON.parse(text);
+    const error = payload?.error;
+    if (typeof error === "string") return error.slice(0, 200);
+    if (typeof error?.message === "string") return error.message.slice(0, 200);
+  } catch {
+    // A non-JSON body is reported as-is below.
+  }
+  return text.slice(0, 200);
+}
+
+/**
+ * Probe a whole channel and store the verdicts.
+ *
+ * The fan-out is deliberately narrow: these are metered free tiers, and a wide
+ * burst would throttle the very user whose availability is being established.
+ */
+export async function probeChannel(
+  provider: string,
+  modelIds: readonly string[],
+  options: {
+    origin: string;
+    apiKey: string;
+    concurrency?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  },
+): Promise<Record<string, ProbeSample & { latencyMs?: number }>> {
+  const concurrency = Math.max(
+    1,
+    Math.min(options.concurrency ?? 2, modelIds.length),
+  );
+  const timeoutMs = options.timeoutMs ?? 20_000;
+  const samples = new Map<string, ProbeSample>();
+  let cursor = 0;
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (cursor < modelIds.length) {
+      if (options.signal?.aborted) return;
+      const index = cursor++;
+      const modelId = modelIds[index];
+      samples.set(
+        modelId,
+        await testModelThroughProxy(
+          options.origin,
+          modelId,
+          options.apiKey,
+          timeoutMs,
+        ),
+      );
+    }
+  });
+  await Promise.all(workers);
+  recordModelHealth(provider, samples);
+  const result: Record<string, ProbeSample & { latencyMs?: number }> = {};
+  for (const [modelId, sample] of samples) result[modelId] = { ...sample };
+  return result;
+}
+
 async function testModel(
   baseUrl: string,
   modelId: string,
