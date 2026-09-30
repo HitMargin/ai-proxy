@@ -236,6 +236,21 @@ commandcode:
 
 若使用远端 Worker/tunnel，只需把 `baseURL` 改为对应 Worker 地址。示例中的 `AI_PROXY_API_KEY` 是 **DSH 客户端访问本代理**所用的 key，其值应已列入代理的 `API_KEYS` 白名单；它与代理进程读取的 CommandCode 上游 `COMMANDCODE_API_KEY` 是两个不同用途。若 `API_KEYS` 留空，DSH 仍可配置一个占位 key，但请求不会鉴权。
 
+### 手动真实上游 smoke
+
+仓库的自动测试使用 fake gateway，不会消耗上游额度。需要验证真实 CommandCode 账号时，显式运行：
+
+```powershell
+deno run --allow-env --allow-net .\scripts\probes\commandcode-smoke.ts `
+  --base-url http://127.0.0.1:8000 `
+  --model deepseek/deepseek-v4-flash `
+  --confirm-live
+```
+
+如果本机代理配置了 `API_KEYS`，可临时设置 `AI_PROXY_API_KEY`；脚本不会读取 `COMMANDCODE_API_KEY`、OAuth 账号文件或 `session.json`，也只输出状态、模型、usage 和长度，不打印模型正文或凭据。`--stream` 可额外检查 SSE 帧和 `[DONE]`。
+
+---
+
 ### 同步 DSH 模型配置
 
 不要手工维护几十个模型。运行：

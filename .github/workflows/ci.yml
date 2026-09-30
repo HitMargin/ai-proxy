@@ -46,10 +46,13 @@ jobs:
           Write-Host "PowerShell syntax ok"
 
       - name: Check formatting
-        run: deno fmt --check main.ts worker.ts src/core.ts src/deepseek-responses.ts src/commandcode src/runtime
+        run: deno fmt --check main.ts worker.ts src/core.ts src/deepseek-responses.ts src/commandcode src/runtime scripts/probes/commandcode-smoke.ts
 
       - name: Type-check and build-check
         run: deno task check
+
+      - name: Check manual smoke probe
+        run: deno check scripts/probes/commandcode-smoke.ts
 
       - name: Compile executable
         run: deno compile --allow-env --allow-net --output ./ai-proxy-ci main.ts
