@@ -9,6 +9,12 @@ globalThis.fetch = async (input, init = {}) => {
   const url = String(input);
   const headers = new Headers(init.headers || {});
   assert.equal(headers.get('authorization'), 'Bearer local-test-key');
+  if (url.endsWith('/panel')) {
+    return new Response(JSON.stringify({ provider: 'commandcode', state: 'available', models: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
   if (url.endsWith('/models')) {
     modelCalls++;
     return new Response(JSON.stringify({
@@ -32,12 +38,20 @@ globalThis.fetch = async (input, init = {}) => {
 try {
   let adapter;
   let discovery;
+  let panelRoute;
   const ctx = {
     fiber: { entry: { options: { id: 'bridge-test' } } },
     llm: {
       registerAdapter(_routes, value) { adapter = value; return { dispose() {} }; },
       registerConfigurableProviders() {},
       registerModelDiscovery(_id, callback) { discovery = callback; },
+    },
+    inject(deps, callback) {
+      assert.deepEqual(deps, ['webServer']);
+      callback({
+        effect(fn) { fn(); },
+        webServer: { register(route) { panelRoute = route; } },
+      });
     },
   };
   const dispose = apply(ctx, {
@@ -61,6 +75,18 @@ try {
   assert.ok(events.some((event) => event.type === 'text-delta' && event.text === 'pong'));
   assert.ok(events.some((event) => event.type === 'usage'));
   assert.deepEqual(events.at(-1), { type: 'finish', reason: { kind: 'stop' } });
+  assert.equal(panelRoute.path, '/api/ai-proxy-commandcode');
+  let panelBody = '';
+  let panelStatus = 0;
+  await panelRoute.handler({
+    method: 'GET',
+    headers: { host: 'dsh.local' },
+  }, {
+    writeHead(status) { panelStatus = status; },
+    end(body) { panelBody = body; },
+  });
+  assert.equal(panelStatus, 200);
+  assert.equal(JSON.parse(panelBody).provider, 'commandcode');
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;

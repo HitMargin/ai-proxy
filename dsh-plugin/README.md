@@ -42,7 +42,8 @@ node dsh-plugin/self-test.mjs
 
 ## 当前边界
 
-- 这是模型 Provider 适配器，不是完整的设置页；
-- DSH 面板可以直接读取代理的 `GET /commandcode/v1/panel`；
+- 设置页只展示模型、账号、健康状态和更新时间，不提供复杂配置编辑；
+- DSH 面板数据通过同源 `/api/ai-proxy-commandcode/panel` 转发到代理的 `GET /commandcode/v1/panel`；
 - 工具调用的历史修复、截断保护、Anthropic Messages 转换仍由代理完成；
-- 插件本身只使用 Node 内置 `fetch`，没有 npm 运行时依赖。
+- 插件本身只使用 Node 内置 `fetch`，没有 npm 运行时依赖；
+- 浏览器半身使用 DSH 自带的 React 和 ModuleLoader，没有构建步骤。

@@ -311,6 +311,31 @@ export class AiProxyAdapter {
 export const name = 'ai-proxy-dsh-bridge';
 export const inject = ['llm'];
 
+function sameOrigin(req) {
+  if (String(req.headers?.['sec-fetch-site'] || '').toLowerCase() === 'cross-site') return false;
+  const origin = req.headers?.origin;
+  const host = req.headers?.host;
+  if (!origin || !host) return true;
+  try { return new URL(origin).host === host; } catch { return false; }
+}
+
+function panelHandler(adapter) {
+  return async (req, res) => {
+    const send = (status, payload) => {
+      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(payload));
+    };
+    if (String(req.method || 'GET').toUpperCase() !== 'GET') return send(405, { error: 'method not allowed' });
+    if (!sameOrigin(req)) return send(403, { error: 'forbidden' });
+    try {
+      const response = await adapter.request('/panel');
+      return send(200, await response.json());
+    } catch (error) {
+      return send(502, { error: error instanceof Error ? error.message : String(error) });
+    }
+  };
+}
+
 export function apply(ctx, config = {}) {
   const adapter = new AiProxyAdapter(config);
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
@@ -322,5 +347,12 @@ export function apply(ctx, config = {}) {
     settingsPath: [],
   }]);
   ctx.llm.registerModelDiscovery?.(entryId, () => adapter.listModels());
+  ctx.inject?.(['webServer'], (scoped) => {
+    scoped.effect(() => scoped.webServer.register({
+      kind: 'prefix',
+      path: '/api/ai-proxy-commandcode',
+      handler: panelHandler(adapter),
+    }), 'ai-proxy bridge: panel route');
+  });
   return () => registration?.dispose?.();
 }

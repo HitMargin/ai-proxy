@@ -239,7 +239,7 @@ commandcode:
 
 ### 可选 DSH Provider 桥接插件
 
-`dsh-plugin/` 提供一个不保存凭据的 DSH Host 插件：它只从本地代理读取模型目录并转发聊天请求，账号池、额度、协议转换仍由 `ai-proxy` 负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
+`dsh-plugin/` 提供一个不保存凭据的 DSH 插件：Host 侧从本地代理读取模型目录并转发聊天请求，浏览器侧提供一个轻量设置分区展示 `/commandcode/v1/panel` 快照。账号池、额度、协议转换仍由 `ai-proxy` 负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
 
 ```powershell
 node dsh-plugin/self-test.mjs

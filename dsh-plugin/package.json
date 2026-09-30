@@ -6,7 +6,8 @@
   "description": "Optional DSH provider bridge for the local ai-proxy CommandCode endpoint.",
   "main": "./index.js",
   "exports": {
-    ".": "./index.js"
+    ".": "./index.js",
+    "./client": "./client.js"
   },
   "engines": {
     "node": ">=22"
@@ -17,8 +18,8 @@
     },
     "client": {
       "platform": "web",
-      "immediately": false,
-      "inject": []
+      "immediately": true,
+      "inject": ["slots", "locale"]
     }
   },
   "scripts": {
