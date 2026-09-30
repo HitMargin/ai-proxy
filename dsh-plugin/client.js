@@ -7,19 +7,19 @@ window.__ModuleLoader__.load({
     const NS = 'settings.aiProxyBridge'
     const DICT = {
       zh: {
-        nav: 'CommandCode 桥接', title: 'CommandCode via ai-proxy',
-        subtitle: '本地代理模型、账号、运行状态和生命周期',
+        nav: 'ai-proxy 全项目', title: 'ai-proxy · 全项目',
+        subtitle: '聚合、CommandCode、DeepSeek 网页端及全部可用渠道',
         refresh: '刷新', loading: '正在读取本地代理…', failed: '无法连接本地代理',
-        state: '运行状态', models: '模型', accounts: '账号', generated: '更新时间', empty: '暂无数据',
+        state: '运行状态', models: '模型', accounts: '账号', generated: '更新时间', empty: '暂无数据', channels: '渠道',
         mode: '运行模式', local: '本地 Deno 项目', external: '已有代理',
         projectRoot: '项目目录', denoPath: 'Deno 路径', port: '端口', externalUrl: '外部地址',
         save: '保存并应用', start: '启动', stop: '停止', restart: '重启', settings: '运行设置',
       },
       en: {
-        nav: 'CommandCode bridge', title: 'CommandCode via ai-proxy',
-        subtitle: 'Local proxy models, accounts, runtime state, and lifecycle',
+        nav: 'ai-proxy project', title: 'ai-proxy · full project',
+        subtitle: 'Aggregate, CommandCode, DeepSeek Web, and every available channel',
         refresh: 'Refresh', loading: 'Reading local proxy…', failed: 'Cannot reach the local proxy',
-        state: 'Runtime state', models: 'Models', accounts: 'Accounts', generated: 'Updated', empty: 'No data',
+        state: 'Runtime state', models: 'Models', accounts: 'Accounts', generated: 'Updated', empty: 'No data', channels: 'Channels',
         mode: 'Mode', local: 'Local Deno project', external: 'Existing proxy',
         projectRoot: 'Project directory', denoPath: 'Deno path', port: 'Port', externalUrl: 'External URL',
         save: 'Save and apply', start: 'Start', stop: 'Stop', restart: 'Restart', settings: 'Runtime settings',
@@ -27,7 +27,7 @@ window.__ModuleLoader__.load({
     }
 
     async function api(path, init = {}) {
-      const response = await fetch(`/api/ai-proxy-commandcode${path}`, {
+      const response = await fetch(`/api/ai-proxy${path}`, {
         ...init,
         headers: { accept: 'application/json', ...(init.headers || {}) },
       })
@@ -67,6 +67,7 @@ window.__ModuleLoader__.load({
       })
       const rows = Array.isArray(data?.models) ? data.models : []
       const accounts = Array.isArray(data?.accounts) ? data.accounts : []
+      const channels = data?.channels && typeof data.channels === 'object' ? data.channels : {}
       const runtime = data?.runtime || settings || {}
       return h('div', { style: { display: 'grid', gap: '16px' } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '12px' } },
@@ -89,10 +90,12 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', onClick: () => act('/restart'), disabled: busy }, t('restart')))) : null,
         data === null ? h('div', null, t('loading')) : h('div', { style: { display: 'grid', gap: '12px' } },
           h('div', null, `${t('state')}: `, h('strong', null, runtime.state || 'unknown'),
-            ` · ${t('models')}: `, h('strong', null, String(data.modelCount ?? rows.length)),
+            ` · ${t('models')}: `, h('strong', null, String(data.projectModelCount ?? data.modelCount ?? rows.length)),
             ` · ${t('accounts')}: `, h('strong', null, String(accounts.length)),
             ` · ${t('generated')}: `, h('code', null, data.generatedAt || '—')),
-          runtime.lastError ? h('div', { role: 'alert' }, runtime.lastError) : null,
+          h('div', null, `${t('channels')}: `, Object.entries(channels).map(([key, count]) =>
+             h('span', { key, style: { marginRight: '10px' } }, `${key} (${count})`))),
+           runtime.lastError ? h('div', { role: 'alert' }, runtime.lastError) : null,
           h('div', { style: { display: 'grid', gap: '6px' } }, rows.length === 0 ? h('div', null, t('empty')) : rows.slice(0, 100).map((row) =>
             h('div', { key: row.id, style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } },
               h('code', null, row.id), h('span', null, row.name || ''),
@@ -104,7 +107,7 @@ window.__ModuleLoader__.load({
       const t = ctx.locale.bind(NS)
       ctx.effect(() => ctx.locale.register(NS, DICT), 'ai-proxy bridge: dictionaries')
       ctx.slots.inject('settings.section', () => ctx.slots.register({
-        name: 'settings.section', id: 'ai-proxy-commandcode', order: 34,
+        name: 'settings.section', id: 'ai-proxy', order: 34,
         label: () => t('nav'), locale: NS,
       }, () => h(Panel, { t })))
     }

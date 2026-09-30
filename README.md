@@ -239,7 +239,7 @@ commandcode:
 
 ### 可选 DSH Provider 桥接插件
 
-`dsh-plugin/` 现在是完整的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。Host 侧从代理读取模型目录并转发聊天请求，浏览器侧提供运行设置、启停、健康状态和 `/commandcode/v1/panel` 快照。账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
+`dsh-plugin/` 现在是整个项目的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。它注册一个覆盖全项目的 `ai-proxy` Provider，动态发现 `/v1` 聚合模型以及 DeepSeek 网页端、OpenRouter、TokenHarbor 等可用渠道，并按模型前缀把请求路由回原始代理。浏览器侧提供全渠道模型数量、账号池摘要、运行设置、启停和健康面板；账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
 
 ```powershell
 node dsh-plugin/self-test.mjs

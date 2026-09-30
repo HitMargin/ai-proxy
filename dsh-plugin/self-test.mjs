@@ -54,10 +54,11 @@ try {
   let adapter;
   let discovery;
   let panelRoute;
+  let registeredRoutes;
   const ctx = {
     fiber: { entry: { options: { id: 'bridge-test' } } },
     llm: {
-      registerAdapter(_routes, value) { adapter = value; return { dispose() {} }; },
+      registerAdapter(routes, value) { registeredRoutes = routes; adapter = value; return { dispose() {} }; },
       registerConfigurableProviders() {},
       registerModelDiscovery(_id, callback) { discovery = callback; },
     },
@@ -75,10 +76,11 @@ try {
     apiKeyEnv: 'TEST_BRIDGE_KEY',
   });
   assert.equal(typeof dispose, 'function');
+  assert.deepEqual(registeredRoutes, ['ai-proxy', 'ai-proxy-commandcode']);
   assert.equal(modelCalls, 0);
   const models = await discovery();
   assert.equal(models[0].id, 'deepseek/test');
-  assert.equal(modelCalls, 1);
+  assert.equal(modelCalls, 6);
   const resolved = await adapter.resolveModel('ai-proxy-commandcode', 'deepseek/test');
   const events = [];
   for await (const event of adapter.stream({
@@ -106,6 +108,8 @@ try {
   assert.equal(panel.provider, 'commandcode');
   assert.equal(panel.panelSource, 'status-fallback');
   assert.equal(panel.accounts[0].keyName, undefined);
+  assert.ok(Object.keys(panel.channels).length >= 2);
+  assert.ok(panel.projectModels.some((model) => model.id.startsWith('deepseek-web/')));
 
   const invoke = async (method, path) => {
     let status = 0;

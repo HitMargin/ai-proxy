@@ -17,7 +17,15 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const ROUTE = 'ai-proxy-commandcode';
+const PROJECT_ROUTE = 'ai-proxy';
 const DEFAULT_MAX_TOKENS = 64000;
+const EXTRA_MODEL_ROUTES = [
+  { prefix: 'deepseek-web', basePath: '/deepseek-web/v1' },
+  { prefix: 'tokenharbor', basePath: '/tokenharbor/v1' },
+  { prefix: 'openrouter', basePath: '/openrouter/v1' },
+  { prefix: 'anthropic', basePath: '/anthropic/v1' },
+  { prefix: 'gemini', basePath: '/gemini/v1' },
+];
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -116,11 +124,20 @@ export class ProxyRuntime {
     this.startPromise = null;
   }
 
-  baseUrl() {
+  originUrl() {
     if (this.settings.mode === 'external') {
-      return safeBaseUrl(this.settings.externalUrl || `http://127.0.0.1:${this.settings.port}/commandcode/v1`);
+      return new URL(safeBaseUrl(this.settings.externalUrl || `http://127.0.0.1:${this.settings.port}/commandcode/v1`)).origin;
     }
-    return `http://127.0.0.1:${this.settings.port}/commandcode/v1`;
+    return `http://127.0.0.1:${this.settings.port}`;
+  }
+
+  serviceUrl(basePath = '/') {
+    const suffix = basePath === '/' ? '' : `/${String(basePath).replace(/^\/+|\/+$/g, '')}`;
+    return `${this.originUrl()}${suffix}`;
+  }
+
+  baseUrl() {
+    return this.serviceUrl('/commandcode/v1');
   }
 
   snapshot() {
@@ -133,6 +150,7 @@ export class ProxyRuntime {
       apiKeyEnv: this.settings.apiKeyEnv,
       externalUrl: this.settings.mode === 'external' ? this.settings.externalUrl : null,
       baseUrl: this.baseUrl(),
+      originUrl: this.originUrl(),
       ownedProcess: this.owned,
       pid: this.child?.pid ?? null,
       startedAt: this.startedAt || null,
@@ -148,7 +166,10 @@ export class ProxyRuntime {
   }
 
   async probe() {
-    const urls = [healthUrl(this.baseUrl()), new URL('/commandcode/v1/models', this.baseUrl()).href];
+    const urls = [
+      healthUrl(this.originUrl()),
+      new URL('/v1/models', this.originUrl()).href,
+    ];
     for (const url of urls) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 2500);
@@ -376,11 +397,14 @@ export class AiProxyAdapter {
   constructor(options = {}) {
     this.runtime = options.runtime ?? new ProxyRuntime(options);
     this.apiKeyEnv = this.runtime.settings.apiKeyEnv;
-    this.provider = ROUTE;
+    this.provider = options.provider || ROUTE;
+    this.basePath = options.basePath || '/commandcode/v1';
+    this.displayName = options.displayName || 'CommandCode via ai-proxy';
+    this.project = options.project === true;
   }
 
   get baseUrl() {
-    return this.runtime.baseUrl();
+    return this.runtime.serviceUrl(this.basePath);
   }
 
   headers() {
@@ -388,21 +412,25 @@ export class AiProxyAdapter {
     return headers;
   }
 
-  async request(path, init = {}) {
+  async requestAt(basePath, path, init = {}) {
     if (!['running', 'external'].includes(this.runtime.state)) await this.runtime.start();
-    const response = await fetch(`${this.baseUrl}${path}`, {
+    const response = await fetch(`${this.runtime.serviceUrl(basePath)}${path}`, {
       ...init,
       headers: { ...this.headers(), ...(init.headers || {}) },
     });
     if (!response.ok) {
       const text = await response.text().catch(() => '');
-      throw new Error(`ai-proxy ${path} returned HTTP ${response.status}: ${text.slice(0, 240)}`);
+      throw new Error(`ai-proxy ${basePath}${path} returned HTTP ${response.status}: ${text.slice(0, 240)}`);
     }
     return response;
   }
 
+  async request(path, init = {}) {
+    return this.requestAt(this.basePath, path, init);
+  }
+
   providerInfo(provider) {
-    return { id: provider, name: 'CommandCode via ai-proxy' };
+    return { id: provider, name: this.displayName };
   }
 
   providerRetryPolicy() {
@@ -430,11 +458,63 @@ export class AiProxyAdapter {
     }));
   }
 
-  async resolveModel(provider, model) {
+  async listProjectModels() {
+    const models = await this.listModels();
+    const extras = await Promise.all(EXTRA_MODEL_ROUTES.map(async (route) => {
+      try {
+        const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
+        const payload = await response.json();
+        const rows = Array.isArray(payload?.data) ? payload.data : [];
+        return rows.filter(isRecord).map((row) => ({
+          provider: this.provider,
+          id: `${route.prefix}/${row.id}`,
+          name: typeof row.name === 'string' ? row.name : `${route.prefix}/${row.id}`,
+          contextWindow: Number(row.contextWindow ?? row.context_window ?? 1000000),
+          maxTokens: Number(row.maxTokens ?? row.max_tokens ?? DEFAULT_MAX_TOKENS),
+          inputModalities: Array.isArray(row.inputModalities) ? row.inputModalities : ['text'],
+        }));
+      } catch {
+        // Optional channels stay absent when their credentials or upstream are unavailable.
+        return [];
+      }
+    }));
+    const seen = new Set(models.map((model) => model.id));
+    for (const model of extras.flat()) {
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      models.push(model);
+    }
+    return models;
+  }
+
+  routeForModel(provider, model) {
     const id = String(model ?? '').replace(/^ai-proxy-commandcode\//, '');
-    const rows = await this.listModels();
-    const row = rows.find((candidate) => candidate.id === id);
-    if (!row) return { provider, id, name: id, context: { contextWindow: 1000000 }, defaultMaxTokens: DEFAULT_MAX_TOKENS };
+    if (provider === ROUTE || this.basePath === '/commandcode/v1') {
+      return { basePath: '/commandcode/v1', wireModel: id.replace(/^commandcode\//, '') };
+    }
+    for (const route of EXTRA_MODEL_ROUTES) {
+      const prefix = `${route.prefix}/`;
+      if (id.startsWith(prefix)) return { basePath: route.basePath, wireModel: id.slice(prefix.length) };
+    }
+    return { basePath: this.basePath, wireModel: id };
+  }
+
+  async resolveModel(provider, model) {
+    const route = this.routeForModel(provider, model);
+    const id = String(model ?? '').replace(/^ai-proxy-commandcode\//, '');
+    const rows = this.project ? await this.listProjectModels() : await this.listModels();
+    const row = rows.find((candidate) => candidate.id === id) ?? rows.find((candidate) => candidate.id === route.wireModel);
+    if (!row) {
+      return {
+        provider,
+        id,
+        name: id,
+        context: { contextWindow: 1000000 },
+        defaultMaxTokens: DEFAULT_MAX_TOKENS,
+        basePath: route.basePath,
+        wireModel: route.wireModel,
+      };
+    }
     return {
       provider,
       id: row.id,
@@ -443,6 +523,8 @@ export class AiProxyAdapter {
       context: { contextWindow: row.contextWindow },
       defaultMaxTokens: row.maxTokens,
       reasoning: { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high' },
+      basePath: route.basePath,
+      wireModel: route.wireModel,
     };
   }
 
@@ -453,7 +535,7 @@ export class AiProxyAdapter {
 
   async *stream(options, resolved) {
     const body = {
-      model: resolved.id,
+      model: resolved.wireModel ?? resolved.id,
       messages: toOpenAiMessages(options),
       stream: true,
       max_tokens: Number(options.maxTokens ?? resolved.defaultMaxTokens ?? DEFAULT_MAX_TOKENS),
@@ -465,7 +547,7 @@ export class AiProxyAdapter {
 
     let response;
     try {
-      response = await this.request('/chat/completions', {
+      response = await this.requestAt(resolved.basePath ?? this.basePath, '/chat/completions', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
@@ -543,6 +625,18 @@ export class AiProxyAdapter {
     }
     if (usage) yield { type: 'usage', usage };
     yield { type: 'finish', reason: { kind: finishKind(finish) } };
+  }
+}
+
+export class ProjectAdapter extends AiProxyAdapter {
+  constructor(options = {}) {
+    super({
+      ...options,
+      provider: PROJECT_ROUTE,
+      basePath: '/v1',
+      displayName: 'ai-proxy · 全项目',
+      project: true,
+    });
   }
 }
 
@@ -638,15 +732,43 @@ async function panelSnapshot(adapter) {
   }
 }
 
-function apiHandler(adapter, runtime) {
+async function projectPanelSnapshot(adapter, projectAdapter) {
+  let base = {};
+  try {
+    base = await panelSnapshot(adapter);
+  } catch (error) {
+    base = { error: error instanceof Error ? error.message : String(error) };
+  }
+  let projectModels = [];
+  try {
+    projectModels = projectAdapter ? await projectAdapter.listProjectModels() : [];
+  } catch (error) {
+    base.projectError = error instanceof Error ? error.message : String(error);
+  }
+  const channels = {};
+  for (const model of projectModels) {
+    const id = String(model.id ?? '');
+    const channel = id.includes('/') ? id.slice(0, id.indexOf('/')) : 'aggregate';
+    channels[channel] = (channels[channel] ?? 0) + 1;
+  }
+  return {
+    ...base,
+    models: projectModels.length > 0 ? projectModels : (Array.isArray(base.models) ? base.models : []),
+    projectModels,
+    projectModelCount: projectModels.length,
+    channels,
+  };
+}
+
+function apiHandler(adapter, runtime, projectAdapter) {
   return async (req, res) => {
     const method = String(req.method || 'GET').toUpperCase();
     const url = new URL(req.url || '/', 'http://localhost');
-    const route = url.pathname.replace(/^\/api\/ai-proxy-commandcode/, '').replace(/\/+$/, '') || '/';
+    const route = url.pathname.replace(/^\/api\/ai-proxy(?:-commandcode)?/, '').replace(/\/+$/, '') || '/';
     if (!sameOrigin(req)) return sendJson(res, 403, { error: 'forbidden' });
     try {
       if (method === 'GET' && (route === '/' || route === '/panel')) {
-        const panel = await panelSnapshot(adapter);
+        const panel = await projectPanelSnapshot(adapter, projectAdapter);
         return sendJson(res, 200, { ...panel, runtime: runtime.snapshot() });
       }
       if (method === 'GET' && route === '/settings') {
@@ -682,21 +804,23 @@ function apiHandler(adapter, runtime) {
 export function apply(ctx, config = {}) {
   const runtime = new ProxyRuntime(config);
   const adapter = new AiProxyAdapter({ runtime });
+  const projectAdapter = new ProjectAdapter({ runtime });
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
-  const registration = ctx.llm.registerAdapter([ROUTE], adapter);
-  ctx.llm.registerConfigurableProviders?.([{
-    provider: ROUTE,
-    displayName: 'CommandCode via ai-proxy',
-    settingsNs: entryId,
-    settingsPath: [],
-  }]);
-  ctx.llm.registerModelDiscovery?.(entryId, () => adapter.listModels());
+  const registration = ctx.llm.registerAdapter([PROJECT_ROUTE, ROUTE], projectAdapter);
+  ctx.llm.registerConfigurableProviders?.([
+    { provider: PROJECT_ROUTE, displayName: 'ai-proxy · 全项目', settingsNs: entryId, settingsPath: [] },
+    { provider: ROUTE, displayName: 'CommandCode via ai-proxy', settingsNs: entryId, settingsPath: [] },
+  ]);
+  ctx.llm.registerModelDiscovery?.(entryId, () => projectAdapter.listProjectModels());
   ctx.inject?.(['webServer'], (scoped) => {
-    scoped.effect(() => scoped.webServer.register({
-      kind: 'prefix',
-      path: '/api/ai-proxy-commandcode',
-      handler: apiHandler(adapter, runtime),
-    }), 'ai-proxy bridge: API routes');
+    const handler = apiHandler(adapter, runtime, projectAdapter);
+    for (const path of ['/api/ai-proxy', '/api/ai-proxy-commandcode']) {
+      scoped.effect(() => scoped.webServer.register({
+        kind: 'prefix',
+        path,
+        handler,
+      }), `ai-proxy bridge: API ${path}`);
+    }
   });
   const start = () => {
     void runtime.start();

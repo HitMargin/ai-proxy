@@ -1,5 +1,5 @@
 - insert:
-    - id: ai-proxy-commandcode
+    - id: ai-proxy
       name: 'ai-proxy-dsh-bridge'
       config:
         mode: local
