@@ -47,7 +47,7 @@ deepseek-web/...  → /deepseek-web/v1
 openrouter/...    → /openrouter/v1
 ```
 
-插件不保存任何上游 key、OAuth 文件或 Cookie；凭据、额度、冷却、协议转换和多账号调度全部由原始 `ai-proxy` 负责。
+插件不保存任何上游 key、OAuth 文件或 Cookie；凭据、额度、冷却、协议转换和多账号调度全部由原始 `ai-proxy` 负责。对 `zen/*` 请求，插件会把 DSH 的 `options.sessionId` 作为 `x-session-id` 传给代理，由代理生成稳定的 OpenCode canonical session。
 
 ## 两种运行模式
 

@@ -5,9 +5,11 @@ process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
 let modelCalls = 0;
 let chatCalls = 0;
+let lastRequestHeaders = new Headers();
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input);
   const headers = new Headers(init.headers || {});
+  lastRequestHeaders = headers;
   assert.equal(headers.get('authorization'), 'Bearer local-test-key');
   if (url.endsWith('/health')) {
     return new Response(JSON.stringify({ status: 'ok' }), {
@@ -92,6 +94,15 @@ try {
     maxTokens: 32,
   }, resolved)) events.push(event);
   assert.equal(chatCalls, 1);
+  const zenResolved = await adapter.resolveModel('ai-proxy', 'zen/test');
+  for await (const _event of adapter.stream({
+    model: zenResolved.id,
+    messages: [{ role: 'user', content: 'ping' }],
+    sessionId: 'dsh-session-123',
+    maxTokens: 32,
+  }, zenResolved)) { /* stream shape is covered above */ }
+  assert.equal(lastRequestHeaders.get('x-session-id'), 'dsh-session-123');
+  assert.match(lastRequestHeaders.get('user-agent') || '', /opencode\//);
   assert.ok(events.some((event) => event.type === 'block-start' && event.blockType === 'text'));
   assert.ok(events.some((event) => event.type === 'text-delta' && event.text === 'pong'));
   assert.ok(events.some((event) => event.type === 'usage'));

@@ -67,7 +67,7 @@ async function sha256(text: string): Promise<Uint8Array> {
 export async function zenSessionId(seed: string): Promise<string> {
   const value = String(seed || "global").trim();
   if (SESSION_RE.test(value)) return value;
-  const digest = await sha256(`ai-proxy\\0${value}`);
+  const digest = await sha256(`our-free-model\0${value}`);
   return `ses_${textToHex(digest.slice(0, 6))}${base62(digest.slice(6, 20))}`;
 }
 
