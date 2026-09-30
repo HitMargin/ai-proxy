@@ -22,6 +22,11 @@ import {
 } from "./models.ts";
 import { type CommandCodeAccount, CommandCodeAccountPool } from "./pool.ts";
 import {
+  anthropicMessagesToChat,
+  chatResponseToAnthropic,
+  openAiStreamToAnthropic,
+} from "./anthropic-messages.ts";
+import {
   CommandCodeLoginManager,
   type CommandCodeLoginSuccess,
 } from "./oauth.ts";
@@ -1153,6 +1158,94 @@ export async function handleCommandCode(
         type: "permission_error",
       },
     }, 403);
+  }
+  if (path.endsWith("/messages") && request.method === "POST") {
+    const parsed = await readJsonBodyLimited(
+      request,
+      commandCodeMaxBodyBytes(),
+    );
+    if (!parsed.ok) {
+      return jsonResponse({
+        type: "error",
+        error: { type: "invalid_request_error", message: parsed.message },
+      }, parsed.status);
+    }
+    let converted;
+    try {
+      converted = anthropicMessagesToChat(parsed.value);
+    } catch (error) {
+      return jsonResponse({
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: error instanceof Error ? error.message : String(error),
+        },
+      }, 400);
+    }
+    if (!converted.ok) {
+      return jsonResponse({
+        type: "error",
+        error: { type: "invalid_request_error", message: converted.message },
+      }, 400);
+    }
+    const originalSignal = request.signal;
+    const sessionHeader = request.headers.get("x-session-id") ??
+      request.headers.get("x-conversation-id");
+    const chatUrl = new URL(url);
+    chatUrl.pathname = "/commandcode/v1/chat/completions";
+    const headers = new Headers();
+    if (sessionHeader) headers.set("x-session-id", sessionHeader);
+    for (
+      const name of [
+        "authorization",
+        "x-api-key",
+        "x-commandcode-client-scope",
+      ]
+    ) {
+      const value = request.headers.get(name);
+      if (value) headers.set(name, value);
+    }
+    const proxyRequest = new Request(chatUrl, {
+      method: "POST",
+      headers,
+      signal: originalSignal,
+    });
+    const chatResponse = await chatCompletion(converted.body, proxyRequest);
+    if (converted.body.stream === true) {
+      if (!chatResponse.ok) {
+        const text = await chatResponse.text();
+        return jsonResponse({
+          type: "error",
+          error: { type: "api_error", message: text.slice(0, 500) },
+        }, chatResponse.status);
+      }
+      return openAiStreamToAnthropic(
+        chatResponse,
+        String(converted.body.model),
+      );
+    }
+    let payload: unknown;
+    try {
+      payload = await chatResponse.json();
+    } catch {
+      payload = null;
+    }
+    if (!chatResponse.ok) {
+      const message = payload && typeof payload === "object" &&
+          (payload as Record<string, any>).error?.message
+        ? String((payload as Record<string, any>).error.message)
+        : "Command Code upstream request failed";
+      return jsonResponse({
+        type: "error",
+        error: { type: "api_error", message },
+      }, chatResponse.status);
+    }
+    const sessionId = chatResponse.headers.get("X-CommandCode-Session-Id");
+    return jsonResponse(
+      chatResponseToAnthropic(payload, String(converted.body.model)),
+      200,
+      sessionId ? { "X-CommandCode-Session-Id": sessionId } : {},
+    );
   }
   if (path.endsWith("/responses") && request.method === "POST") {
     const originalSignal = request.signal;

@@ -55,7 +55,7 @@ main.ts                    入口、鉴权、Provider 路由、/v1 聚合、本�
 src/core.ts                环境变量、Provider 配置、协议适配器、通用 HTTP/流式工具
 src/cnb.ts                 cnb.cool CSRF、登录态、工具调用、Responses 转换
 src/deepseek-web.ts        DeepSeek 网页登录态、PoW WASM、SSE 解析、OpenAI 转换
-src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度与路由
+src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度、Messages 转换与路由
 src/runtime/               响应体形状嗅探、流回放与 abort/截断分类
 deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 ```
@@ -297,6 +297,7 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 ```
 
 - `/commandcode/v1/responses` 支持非流式和 SSE 流式 Responses；输入会转换为同一套 CLI 网关请求。`previous_response_id`、`conversation`、后台/存储模式等无法在无状态代理中兑现的字段会明确返回 400，不会静默丢弃。
+- `/commandcode/v1/messages` 支持 Anthropic Messages 的 JSON 与 SSE 转换，覆盖 system、文本、base64 图片、tool_use/tool_result 和 `auto/none` 工具选择；`stop_sequences`、`thinking`、`top_k` 以及需要指定工具的 `tool_choice` 会明确返回 400。
 - 网关 NDJSON 的文本、思考、工具调用、usage、finish/error 事件会分别转换成 OpenAI `content`、`reasoning_content`、`tool_calls` 和 `usage`。`pause_turn` 在尚未产生客户端输出时会使用同一 session 做有限次数续写；一旦已经输出内容则返回 `unsupported_pause_turn`，避免重复生成。
 - 客户端显式发送 `x-session-id` / `x-conversation-id` 时，代理会按“客户端鉴权凭据 + 服务端盐 + 会话头”派生稳定的 `sess_<16 hex>`；未发送时每个 one-shot 请求使用独立随机 ID，避免不同用户共用上游会话。隧道与 `/v1` 聚合入口会透传这两个头。
 - 图片默认支持 data URL；只有显式设置 `COMMANDCODE_ALLOW_REMOTE_IMAGES=1` 才会下载 HTTP(S) 图片并转为 data URL（远程下载有 SSRF 风险，默认关闭）。工具调用会在发出前保证 call/result 严格配对，网关点名缺结果时最多自愈重试 4 次。

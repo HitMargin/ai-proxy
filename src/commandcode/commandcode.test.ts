@@ -148,6 +148,84 @@ Deno.test("CommandCode handler translates Chat and Responses through a fake gate
   }
 });
 
+Deno.test("CommandCode exposes Anthropic Messages for JSON and SSE", async () => {
+  const previous = {
+    key: ENV.COMMANDCODE_API_KEY,
+    baseURL: ENV.COMMANDCODE_BASE_URL,
+    accountsFile: ENV.COMMANDCODE_ACCOUNTS_FILE,
+  };
+  const previousFetch = globalThis.fetch;
+  const previousDeployment = Deno.env.get("DENO_DEPLOYMENT_ID");
+  ENV.COMMANDCODE_API_KEY = "messages-test-key";
+  ENV.COMMANDCODE_BASE_URL = "https://fake.commandcode.test";
+  ENV.COMMANDCODE_ACCOUNTS_FILE = "disabled-in-deploy-test";
+  Deno.env.set("DENO_DEPLOYMENT_ID", "messages-test");
+  globalThis.fetch = ((_input: URL | RequestInfo, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    if (headers.get("authorization") !== "Bearer messages-test-key") {
+      throw new Error("missing Messages authorization");
+    }
+    const nl = String.fromCharCode(10);
+    return Promise.resolve(
+      new Response(
+        [
+          JSON.stringify({ type: "text-delta", text: "pong" }),
+          JSON.stringify({
+            type: "finish-step",
+            finishReason: "stop",
+            usage: { inputTokens: 5, outputTokens: 2 },
+          }),
+        ].join(nl) + nl,
+        { status: 200 },
+      ),
+    );
+  }) as unknown as typeof fetch;
+
+  try {
+    const { handleCommandCode } = await import("./handler.ts?messages-test");
+    const makeRequest = (stream: boolean) =>
+      new Request("http://local/commandcode/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "openai/model",
+          max_tokens: 32,
+          messages: [{ role: "user", content: "ping" }],
+          stream,
+        }),
+      });
+    const jsonRequest = makeRequest(false);
+    const jsonResponse = await handleCommandCode(
+      "/commandcode/v1/messages",
+      jsonRequest,
+      new URL(jsonRequest.url),
+    );
+    const message = await jsonResponse.json();
+    equal(jsonResponse.status, 200);
+    equal(message.type, "message");
+    equal(message.content[0], { type: "text", text: "pong" });
+    equal(message.usage, { input_tokens: 5, output_tokens: 2 });
+
+    const streamRequest = makeRequest(true);
+    const streamResponse = await handleCommandCode(
+      "/commandcode/v1/messages",
+      streamRequest,
+      new URL(streamRequest.url),
+    );
+    const events = await streamResponse.text();
+    assert(events.includes("event: message_start"), "missing message_start");
+    assert(events.includes("content_block_delta"), "missing text delta");
+    assert(events.includes("event: message_stop"), "missing message_stop");
+  } finally {
+    globalThis.fetch = previousFetch;
+    ENV.COMMANDCODE_API_KEY = previous.key;
+    ENV.COMMANDCODE_BASE_URL = previous.baseURL;
+    ENV.COMMANDCODE_ACCOUNTS_FILE = previous.accountsFile;
+    if (previousDeployment === undefined) Deno.env.delete("DENO_DEPLOYMENT_ID");
+    else Deno.env.set("DENO_DEPLOYMENT_ID", previousDeployment);
+  }
+});
+
 Deno.test("CommandCode safely continues pause_turn before output", async () => {
   const previous = {
     key: ENV.COMMANDCODE_API_KEY,
