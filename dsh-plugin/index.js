@@ -459,7 +459,14 @@ export class AiProxyAdapter {
   }
 
   async listProjectModels() {
-    const models = await this.listModels();
+    const discovered = await this.listModels();
+    const models = [];
+    const seen = new Set();
+    for (const model of discovered) {
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      models.push(model);
+    }
     const extras = await Promise.all(EXTRA_MODEL_ROUTES.map(async (route) => {
       try {
         const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
@@ -478,7 +485,6 @@ export class AiProxyAdapter {
         return [];
       }
     }));
-    const seen = new Set(models.map((model) => model.id));
     for (const model of extras.flat()) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
@@ -828,10 +834,9 @@ export function apply(ctx, config = {}) {
   const adapter = new AiProxyAdapter({ runtime });
   const projectAdapter = new ProjectAdapter({ runtime });
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
-  const registration = ctx.llm.registerAdapter([PROJECT_ROUTE, ROUTE], projectAdapter);
+  const registration = ctx.llm.registerAdapter([PROJECT_ROUTE], projectAdapter);
   ctx.llm.registerConfigurableProviders?.([
     { provider: PROJECT_ROUTE, displayName: 'ai-proxy · 全项目', settingsNs: entryId, settingsPath: [] },
-    { provider: ROUTE, displayName: 'CommandCode via ai-proxy', settingsNs: entryId, settingsPath: [] },
   ]);
   ctx.llm.registerModelDiscovery?.(entryId, () => projectAdapter.listProjectModels());
   ctx.inject?.(['webServer'], (scoped) => {

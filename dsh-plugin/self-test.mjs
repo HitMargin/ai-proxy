@@ -76,7 +76,7 @@ try {
     apiKeyEnv: 'TEST_BRIDGE_KEY',
   });
   assert.equal(typeof dispose, 'function');
-  assert.deepEqual(registeredRoutes, ['ai-proxy', 'ai-proxy-commandcode']);
+  assert.deepEqual(registeredRoutes, ['ai-proxy']);
   assert.equal(modelCalls, 0);
   const models = await discovery();
   assert.equal(models[0].id, 'deepseek/test');
