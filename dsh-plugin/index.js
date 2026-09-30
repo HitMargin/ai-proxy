@@ -22,10 +22,68 @@ const DEFAULT_MAX_TOKENS = 64000;
 const EXTRA_MODEL_ROUTES = [
   { prefix: 'deepseek-web', basePath: '/deepseek-web/v1' },
   { prefix: 'tokenharbor', basePath: '/tokenharbor/v1' },
-  { prefix: 'openrouter', basePath: '/openrouter/v1' },
-  { prefix: 'anthropic', basePath: '/anthropic/v1' },
-  { prefix: 'gemini', basePath: '/gemini/v1' },
 ];
+// The DSH picker groups strictly by provider route, so a channel that cannot
+// serve a real turn does not belong in the roster at all. OpenRouter, Anthropic
+// and Gemini need per-user keys this proxy never holds, and their listings
+// answered with an empty or error body; keeping them out of the model list is
+// what stops the picker from offering models that can only fail.
+const BLOCKED_MODEL_PREFIXES = ['openrouter/', 'anthropic/', 'gemini/'];
+
+/**
+ * Read one listing row into the shape the harness adapter expects.
+ *
+ * The proxy answers the aggregate route in OpenAI's snake_case (`input_modalities`,
+ * `context_window`, `max_output_tokens`) while the per-channel routes may answer in
+ * camelCase, so both spellings have to be accepted here. Reading only one of them
+ * is what turned 33 image-capable CommandCode models into text-only rows.
+ */
+const EFFORT_ORDER = ['off', 'low', 'medium', 'high', 'xhigh', 'max'];
+const EFFORT_LABELS = { off: '关闭', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最大' };
+const EFFORT_HINTS = {
+  off: '不启用额外思考',
+  low: '较低的思考预算',
+  medium: '中等思考预算',
+  high: '默认思考预算',
+  xhigh: '高于默认的思考预算',
+  max: '最高的思考预算',
+};
+
+/**
+ * Keep the efforts a channel actually published, in ladder order.
+ *
+ * CommandCode models do not all offer the same rungs (some publish only
+ * off/high/max), and offering one a channel never advertised produced the
+ * harness's duplicate-effort rejection.
+ */
+function pickEfforts(published) {
+  if (!Array.isArray(published) || published.length === 0) {
+    return ['off', 'low', 'high', 'max'];
+  }
+  const seen = new Set(published.filter((value) => typeof value === 'string'));
+  return EFFORT_ORDER.filter((effort) => seen.has(effort));
+}
+
+function normalizeModel(provider, row) {
+  const modalities = Array.isArray(row.inputModalities)
+    ? row.inputModalities
+    : Array.isArray(row.input_modalities)
+    ? row.input_modalities
+    : ['text'];
+  return {
+    provider,
+    id: row.id,
+    name: typeof row.name === 'string' ? row.name : row.id,
+    contextWindow: Number(row.contextWindow ?? row.context_window ?? 1000000),
+    maxTokens: Number(row.maxTokens ?? row.max_tokens ?? DEFAULT_MAX_TOKENS),
+    inputModalities: modalities,
+    reasoningEfforts: Array.isArray(row.reasoningEfforts)
+      ? row.reasoningEfforts
+      : Array.isArray(row.reasoning_efforts)
+      ? row.reasoning_efforts
+      : undefined,
+  };
+}
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -401,6 +459,7 @@ export class AiProxyAdapter {
     this.basePath = options.basePath || '/commandcode/v1';
     this.displayName = options.displayName || 'CommandCode via ai-proxy';
     this.project = options.project === true;
+    this.blockedModelCount = 0;
   }
 
   get baseUrl() {
@@ -448,37 +507,33 @@ export class AiProxyAdapter {
     const response = await this.request('/models');
     const payload = await response.json();
     const rows = Array.isArray(payload?.data) ? payload.data : [];
-    return rows.filter((row) => isRecord(row) && typeof row.id === 'string').map((row) => ({
-      provider: this.provider,
-      id: row.id,
-      name: typeof row.name === 'string' ? row.name : row.id,
-      contextWindow: Number(row.contextWindow ?? row.context_window ?? 1000000),
-      maxTokens: Number(row.maxTokens ?? row.max_tokens ?? DEFAULT_MAX_TOKENS),
-      inputModalities: Array.isArray(row.inputModalities) ? row.inputModalities : ['text'],
-    }));
+    return rows.filter((row) => isRecord(row) && typeof row.id === 'string').map((row) => normalizeModel(this.provider, row));
   }
 
   async listProjectModels() {
     const discovered = await this.listModels();
     const models = [];
     const seen = new Set();
+    let blocked = 0;
     for (const model of discovered) {
+      if (BLOCKED_MODEL_PREFIXES.some((prefix) => model.id.startsWith(prefix))) {
+        blocked += 1;
+        continue;
+      }
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       models.push(model);
     }
+    this.blockedModelCount = blocked;
     const extras = await Promise.all(EXTRA_MODEL_ROUTES.map(async (route) => {
       try {
         const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
         const payload = await response.json();
         const rows = Array.isArray(payload?.data) ? payload.data : [];
         return rows.filter(isRecord).map((row) => ({
-          provider: this.provider,
+          ...normalizeModel(this.provider, row),
           id: `${route.prefix}/${row.id}`,
           name: typeof row.name === 'string' ? row.name : `${route.prefix}/${row.id}`,
-          contextWindow: Number(row.contextWindow ?? row.context_window ?? 1000000),
-          maxTokens: Number(row.maxTokens ?? row.max_tokens ?? DEFAULT_MAX_TOKENS),
-          inputModalities: Array.isArray(row.inputModalities) ? row.inputModalities : ['text'],
         }));
       } catch {
         // Optional channels stay absent when their credentials or upstream are unavailable.
@@ -521,6 +576,7 @@ export class AiProxyAdapter {
         wireModel: route.wireModel,
       };
     }
+    const efforts = pickEfforts(row.reasoningEfforts);
     return {
       provider,
       id: row.id,
@@ -529,13 +585,12 @@ export class AiProxyAdapter {
       context: { contextWindow: row.contextWindow },
       defaultMaxTokens: row.maxTokens,
       reasoning: {
-        efforts: [
-          { id: 'off', name: '关闭', description: '不启用额外思考' },
-          { id: 'low', name: '低', description: '较低的思考预算' },
-          { id: 'high', name: '高', description: '默认思考预算' },
-          { id: 'max', name: '最大', description: '使用更高的思考预算' },
-        ],
-        defaultEffort: 'high',
+        efforts: efforts.map((id) => ({
+          id,
+          name: EFFORT_LABELS[id] ?? id,
+          description: EFFORT_HINTS[id] ?? '',
+        })),
+        defaultEffort: efforts.includes('high') ? 'high' : efforts[0],
       },
       basePath: route.basePath,
       wireModel: route.wireModel,
@@ -549,6 +604,19 @@ export class AiProxyAdapter {
 
   async *stream(options, resolved) {
     const modelId = String(resolved.wireModel ?? resolved.id ?? '');
+    if (BLOCKED_MODEL_PREFIXES.some((prefix) => modelId.startsWith(prefix))) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: 'this channel needs a per-user upstream key and is not served by ai-proxy',
+            code: 'CONFIG_DISABLED',
+          },
+        },
+      };
+      return;
+    }
     const body = {
       model: resolved.wireModel ?? resolved.id,
       messages: toOpenAiMessages(options),
@@ -663,7 +731,7 @@ export class ProjectAdapter extends AiProxyAdapter {
       ...options,
       provider: PROJECT_ROUTE,
       basePath: '/v1',
-      displayName: 'ai-proxy · 全项目',
+      displayName: 'ai-proxy',
       project: true,
     });
   }
@@ -799,6 +867,7 @@ async function projectPanelSnapshot(adapter, projectAdapter) {
     models: projectModels.length > 0 ? projectModels : (Array.isArray(base.models) ? base.models : []),
     projectModels,
     projectModelCount: projectModels.length,
+    blockedModelCount: projectAdapter?.blockedModelCount ?? 0,
     channels,
   };
 }
@@ -851,7 +920,7 @@ export function apply(ctx, config = {}) {
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
   const registration = ctx.llm.registerAdapter([PROJECT_ROUTE], projectAdapter);
   ctx.llm.registerConfigurableProviders?.([
-    { provider: PROJECT_ROUTE, displayName: 'ai-proxy · 全项目', settingsNs: entryId, settingsPath: [] },
+    { provider: PROJECT_ROUTE, displayName: 'ai-proxy', settingsNs: entryId, settingsPath: [] },
   ]);
   ctx.llm.registerModelDiscovery?.(entryId, () => projectAdapter.listProjectModels());
   ctx.inject?.(['webServer'], (scoped) => {

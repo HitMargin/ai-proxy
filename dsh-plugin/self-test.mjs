@@ -34,6 +34,27 @@ globalThis.fetch = async (input, init = {}) => {
   }
   if (url.endsWith('/models')) {
     modelCalls++;
+    if (url.includes('/openrouter/')) {
+      return new Response(JSON.stringify({ data: [{ id: 'blocked/channel', name: 'Blocked' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (url.includes('/v1/models')) {
+      return new Response(JSON.stringify({
+        data: [
+          { id: 'openrouter/paid/model', name: 'Paid', context_window: 128000, max_output_tokens: 32000 },
+          {
+            id: 'deepseek/test',
+            name: 'DeepSeek Test',
+            context_window: 1000000,
+            max_output_tokens: 64000,
+            input_modalities: ['text', 'image'],
+            reasoning_efforts: ['off', 'high', 'max'],
+          },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     return new Response(JSON.stringify({
       data: [{
         id: 'deepseek/test',
@@ -82,11 +103,34 @@ try {
   assert.equal(modelCalls, 0);
   const models = await discovery();
   assert.equal(models[0].id, 'deepseek/test');
-  assert.equal(modelCalls, 6);
+  assert.equal(models.some((model) => model.id.startsWith('openrouter/')), false);
+  assert.equal(models.some((model) => model.id === 'blocked/channel'), false);
+  assert.equal(modelCalls, 3);
+  // The aggregate route answers in snake_case; reading only the camelCase
+  // spelling silently downgraded every image-capable model to text-only.
+  const listed = models.find((model) => model.id === 'deepseek/test');
+  assert.equal(listed.contextWindow, 1000000);
+  assert.equal(listed.maxTokens, 64000);
+  assert.deepEqual(listed.inputModalities, ['text', 'image']);
+  const blockedEvents = [];
+  const blockedResolved = await adapter.resolveModel('ai-proxy', 'openrouter/paid/model');
+  for await (const event of adapter.stream({
+    model: blockedResolved.id,
+    messages: [{ role: 'user', content: 'ping' }],
+    maxTokens: 32,
+  }, blockedResolved)) blockedEvents.push(event);
+  assert.equal(blockedEvents.length, 1);
+  assert.equal(blockedEvents[0].reason.kind, 'error');
+  assert.equal(blockedEvents[0].reason.failure.code, 'CONFIG_DISABLED');
   const resolved = await adapter.resolveModel('ai-proxy-commandcode', 'deepseek/test');
   const projectResolved = await adapter.resolveModel('ai-proxy', 'deepseek/test');
-  assert.deepEqual(projectResolved.reasoning.efforts.map((effort) => effort.id), ['off', 'low', 'high', 'max']);
-  assert.equal(new Set(projectResolved.reasoning.efforts.map((effort) => effort.id)).size, 4);
+  // Only the efforts the channel actually published may be declared; a rung the
+  // upstream never offered is what produced the duplicate-effort rejection.
+  assert.deepEqual(projectResolved.reasoning.efforts.map((effort) => effort.id), ['off', 'high', 'max']);
+  assert.equal(new Set(projectResolved.reasoning.efforts.map((effort) => effort.id)).size, 3);
+  assert.deepEqual(projectResolved.inputModalities, ['text', 'image']);
+  assert.equal(projectResolved.context.contextWindow, 1000000);
+  assert.equal(projectResolved.defaultMaxTokens, 64000);
   const events = [];
   for await (const event of adapter.stream({
     model: resolved.id,
