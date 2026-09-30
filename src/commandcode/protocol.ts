@@ -743,6 +743,7 @@ export interface CcStreamState {
   toolSchemas: Map<string, unknown>;
   providerUsage?: CcUsage;
   pauseTurn?: boolean;
+  brokenToolCall?: boolean;
 }
 
 export function newStreamState(
@@ -755,6 +756,7 @@ export function newStreamState(
     toolCallIds: new Map(),
     toolIndexes: new Map(),
     toolSchemas: new Map(toolSchemas),
+    brokenToolCall: false,
   };
 }
 
@@ -822,6 +824,16 @@ function coerceToolInput(input: unknown, schema: unknown): unknown {
   return input;
 }
 
+function hasMalformedToolArguments(input: unknown): boolean {
+  if (typeof input !== "string" || input.trim() === "") return false;
+  try {
+    JSON.parse(input);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 /** Convert one gateway event into OpenAI-compatible logical deltas. */
 export function normalizeEvent(
   event: CcStreamEvent,
@@ -849,6 +861,10 @@ export function normalizeEvent(
       : "";
     const name = typeof event.toolName === "string" ? event.toolName : "";
     const rawInput = event.input ?? event.args ?? event.arguments ?? {};
+    if (hasMalformedToolArguments(rawInput)) {
+      state.brokenToolCall = true;
+      return [];
+    }
     const input = coerceToolInput(rawInput, state.toolSchemas.get(name));
     const args = typeof input === "string" ? input : JSON.stringify(input);
     const id = uniqueToolCallId(state, declared, `${name}\u0000${args}`);
@@ -916,7 +932,7 @@ export function normalizeEvent(
         : undefined);
     return [{
       type: "finish",
-      reason: mapFinishReason(
+      reason: state.brokenToolCall ? "length" : mapFinishReason(
         event.rawFinishReason ?? event.finishReason,
         state.nextToolIndex > 0,
       ),

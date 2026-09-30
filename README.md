@@ -70,7 +70,8 @@ deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 - 检查后把已读字节回放到新的 `ReadableStream`，不丢首帧；
 - 等待首个响应体字节有 15 秒上限，避免上游只回 headers 后长期挂起；
 - 区分 `aborted`、`timeout`、`stream_cut` 和 `transport`，客户端取消不会被当成可重试错误；
-- 已经向客户端输出后发生截断时不会重放请求。
+- 已经向客户端输出后发生截断时不会重放请求；
+- CommandCode 收到无法解析的 tool arguments 时不会把损坏调用交给客户端，而是按 `length`/截断处理。
 
 CommandCode 已接入 abort/timeout 分类；DeepSeek 网页端和 cnb 已接入响应体嗅探。
 

@@ -366,6 +366,25 @@ Deno.test("CommandCode NDJSON parser handles split chunks and normalizes events"
   );
 });
 
+Deno.test("CommandCode drops malformed tool arguments and reports length", () => {
+  const state = newStreamState();
+  const emitted = normalizeEvent({
+    type: "tool-call",
+    toolName: "f",
+    input: '{"a":',
+  }, state);
+  equal(emitted, []);
+  equal(state.brokenToolCall, true);
+  const finished = normalizeEvent({
+    type: "finish-step",
+    finishReason: "tool_calls",
+  }, state);
+  equal(
+    finished[0]?.type === "finish" ? finished[0].reason : undefined,
+    "length",
+  );
+});
+
 Deno.test("CommandCode usage keeps cache fields absent when gateway omits them", () => {
   equal(
     usageSummary({

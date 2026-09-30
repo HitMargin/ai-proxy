@@ -732,6 +732,13 @@ async function* generateEvents(
             return;
           }
         }
+        if (state.brokenToolCall) {
+          throw new CommandCodeError(
+            "Command Code tool call arguments were truncated before a valid JSON payload",
+            502,
+            "stream_cut",
+          );
+        }
         if (state.pauseTurn) {
           if (
             !yielded &&
