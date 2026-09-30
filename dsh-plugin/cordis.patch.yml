@@ -1,4 +1,9 @@
 - insert:
     - id: ai-proxy-commandcode
       name: 'ai-proxy-dsh-bridge'
-      config: {}
+      config:
+        mode: local
+        projectRoot: ''
+        port: 8000
+        denoPath: deno
+        apiKeyEnv: LOCAL_AGGREGATION_API_KEY

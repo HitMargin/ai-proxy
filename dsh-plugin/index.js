@@ -10,8 +10,13 @@
  * node_modules and add the bundle entry only after reviewing the endpoint.
  */
 
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+
 const ROUTE = 'ai-proxy-commandcode';
-const DEFAULT_BASE_URL = 'http://127.0.0.1:8000/commandcode/v1';
 const DEFAULT_MAX_TOKENS = 64000;
 
 function isRecord(value) {
@@ -34,6 +39,233 @@ function envValue(name) {
     return typeof process !== 'undefined' ? process.env[name] || '' : '';
   } catch {
     return '';
+  }
+}
+
+const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_PORT = 8000;
+const DEFAULT_SETTINGS = {
+  mode: 'local',
+  projectRoot: '',
+  port: DEFAULT_PORT,
+  denoPath: 'deno',
+  externalUrl: '',
+  apiKeyEnv: 'LOCAL_AGGREGATION_API_KEY',
+};
+
+function dataDir() {
+  const home = envValue('DSH_HOME') || path.join(os.homedir(), '.dsh');
+  return path.join(home, 'ai-proxy-dsh-bridge');
+}
+
+function loadSettings(config = {}) {
+  let stored = {};
+  try {
+    stored = JSON.parse(fs.readFileSync(path.join(dataDir(), 'settings.json'), 'utf8'));
+  } catch {}
+  const merged = { ...DEFAULT_SETTINGS, ...(isRecord(stored) ? stored : {}), ...config };
+  const port = Number(merged.port);
+  return {
+    ...merged,
+    mode: merged.mode === 'external' ? 'external' : 'local',
+    port: Number.isSafeInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_PORT,
+  };
+}
+
+function saveSettings(settings) {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'settings.json');
+  const temporary = `${file}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  fs.renameSync(temporary, file);
+}
+
+function projectCandidates(settings) {
+  const candidates = [
+    settings.projectRoot,
+    envValue('AI_PROXY_HOME'),
+    path.resolve(PLUGIN_DIR, '..'),
+    process.cwd(),
+  ].filter(Boolean);
+  return [...new Set(candidates.map((value) => path.resolve(value)))];
+}
+
+function resolveProjectRoot(settings) {
+  for (const candidate of projectCandidates(settings)) {
+    if (fs.existsSync(path.join(candidate, 'main.ts')) &&
+      fs.existsSync(path.join(candidate, 'deno.jsonc'))) return candidate;
+  }
+  return '';
+}
+
+function healthUrl(baseUrl) {
+  const url = new URL('/health', baseUrl);
+  return url.href;
+}
+
+export class ProxyRuntime {
+  constructor(config = {}) {
+    this.settings = loadSettings(config);
+    this.state = 'stopped';
+    this.child = null;
+    this.owned = false;
+    this.lastError = '';
+    this.startedAt = 0;
+    this.logs = [];
+    this.startPromise = null;
+  }
+
+  baseUrl() {
+    if (this.settings.mode === 'external') {
+      return safeBaseUrl(this.settings.externalUrl || `http://127.0.0.1:${this.settings.port}/commandcode/v1`);
+    }
+    return `http://127.0.0.1:${this.settings.port}/commandcode/v1`;
+  }
+
+  snapshot() {
+    return {
+      state: this.state,
+      mode: this.settings.mode,
+      projectRoot: this.settings.projectRoot || null,
+      port: this.settings.port,
+      denoPath: this.settings.denoPath,
+      apiKeyEnv: this.settings.apiKeyEnv,
+      externalUrl: this.settings.mode === 'external' ? this.settings.externalUrl : null,
+      baseUrl: this.baseUrl(),
+      ownedProcess: this.owned,
+      pid: this.child?.pid ?? null,
+      startedAt: this.startedAt || null,
+      lastError: this.lastError,
+      logs: this.logs.slice(-80),
+    };
+  }
+
+  record(message) {
+    const line = `${new Date().toISOString()} ${message}`.slice(-2000);
+    this.logs.push(line);
+    if (this.logs.length > 200) this.logs.splice(0, this.logs.length - 200);
+  }
+
+  async probe() {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    try {
+      const response = await fetch(healthUrl(this.baseUrl()), {
+        headers: this.headers(), signal: controller.signal,
+      });
+      if (!response.ok) return false;
+      const payload = await response.json().catch(() => ({}));
+      return isRecord(payload) ? payload.status !== 'unavailable' : true;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  headers() {
+    const key = envValue(this.settings.apiKeyEnv);
+    return key ? { authorization: `Bearer ${key}` } : {};
+  }
+
+  async start() {
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this.startInternal().finally(() => { this.startPromise = null; });
+    return this.startPromise;
+  }
+
+  async startInternal() {
+    this.lastError = '';
+    if (await this.probe()) {
+      this.state = this.settings.mode === 'external' ? 'external' : 'running';
+      this.owned = false;
+      this.record(`proxy already available at ${this.baseUrl()}`);
+      return;
+    }
+    if (this.settings.mode === 'external') {
+      let target = '';
+      try { target = this.baseUrl(); } catch (error) {
+        this.state = 'error';
+        this.lastError = error instanceof Error ? error.message : String(error);
+        this.record(this.lastError);
+        return;
+      }
+      this.state = 'error';
+      this.lastError = `external proxy is not reachable at ${target}`;
+      this.record(this.lastError);
+      return;
+    }
+    const root = resolveProjectRoot(this.settings);
+    if (!root) {
+      this.state = 'error';
+      this.lastError = 'projectRoot does not contain main.ts and deno.jsonc';
+      this.record(this.lastError);
+      return;
+    }
+    const deno = this.settings.denoPath || 'deno';
+    this.state = 'starting';
+    this.record(`starting ${deno} in ${root}`);
+    try {
+      this.child = spawn(deno, ['run', '-A', 'main.ts'], {
+        cwd: root,
+        windowsHide: true,
+        env: { ...process.env, PORT: String(this.settings.port), DENO_NO_UPDATE_CHECK: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      this.owned = true;
+      this.startedAt = Date.now();
+      const onData = (chunk) => this.record(String(chunk).trimEnd());
+      this.child.stdout?.on('data', onData);
+      this.child.stderr?.on('data', onData);
+      this.child.on('error', (error) => {
+        this.state = 'error';
+        this.lastError = error.message;
+        this.record(`spawn error: ${error.message}`);
+      });
+      this.child.on('exit', (code, signal) => {
+        this.record(`deno exited code=${code} signal=${signal ?? ''}`);
+        this.child = null;
+        this.owned = false;
+        if (this.state !== 'stopped') this.state = 'stopped';
+      });
+      for (let attempt = 0; attempt < 30; attempt++) {
+        if (await this.probe()) {
+          this.state = 'running';
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      this.state = 'error';
+      this.lastError = 'deno started but /health did not become ready within 15s';
+      this.record(this.lastError);
+    } catch (error) {
+      this.state = 'error';
+      this.lastError = error instanceof Error ? error.message : String(error);
+      this.record(this.lastError);
+    }
+  }
+
+  async stop() {
+    if (!this.owned || !this.child) {
+      this.state = 'stopped';
+      return;
+    }
+    this.state = 'stopping';
+    const child = this.child;
+    this.owned = false;
+    this.child = null;
+    try { child.kill(); } catch {}
+    this.state = 'stopped';
+    this.record('local proxy stopped by DSH plugin');
+  }
+
+  async update(values = {}) {
+    await this.stop();
+    this.settings = loadSettings({ ...this.settings, ...values });
+    try { saveSettings(this.settings); } catch (error) { this.lastError = error.message; }
+    await this.start();
+    return this.snapshot();
   }
 }
 
@@ -139,19 +371,22 @@ async function* readSse(response) {
 
 export class AiProxyAdapter {
   constructor(options = {}) {
-    this.baseUrl = safeBaseUrl(options.baseUrl || envValue('AI_PROXY_BASE_URL') || DEFAULT_BASE_URL);
-    this.apiKeyEnv = options.apiKeyEnv || 'LOCAL_AGGREGATION_API_KEY';
+    this.runtime = options.runtime ?? new ProxyRuntime(options);
+    this.apiKeyEnv = this.runtime.settings.apiKeyEnv;
     this.provider = ROUTE;
   }
 
+  get baseUrl() {
+    return this.runtime.baseUrl();
+  }
+
   headers() {
-    const headers = { accept: 'application/json, text/event-stream' };
-    const key = envValue(this.apiKeyEnv);
-    if (key) headers.authorization = `Bearer ${key}`;
+    const headers = { accept: 'application/json, text/event-stream', ...this.runtime.headers() };
     return headers;
   }
 
   async request(path, init = {}) {
+    if (!['running', 'external'].includes(this.runtime.state)) await this.runtime.start();
     const response = await fetch(`${this.baseUrl}${path}`, {
       ...init,
       headers: { ...this.headers(), ...(init.headers || {}) },
@@ -315,29 +550,94 @@ function sameOrigin(req) {
   if (String(req.headers?.['sec-fetch-site'] || '').toLowerCase() === 'cross-site') return false;
   const origin = req.headers?.origin;
   const host = req.headers?.host;
-  if (!origin || !host) return true;
+  if (!origin) return true;
+  if (!host) return false;
   try { return new URL(origin).host === host; } catch { return false; }
 }
 
-function panelHandler(adapter) {
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > 64 * 1024) {
+        reject(new Error('request body is too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      try { resolve(chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch (error) { reject(error); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, status, payload) {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(payload));
+}
+
+function cleanSettings(values) {
+  const next = {};
+  if (values.mode === 'local' || values.mode === 'external') next.mode = values.mode;
+  if (typeof values.projectRoot === 'string' && values.projectRoot.length <= 512) next.projectRoot = values.projectRoot;
+  if (typeof values.denoPath === 'string' && values.denoPath.length <= 512) next.denoPath = values.denoPath;
+  if (typeof values.externalUrl === 'string' && values.externalUrl.length <= 2048) next.externalUrl = values.externalUrl;
+  if (typeof values.apiKeyEnv === 'string' && /^[A-Z_][A-Z0-9_]*$/.test(values.apiKeyEnv)) next.apiKeyEnv = values.apiKeyEnv;
+  const port = Number(values.port);
+  if (Number.isSafeInteger(port) && port > 0 && port < 65536) next.port = port;
+  return next;
+}
+
+function apiHandler(adapter, runtime) {
   return async (req, res) => {
-    const send = (status, payload) => {
-      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-      res.end(JSON.stringify(payload));
-    };
-    if (String(req.method || 'GET').toUpperCase() !== 'GET') return send(405, { error: 'method not allowed' });
-    if (!sameOrigin(req)) return send(403, { error: 'forbidden' });
+    const method = String(req.method || 'GET').toUpperCase();
+    const url = new URL(req.url || '/', 'http://localhost');
+    const route = url.pathname.replace(/^\/api\/ai-proxy-commandcode/, '').replace(/\/+$/, '') || '/';
+    if (!sameOrigin(req)) return sendJson(res, 403, { error: 'forbidden' });
     try {
-      const response = await adapter.request('/panel');
-      return send(200, await response.json());
+      if (method === 'GET' && (route === '/' || route === '/panel')) {
+        const response = await adapter.request('/panel');
+        const panel = await response.json();
+        return sendJson(res, 200, { ...panel, runtime: runtime.snapshot() });
+      }
+      if (method === 'GET' && route === '/settings') {
+        return sendJson(res, 200, runtime.snapshot());
+      }
+      if (method === 'GET' && route === '/logs') {
+        return sendJson(res, 200, { logs: runtime.snapshot().logs });
+      }
+      if (method === 'POST' && route === '/settings') {
+        const body = cleanSettings(await readBody(req));
+        return sendJson(res, 200, await runtime.update(body));
+      }
+      if (method === 'POST' && route === '/start') {
+        await runtime.start();
+        return sendJson(res, 200, runtime.snapshot());
+      }
+      if (method === 'POST' && route === '/stop') {
+        await runtime.stop();
+        return sendJson(res, 200, runtime.snapshot());
+      }
+      if (method === 'POST' && route === '/restart') {
+        await runtime.stop();
+        await runtime.start();
+        return sendJson(res, 200, runtime.snapshot());
+      }
+      return sendJson(res, 404, { error: 'not found' });
     } catch (error) {
-      return send(502, { error: error instanceof Error ? error.message : String(error) });
+      return sendJson(res, 502, { error: error instanceof Error ? error.message : String(error), runtime: runtime.snapshot() });
     }
   };
 }
 
 export function apply(ctx, config = {}) {
-  const adapter = new AiProxyAdapter(config);
+  const runtime = new ProxyRuntime(config);
+  const adapter = new AiProxyAdapter({ runtime });
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
   const registration = ctx.llm.registerAdapter([ROUTE], adapter);
   ctx.llm.registerConfigurableProviders?.([{
@@ -351,8 +651,17 @@ export function apply(ctx, config = {}) {
     scoped.effect(() => scoped.webServer.register({
       kind: 'prefix',
       path: '/api/ai-proxy-commandcode',
-      handler: panelHandler(adapter),
-    }), 'ai-proxy bridge: panel route');
+      handler: apiHandler(adapter, runtime),
+    }), 'ai-proxy bridge: API routes');
   });
-  return () => registration?.dispose?.();
+  const start = () => {
+    void runtime.start();
+    return () => { void runtime.stop(); };
+  };
+  if (typeof ctx.effect === 'function') ctx.effect(start, 'ai-proxy bridge: proxy lifecycle');
+  else start();
+  return () => {
+    void runtime.stop();
+    registration?.dispose?.();
+  };
 }

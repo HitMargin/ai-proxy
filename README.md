@@ -239,7 +239,7 @@ commandcode:
 
 ### 可选 DSH Provider 桥接插件
 
-`dsh-plugin/` 提供一个不保存凭据的 DSH 插件：Host 侧从本地代理读取模型目录并转发聊天请求，浏览器侧提供一个轻量设置分区展示 `/commandcode/v1/panel` 快照。账号池、额度、协议转换仍由 `ai-proxy` 负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
+`dsh-plugin/` 现在是完整的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。Host 侧从代理读取模型目录并转发聊天请求，浏览器侧提供运行设置、启停、健康状态和 `/commandcode/v1/panel` 快照。账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
 
 ```powershell
 node dsh-plugin/self-test.mjs

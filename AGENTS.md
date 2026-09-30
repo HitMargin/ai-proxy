@@ -16,7 +16,7 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
 - **请求指纹**：DeepSeek 的 PoW、建会话、删除会话、图片上传和 completion 共用 `deepseek-headers.json` 的浏览器头集合；不再发送重复版本头或 `X-Deepseek-Harness`。
 - **健康状态**：`GET /health` 返回最近一次标准 Provider 探测汇总；`GET /commandcode/v1/panel` 返回 CommandCode 模型/账号/额度快照，供 DSH 设置页读取；`src/runtime/health.ts` 将 200/429/5xx/鉴权失败/网络失败区分为 available/degraded/unavailable/unknown，unknown 不会清空模型列表。
 - **真实 smoke**：`scripts/probes/commandcode-smoke.ts` 是显式 `--confirm-live` 才会发请求的手动探针；只走本地代理，不读取上游 key/OAuth/session 文件，输出元数据不输出正文。
-- **DSH 桥接**：`dsh-plugin/` 是可选 Node Host + 轻量浏览器设置分区，只调用本地代理的 `/commandcode/v1`，通过同源 `/api/ai-proxy-commandcode/panel` 展示状态，不保存上游凭据；`node dsh-plugin/self-test.mjs` 使用 fake fetch 验证注册、面板路由和 SSE 转换。
+- **DSH 桥接**：`dsh-plugin/` 是可选 Node Host + 轻量浏览器设置分区，支持自动启动/监控 `projectRoot` 中的原始 Deno 项目或连接已有本地/远程代理；只调用 `/commandcode/v1`，通过同源 `/api/ai-proxy-commandcode/*` 提供面板、设置和启停，不保存上游凭据；`node dsh-plugin/self-test.mjs` 使用 fake fetch 验证注册、生命周期路由和 SSE 转换。
 - **源码结构**：`main.ts` 为入口/路由；`src/core.ts` 为通用核心；`src/cnb.ts`、`src/deepseek-web.ts`、`src/commandcode/` 为上游适配模块；`src/runtime/stream-normalizer.ts` 提供响应体形状嗅探、流回放和 abort/截断分类；`src/runtime/health.ts` 提供健康状态聚合；`dsh-plugin/` 为可选 DSH 桥接；`third_party/dsh-deepseek-web-login` 与 `third_party/dsh-cmdgo-provider` 分别保留 Apache-2.0 / MIT 派生代码的许可与说明。
 - git 已于今日 init（身份 HitMargin），`.gitignore` 已排除 cookies.txt / cnb-login.txt / deepseek-auth.txt / deepseek-cookies.txt / commandcode-accounts.json / *.bak 等。
 - **未决事项**：是否参考 https://github.com/jieapi/AiCode issue #23 在后续模块中实现「自动上下文压缩」——仅参考，未决定；session journal/启动补删仍未完成。CommandCode `pause_turn` 目前仅支持尚未产生客户端输出时的有限同会话续写，输出开始后仍明确拒绝重放。

@@ -9,6 +9,12 @@ globalThis.fetch = async (input, init = {}) => {
   const url = String(input);
   const headers = new Headers(init.headers || {});
   assert.equal(headers.get('authorization'), 'Bearer local-test-key');
+  if (url.endsWith('/health')) {
+    return new Response(JSON.stringify({ status: 'ok' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }
   if (url.endsWith('/panel')) {
     return new Response(JSON.stringify({ provider: 'commandcode', state: 'available', models: [] }), {
       status: 200,
@@ -55,7 +61,8 @@ try {
     },
   };
   const dispose = apply(ctx, {
-    baseUrl: 'http://127.0.0.1:8000/commandcode/v1',
+    mode: 'external',
+    externalUrl: 'http://127.0.0.1:8000/commandcode/v1',
     apiKeyEnv: 'TEST_BRIDGE_KEY',
   });
   assert.equal(typeof dispose, 'function');
@@ -87,6 +94,28 @@ try {
   });
   assert.equal(panelStatus, 200);
   assert.equal(JSON.parse(panelBody).provider, 'commandcode');
+
+  const invoke = async (method, path) => {
+    let status = 0;
+    let body = '';
+    await panelRoute.handler({
+      method,
+      url: path,
+      headers: { host: 'dsh.local' },
+    }, {
+      writeHead(value) { status = value; },
+      end(value) { body = value; },
+    });
+    return { status, body: JSON.parse(body) };
+  };
+  const settings = await invoke('GET', '/api/ai-proxy-commandcode/settings');
+  assert.equal(settings.status, 200);
+  assert.equal(settings.body.mode, 'external');
+  const started = await invoke('POST', '/api/ai-proxy-commandcode/start');
+  assert.equal(started.status, 200);
+  const stopped = await invoke('POST', '/api/ai-proxy-commandcode/stop');
+  assert.equal(stopped.status, 200);
+  assert.equal(stopped.body.state, 'stopped');
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;
