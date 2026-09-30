@@ -6,7 +6,7 @@
 DSH 插件
   ├─ 自动启动/监控本地 Deno 项目（可选）
   ├─ 或连接已经运行的本地/远程代理
-  ├─ 注册 ai-proxy 全项目 Provider
+  ├─ 注册 ai-proxy Provider
   └─ 提供全渠道模型、运行状态和生命周期面板
 
 原始项目目录
@@ -26,9 +26,9 @@ DSH 中的 `ai-proxy` Provider 会从本地代理读取完整模型目录：
 - `cnb/*`：CNB 通道；
 - `commandcode/*`：CommandCode Go 通道；
 - `deepseek-web/*`：DeepSeek 网页端；
-- `tokenharbor/*`：TokenHarbor 通道（可用时）；
-- `openrouter/*`：OpenRouter 通道（可用时）；
-- `anthropic/*`、`gemini/*`：配置了凭据且端点可用时显示。
+- `tokenharbor/*`：TokenHarbor 通道（可用时）。
+
+`openrouter/*`、`anthropic/*`、`gemini/*` 依赖各自的 per-user key，本代理从不持有，因此不进入模型列表；即使旧会话仍缓存着这些 ID，调用也会立刻以 `CONFIG_DISABLED` 拒绝，不会消耗一轮请求。
 
 聚合入口本身是：
 
@@ -44,7 +44,7 @@ commandcode/...   → /v1
 cnb/...           → /v1
 zen/...           → /v1
 deepseek-web/...  → /deepseek-web/v1
-openrouter/...    → /openrouter/v1
+tokenharbor/...   → /tokenharbor/v1
 ```
 
 插件不保存任何上游 key、OAuth 文件或 Cookie；凭据、额度、冷却、协议转换和多账号调度全部由原始 `ai-proxy` 负责。对 `zen/*` 请求，插件会把 DSH 的 `options.sessionId` 作为 `x-session-id` 传给代理，由代理生成稳定的 OpenCode canonical session。
@@ -64,7 +64,7 @@ deno run -A main.ts
 - 从 `projectRoot` 找 `main.ts` 和 `deno.jsonc`；
 - 启动 Deno 子进程；
 - 等待 `http://127.0.0.1:<port>/health`；
-- 自动注册 DSH 全项目 Provider；
+- 自动注册 DSH `ai-proxy` Provider；
 - 在插件卸载时停止自己启动的进程；
 - 读取最近日志并显示状态。
 
@@ -125,10 +125,10 @@ config:
 启用后可在：
 
 ```text
-DSH 设置 → ai-proxy 全项目
+DSH 设置 → ai-proxy
 ```
 
-修改模式、项目目录、端口、外部地址，并执行启动、停止或重启。
+修改模式、项目目录、端口、外部地址，并执行启动、停止或重启。面板按「总览 / 模型 / 渠道 / 运行 / 设置」五个标签组织：运行时长每秒刷新，快照每 10 秒拉取一次，模型表支持搜索。
 
 ## 面板 API
 
@@ -150,9 +150,9 @@ POST /api/ai-proxy/restart
 
 - 全项目模型数量；
 - 各渠道模型数量；
+- 模型搜索表（ID、名称、上下文、最长输出、输入模态）；
 - CommandCode 账号池摘要；
-- 本地/远程运行状态；
-- Deno 进程 PID；
+- 本地/远程运行状态与 Deno 进程 PID；
 - 最近日志。
 
 ## 安全边界
@@ -172,8 +172,10 @@ node dsh-plugin/self-test.mjs
 
 自检使用 fake `fetch`，验证：
 
-- 全项目 Provider 注册；
+- Provider 注册；
 - 聚合与多渠道模型发现；
+- 蛇形/驼峰元数据归一（`input_modalities` 不再被降级成 text）；
+- 屏蔽渠道不进入列表且调用被拒；
 - 模型前缀路由；
 - SSE 转换；
 - 面板和兼容回退；
@@ -184,7 +186,8 @@ node dsh-plugin/self-test.mjs
 
 - 原始 Deno 项目是唯一代码实现，插件不复制 `main.ts` 或 `src/`；
 - 本地模式要求机器安装 Deno；已有代理模式不要求；
-- 设置页是轻量全项目状态/生命周期面板，不是完整账号管理 UI；
+- 设置页是状态/生命周期面板，不是完整账号管理 UI；
+- `max_output_tokens` 目前对所有 CommandCode 模型取同一个全局配置值，这是代理侧的真实行为，插件不做粉饰；
 - 工具历史修复、截断保护、Responses/Messages 转换仍由代理完成；
 - 插件运行时只使用 Node 内置模块，没有 npm 运行时依赖；
 - 浏览器半身使用 DSH 自带的 React 和 ModuleLoader，没有构建步骤。
