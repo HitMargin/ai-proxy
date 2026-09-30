@@ -148,20 +148,23 @@ export class ProxyRuntime {
   }
 
   async probe() {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 2500);
-    try {
-      const response = await fetch(healthUrl(this.baseUrl()), {
-        headers: this.headers(), signal: controller.signal,
-      });
-      if (!response.ok) return false;
-      const payload = await response.json().catch(() => ({}));
-      return isRecord(payload) ? payload.status !== 'unavailable' : true;
-    } catch {
-      return false;
-    } finally {
-      clearTimeout(timer);
+    const urls = [healthUrl(this.baseUrl()), new URL('/commandcode/v1/models', this.baseUrl()).href];
+    for (const url of urls) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 2500);
+      try {
+        const response = await fetch(url, { headers: this.headers(), signal: controller.signal });
+        if (response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          if (!isRecord(payload) || payload.status !== 'unavailable') return true;
+        }
+      } catch {
+        // Try the next endpoint; older proxy builds may not expose /health yet.
+      } finally {
+        clearTimeout(timer);
+      }
     }
+    return false;
   }
 
   headers() {

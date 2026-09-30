@@ -15,6 +15,7 @@ commandcode-models.generated.yml
 # --- local tool state ---
 .wrangler/
 .cloudflared/
+ai-proxy-dsh-bridge-*.tgz
 
 # --- big local binaries ---
 cloudflared.exe
