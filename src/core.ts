@@ -430,6 +430,7 @@ export const providers: Record<string, any> = {
 
 // ---------- 健康检查 ----------
 const healthRegistry = new HealthRegistry();
+const modelHealthRegistry = new Map<string, Map<string, ProbeSample>>();
 
 export function getProviderHealth(): Record<string, ProviderHealthSnapshot>;
 export function getProviderHealth(provider: string): ProviderHealthSnapshot;
@@ -437,6 +438,25 @@ export function getProviderHealth(provider?: string) {
   return provider === undefined
     ? healthRegistry.all()
     : healthRegistry.get(provider);
+}
+
+/**
+ * Per-model verdicts for one provider, keyed by the upstream model id.
+ *
+ * The provider-level snapshot only carries counts, so a panel cannot say which
+ * specific model is throttled or refused. This keeps the individual samples the
+ * probe already paid for; the picker can label each row without re-probing.
+ */
+export function getModelHealth(
+  provider: string,
+): Record<string, ProbeSample & { latencyMs?: number }> {
+  const recorded = modelHealthRegistry.get(provider);
+  const result: Record<string, ProbeSample & { latencyMs?: number }> = {};
+  if (!recorded) return result;
+  for (const [modelId, sample] of recorded) {
+    result[modelId] = { ...sample };
+  }
+  return result;
 }
 
 async function testModel(
@@ -502,6 +522,7 @@ export async function filterHealthyModels(
   const concurrency = 5;
   const results = [];
   const samples: ProbeSample[] = [];
+  const perModel = new Map<string, ProbeSample>();
   for (let i = 0; i < models.length; i += concurrency) {
     const chunk = models.slice(i, i + concurrency);
     const statuses = await Promise.all(
@@ -509,9 +530,11 @@ export async function filterHealthyModels(
     );
     for (let j = 0; j < chunk.length; j++) {
       samples.push(statuses[j]);
+      perModel.set(chunk[j].id, statuses[j]);
       if (statuses[j].state !== "unavailable") results.push(chunk[j]);
     }
   }
+  modelHealthRegistry.set(providerKey, perModel);
   healthRegistry.record(providerKey, samples);
   return results;
 }

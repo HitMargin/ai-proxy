@@ -3,6 +3,7 @@ import {
   createStreamTransformer,
   ENV,
   filterHealthyModels,
+  getModelHealth,
   getProviderHealth,
   providers,
   safeJsonParse,
@@ -383,6 +384,7 @@ export async function handler(request: Request): Promise<Response> {
     if (path === "/health" && request.method === "GET") {
       const observed = getProviderHealth();
       const providerHealth: Record<string, unknown> = {};
+      const modelHealth: Record<string, Record<string, unknown>> = {};
       for (const key of Object.keys(providers)) {
         providerHealth[key] = observed[key] ?? {
           state: "unknown",
@@ -390,6 +392,8 @@ export async function handler(request: Request): Promise<Response> {
           modelCount: 0,
           stale: false,
         };
+        const perModel = getModelHealth(key);
+        if (Object.keys(perModel).length > 0) modelHealth[key] = perModel;
       }
       const states = Object.values(providerHealth).map((value: any) =>
         value?.state
@@ -405,6 +409,10 @@ export async function handler(request: Request): Promise<Response> {
             : "unknown",
           checkedAt: new Date().toISOString(),
           providers: providerHealth,
+          // Provider-level counts cannot say *which* model is throttled or
+          // refused, so the individual verdicts travel with the snapshot. A
+          // picker labels each row from these instead of re-probing.
+          models: modelHealth,
         }),
         {
           headers: {

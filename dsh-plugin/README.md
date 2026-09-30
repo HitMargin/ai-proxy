@@ -146,14 +146,37 @@ POST /api/ai-proxy/restart
 
 旧路径 `/api/ai-proxy-commandcode/*` 仍保留兼容。
 
+`/api/ai-proxy/panel` 的响应里，每个模型行可能带 `state`（`available` / `degraded` / `unavailable`）、
+`latencyMs` 和 `reason`；顶层还有 `modelHealth` 计数和完整的 `health` 快照。没有探测记录的模型
+不会带 `state` 字段，前端按「未探测」显示。
+
 面板会显示：
 
 - 全项目模型数量；
 - 各渠道模型数量；
-- 模型搜索表（ID、名称、上下文、最长输出、输入模态）；
+- 模型搜索表（ID、名称、**可用状态**、上下文、最长输出、输入模态）；
 - CommandCode 账号池摘要；
 - 本地/远程运行状态与 Deno 进程 PID；
 - 最近日志。
+
+## 模型可用状态
+
+代理在拉取模型列表时会顺带探测每个模型，面板据此给每行标注状态：
+
+| 状态 | 含义 | 判定依据 |
+| --- | --- | --- |
+| 可用 `available` | 该模型能正常出结果 | HTTP 2xx |
+| 限流 `degraded` | 上游过载或限流，稍后可能恢复 | 408 / 425 / 429 / 5xx |
+| 不可用 `unavailable` | 凭据被拒或该模型已下线 | 401 / 403 / 407 / 其他 4xx |
+| 未探测 | 该渠道尚未跑过探测 | 没有探测记录 |
+
+逐模型判定来自代理 `GET /health` 的 `models` 字段，由 `src/runtime/health.ts` 的 `classifyProbeStatus` 统一分类。插件只负责把样本按 `provider + 未加前缀的 model id` 拼回 `kilo/…` 这样的完整 ID。
+
+要点：
+
+- **未探测不等于不可用。** 没有探测记录的模型照常显示，不会因为没测过就被判定为故障。
+- **插件不自行发起推理探测**，只复用代理已经付出的探测结果，不额外消耗上游额度。
+- 想立刻刷新状态，对对应渠道的模型列表加 `?health=true` 强制重探一次。
 
 ## 安全边界
 

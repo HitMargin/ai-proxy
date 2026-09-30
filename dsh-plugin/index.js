@@ -904,6 +904,50 @@ async function panelSnapshot(adapter) {
   }
 }
 
+async function healthSnapshot(adapter) {
+  try {
+    // `/health` is served at the proxy root, not under a provider basePath.
+    // Requesting it through `request()` would ask for `/commandcode/v1/health`
+    // and silently return the catalog, leaving every row "unprobed".
+    const response = await adapter.requestAt('/', '/health', {
+      signal: AbortSignal.timeout(5000),
+    });
+    const payload = await response.json();
+    return isRecord(payload) ? payload : {};
+  } catch {
+    // Health is advisory: a proxy that cannot report it must not empty the
+    // roster, so the panel simply keeps showing every model as unprobed.
+    return {};
+  }
+}
+
+// The proxy keys per-model verdicts by provider, but the picker sees one flat
+// list of prefixed ids (`kilo/…`, `zen/…`). Match on the channel segment so a
+// row can be labelled from the sample that was already paid for, instead of
+// probing again from the browser.
+//
+// The provider prefix must always be added. A kilo id like `kilo-auto/free`
+// already contains a slash yet is still a *relative* id under `kilo`, so
+// `includes('/')` as a test for "already prefixed" drops the prefix and makes
+// the lookup miss.
+function healthIndex(payload) {
+  const index = new Map();
+  const models = isRecord(payload?.models) ? payload.models : {};
+  for (const [provider, samples] of Object.entries(models)) {
+    if (!isRecord(samples)) continue;
+    for (const [modelId, sample] of Object.entries(samples)) {
+      if (!isRecord(sample)) continue;
+      const prefixed = `${provider}/${modelId}`;
+      index.set(prefixed, {
+        state: String(sample.state ?? 'unknown'),
+        latencyMs: Number(sample.latencyMs ?? 0),
+        reason: typeof sample.reason === 'string' ? sample.reason : '',
+      });
+    }
+  }
+  return index;
+}
+
 async function projectPanelSnapshot(adapter, projectAdapter) {
   let base = {};
   try {
@@ -923,13 +967,33 @@ async function projectPanelSnapshot(adapter, projectAdapter) {
     const channel = id.includes('/') ? id.slice(0, id.indexOf('/')) : 'aggregate';
     channels[channel] = (channels[channel] ?? 0) + 1;
   }
+  const health = await healthSnapshot(adapter);
+  const verdicts = healthIndex(health);
+  const models = projectModels.length > 0
+    ? projectModels.map((model) => {
+      const verdict = verdicts.get(String(model.id ?? ''));
+      return verdict ? { ...model, ...verdict } : model;
+    })
+    : (Array.isArray(base.models) ? base.models : []);
+  const counts = { available: 0, degraded: 0, unavailable: 0, unknown: 0, total: 0 };
+  for (const model of models) {
+    const state = String(model?.state ?? 'unknown');
+    // Only a probed row has a verdict. Counting unprobed models as `unknown`
+    // would report every channel that never ran a probe as broken, so `total`
+    // tracks how many rows actually carry a verdict.
+    if (model?.state === undefined) continue;
+    if (state in counts) counts[state] += 1;
+    counts.total += 1;
+  }
   return {
     ...base,
-    models: projectModels.length > 0 ? projectModels : (Array.isArray(base.models) ? base.models : []),
-    projectModels,
-    projectModelCount: projectModels.length,
+    models,
+    projectModels: models,
+    projectModelCount: models.length,
     blockedModelCount: projectAdapter?.blockedModelCount ?? 0,
     channels,
+    health,
+    modelHealth: counts,
   };
 }
 

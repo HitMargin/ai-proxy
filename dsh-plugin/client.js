@@ -21,6 +21,7 @@ window.__ModuleLoader__.load({
         projectRoot: '项目目录', denoPath: 'Deno', port: '端口', externalUrl: '外部地址', apiKeyEnv: 'Key 环境变量',
         start: '启动', stop: '停止', restart: '重启', save: '保存', logs: '运行日志', empty: '暂无模型',
         search: '搜索模型…', uptime: '已运行', state: '状态', excluded: '已按渠道策略隐藏',
+        available: '可用', throttled: '限流', unavailable: '不可用', unprobed: '未探测',
       },
       en: {
         nav: 'ai-proxy', tagline: 'Runtime panel for the local multi-provider proxy',
@@ -37,6 +38,7 @@ window.__ModuleLoader__.load({
         projectRoot: 'Project', denoPath: 'Deno', port: 'Port', externalUrl: 'External URL', apiKeyEnv: 'Key env',
         start: 'Start', stop: 'Stop', restart: 'Restart', save: 'Save', logs: 'Logs', empty: 'No models',
         search: 'Search models…', uptime: 'Uptime', state: 'State', excluded: 'Hidden by channel policy',
+        available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
       },
     }
 
@@ -94,6 +96,14 @@ window.__ModuleLoader__.load({
 .apx_logs{max-height:240px;overflow:auto;padding:11px 13px;border-radius:12px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.7;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere}
 .apx_empty{padding:26px;text-align:center;font-size:12.5px;color:var(--dsw-alias-label-tertiary);border:1px dashed var(--dsw-alias-border-l2);border-radius:13px}
 .apx_skel{height:12px;border-radius:6px;background:linear-gradient(90deg,var(--dsw-alias-bg-layer-2),var(--dsw-alias-bg-layer-1),var(--dsw-alias-bg-layer-2));background-size:200% 100%;animation:apx-skel 1.2s linear infinite}
+.apx_badge{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;font-size:11px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+.apx_badge .apx_dot{background:currentColor;box-shadow:none}
+.apx_badge.ok{color:var(--dsw-alias-state-success-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 40%,transparent)}
+.apx_badge.warn{color:var(--dsw-alias-state-warning-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-warning-primary) 40%,transparent)}
+.apx_badge.err{color:var(--dsw-alias-state-error-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 40%,transparent)}
+.apx_badge.idle{color:var(--dsw-alias-label-tertiary)}
+.apx_lat{font-style:normal;opacity:.7;font-variant-numeric:tabular-nums}
+.apx_legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
 @keyframes apx-skel{from{background-position:200% 0}to{background-position:-200% 0}}
 `
 
@@ -121,6 +131,26 @@ window.__ModuleLoader__.load({
       if (value === 'starting' || value === 'stopping' || value === 'degraded') return 'warn'
       if (value === 'error' || value === 'unavailable' || value === 'stopped') return 'err'
       return ''
+    }
+
+    // A model verdict is a different axis from the runtime state: the runtime
+    // can be perfectly `running` while every upstream model is throttled, so
+    // it gets its own badge rather than reusing the runtime dot.
+    const MODEL_STATES = {
+      available: { cls: 'ok', zh: '可用', en: 'Available' },
+      degraded: { cls: 'warn', zh: '限流', en: 'Throttled' },
+      unavailable: { cls: 'err', zh: '不可用', en: 'Unavailable' },
+      unknown: { cls: 'idle', zh: '未探测', en: 'Unprobed' },
+    }
+
+    function modelStateLabel(state, t) {
+      const entry = MODEL_STATES[String(state || 'unknown').toLowerCase()]
+      return entry ? t(entry.zh) : String(state || '—')
+    }
+
+    function modelStateClass(state) {
+      const entry = MODEL_STATES[String(state || 'unknown').toLowerCase()]
+      return entry ? entry.cls : 'idle'
     }
 
     function formatUptime(startedAt, now) {
@@ -212,6 +242,15 @@ window.__ModuleLoader__.load({
         return projectRows.filter((row) => `${row.id} ${row.name || ''}`.toLowerCase().includes(needle)).slice(0, 200)
       }, [projectRows, query])
       const modelTotal = Number(data?.projectModelCount ?? data?.modelCount ?? projectRows.length)
+      const healthCounts = useMemo(() => {
+        const counts = { available: 0, degraded: 0, unavailable: 0, unknown: 0, total: 0 }
+        for (const row of projectRows) {
+          const state = String(row?.state ?? 'unknown').toLowerCase()
+          if (state in counts) counts[state] += 1
+          if (row?.state) counts.total += 1
+        }
+        return counts
+      }, [projectRows])
 
       const stats = h('div', { className: 'apx_stats' },
         h('div', { className: 'apx_stat' }, h('span', null, t('state')),
@@ -295,13 +334,28 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'apx_empty' }, projectRows.length === 0 ? t('empty') : t('search'))
           : h('table', { className: 'apx_table' },
             h('thead', null, h('tr', null,
-              h('th', null, 'ID'), h('th', null, 'Name'), h('th', null, 'Context'), h('th', null, 'Max'), h('th', null, 'Input'))),
+              h('th', null, 'ID'), h('th', null, 'Name'), h('th', null, t('state')),
+              h('th', null, 'Context'), h('th', null, 'Max'), h('th', null, 'Input'))),
             h('tbody', null, filtered.map((row) => h('tr', { key: row.id },
               h('td', { className: 'apx_mono' }, row.id),
               h('td', null, row.name || ''),
+              h('td', null, h('span', {
+                className: `apx_badge ${modelStateClass(row.state)}`,
+                title: row.reason || '',
+              },
+                h('i', { className: 'apx_dot' }),
+                modelStateLabel(row.state, t),
+                row.latencyMs > 0 ? h('em', { className: 'apx_lat' }, `${row.latencyMs}ms`) : null)),
               h('td', null, formatTokens(row.contextWindow)),
               h('td', null, formatTokens(row.maxTokens)),
               h('td', null, h('span', { className: 'apx_tag' }, (row.inputModalities || ['text']).join('+'))))))),
+        healthCounts.total > 0
+          ? h('div', { className: 'apx_legend' },
+            h('span', null, `${t('models')}: ${healthCounts.available} ${t('available')}`),
+            h('span', null, `${healthCounts.degraded} ${t('throttled')}`),
+            h('span', null, `${healthCounts.unavailable} ${t('unavailable')}`),
+            h('span', null, `${healthCounts.unknown} ${t('unprobed')}`))
+          : null,
       )
 
       const channelsCard = h('div', { className: 'apx_card' },

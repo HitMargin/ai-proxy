@@ -12,7 +12,20 @@ globalThis.fetch = async (input, init = {}) => {
   lastRequestHeaders = headers;
   assert.equal(headers.get('authorization'), 'Bearer local-test-key');
   if (url.endsWith('/health')) {
-    return new Response(JSON.stringify({ status: 'ok' }), {
+    // Per-model verdicts are keyed by provider and use the *unprefixed* id, so
+    // the panel has to match `kilo/stealth/…` against `kilo` + `stealth/…`.
+    // Without that join every row stayed `unknown`.
+    return new Response(JSON.stringify({
+      status: 'degraded',
+      providers: {
+        kilo: { state: 'degraded', modelCount: 2, availableModels: 1, degradedModels: 1, unavailableModels: 0 },
+      },
+      models: {
+        kilo: {
+          'stealth/space-bunny-alpha': { state: 'available', latencyMs: 1247 },
+          'kilo-auto/free': { state: 'degraded', latencyMs: 300, reason: 'HTTP 429' },
+        },
+      },    }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
@@ -65,6 +78,14 @@ globalThis.fetch = async (input, init = {}) => {
             },
             context_length: 1000000,
             top_provider: { context_length: 1000000, max_completion_tokens: 524288 },
+          },
+          {
+            // The id itself contains a slash yet is still relative to `kilo`,
+            // so treating "has a slash" as "already prefixed" misses the join.
+            id: 'kilo/kilo-auto/free',
+            name: 'Auto Free',
+            architecture: { input_modalities: ['text'] },
+            context_length: 256000,
           },
           {
             // No modality list at all: the `modality` shorthand is the only
@@ -217,6 +238,21 @@ try {
   assert.equal(panel.accounts[0].keyName, undefined);
   assert.ok(Object.keys(panel.channels).length >= 2);
   assert.ok(panel.projectModels.some((model) => model.id.startsWith('deepseek-web/')));
+  // The panel only shows 可用/限流/不可用 if the per-model verdicts are joined
+  // onto the rows: /health keys samples by provider + unprefixed id, while the
+  // roster uses `kilo/…`.
+  const probed = panel.projectModels.find((model) => model.id === 'kilo/stealth/space-bunny-alpha');
+  assert.equal(probed.state, 'available');
+  assert.equal(probed.latencyMs, 1247);
+  const throttled = panel.projectModels.find((model) => model.id === 'kilo/kilo-auto/free');
+  assert.equal(throttled.state, 'degraded');
+  assert.equal(throttled.reason, 'HTTP 429');
+  assert.equal(panel.modelHealth.available, 1);
+  assert.equal(panel.modelHealth.degraded, 1);
+  assert.equal(panel.modelHealth.total, 2);
+  // An unprobed channel must stay visible rather than being counted as broken.
+  const unprobed = panel.projectModels.find((model) => model.id === 'deepseek/test');
+  assert.equal(unprobed.state, undefined);
 
   const invoke = async (method, path) => {
     let status = 0;
