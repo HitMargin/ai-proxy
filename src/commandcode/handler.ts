@@ -1146,7 +1146,7 @@ export async function handleCommandCode(
   url: URL,
 ): Promise<Response> {
   const managementPath =
-    /(\/status|\/usage(?:\/refresh)?|\/login(?:\/cancel)?|\/account\/toggle|\/account\/remove|\/logout)$/
+    /(\/status|\/panel|\/usage(?:\/refresh)?|\/login(?:\/cancel)?|\/account\/toggle|\/account\/remove|\/logout)$/
       .test(path);
   const modelRefresh = path.endsWith("/models") &&
     url.searchParams.get("refresh") === "true";
@@ -1290,6 +1290,40 @@ export async function handleCommandCode(
         ? { "X-CommandCode-Catalog-Error": catalogError.slice(0, 200) }
         : {},
     );
+  }
+
+  if (path.endsWith("/panel") && request.method === "GET") {
+    const models = catalogModels.length > 0
+      ? catalogModels
+      : await getCommandCodeModels();
+    const status = await statusSnapshot(
+      request,
+      url.searchParams.get("sessionId") ?? undefined,
+    );
+    const accounts = Array.isArray(status.accounts) ? status.accounts : [];
+    const activeAccounts = Number(status.activeAccounts ?? 0);
+    const state = activeAccounts > 0
+      ? "available"
+      : accounts.length === 0
+      ? "unknown"
+      : "unavailable";
+    return jsonResponse({
+      provider: "commandcode",
+      generatedAt: new Date().toISOString(),
+      state,
+      modelCount: models.length,
+      models: models.map((model) => ({
+        id: model.id,
+        name: model.name,
+        contextWindow: model.contextWindow,
+        inputModalities: model.inputModalities ?? ["text"],
+        efforts: model.efforts ?? [],
+      })),
+      accounts,
+      activeAccounts,
+      catalogError: status.catalogError ?? null,
+      cache: status.cache,
+    });
   }
 
   if (

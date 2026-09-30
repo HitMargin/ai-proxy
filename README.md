@@ -307,6 +307,7 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 | 方法与路径 | 说明 |
 |---|---|
 | `GET /commandcode/v1/status` | 账号池、冷却、登录、额度与缓存统计；不会返回 key |
+| `GET /commandcode/v1/panel` | 面向设置页的模型、账号和健康状态快照；不会返回 key |
 | `GET /commandcode/v1/usage` | `status` 的额度兼容别名 |
 | `POST /commandcode/v1/usage/refresh` | 强制刷新全部账号，或正文 `{ "id": "账号 id" }` |
 | `POST /commandcode/v1/login` | 启动本机 OAuth 回调并返回授权地址 |
@@ -315,7 +316,7 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 | `POST /commandcode/v1/account/remove` | 删除文件账号及其 key |
 | `POST /commandcode/v1/logout` | 清空文件账号池；环境变量 key 无法由 HTTP 修改 |
 
-> **管理面安全**：`/status`、`/usage/refresh`、`/login`、`/account/*`、`/logout` 以及 `GET /models?refresh=true` 在未配置 `API_KEYS` 时只接受 loopback 请求；公网 Worker/隧道应同时设置 `API_KEYS` 与 `COMMANDCODE_ADMIN_KEY`，并通过 `X-CommandCode-Admin-Key` 发送管理密钥。`COMMANDCODE_BASE_URL` 仅允许 HTTPS（HTTP 只允许 loopback 测试），并禁止带凭据的重定向。
+> **管理面安全**：`/status`、`/panel`、`/usage/refresh`、`/login`、`/account/*`、`/logout` 以及 `GET /models?refresh=true` 在未配置 `API_KEYS` 时只接受 loopback 请求；公网 Worker/隧道应同时设置 `API_KEYS` 与 `COMMANDCODE_ADMIN_KEY`，并通过 `X-CommandCode-Admin-Key` 发送管理密钥。`COMMANDCODE_BASE_URL` 仅允许 HTTPS（HTTP 只允许 loopback 测试），并禁止带凭据的重定向。
 >
 > CommandCode `/alpha/*` 是私有接口，上游改版、套餐策略和风控均可能使它失效。本项目仅供个人学习研究，请遵守上游服务条款。
 

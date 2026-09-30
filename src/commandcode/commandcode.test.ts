@@ -153,12 +153,14 @@ Deno.test("CommandCode exposes Anthropic Messages for JSON and SSE", async () =>
     key: ENV.COMMANDCODE_API_KEY,
     baseURL: ENV.COMMANDCODE_BASE_URL,
     accountsFile: ENV.COMMANDCODE_ACCOUNTS_FILE,
+    adminKey: ENV.COMMANDCODE_ADMIN_KEY,
   };
   const previousFetch = globalThis.fetch;
   const previousDeployment = Deno.env.get("DENO_DEPLOYMENT_ID");
   ENV.COMMANDCODE_API_KEY = "messages-test-key";
   ENV.COMMANDCODE_BASE_URL = "https://fake.commandcode.test";
   ENV.COMMANDCODE_ACCOUNTS_FILE = "disabled-in-deploy-test";
+  ENV.COMMANDCODE_ADMIN_KEY = "messages-admin";
   Deno.env.set("DENO_DEPLOYMENT_ID", "messages-test");
   globalThis.fetch = ((_input: URL | RequestInfo, init?: RequestInit) => {
     const headers = new Headers(init?.headers);
@@ -216,11 +218,28 @@ Deno.test("CommandCode exposes Anthropic Messages for JSON and SSE", async () =>
     assert(events.includes("event: message_start"), "missing message_start");
     assert(events.includes("content_block_delta"), "missing text delta");
     assert(events.includes("event: message_stop"), "missing message_stop");
+
+    const panelRequest = new Request("http://local/commandcode/v1/panel", {
+      headers: { "x-commandcode-admin-key": "messages-admin" },
+    });
+    const panelResponse = await handleCommandCode(
+      "/commandcode/v1/panel",
+      panelRequest,
+      new URL(panelRequest.url),
+    );
+    const panel = await panelResponse.json();
+    equal(panelResponse.status, 200);
+    equal(panel.provider, "commandcode");
+    assert(
+      !JSON.stringify(panel).includes("messages-test-key"),
+      "panel leaked a key",
+    );
   } finally {
     globalThis.fetch = previousFetch;
     ENV.COMMANDCODE_API_KEY = previous.key;
     ENV.COMMANDCODE_BASE_URL = previous.baseURL;
     ENV.COMMANDCODE_ACCOUNTS_FILE = previous.accountsFile;
+    ENV.COMMANDCODE_ADMIN_KEY = previous.adminKey;
     if (previousDeployment === undefined) Deno.env.delete("DENO_DEPLOYMENT_ID");
     else Deno.env.set("DENO_DEPLOYMENT_ID", previousDeployment);
   }
