@@ -695,12 +695,26 @@ async function panelSnapshot(adapter) {
     const response = await adapter.request('/panel', { signal: AbortSignal.timeout(5000) });
     return await response.json();
   } catch (error) {
-    const [statusResponse, modelsResponse] = await Promise.all([
-      adapter.request('/status', { signal: AbortSignal.timeout(5000) }),
-      adapter.request('/models', { signal: AbortSignal.timeout(5000) }),
-    ]);
-    const status = await statusResponse.json();
-    const catalog = await modelsResponse.json();
+    let status = {};
+    let catalog = {};
+    try {
+      const [statusResponse, modelsResponse] = await Promise.all([
+        adapter.request('/status', { signal: AbortSignal.timeout(5000) }),
+        adapter.request('/models', { signal: AbortSignal.timeout(5000) }),
+      ]);
+      status = await statusResponse.json();
+      catalog = await modelsResponse.json();
+    } catch (fallbackError) {
+      return {
+        provider: 'commandcode',
+        state: 'unknown',
+        modelCount: 0,
+        models: [],
+        accounts: [],
+        panelError: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+        generatedAt: new Date().toISOString(),
+      };
+    }
     const rows = Array.isArray(catalog?.data) ? catalog.data : [];
     const accounts = Array.isArray(status?.accounts) ? status.accounts : [];
     return {

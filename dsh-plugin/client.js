@@ -95,6 +95,7 @@ window.__ModuleLoader__.load({
             ` · ${t('generated')}: `, h('code', null, data.generatedAt || '—')),
           h('div', null, `${t('channels')}: `, Object.entries(channels).map(([key, count]) =>
              h('span', { key, style: { marginRight: '10px' } }, `${key} (${count})`))),
+           data?.panelError || data?.projectError ? h('div', { role: 'status' }, data.panelError || data.projectError) : null,
            runtime.lastError ? h('div', { role: 'alert' }, runtime.lastError) : null,
           h('div', { style: { display: 'grid', gap: '6px' } }, rows.length === 0 ? h('div', null, t('empty')) : rows.slice(0, 100).map((row) =>
             h('div', { key: row.id, style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } },
