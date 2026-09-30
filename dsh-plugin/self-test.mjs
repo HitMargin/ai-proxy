@@ -82,6 +82,9 @@ try {
   assert.equal(models[0].id, 'deepseek/test');
   assert.equal(modelCalls, 6);
   const resolved = await adapter.resolveModel('ai-proxy-commandcode', 'deepseek/test');
+  const projectResolved = await adapter.resolveModel('ai-proxy', 'deepseek/test');
+  assert.deepEqual(projectResolved.reasoning.efforts.map((effort) => effort.id), ['off', 'low', 'high', 'max']);
+  assert.equal(new Set(projectResolved.reasoning.efforts.map((effort) => effort.id)).size, 4);
   const events = [];
   for await (const event of adapter.stream({
     model: resolved.id,

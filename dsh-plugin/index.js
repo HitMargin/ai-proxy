@@ -522,7 +522,15 @@ export class AiProxyAdapter {
       inputModalities: row.inputModalities,
       context: { contextWindow: row.contextWindow },
       defaultMaxTokens: row.maxTokens,
-      reasoning: { efforts: ['off', 'low', 'high', 'max'], defaultEffort: 'high' },
+      reasoning: {
+        efforts: [
+          { id: 'off', name: '关闭', description: '不启用额外思考' },
+          { id: 'low', name: '低', description: '较低的思考预算' },
+          { id: 'high', name: '高', description: '默认思考预算' },
+          { id: 'max', name: '最大', description: '使用更高的思考预算' },
+        ],
+        defaultEffort: 'high',
+      },
       basePath: route.basePath,
       wireModel: route.wireModel,
     };
