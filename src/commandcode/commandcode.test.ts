@@ -440,6 +440,24 @@ Deno.test("CommandCode account pool rotates and cools without exposing keys", as
   );
 });
 
+Deno.test("CommandCode pool reserves concurrency and start spacing", async () => {
+  const pool = new CommandCodeAccountPool("", "", undefined, {
+    maxConcurrent: 1,
+    minIntervalMs: 1000,
+  });
+  const account = await pool.add({ apiKey: "limited-key", userName: "Limit" });
+  const first = await pool.acquire(new Set(), 1000);
+  assert(first?.id === account.id, "first reservation was not assigned");
+  equal(await pool.acquire(new Set(), 1000), undefined);
+  equal(pool.inFlightCount(), 1);
+  pool.release(first!);
+  equal(await pool.acquire(new Set(), 1000), undefined);
+  const second = await pool.acquire(new Set(), 2000);
+  assert(second?.id === account.id, "spacing did not release the account");
+  pool.release(second!);
+  equal(pool.inFlightCount(), 0);
+});
+
 Deno.test("CommandCode request stats expose only a short session label", () => {
   const stats = new RequestStats();
   const sessionId = "very-private-conversation-id";

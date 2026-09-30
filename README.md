@@ -150,6 +150,8 @@ deno task test
 | `COMMANDCODE_MAX_TOKENS` | 否 | `/models` 声明和实际上游请求的输出 token 上限，默认 `64000` |
 | `COMMANDCODE_MAX_BODY_BYTES` | 否 | 直接 CommandCode Chat/Responses 请求体上限，默认 `12582912`（12 MiB）；聚合/反代请用 `MAX_REQUEST_BODY_BYTES` |
 | `COMMANDCODE_MAX_PAUSE_TURNS` | 否 | `pause_turn` 在尚未产生输出时的同会话安全续写次数，默认 `2`；输出开始后仍会拒绝重放 |
+| `COMMANDCODE_MAX_INFLIGHT` | 否 | 每个 CommandCode 账号允许的同时在途请求数；`0` 表示不限制，默认 `0` |
+| `COMMANDCODE_MIN_INTERVAL_MS` | 否 | 同一账号两次请求启动的最小间隔毫秒数，默认 `0` |
 | `COMMANDCODE_TIMEOUT_MS` | 否 | 单次 CommandCode 请求总超时，默认 `600000` |
 | `COMMANDCODE_SESSION_SALT` | 否 | 显式会话头哈希的服务端盐；不设时每进程随机，重启后亲和性改变 |
 | `COMMANDCODE_ALLOW_REMOTE_IMAGES` | 否 | 设为 `1/true/yes` 才允许代理下载 HTTP(S) 图片；默认关闭以避免 SSRF |
@@ -205,7 +207,7 @@ deno task test
    Start-Process $login.authUrl
    Invoke-RestMethod http://localhost:8000/commandcode/v1/status | ConvertTo-Json -Depth 8
    ```
-   浏览器授权后，key 自动写入 `commandcode-accounts.json`。该文件已加入 `.gitignore`，并尽可能设置为仅当前用户可读写；它仍包含明文 key，请勿上传或分享。每次 OAuth 登录新增一个账号，请求按 round-robin 调度。401/403/429/5xx 或传输错误会令该账号指数冷却，并在首字节前切换下一个账号。`COMMANDCODE_API_KEY` 只在账号池为空时作为兜底。
+   浏览器授权后，key 自动写入 `commandcode-accounts.json`。该文件已加入 `.gitignore`，并尽可能设置为仅当前用户可读写；它仍包含明文 key，请勿上传或分享。每次 OAuth 登录新增一个账号，请求按 round-robin 调度。401/403/429/5xx 或传输错误会令该账号指数冷却，并在首字节前切换下一个账号。`COMMANDCODE_MAX_INFLIGHT` 和 `COMMANDCODE_MIN_INTERVAL_MS` 可进一步限制单账号并发与请求启动间隔。`COMMANDCODE_API_KEY` 只在账号池为空时作为兜底。
 
 **模型目录**：`GET /commandcode/v1/models` 从公开目录拉取模型，先用静态 Go 档位规则快速发布，再用官方 CLI `models.md` 的 `Min plan` 列双向覆盖，同时合并 reasoning effort 与图像模态。目录缓存 15 分钟；`?refresh=true` 可强制刷新。
 

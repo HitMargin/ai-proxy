@@ -159,6 +159,10 @@ const accountPool = new CommandCodeAccountPool(
   accountsFile(),
   () => ENV.COMMANDCODE_API_KEY || "",
   (message) => console.warn(message),
+  {
+    maxConcurrent: numberSetting("COMMANDCODE_MAX_INFLIGHT", 0, 0),
+    minIntervalMs: numberSetting("COMMANDCODE_MIN_INTERVAL_MS", 0, 0),
+  },
 );
 const usageReader = new UsageReader({
   baseURL: () => baseUrl(),
@@ -604,7 +608,7 @@ async function* generateEvents(
   let pauseTurns = 0;
 
   for (let attempt = 0; attempt < attempts; attempt++) {
-    const account = await accountPool.pick(excluded);
+    const account = await accountPool.acquire(excluded);
     if (!account) throw await coolingError();
     exchangeLoop: while (true) {
       let yielded = false;
@@ -729,6 +733,7 @@ async function* generateEvents(
           }
           if (state.finished) {
             await accountPool.reportSuccess(account);
+            accountPool.release(account);
             return;
           }
         }
@@ -767,6 +772,7 @@ async function* generateEvents(
           deliveredOutput: yielded,
         });
         if (failure === "aborted") {
+          accountPool.release(account);
           throw new CommandCodeError(
             "Command Code request cancelled by client",
             499,
@@ -774,6 +780,7 @@ async function* generateEvents(
           );
         }
         if (failure === "timeout") {
+          accountPool.release(account);
           throw new CommandCodeError(
             "Command Code request timed out",
             504,
@@ -817,9 +824,11 @@ async function* generateEvents(
           );
         }
         if (yielded || attempt >= attempts - 1 || !canFailover) {
+          accountPool.release(account);
           throw error;
         }
         excluded.add(account.id);
+        accountPool.release(account);
         break exchangeLoop;
       }
     }

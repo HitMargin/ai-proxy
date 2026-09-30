@@ -30,12 +30,20 @@ export interface PublicCommandCodeAccount {
   cooldownUntil?: number;
   lastError?: string;
   lastUsedAt?: number;
+  inFlight: number;
   source: "file" | "env";
 }
 
 interface Manifest {
   version: 1;
   accounts: CommandCodeAccount[];
+}
+
+export interface CommandCodePoolOptions {
+  /** 0 means unlimited in-flight requests per account. */
+  maxConcurrent?: number;
+  /** Minimum spacing between request starts for one account. */
+  minIntervalMs?: number;
 }
 
 function runningOnDenoDeploy(): boolean {
@@ -71,7 +79,10 @@ function directoryOf(file: string): string {
   return normalized.slice(0, index);
 }
 
-function publicAccount(account: CommandCodeAccount): PublicCommandCodeAccount {
+function publicAccount(
+  account: CommandCodeAccount,
+  inFlight = 0,
+): PublicCommandCodeAccount {
   return {
     id: account.id,
     ...(account.userId === undefined ? {} : { userId: account.userId }),
@@ -89,6 +100,7 @@ function publicAccount(account: CommandCodeAccount): PublicCommandCodeAccount {
     ...(account.lastUsedAt === undefined
       ? {}
       : { lastUsedAt: account.lastUsedAt }),
+    inFlight,
     source: account.source,
   };
 }
@@ -116,6 +128,10 @@ export class CommandCodeAccountPool {
   private readonly envApiKey: string | (() => string);
   private readonly log: (message: string) => void;
   private writeChain: Promise<void> = Promise.resolve();
+  private readonly maxConcurrent: number;
+  private readonly minIntervalMs: number;
+  private readonly inFlight = new Map<string, number>();
+  private readonly nextStartAt = new Map<string, number>();
   private persist = (): Promise<void> => {
     this.writeChain = this.writeChain.then(
       () => this.writeNow(),
@@ -163,10 +179,13 @@ export class CommandCodeAccountPool {
     file: string,
     envApiKey: string | (() => string),
     log?: (message: string) => void,
+    options: CommandCodePoolOptions = {},
   ) {
     this.file = file;
     this.envApiKey = envApiKey;
     this.log = log ?? (() => {});
+    this.maxConcurrent = Math.max(0, Math.floor(options.maxConcurrent ?? 0));
+    this.minIntervalMs = Math.max(0, Math.floor(options.minIntervalMs ?? 0));
   }
 
   private async ensureLoaded(): Promise<void> {
@@ -233,9 +252,13 @@ export class CommandCodeAccountPool {
 
   async list(): Promise<PublicCommandCodeAccount[]> {
     await this.ensureLoaded();
-    if (this.accounts.length > 0) return this.accounts.map(publicAccount);
+    if (this.accounts.length > 0) {
+      return this.accounts.map((account) =>
+        publicAccount(account, this.inFlight.get(account.id) ?? 0)
+      );
+    }
     const env = this.envAccount();
-    return env ? [publicAccount(env)] : [];
+    return env ? [publicAccount(env, this.inFlight.get(env.id) ?? 0)] : [];
   }
 
   async size(): Promise<number> {
@@ -282,6 +305,69 @@ export class CommandCodeAccountPool {
       return account;
     }
     return undefined;
+  }
+
+  private canReserve(id: string, now: number): boolean {
+    if (
+      this.maxConcurrent > 0 &&
+      (this.inFlight.get(id) ?? 0) >= this.maxConcurrent
+    ) {
+      return false;
+    }
+    return (this.nextStartAt.get(id) ?? 0) <= now;
+  }
+
+  private reserve(id: string, now: number): void {
+    this.inFlight.set(id, (this.inFlight.get(id) ?? 0) + 1);
+    if (this.minIntervalMs > 0) {
+      this.nextStartAt.set(id, now + this.minIntervalMs);
+    }
+  }
+
+  /** Pick and reserve an account for one request/continuation exchange. */
+  async acquire(
+    exclude: ReadonlySet<string> = new Set(),
+    now = Date.now(),
+  ): Promise<CommandCodeAccount | undefined> {
+    await this.ensureLoaded();
+    if (this.accounts.length === 0) {
+      const env = this.envAccount();
+      if (
+        !env || (env.cooldownUntil ?? 0) > now || !this.canReserve(env.id, now)
+      ) {
+        return undefined;
+      }
+      env.lastUsedAt = now;
+      this.reserve(env.id, now);
+      return env;
+    }
+    const usable = this.accounts.filter((account) =>
+      account.enabled && !exclude.has(account.id) &&
+      (account.cooldownUntil ?? 0) <= now
+    );
+    for (let offset = 0; offset < usable.length; offset++) {
+      const index = (this.cursor + offset) % usable.length;
+      const account = usable[index];
+      if (!this.canReserve(account.id, now)) continue;
+      this.cursor = (index + 1) % usable.length;
+      account.lastUsedAt = now;
+      this.reserve(account.id, now);
+      return account;
+    }
+    return undefined;
+  }
+
+  /** Release a reservation made by acquire. Safe to call once per request. */
+  release(account: Pick<CommandCodeAccount, "id">): void {
+    const current = this.inFlight.get(account.id) ?? 0;
+    if (current <= 1) this.inFlight.delete(account.id);
+    else this.inFlight.set(account.id, current - 1);
+  }
+
+  inFlightCount(): number {
+    let total = 0;
+    for (const value of this.inFlight.values()) total += value;
+    return total;
   }
 
   async nextAvailableAt(now = Date.now()): Promise<number | undefined> {
