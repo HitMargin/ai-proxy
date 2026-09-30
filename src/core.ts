@@ -29,6 +29,8 @@ export const ENV: Record<string, string> = {
   ANTHROPIC_API_KEY: getEnv("ANTHROPIC_API_KEY"),
   GEMINI_API_KEY: getEnv("GEMINI_API_KEY"),
   OPENROUTER_API_KEY: getEnv("OPENROUTER_API_KEY"),
+  ZEN_BASE_URL: getEnv("ZEN_BASE_URL"),
+  ZEN_BEARER_TOKEN: getEnv("ZEN_BEARER_TOKEN"),
   COMMANDCODE_API_KEY: getEnv("COMMANDCODE_API_KEY"),
   COMMANDCODE_BASE_URL: getEnv("COMMANDCODE_BASE_URL"),
   COMMANDCODE_VERSION: getEnv("COMMANDCODE_VERSION"),
@@ -312,8 +314,15 @@ export const providers: Record<string, any> = {
     baseUrl: "https://opencode.ai/zen",
     auth: { type: "bearer", defaultToken: "public" },
     pathRewrite: (path: string) => path.replace(/^\/zen/, ""),
-    endpoints: { models: "/models", chat: "/chat/completions" },
+    endpoints: {
+      models: "/models",
+      chat: "/chat/completions",
+      responses: "/responses",
+      messages: "/messages",
+    },
     adapter: adapters.passthrough,
+    customHandler: "zen",
+    healthProbe: false,
     filterModels: (data: any) => {
       if (!data?.data) return data;
       return {

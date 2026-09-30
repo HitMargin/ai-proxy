@@ -26,6 +26,7 @@ const EXTRA_MODEL_ROUTES = [
   { prefix: 'anthropic', basePath: '/anthropic/v1' },
   { prefix: 'gemini', basePath: '/gemini/v1' },
 ];
+const EXCLUDED_MODEL_PREFIXES = ['zen/'];
 
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -401,6 +402,7 @@ export class AiProxyAdapter {
     this.basePath = options.basePath || '/commandcode/v1';
     this.displayName = options.displayName || 'CommandCode via ai-proxy';
     this.project = options.project === true;
+    this.excludedModelCount = 0;
   }
 
   get baseUrl() {
@@ -462,11 +464,17 @@ export class AiProxyAdapter {
     const discovered = await this.listModels();
     const models = [];
     const seen = new Set();
+    let excludedCount = 0;
     for (const model of discovered) {
+      if (EXCLUDED_MODEL_PREFIXES.some((prefix) => model.id.startsWith(prefix))) {
+        excludedCount += 1;
+        continue;
+      }
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       models.push(model);
     }
+    this.excludedModelCount = excludedCount;
     const extras = await Promise.all(EXTRA_MODEL_ROUTES.map(async (route) => {
       try {
         const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
@@ -548,6 +556,20 @@ export class AiProxyAdapter {
   }
 
   async *stream(options, resolved) {
+    const modelId = String(resolved.wireModel ?? resolved.id ?? '');
+    if (EXCLUDED_MODEL_PREFIXES.some((prefix) => modelId.startsWith(prefix))) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: 'zen free tier is only available inside OpenCode and is not exposed through DSH',
+            code: 'CONFIG_DISABLED',
+          },
+        },
+      };
+      return;
+    }
     const body = {
       model: resolved.wireModel ?? resolved.id,
       messages: toOpenAiMessages(options),
@@ -784,6 +806,7 @@ async function projectPanelSnapshot(adapter, projectAdapter) {
     models: projectModels.length > 0 ? projectModels : (Array.isArray(base.models) ? base.models : []),
     projectModels,
     projectModelCount: projectModels.length,
+    excludedModelCount: projectAdapter?.excludedModelCount ?? 0,
     channels,
   };
 }

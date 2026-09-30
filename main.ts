@@ -12,6 +12,7 @@ export { ENV } from "./src/core.ts";
 import { CNB_MODELS, handleCnb } from "./src/cnb.ts";
 import { readJsonBodyLimited } from "./src/deepseek-responses.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
+import { fetchZenModels, handleZen } from "./src/zen.ts";
 import {
   getCommandCodeModels,
   handleCommandCode,
@@ -176,6 +177,10 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
     },
   });
   await Promise.allSettled(V1_AGGREGATE_MEMBERS.map(async (key) => {
+    if (key === "zen") {
+      out[key] = await fetchZenModels();
+      return;
+    }
     if (key === "cnb") {
       out[key] = CNB_MODELS;
       return;
@@ -439,6 +444,9 @@ export async function handler(request: Request): Promise<Response> {
 
     const provider = matchedProvider;
     const providerKey = matchedKey;
+    if (provider.customHandler === "zen") {
+      return await handleZen(path, request, url);
+    }
     if (provider.customHandler === "cnb") {
       return await handleCnb(path, request, url);
     }

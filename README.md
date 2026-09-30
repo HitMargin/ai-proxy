@@ -239,6 +239,8 @@ commandcode:
 
 ### 可选 DSH Provider 桥接插件
 
+`/zen/v1` 现在由 `src/zen.ts` 处理：它补齐 OpenCode 客户端 User-Agent、`x-opencode-session`/`x-opencode-request`、canonical session、工具 quartet、Muse Spark 的 Responses 转换和 FreeTier/Region 错误分类。可用 `ZEN_BASE_URL` 和 `ZEN_BEARER_TOKEN` 覆盖默认上游；原始项目代码仍是唯一实现。
+
 `dsh-plugin/` 现在是整个项目的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。它注册一个覆盖全项目的 `ai-proxy` Provider，动态发现 `/v1` 聚合模型以及 DeepSeek 网页端、OpenRouter、TokenHarbor 等可用渠道，并按模型前缀把请求路由回原始代理。浏览器侧提供全渠道模型数量、账号池摘要、运行设置、启停和健康面板；账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
 
 ```powershell

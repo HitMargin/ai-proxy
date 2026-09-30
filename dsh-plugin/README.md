@@ -22,7 +22,7 @@ DSH 插件
 DSH 中的 `ai-proxy` Provider 会从本地代理读取完整模型目录：
 
 - `kilo/*`：Kilo 免费模型；
-- `zen/*`：Zen 免费模型；
+- `zen/*`：Zen 免费模型（代理会补 OpenCode 指纹和 session；上游拒绝时返回明确错误）；
 - `cnb/*`：CNB 通道；
 - `commandcode/*`：CommandCode Go 通道；
 - `deepseek-web/*`：DeepSeek 网页端；

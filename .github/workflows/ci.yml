@@ -46,7 +46,7 @@ jobs:
           Write-Host "PowerShell syntax ok"
 
       - name: Check formatting
-        run: deno fmt --check main.ts worker.ts src/core.ts src/deepseek-responses.ts src/commandcode src/runtime scripts/probes/commandcode-smoke.ts
+        run: deno fmt --check main.ts worker.ts src/core.ts src/deepseek-responses.ts src/zen.ts src/zen.test.ts src/commandcode src/runtime scripts/probes/commandcode-smoke.ts
 
       - name: Type-check and build-check
         run: deno task check
@@ -63,8 +63,8 @@ jobs:
       - name: Compile executable
         run: deno compile --allow-env --allow-net --output ./ai-proxy-ci main.ts
 
-      - name: Lint shared runtime, CommandCode, and Responses modules
-        run: deno lint src/runtime src/commandcode src/deepseek-responses.ts
+      - name: Lint shared runtime, CommandCode, Zen, and Responses modules
+        run: deno lint src/runtime src/commandcode src/zen.ts src/deepseek-responses.ts
 
       - name: Run tests
         run: deno task test
