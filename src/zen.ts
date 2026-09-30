@@ -215,7 +215,8 @@ export function applyZenFingerprint(
 
   body.tools = output;
   if (!body.tool_choice) {
-    body.tool_choice = flat ? "auto" : (hadClientTools ? "auto" : "none");
+    if (flat) body.tool_choice = "auto";
+    else if (!hadClientTools) body.tool_choice = "none";
   }
   return map;
 }
@@ -653,7 +654,7 @@ function claudeEventsToChat(
   });
 }
 
-function restoreChatStream(
+export function restoreChatStream(
   body: ReadableStream<Uint8Array>,
   map: Map<string, string>,
 ): ReadableStream<Uint8Array> {
@@ -664,39 +665,46 @@ function restoreChatStream(
   let buffer = "";
   return new ReadableStream({
     async pull(controller) {
-      const result = await reader.read();
-      if (result.done) {
-        controller.close();
-        return;
-      }
-      buffer += decoder.decode(result.value, { stream: true });
-      const frames = buffer.split(/\r?\n\r?\n/);
-      buffer = frames.pop() || "";
-      const output: string[] = [];
-      for (const frame of frames) {
-        const lines = frame.split(/\r?\n/);
-        for (const line of lines) {
-          if (!line.startsWith("data:")) {
-            output.push(line);
-            continue;
-          }
-          const raw = line.slice(5).trim();
-          if (!raw || raw === "[DONE]") {
-            output.push(line);
-            continue;
-          }
-          try {
-            output.push(
-              `data: ${JSON.stringify(restoreToolNames(JSON.parse(raw), map))}`,
-            );
-          } catch {
-            output.push(line);
-          }
+      while (true) {
+        const result = await reader.read();
+        if (result.done) {
+          controller.close();
+          return;
         }
-        output.push("");
-      }
-      if (output.length > 0) {
-        controller.enqueue(encoder.encode(output.join("\n")));
+        buffer += decoder.decode(result.value, { stream: true });
+        const frames = buffer.split(/\r?\n\r?\n/);
+        buffer = frames.pop() || "";
+        const output: string[] = [];
+        for (const frame of frames) {
+          if (frame === "") continue;
+          const lines = frame.split(/\r?\n/);
+          const mapped: string[] = [];
+          for (const line of lines) {
+            if (!line.startsWith("data:")) {
+              mapped.push(line);
+              continue;
+            }
+            const raw = line.slice(5).trim();
+            if (!raw || raw === "[DONE]") {
+              mapped.push(line);
+              continue;
+            }
+            try {
+              mapped.push(
+                `data: ${
+                  JSON.stringify(restoreToolNames(JSON.parse(raw), map))
+                }`,
+              );
+            } catch {
+              mapped.push(line);
+            }
+          }
+          output.push(mapped.join("\n"));
+        }
+        if (output.length > 0) {
+          controller.enqueue(encoder.encode(`${output.join("\n\n")}\n\n`));
+          return;
+        }
       }
     },
     cancel(reason) {
@@ -853,6 +861,7 @@ export async function handleZen(
       ),
       body: JSON.stringify(upstreamBody),
       redirect: "error",
+      signal: request.signal,
     });
   } catch (error) {
     return jsonResponse({

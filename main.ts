@@ -293,8 +293,10 @@ async function handleAggregateV1(
     if (accept) h.set("accept", accept);
     for (
       const name of [
+        "user-agent",
         "x-session-id",
         "x-conversation-id",
+        "x-request-id",
         "x-commandcode-admin-key",
       ]
     ) {

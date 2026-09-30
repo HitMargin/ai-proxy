@@ -2,6 +2,7 @@ import {
   applyZenFingerprint,
   handleZen,
   mintZenRequestId,
+  restoreChatStream,
   zenEndpointForModel,
   zenGatewayHeaders,
   zenSessionId,
@@ -177,6 +178,71 @@ Deno.test("Zen handler converts a Responses stream back to Chat Completions SSE"
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+Deno.test("Zen streams chat with a promoted tool name end to end", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    const encoder = new TextEncoder();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+        ));
+        controller.enqueue(encoder.encode(
+          'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{}"}}]}}]}\n\n',
+        ));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  };
+  try {
+    const request = new Request("http://local/zen/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "mimo-v2.6-flash-free",
+        messages: [{ role: "user", content: "ping" }],
+        tools: [{
+          type: "function",
+          function: { name: "pwsh", parameters: { type: "object" } },
+        }],
+        stream: true,
+      }),
+    });
+    const response = await handleZen(
+      "/zen/v1/chat/completions",
+      request,
+      new URL(request.url),
+    );
+    const text = await response.text();
+    assertStringIncludes(text, '"content":"hi"');
+    assertStringIncludes(text, '"name":"pwsh"');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("Zen restores promoted tool names in a chat SSE stream", async () => {
+  const encoder = new TextEncoder();
+  const source = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{}"}}]}}]}\n\n' +
+          "data: [DONE]\n\n",
+      ));
+      controller.close();
+    },
+  });
+  const restored = await new Response(
+    restoreChatStream(source, new Map([["bash", "Bash"]])),
+  ).text();
+  assertStringIncludes(restored, '"name":"Bash"');
 });
 
 function assertMatch(value: string, pattern: RegExp): void {

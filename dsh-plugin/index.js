@@ -389,7 +389,7 @@ async function* readSse(response) {
     buffer += decoder.decode();
     if (buffer.trim().startsWith('data:')) yield buffer.trim().slice(5).trim();
   } finally {
-    try { await reader.cancel(); } catch { /* already closed */ }
+    void reader.cancel().catch(() => {});
   }
 }
 
