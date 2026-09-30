@@ -1,3 +1,10 @@
+import {
+  classifyProbeStatus,
+  HealthRegistry,
+  type ProbeSample,
+  type ProviderHealthSnapshot,
+} from "./runtime/health.ts";
+
 // ============================================
 // 可扩展 AI API 代理框架（Deno Deploy 版）
 // 原 Cloudflare Workers 逻辑保持不变
@@ -411,11 +418,21 @@ export const providers: Record<string, any> = {
 };
 
 // ---------- 健康检查 ----------
+const healthRegistry = new HealthRegistry();
+
+export function getProviderHealth(): Record<string, ProviderHealthSnapshot>;
+export function getProviderHealth(provider: string): ProviderHealthSnapshot;
+export function getProviderHealth(provider?: string) {
+  return provider === undefined
+    ? healthRegistry.all()
+    : healthRegistry.get(provider);
+}
+
 async function testModel(
   baseUrl: string,
   modelId: string,
   providerKey: string,
-) {
+): Promise<ProbeSample> {
   const provider = providers[providerKey];
   const url = `${baseUrl}${provider.endpoints.chat}`;
   const auth = provider.auth;
@@ -434,19 +451,31 @@ async function testModel(
   const finalBody = provider.adapter.request
     ? provider.adapter.request(testBody)
     : testBody;
+  const startedAt = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
+    timer = setTimeout(() => controller.abort(), 3000);
     const resp = await fetch(url, {
       method: "POST",
       headers,
       body: JSON.stringify(finalBody),
       signal: controller.signal,
     });
-    clearTimeout(timer);
-    return resp.status === 200 || resp.status === 429;
-  } catch {
-    return false;
+    return {
+      ...classifyProbeStatus(resp.status),
+      latencyMs: Date.now() - startedAt,
+      checkedAt: Date.now(),
+    };
+  } catch (error) {
+    return {
+      state: "unknown",
+      latencyMs: Date.now() - startedAt,
+      reason: error instanceof Error ? error.message : String(error),
+      checkedAt: Date.now(),
+    };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -455,18 +484,24 @@ export async function filterHealthyModels(
   providerKey: string,
   baseUrl: string,
 ) {
-  if (!models || !models.length) return models;
+  if (!models || !models.length) {
+    healthRegistry.record(providerKey, []);
+    return models;
+  }
   const concurrency = 5;
   const results = [];
+  const samples: ProbeSample[] = [];
   for (let i = 0; i < models.length; i += concurrency) {
     const chunk = models.slice(i, i + concurrency);
     const statuses = await Promise.all(
       chunk.map((m) => testModel(baseUrl, m.id, providerKey)),
     );
     for (let j = 0; j < chunk.length; j++) {
-      if (statuses[j]) results.push(chunk[j]);
+      samples.push(statuses[j]);
+      if (statuses[j].state !== "unavailable") results.push(chunk[j]);
     }
   }
+  healthRegistry.record(providerKey, samples);
   return results;
 }
 

@@ -3,6 +3,7 @@ import {
   createStreamTransformer,
   ENV,
   filterHealthyModels,
+  getProviderHealth,
   providers,
   safeJsonParse,
   tryParseResponse,
@@ -366,6 +367,42 @@ export async function handler(request: Request): Promise<Response> {
         {
           headers: {
             "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
+    }
+
+    if (path === "/health" && request.method === "GET") {
+      const observed = getProviderHealth();
+      const providerHealth: Record<string, unknown> = {};
+      for (const key of Object.keys(providers)) {
+        providerHealth[key] = observed[key] ?? {
+          state: "unknown",
+          checkedAt: null,
+          modelCount: 0,
+          stale: false,
+        };
+      }
+      const states = Object.values(providerHealth).map((value: any) =>
+        value?.state
+      );
+      return new Response(
+        JSON.stringify({
+          status: states.includes("available")
+            ? "ok"
+            : states.includes("degraded")
+            ? "degraded"
+            : states.includes("unavailable")
+            ? "unavailable"
+            : "unknown",
+          checkedAt: new Date().toISOString(),
+          providers: providerHealth,
+        }),
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
           },
         },

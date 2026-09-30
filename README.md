@@ -322,15 +322,15 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 | `/openrouter/v1/responses` | openrouter.ai | 透传 Responses API |
 | `/tokenharbor/v1` | tokenharbor.ai | 透传，仅保留 `:free` 模型 |
 | `/cnb/v1` | cnb.cool | **自定义处理器**（见下节） |
+| `/health` | 本地代理 | 返回最近一次模型健康探测汇总；不会在请求时自动发起探测 |
 
-`GET /` 会返回所有可用 provider 列表。
+`GET /` 会返回所有可用 provider 列表。`GET /health` 返回各 provider 最近一次健康探测的状态（`available` / `degraded` / `unavailable` / `unknown`）；没有探测记录时显示 `unknown`，不会因为一次网络失败把模型清单清空。
 
 **聚合端点 `/v1`**：`GET /v1/models` 返回 kilo + zen + cnb + commandcode 全部模型的并集（id 分别加 `kilo/`、`zen/`、`cnb/`、`commandcode/` 前缀防冲突）；
 POST 时 model 写带前缀的 id（如 `cnb/deepseek-v4-pro`、`commandcode/deepseek/deepseek-v4-flash`）即自动分发到对应上游，完整复用该上游的
 处理链。不带前缀的裸 id 按 kilo→zen→cnb→commandcode 顺序解析（保持旧行为），冷启动后需先 GET 一次 `/v1/models` 暖缓存。分发时会剥掉客户端 token，让各成员用自家默认凭据；仅当本代理设置 `API_KEYS` 时才透传客户端鉴权头。
 
-**模型列表**有 5 分钟内存缓存，并会在后台异步做健康探测（`testModel`，3 秒超时，200/429 视为可用），
-在 Deno Deploy 上用 `EdgeRuntime.waitUntil` 挂起，不阻塞响应；加 `?health=true` 可强制同步探测。
+**模型列表**有 5 分钟内存缓存，并会在后台异步做健康探测（`testModel`，3 秒超时；200 可用，429/5xx 视为 degraded，401/403 才是 unavailable，网络失败保留为 unknown），在 Deno Deploy 上用 `EdgeRuntime.waitUntil` 挂起，不阻塞响应；加 `?health=true` 可强制同步探测。探测结果可通过 `GET /health` 查看。
 
 ---
 
