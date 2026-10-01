@@ -252,14 +252,41 @@ export function normalizeModel(provider, row) {
       readNumber(upstream, ['max_output_tokens', 'max_completion_tokens'], DEFAULT_MAX_TOKENS),
     ),
     inputModalities: modalities,
-    reasoningEfforts: Array.isArray(row.reasoningEfforts)
-      ? row.reasoningEfforts
-      : Array.isArray(row.reasoning_efforts)
-      ? row.reasoning_efforts
-      : undefined,
+    reasoningEfforts: publishedEfforts(row),
   };
 }
 
+/**
+ * The reasoning ladder the upstream actually published.
+ *
+ * Two shapes carry it, and reading only one made kilo look like it had no ladder
+ * at all. kilo puts the rungs in `opencode.variants` - one entry per rung, each
+ * naming its effort:
+ *
+ *   opencode: { variants: { low: { reasoning: { enabled, effort } }, ... } }
+ *
+ * so `space-bunny-alpha` published low/medium/high/xhigh/max and this code saw
+ * nothing, fell through to the fallback table, and published off/low/high/max
+ * instead: an `off` the upstream never offered, and no `medium` or `xhigh` at all.
+ * 16 of kilo's 18 models carry the field.
+ *
+ * Both shapes feed one reader, and `pickEfforts` dedupes them, so a gateway that
+ * publishes both loses nothing.
+ */
+function publishedEfforts(row) {
+  const sources = [];
+  if (Array.isArray(row.reasoningEfforts)) sources.push(row.reasoningEfforts);
+  if (Array.isArray(row.reasoning_efforts)) sources.push(row.reasoning_efforts);
+  const variants = isRecord(row.opencode) ? row.opencode.variants : undefined;
+  if (isRecord(variants)) {
+    // `enabled: false` is not a missing rung - it is the rung that turns reasoning
+    // off. kilo names it `instant` or `none` and pairs it with `thinking`, so the
+    // two are the same choice seen from both sides. Filtering those out dropped
+    // the only no-thinking option from half the catalogue.
+    sources.push(Object.keys(variants));
+  }
+  return sources.length > 0 ? sources.flat() : undefined;
+}
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

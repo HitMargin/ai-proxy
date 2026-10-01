@@ -226,6 +226,15 @@ globalThis.fetch = async (input, init = {}) => {
       'data: {"choices":[{"delta":{"content":"half an ans"},"finish_reason":null}]}\n\n',
     ].join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }
+  if (streamMode === 'kilo-variants') {
+    return new Response(
+      [
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
   if (streamMode === 'usage-cached') {
     return new Response(
       [
@@ -572,6 +581,20 @@ try {
     purpose: 'session-title',
   }, toolResolved)) { /* asserted below */ }
   assert.equal(lastChatBody.reasoning_effort, undefined, 'a session title must not spend reasoning tokens');
+
+  // kilo publishes its ladder in opencode.variants, not reasoning_efforts, so
+  // this path used to publish the fallback table instead: an `off` the upstream
+  // never offered and no `medium` or `xhigh` at all. `enabled: false` is the rung
+  // that turns reasoning off, not a missing one - kilo names it `instant`/`none`
+  // and pairs it with `thinking`.
+  streamMode = 'kilo-variants';
+  let variantEfforts = null;
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+    maxTokens: 32,
+  }, { ...toolResolved, reasoning: undefined })) { /* asserted below */ }
+  assert.equal(lastChatBody.max_tokens > 0, true, 'the variant route still sends a request');
 
   // TokenUsage carries cacheReadTokens / cacheWriteTokens, and mapUsage used to
   // drop both - so a call that really did read 149 of 880 tokens from cache was
