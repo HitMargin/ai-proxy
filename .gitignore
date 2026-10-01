@@ -22,6 +22,8 @@ cloudflared.exe
 
 # --- captured page snapshots / scratch ---
 page.html
+tmp-*.mjs
+.git-commit-msg-tmp
 
 # --- backups ---
 *.bak
