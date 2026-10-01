@@ -361,11 +361,16 @@ try {
   }, dwResolved)) dwEvents.push(event);
   assert.equal(dwEvents.length, 1, 'a blocked channel must not reach the upstream');
   assert.equal(dwEvents[0].reason.failure.code, 'CONFIG_DISABLED');
-  assert.equal(
+  // The panel owns the hidden-channel list now, so the wording is the shared one.
+  // What still has to hold is that it says "switched off" and not "needs a key":
+  // deepseek-web works, and telling the user to add credentials sends them chasing
+  // a problem they do not have.
+  assert.match(
     dwEvents[0].reason.failure.message,
-    'deepseek-web is switched off in the ai-proxy panel',
+    /switched off/,
     'the refusal must name the real reason, not a missing-key story',
   );
+  assert.doesNotMatch(dwEvents[0].reason.failure.message, /per-user upstream key/);
   assert.equal(
     blockedEvents[0].reason.failure.message.includes('per-user upstream key'),
     true,

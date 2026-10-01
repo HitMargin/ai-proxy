@@ -55,13 +55,33 @@ const IMAGE_TOKEN_ESTIMATE = 1600;
 //
 // Matched against the first path segment, which is the channel this proxy
 // routes by — see isBlockedModelId for why a substring test is not enough.
-const BLOCKED_CHANNELS = new Set([
+const DEFAULT_HIDDEN_CHANNELS = [
   'openrouter',
   'anthropic',
   'gemini',
   'deepseek-web',
   'cnb',
-]);
+];
+
+/**
+ * The channels the user has switched off, which the panel owns.
+ *
+ * Kept as a module-level set because `isBlockedModelId` is a free function reached
+ * from the roster builder and the call path, and threading a list through both
+ * would only add a way for them to disagree. `applyHiddenChannels` replaces the
+ * contents rather than mutating a shared array, so a read in progress keeps
+ * seeing one consistent set.
+ */
+const BLOCKED_CHANNELS = new Set(DEFAULT_HIDDEN_CHANNELS);
+
+function applyHiddenChannels(value) {
+  const next = Array.isArray(value)
+    ? value.map((entry) => String(entry ?? '').trim().toLowerCase()).filter(Boolean)
+    : DEFAULT_HIDDEN_CHANNELS;
+  BLOCKED_CHANNELS.clear();
+  for (const channel of new Set(next)) BLOCKED_CHANNELS.add(channel);
+  return [...BLOCKED_CHANNELS];
+}
 
 /** Why a channel is withheld, so the refusal can say something true. */
 const BLOCK_REASON = {
@@ -71,9 +91,12 @@ const BLOCK_REASON = {
     'this channel needs a per-user upstream key and is not served by ai-proxy',
   gemini:
     'this channel needs a per-user upstream key and is not served by ai-proxy',
-  'deepseek-web': 'deepseek-web is switched off in the ai-proxy panel',
+  'deepseek-web': 'this channel is switched off in the ai-proxy panel',
   cnb: 'cnb needs a login cookie; paste one into cnb-login.txt to re-enable it',
 };
+
+/** Fallback text for a channel the user switched off that has no specific reason. */
+const GENERIC_BLOCK_REASON = 'this channel is switched off in the ai-proxy panel';
 
 /**
  * Channels reached by their own route rather than through the aggregate one.
@@ -107,7 +130,9 @@ const CHANNEL_ROUTES = [
 function blockReasonFor(modelId) {
   const id = String(modelId ?? '');
   const channel = (id.includes('/') ? id.slice(0, id.indexOf('/')) : id).toLowerCase();
-  return BLOCK_REASON[channel] ?? `${channel} is not served by ai-proxy`;
+  // A channel the user switched off from the panel has no entry here, and the
+  // reason must not imply a per-user key is what is missing.
+  return BLOCK_REASON[channel] ?? (BLOCKED_CHANNELS.has(channel) ? GENERIC_BLOCK_REASON : `${channel} is not served by ai-proxy`);
 }
 
 /**
@@ -319,6 +344,7 @@ const DEFAULT_SETTINGS = {
   denoPath: 'deno',
   externalUrl: '',
   apiKeyEnv: 'LOCAL_AGGREGATION_API_KEY',
+  hiddenChannels: DEFAULT_HIDDEN_CHANNELS,
 };
 
 function dataDir() {
@@ -333,10 +359,14 @@ function loadSettings(config = {}) {
   } catch {}
   const merged = { ...DEFAULT_SETTINGS, ...(isRecord(stored) ? stored : {}), ...config };
   const port = Number(merged.port);
+  // Applied on load so a stored choice survives a restart, and normalised here
+  // rather than trusted: the file is editable outside the panel.
+  const hiddenChannels = applyHiddenChannels(merged.hiddenChannels);
   return {
     ...merged,
     mode: merged.mode === 'external' ? 'external' : 'local',
     port: Number.isSafeInteger(port) && port > 0 && port < 65536 ? port : DEFAULT_PORT,
+    hiddenChannels,
   };
 }
 
@@ -408,6 +438,7 @@ export class ProxyRuntime {
       port: this.settings.port,
       denoPath: this.settings.denoPath,
       apiKeyEnv: this.settings.apiKeyEnv,
+      hiddenChannels: [...BLOCKED_CHANNELS],
       externalUrl: this.settings.mode === 'external' ? this.settings.externalUrl : null,
       baseUrl: this.baseUrl(),
       originUrl: this.originUrl(),
@@ -1490,6 +1521,15 @@ function cleanSettings(values) {
   if (typeof values.apiKeyEnv === 'string' && /^[A-Z_][A-Z0-9_]*$/.test(values.apiKeyEnv)) next.apiKeyEnv = values.apiKeyEnv;
   const port = Number(values.port);
   if (Number.isSafeInteger(port) && port > 0 && port < 65536) next.port = port;
+  // A channel name reaches a URL path segment, so it is validated rather than
+  // trusted: the panel posts a list, and anything that is not a plain lowercase
+  // segment is dropped instead of being written to settings and matched later.
+  if (Array.isArray(values.hiddenChannels)) {
+    next.hiddenChannels = [...new Set(values.hiddenChannels
+      .filter((entry) => typeof entry === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(entry.trim().toLowerCase()))
+      .map((entry) => entry.trim().toLowerCase())
+    )];
+  }
   return next;
 }
 
@@ -1657,6 +1697,11 @@ async function projectPanelSnapshot(adapter, projectAdapter) {
     projectModels: models,
     projectModelCount: models.length,
     blockedModelCount: projectAdapter?.blockedModelCount ?? 0,
+    // A hidden channel is absent from the roster by construction, so a toggle
+    // built from `channels` alone could only ever turn channels off. The union is
+    // what the panel needs to offer both directions.
+    hiddenChannels: [...BLOCKED_CHANNELS],
+    allChannels: [...new Set([...Object.keys(channels), ...BLOCKED_CHANNELS])].sort(),
     channels,
     health,
     modelHealth: counts,
@@ -1707,7 +1752,21 @@ function apiHandler(adapter, runtime, projectAdapter) {
       }
       if (method === 'POST' && route === '/settings') {
         const body = cleanSettings(await readBody(req));
-        return sendJson(res, 200, await runtime.update(body));
+        // A channel toggle is a display choice, not a runtime change, so it does
+        // not go through `runtime.update` - that stops and starts the proxy, and
+        // restarting it to hide a channel is both slow and a second chance to fail.
+        const onlyChannels = Object.keys(body).length === 1 &&
+          Object.prototype.hasOwnProperty.call(body, 'hiddenChannels');
+        if (onlyChannels) {
+          const applied = applyHiddenChannels(body.hiddenChannels);
+          runtime.settings = { ...runtime.settings, hiddenChannels: applied };
+          try { saveSettings(runtime.settings); } catch (error) { runtime.lastError = error.message; }
+          runtime.record(`channels hidden: ${applied.length > 0 ? applied.join(', ') : '(none)'}`);
+          return sendJson(res, 200, runtime.snapshot());
+        }
+        const next = await runtime.update(body);
+        if (Array.isArray(body.hiddenChannels)) applyHiddenChannels(body.hiddenChannels);
+        return sendJson(res, 200, next);
       }
       if (method === 'POST' && route === '/start') {
         await runtime.start();

@@ -30,6 +30,7 @@ window.__ModuleLoader__.load({
         localOnly: '数据只在本机统计，不会上传。', noUsage: '还没有调用记录，在 DSH 里发一条消息后就会出现。',
         usageFailed: '读取用量失败',
         efforts: '推理档位', noEfforts: '—',
+        channels: '渠道显示', channelsHint: '取消勾选的渠道不会出现在模型列表里。保存后立即生效。',
         speedNote: '输出速度只统计解码窗口 ≥250ms 且速率 ≤250 tok/s 的调用；窗口太短的一次性回答不算速度。',
       },
       en: {
@@ -48,6 +49,7 @@ window.__ModuleLoader__.load({
         start: 'Start', stop: 'Stop', restart: 'Restart', save: 'Save', logs: 'Logs', empty: 'No models',
         search: 'Search models…', uptime: 'Uptime', state: 'State', excluded: 'Removed from the list', listingFailed: 'listing failed',
         efforts: 'Efforts', noEfforts: '—',
+        channels: 'Channels', channelsHint: 'Unchecked channels are withheld from the model list. Takes effect on save.',
         available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
         check: 'Check status', checking: 'Checking…', checkAll: 'All channels', checkDone: 'Checked {0} models',
         checkFailed: 'Check failed', checkHint: 'Each model sends one minimal request and uses that channel’s free quota.',
@@ -120,6 +122,9 @@ window.__ModuleLoader__.load({
 .apx_tag{display:inline-flex;padding:2px 8px;border-radius:7px;font-size:10.5px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);white-space:nowrap}
 .apx_efforts{white-space:nowrap}
 .apx_muted{color:var(--dsw-alias-label-tertiary)}
+.apx_toggles{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:4px}
+.apx_toggle{display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer}
+.apx_toggle em{font-style:normal;font-size:10.5px;opacity:.65;font-variant-numeric:tabular-nums}
 .apx_dot{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-tertiary);flex:none;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 18%,transparent)}
 .apx_state{display:inline-flex;align-items:center;gap:7px;font-size:12px}
 .apx_state.ok{color:var(--dsw-alias-state-success-primary)}
@@ -384,6 +389,13 @@ window.__ModuleLoader__.load({
               ])
               if (cancelled) return
               setData(panel)
+              // Seed the toggles once. After that the server value would stomp a
+              // choice the user has made but not yet saved, which is the same trap
+              // that made the usage tab read as permanently empty.
+              if (!hydrated && Array.isArray(panel.hiddenChannels)) {
+                setHiddenChannels(panel.hiddenChannels)
+                setHydrated(true)
+              }
               if (usage && usage.failed) {
                 setUsageError(usage.failed instanceof Error ? usage.failed.message : String(usage.failed))
                 setUsage(null)
@@ -420,6 +432,17 @@ window.__ModuleLoader__.load({
           .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
           .finally(() => { setBusy(false); loadRef.current() })
       }
+      // Held separately from `settings` because the panel owns the choice locally
+      // until Save is pressed, the same as every other field on this card.
+      const [hiddenChannels, setHiddenChannels] = useState(null)
+      const [hydrated, setHydrated] = useState(false)
+      const channelList = Array.isArray(data?.allChannels) ? data.allChannels : []
+      const hiddenNow = hiddenChannels ?? (Array.isArray(data?.hiddenChannels) ? data.hiddenChannels : [])
+      const toggleChannel = (channel) => setHiddenChannels(
+        hiddenNow.includes(channel)
+          ? hiddenNow.filter((entry) => entry !== channel)
+          : [...hiddenNow, channel],
+      )
       const save = () => act('/settings', {
         mode: settings?.mode,
         projectRoot: settings?.projectRoot,
@@ -427,6 +450,7 @@ window.__ModuleLoader__.load({
         port: settings?.port,
         externalUrl: settings?.externalUrl,
         apiKeyEnv: settings?.apiKeyEnv,
+        hiddenChannels: hiddenNow,
       })
 
       const rows = useMemo(() => (Array.isArray(data?.models) ? data.models : []), [data])
@@ -521,6 +545,22 @@ window.__ModuleLoader__.load({
           h('label', { className: 'apx_field' }, h('span', null, t('apiKeyEnv')),
             h('input', { className: 'apx_input', value: settings.apiKeyEnv || '', onChange: (event) => setSettings({ ...settings, apiKeyEnv: event.target.value }) })),
         ),
+        channelList.length > 0
+          ? h('div', { className: 'apx_field' },
+            h('span', null, t('channels')),
+            h('p', { className: 'apx_tag' }, t('channelsHint')),
+            h('div', { className: 'apx_toggles' }, channelList.map((channel) => h('label',
+              { key: channel, className: 'apx_toggle' },
+              h('input', {
+                type: 'checkbox',
+                checked: !hiddenNow.includes(channel),
+                onChange: () => toggleChannel(channel),
+              }),
+              h('span', null, channel),
+              h('em', null, `${data?.channels?.[channel] ?? 0}`),
+            ))),
+          )
+          : null,
         h('div', { className: 'apx_row' },
           h('button', { className: 'apx_btn primary', type: 'button', onClick: save, disabled: busy }, t('save')),
           h('button', { className: 'apx_btn', type: 'button', onClick: () => act('/start'), disabled: busy }, t('start')),
