@@ -753,6 +753,26 @@ try {
     );
   }
   assert.equal(panel.hiddenChannels.includes('deepseek-web'), true);
+
+  // Everything the panel renders has to come from the panel snapshot, which is
+  // computed per request. The runtime snapshot is built once per apply() and kept
+  // by an instance that outlives a window reload, so a field placed there is stale
+  // until the Host restarts - which is exactly how channelKeySet went missing
+  // while the rest of the panel showed new data.
+  for (const field of ['hiddenChannels', 'allChannels', 'keyedChannels', 'channelKeySet', 'deepseekWeb', 'projectModels']) {
+    assert.ok(field in panel, `${field} must be on the panel snapshot`);
+  }
+  const settingsBody = await (async () => {
+    let status = 0;
+    let payload = '';
+    await panelRoute.handler({ method: 'GET', url: '/api/ai-proxy-commandcode/settings', headers: { host: 'dsh.local' } }, {
+      writeHead(value) { status = value; },
+      end(value) { payload = value; },
+    });
+    assert.equal(status, 200);
+    return JSON.parse(payload);
+  })();
+  assert.equal('channelKeySet' in settingsBody, false, 'the runtime snapshot is not where the panel reads it from');
   // The panel only shows 可用/限流/不可用 if the per-model verdicts are joined
   // onto the rows: /health keys samples by provider + unprefixed id, while the
   // roster uses `kilo/…`.

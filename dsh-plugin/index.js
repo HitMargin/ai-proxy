@@ -530,15 +530,11 @@ export class ProxyRuntime {
       port: this.settings.port,
       denoPath: this.settings.denoPath,
       apiKeyEnv: this.settings.apiKeyEnv,
-      hiddenChannels: [...BLOCKED_CHANNELS],
-      // Presence only, per channel. The values are write-only from the panel's
-      // point of view: echoing a credential back into a page that renders in a
-      // browser is how one ends up in a screenshot.
-      channelKeySet: Object.fromEntries(KEYED_CHANNELS.map((entry) => [
-        entry.channel,
-        typeof this.settings.channelKeys?.[entry.channel] === 'string' &&
-        this.settings.channelKeys[entry.channel] !== '',
-      ])),
+      // The hidden list and the key presence live in the panel snapshot instead of
+      // here. This snapshot is built once per `apply()` and kept by an instance that
+      // survives a window reload, so a field added here is stale until the Host is
+      // restarted - which is how `channelKeySet` went missing while the rest of the
+      // panel showed the new data.
       externalUrl: this.settings.mode === 'external' ? this.settings.externalUrl : null,
       baseUrl: this.baseUrl(),
       originUrl: this.originUrl(),
@@ -1841,9 +1837,18 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
       ...Object.keys(channels),
       ...BLOCKED_CHANNELS,
     ])].sort(),
+    hiddenChannels: [...BLOCKED_CHANNELS],
     // The channels the panel offers a key for, each naming the variable the proxy
     // reads, so the field can say which one it is writing.
     keyedChannels: KEYED_CHANNELS,
+    // Presence only, per channel. The values are write-only from the panel's point
+    // of view: echoing a credential back into a page that renders in a browser is
+    // how one ends up in a screenshot.
+    channelKeySet: Object.fromEntries(KEYED_CHANNELS.map((entry) => [
+      entry.channel,
+      typeof runtime.settings.channelKeys?.[entry.channel] === 'string' &&
+      runtime.settings.channelKeys[entry.channel] !== '',
+    ])),
     // What deepseek-web still needs, and whether its capture is already running.
     deepseekWeb: {
       ...deepseekWebStatus(runtime.settings),
