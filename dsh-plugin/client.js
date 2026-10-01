@@ -301,7 +301,6 @@ window.__ModuleLoader__.load({
       const [usage, setUsage] = useState(null)
       const [usageError, setUsageError] = useState('')
       const [error, setError] = useState('')
-  const [notice, setNotice] = useState('')
       const [notice, setNotice] = useState('')
       const [busy, setBusy] = useState(false)
       const [checking, setChecking] = useState(false)
