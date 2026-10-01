@@ -128,15 +128,39 @@ function isBlockedModelId(modelId) {
  * is what turned 33 image-capable CommandCode models into text-only rows.
  */
 const EFFORT_ORDER = ['off', 'low', 'medium', 'high', 'xhigh', 'max'];
-const EFFORT_LABELS = { off: '关闭', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最大' };
-const EFFORT_HINTS = {
-  off: '不启用额外思考',
-  low: '较低的思考预算',
-  medium: '中等思考预算',
-  high: '默认思考预算',
-  xhigh: '高于默认的思考预算',
-  max: '最高的思考预算',
+// `name` is English so an English UI reads naturally; the Chinese label goes in
+// `zh` the way dsh-our-free-model does it (src/effort.js). A hardcoded Chinese
+// `name` is not wrong in a Chinese harness, it is just wrong in every other one.
+const EFFORT_LABELS = {
+  off: { name: 'Off', zh: '关闭' },
+  low: { name: 'Low', zh: '低' },
+  medium: { name: 'Medium', zh: '中' },
+  high: { name: 'High', zh: '高' },
+  xhigh: { name: 'Very high', zh: '极高' },
+  max: { name: 'Maximum', zh: '最大' },
 };
+const EFFORT_HINTS = {
+  off: { name: 'No extra thinking', zh: '不启用额外思考' },
+  low: { name: 'A smaller thinking budget', zh: '较低的思考预算' },
+  medium: { name: 'A moderate thinking budget', zh: '中等思考预算' },
+  high: { name: 'The default thinking budget', zh: '默认思考预算' },
+  xhigh: { name: 'More than the default budget', zh: '高于默认的思考预算' },
+  max: { name: 'The largest thinking budget', zh: '最高的思考预算' },
+};
+
+/** The harness's current UI language, so effort labels can follow it. */
+function uiLocale() {
+  const candidate = globalThis.navigator?.language
+    ?? globalThis.document?.documentElement?.lang
+    ?? '';
+  return String(candidate).toLowerCase().startsWith('zh') ? 'zh' : 'en';
+}
+
+/** Pick the label for the harness's current UI language. */
+function effortText(entry) {
+  if (!entry) return '';
+  return uiLocale() === 'zh' ? entry.zh : entry.name;
+}
 
 /**
  * Keep the efforts a channel actually published, in ladder order.
@@ -797,8 +821,8 @@ export class AiProxyAdapter {
       reasoning: {
         efforts: efforts.map((id) => ({
           id,
-          name: EFFORT_LABELS[id] ?? id,
-          description: EFFORT_HINTS[id] ?? '',
+          name: effortText(EFFORT_LABELS[id]) || id,
+          description: effortText(EFFORT_HINTS[id]),
         })),
         defaultEffort: efforts.includes('high') ? 'high' : efforts[0],
       },

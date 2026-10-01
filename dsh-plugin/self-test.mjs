@@ -359,6 +359,29 @@ try {
   // upstream never offered is what produced the duplicate-effort rejection.
   assert.deepEqual(projectResolved.reasoning.efforts.map((effort) => effort.id), ['off', 'high', 'max']);
   assert.equal(new Set(projectResolved.reasoning.efforts.map((effort) => effort.id)).size, 3);
+  // Effort labels follow the harness UI language rather than being pinned to
+  // Chinese, which reads wrong in every other locale.
+  {
+    const realNavigator = globalThis.navigator;
+    const labelFor = async (language) => {
+      Object.defineProperty(globalThis, 'navigator', {
+        value: { language },
+        configurable: true,
+        writable: true,
+      });
+      const r = await adapter.resolveModel('ai-proxy', 'deepseek/test');
+      return r.reasoning.efforts.map((e) => e.name).join(',');
+    };
+    assert.equal(await labelFor('zh-CN'), '关闭,高,最大');
+    assert.equal(await labelFor('en-US'), 'Off,High,Maximum');
+    // No language to read: English rather than a guess at the user's origin.
+    assert.equal(await labelFor(undefined), 'Off,High,Maximum');
+    Object.defineProperty(globalThis, 'navigator', {
+      value: realNavigator,
+      configurable: true,
+      writable: true,
+    });
+  }
   assert.deepEqual(projectResolved.inputModalities, ['text', 'image']);
   assert.equal(projectResolved.context.contextWindow, 1000000);
   assert.equal(projectResolved.defaultMaxTokens, 64000);
