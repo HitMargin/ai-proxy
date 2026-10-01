@@ -551,7 +551,64 @@ function textOf(content) {
  * that path goes through the harness's own client, which serializes `tool_calls`
  * and `tool` messages properly.
  */
-function toOpenAiMessages(options) {
+/**
+ * An image block's data URL, or undefined when it cannot travel.
+ *
+ * `offloaded` means the harness decided not to inline it; a bare `url` is taken as
+ * given, which is the form an OpenAI-shaped caller produces.
+ */
+function imageDataUrl(block, resolveImage) {
+  if (block?.offloaded === true) return undefined;
+  const resolved = resolveImage?.(block?.attachment);
+  if (typeof resolved === 'string' && resolved !== '') return resolved;
+  const url = block?.attachment?.url;
+  return typeof url === 'string' && url !== '' ? url : undefined;
+}
+
+/**
+ * Read an attachment out of the session store and inline it as a data URL.
+ *
+ * The adapter contract has no way to turn an `ImageAttachmentRef` into bytes -
+ * that path exists only on the built-in DeepSeek adapter, which gets it through
+ * constructor dependencies. A cordis service does expose it:
+ * `ctx.get('attachments').imageHostPath(ref)` yields the on-disk path.
+ *
+ * Looked up per call and never cached across calls. A cordis service a plugin
+ * loads before it is provided is simply absent at that moment, so reading it
+ * once during `apply` yields undefined forever and takes the whole feature with
+ * no error anywhere.
+ */
+function installImageResolver(ctx, logger) {
+  if (ctx === null || typeof ctx !== 'object') return undefined;
+  const cache = new Map();
+  const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+  return (ref) => {
+    const service = typeof ctx.get === 'function' ? ctx.get('attachments') : undefined;
+    if (service === undefined || typeof service.imageHostPath !== 'function') return undefined;
+    const id = String(ref?.attachmentId ?? '');
+    if (id === '') return undefined;
+    const cached = cache.get(id);
+    if (cached !== undefined) return cached;
+    try {
+      const hostPath = service.imageHostPath(ref);
+      if (typeof hostPath !== 'string' || hostPath === '') return undefined;
+      const size = fs.statSync(hostPath).size;
+      if (size > MAX_IMAGE_BYTES) {
+        logger?.warn?.(`ai-proxy: image ${id} is ${size} bytes, above the ${MAX_IMAGE_BYTES} send limit`);
+        return undefined;
+      }
+      const media = typeof ref.mediaType === 'string' ? ref.mediaType : 'image/png';
+      const url = `data:${media};base64,${fs.readFileSync(hostPath).toString('base64')}`;
+      if (cache.size > 48) cache.clear();
+      cache.set(id, url);
+      return url;
+    } catch (error) {
+      logger?.warn?.(`ai-proxy: could not read image ${id} (${error instanceof Error ? error.message : String(error)})`);
+      return undefined;
+    }
+  };
+}
+function toOpenAiMessages(options, resolveImage, supportsImages, warnings) {
   const output = [];
   if (typeof options.system === 'string' && options.system !== '') {
     output.push({ role: 'system', content: options.system });
@@ -572,13 +629,33 @@ function toOpenAiMessages(options) {
       // answer a question the transcript never answered. The harness client
       // marks both cases, so the shapes match again.
       let body = textOf(content);
-      if (body === '') body = '(no tool output)';
+      // `role: 'tool'` is text-only on the OpenAI wire, so an image the tool
+      // returned cannot ride along with it. It travels as the user turn right
+      // after, which is what the harness's own adapter does - the alternative
+      // is a screenshot no model ever sees.
+      const images = [];
+      for (const part of Array.isArray(content) ? content : []) {
+        if (!isRecord(part) || part.type !== 'image') continue;
+        const url = supportsImages ? imageDataUrl(part, resolveImage) : undefined;
+        if (url !== undefined) images.push({ type: 'image_url', image_url: { url } });
+        else warnings?.push('image-dropped');
+      }
+      if (body === '') body = images.length > 0 ? '(see attached images)' : '(no tool output)';
       if (message.isError === true) body = `[tool error] ${body}`;
       output.push({
         role: 'tool',
         tool_call_id: callId,
         content: body,
       });
+      if (images.length > 0) {
+        output.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: `The result of tool call ${callId} is ${images.length} image(s).` },
+            ...images,
+          ],
+        });
+      }
       continue;
     }
 
@@ -618,18 +695,32 @@ function toOpenAiMessages(options) {
 
     if (Array.isArray(content)) {
       const parts = [];
+      let sawImage = false;
       for (const part of content) {
         if (!isRecord(part)) continue;
         if (part.type === 'text' && typeof part.text === 'string') {
           parts.push({ type: 'text', text: part.text });
-        } else if (part.type === 'image' && isRecord(part.source) &&
-          part.source.type === 'base64' && typeof part.source.media_type === 'string' &&
-          typeof part.source.data === 'string') {
-          parts.push({
-            type: 'image_url',
-            image_url: { url: `data:${part.source.media_type};base64,${part.source.data}` },
-          });
+        } else if (part.type === 'image') {
+          sawImage = true;
+          // `attachment`, not `source`: the block shape is { type:'image',
+          // attachment: ImageAttachmentRef }, and `part.source` does not exist
+          // anywhere in the harness - that check could never match, which is
+          // why images never reached a plugin-routed model at all.
+          const url = supportsImages ? imageDataUrl(part, resolveImage) : undefined;
+          if (url !== undefined) parts.push({ type: 'image_url', image_url: { url } });
+          else warnings?.push('image-dropped');
         }
+      }
+      if (parts.length === 0) {
+        // Text-only route: the harness projects images to a description before
+        // this point when the model cannot see them, but say so if one arrives
+        // anyway rather than sending a message with an empty content array.
+        const fallback = textOf(content);
+        if (fallback !== '') output.push({ role: role === 'system' ? 'system' : 'user', content: fallback });
+        continue;
+      }
+      if (sawImage && !supportsImages && parts.every((p) => p.type === 'text')) {
+        parts.push({ type: 'text', text: '(image omitted: model does not support images)' });
       }
       output.push({ role: role === 'system' ? 'system' : 'user', content: parts });
       continue;
@@ -745,6 +836,11 @@ export class AiProxyAdapter {
     this.basePath = options.basePath || '/commandcode/v1';
     this.displayName = options.displayName || 'CommandCode via ai-proxy';
     this.project = options.project === true;
+    // Set once during apply; the function itself re-reads the cordis service on
+    // every call, because a service loaded before it is provided is absent until
+    // later and a one-shot read would disable images for the whole process with
+    // nothing logged.
+    this.resolveImage = options.resolveImage;
     this.blockedModelCount = 0;
   }
 
@@ -932,14 +1028,28 @@ export class AiProxyAdapter {
       };
       return;
     }
+    const imageWarnings = [];
     const body = {
       model: resolved.wireModel ?? resolved.id,
-      messages: toOpenAiMessages(options),
+      // Capability gate: sending `image_url` to a model that cannot see one is
+      // a 400 for the whole turn, not a dropped image.
+      messages: toOpenAiMessages(
+        options,
+        this.resolveImage,
+        Array.isArray(resolved.inputModalities) && resolved.inputModalities.includes('image'),
+        imageWarnings,
+      ),
       stream: true,
       max_tokens: Number(options.maxTokens ?? resolved.defaultMaxTokens ?? DEFAULT_MAX_TOKENS),
     };
     const tools = toOpenAiTools(options.tools);
     if (tools) body.tools = tools;
+    if (imageWarnings.length > 0) {
+      // Never silent. An image that could not travel is exactly the class of
+      // failure this plugin has been guilty of all day: the turn looks fine and
+      // the operator learns nothing until they notice the model never saw it.
+      this.runtime?.record?.(`dropped ${imageWarnings.length} image(s) on ${requestedId}`);
+    }
     // OpenAI defaults this to true, which asks the gateway to retain the
     // conversation server-side. The harness client sends false explicitly and
     // a config-listed model on the same upstream therefore did too; omitting
@@ -1556,8 +1666,9 @@ async function findNewest(files) {
 
 export function apply(ctx, config = {}) {
   const runtime = new ProxyRuntime(config);
-  const adapter = new AiProxyAdapter({ runtime });
-  const projectAdapter = new ProjectAdapter({ runtime });
+  const resolveImage = installImageResolver(ctx, ctx?.logger);
+  const adapter = new AiProxyAdapter({ runtime, resolveImage });
+  const projectAdapter = new ProjectAdapter({ runtime, resolveImage });
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
   const registration = ctx.llm.registerAdapter([PROJECT_ROUTE], projectAdapter);
   ctx.llm.registerConfigurableProviders?.([

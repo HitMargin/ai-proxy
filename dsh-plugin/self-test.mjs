@@ -555,6 +555,48 @@ try {
     purpose: 'session-title',
   }, toolResolved)) { /* asserted below */ }
   assert.equal(lastChatBody.reasoning_effort, undefined, 'a session title must not spend reasoning tokens');
+
+  // Images reach the wire now. The block shape is { type:'image', attachment }
+  // - the old code read `part.source`, which does not exist in the harness, so
+  // this path could never match and no image ever reached a plugin model.
+  const fakeImage = {
+    attachment: { attachmentId: 'att_1', mediaType: 'image/png' },
+  };
+  const resolveImage = (ref) =>
+    ref?.attachmentId === 'att_1' ? 'data:image/png;base64,AAAA' : undefined;
+  adapter.resolveImage = resolveImage;
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image', ...fakeImage }] }],
+    maxTokens: 32,
+  }, { ...toolResolved, resolveImage, inputModalities: ['text', 'image'] })) { /* asserted below */ }
+  assert.equal(lastChatBody.messages[0].content[1]?.image_url?.url, 'data:image/png;base64,AAAA');
+
+  // A text-only model must not be sent image_url at all: that is a 400 for the
+  // whole turn, not a dropped image.
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image', ...fakeImage }] }],
+    maxTokens: 32,
+  }, { ...toolResolved, resolveImage, inputModalities: ['text'] })) { /* asserted below */ }
+  const textOnly = lastChatBody.messages[0].content;
+  assert.equal(textOnly.some((part) => part.type === 'image_url'), false);
+  assert.match(textOnly.at(-1)?.text ?? '', /does not support images/);
+
+  // role 'tool' is text-only on this wire, so an image a tool returned travels
+  // as the user turn right after - otherwise a read_image result is lost.
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [
+      { role: 'tool', toolCallId: 'call_img', content: [{ type: 'image', ...fakeImage }] },
+    ],
+    maxTokens: 32,
+  }, { ...toolResolved, resolveImage, inputModalities: ['text', 'image'] })) { /* asserted below */ }
+  const withImage = lastChatBody.messages;
+  assert.equal(withImage[0].role, 'tool');
+  assert.equal(withImage[0].content, '(see attached images)');
+  assert.equal(withImage[1].role, 'user');
+  assert.ok(withImage[1].content.some((part) => part.type === 'image_url'));
   assert.equal(panelRoute.path, '/api/ai-proxy-commandcode');
   let panelBody = '';
   let panelStatus = 0;
