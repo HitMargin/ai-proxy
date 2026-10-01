@@ -28,14 +28,6 @@ import {
 const ROUTE = 'ai-proxy-commandcode';
 const PROJECT_ROUTE = 'ai-proxy';
 const DEFAULT_MAX_TOKENS = 64000;
-// Still listed here even when blocked, so a blocked channel is filtered by the
-// same rule as every other blocked prefix rather than by not looking. Dropping
-// it here would have made the block invisible: the count would read zero and
-// the roster would have no record of what was withheld.
-const EXTRA_MODEL_ROUTES = [
-  { prefix: 'deepseek-web', basePath: '/deepseek-web/v1' },
-  { prefix: 'tokenharbor', basePath: '/tokenharbor/v1' },
-];
 // The DSH picker groups strictly by provider route, so a channel that cannot
 // serve a real turn does not belong in the roster at all. OpenRouter, Anthropic
 // and Gemini need per-user keys this proxy never holds, and their listings
@@ -73,6 +65,35 @@ const BLOCK_REASON = {
   'deepseek-web': 'deepseek-web is switched off in the ai-proxy panel',
   cnb: 'cnb needs a login cookie; paste one into cnb-login.txt to re-enable it',
 };
+
+/**
+ * Channels reached by their own route rather than through the aggregate one.
+ *
+ * A blocked channel is not listed here. The panel re-reads this list on every
+ * snapshot, and keeping a withheld channel in it meant asking the proxy for a
+ * listing whose rows were all going to be thrown away — a request per poll,
+ * forever, for a channel the user had switched off. A channel that is blocked
+ * after being added here is still refused at call time and still filtered if it
+ * arrives from the aggregate listing, so nothing reaches it either way.
+ */
+const EXTRA_MODEL_ROUTES = [
+  { prefix: 'tokenharbor', basePath: '/tokenharbor/v1' },
+];
+
+/**
+ * Every channel's own route, blocked or not.
+ *
+ * Kept separately from {@link EXTRA_MODEL_ROUTES} because the two answer
+ * different questions. That list is "which listings should the panel fetch";
+ * this one is "how is an id of this shape addressed". Dropping a blocked channel
+ * from the second would leave `resolveModel` unable to say where its call would
+ * have gone, which is exactly the information a caller inspecting a refusal
+ * needs.
+ */
+const CHANNEL_ROUTES = [
+  { prefix: 'deepseek-web', basePath: '/deepseek-web/v1' },
+  ...EXTRA_MODEL_ROUTES,
+];
 
 function blockReasonFor(modelId) {
   const id = String(modelId ?? '');
@@ -742,7 +763,7 @@ export class AiProxyAdapter {
     if (provider === ROUTE || this.basePath === '/commandcode/v1') {
       return { basePath: '/commandcode/v1', wireModel: id.replace(/^commandcode\//, '') };
     }
-    for (const route of EXTRA_MODEL_ROUTES) {
+    for (const route of CHANNEL_ROUTES) {
       const prefix = `${route.prefix}/`;
       if (id.startsWith(prefix)) return { basePath: route.basePath, wireModel: id.slice(prefix.length) };
     }

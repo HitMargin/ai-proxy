@@ -6,6 +6,9 @@ const originalFetch = globalThis.fetch;
 let modelCalls = 0;
 let chatCalls = 0;
 let lastRequestHeaders = new Headers();
+// Which listing routes were asked for, so a test can assert that a channel the
+// user switched off is not being polled at all.
+const modelCallsByPath = {};
 globalThis.fetch = async (input, init = {}) => {
   const url = String(input);
   const headers = new Headers(init.headers || {});
@@ -61,6 +64,10 @@ globalThis.fetch = async (input, init = {}) => {
   }
   if (url.endsWith('/models')) {
     modelCalls++;
+    {
+      const { pathname } = new URL(url);
+      modelCallsByPath[pathname] = (modelCallsByPath[pathname] ?? 0) + 1;
+    }
     if (url.includes('/openrouter/')) {
       return new Response(JSON.stringify({ data: [{ id: 'blocked/channel', name: 'Blocked' }] }), {
         status: 200,
@@ -219,7 +226,12 @@ try {
   assert.equal(models[0].id, 'deepseek/test');
   assert.equal(models.some((model) => model.id.startsWith('openrouter/')), false);
   assert.equal(models.some((model) => model.id === 'blocked/channel'), false);
-  assert.equal(modelCalls, 3);
+  // The aggregate listing plus the one channel that has its own route and is
+  // not blocked. deepseek-web used to be the third, which is what the poller's
+  // log was full of.
+  assert.equal(modelCalls, 2);
+  assert.equal(modelCallsByPath['/tokenharbor/v1/models'], 1);
+  assert.equal(modelCallsByPath['/deepseek-web/v1/models'], undefined);
   // The aggregate route answers in snake_case; reading only the camelCase
   // spelling silently downgraded every image-capable model to text-only.
   const listed = models.find((model) => model.id === 'deepseek/test');
@@ -262,12 +274,17 @@ try {
   assert.equal(blockedEvents[0].reason.kind, 'error');
   assert.equal(blockedEvents[0].reason.failure.code, 'CONFIG_DISABLED');
 
-  // A channel reached through its own base path has already had its prefix
-  // stripped by the time the block is checked, so the test has to run on the
-  // caller's id. Judged on `wireModel` it passed, and the channel stayed
-  // reachable behind a block that looked like it was holding.
+  // The block is judged on the caller's id, never on `wireModel`. Routing has
+  // already stripped the channel prefix, so a block tested against the wire
+  // spelling would let `deepseek-web/deepseek-chat` through as `deepseek-chat`
+  // and the channel would stay reachable behind a block that looked like it
+  // was holding.
   const dwResolved = await adapter.resolveModel('ai-proxy', 'deepseek-web/deepseek-chat');
-  assert.equal(dwResolved.wireModel, 'deepseek-chat', 'routing strips the prefix');
+  assert.equal(
+    dwResolved.wireModel,
+    'deepseek-chat',
+    'routing must still know how to address a blocked channel',
+  );
   const dwEvents = [];
   for await (const event of adapter.stream({
     model: dwResolved.id,
@@ -286,11 +303,12 @@ try {
     true,
     'a key-only channel still gets the key explanation',
   );
-  // Blocked rows found through the per-channel path are counted too, or the
-  // panel would report the roster as complete while withholding models. In this
-  // fixture that is 3 rows inside the aggregate listing (1 openrouter, 2 cnb)
-  // plus the 2 deepseek-web rows its own channel answers with.
-  assert.equal(adapter.blockedModelCount, 5);
+  // The withheld count describes rows that were actually seen and dropped: the
+  // 3 blocked rows inside the aggregate listing (1 openrouter, 2 cnb). A
+  // blocked channel that has its own route is never fetched at all, so it
+  // contributes nothing here — asking the proxy for a listing whose rows would
+  // all be discarded cost one request per poll for nothing.
+  assert.equal(adapter.blockedModelCount, 3);
   for (const prefix of ['deepseek-web/', 'cnb/', 'openrouter/']) {
     assert.equal(
       models.some((model) => model.id.startsWith(prefix)),
@@ -298,6 +316,14 @@ try {
       `${prefix} must not reach the roster`,
     );
   }
+  // deepseek-web is blocked *and* has its own route, so it must not be asked
+  // about at all. A poll that keeps requesting a channel the user switched off
+  // is the log noise this guards against.
+  assert.equal(
+    modelCallsByPath['/deepseek-web/v1/models'] ?? 0,
+    0,
+    'a blocked channel must not be polled',
+  );
   // A blocked channel must not come back under another channel's prefix: the
   // block is read off the first path segment, so a row whose *channel* is
   // blocked is withheld however many prefixes were stacked in front of it.
