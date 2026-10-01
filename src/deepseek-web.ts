@@ -14,10 +14,10 @@ import {
 import { handleDeepseekResponses } from "./deepseek-responses.ts";
 import {
   serializePrompt,
-  ToolCallStreamFilter,
-  TranscriptEchoGuard,
   type ToolCallRequest,
+  ToolCallStreamFilter,
   type ToolSchemaLike,
+  TranscriptEchoGuard,
 } from "../third_party/dsh-deepseek-web-login/src/protocol.ts";
 
 // ============================================
@@ -33,25 +33,53 @@ const DEEPSEEK_WEB_COOLDOWN_FILE = "./deepseek-web-cooldown.json";
 const DEEPSEEK_MAX_PROMPT_CHARS = 200_000;
 const DEEPSEEK_MAX_REF_IMAGES = 24;
 const DEEPSEEK_SESSION_REUSE_TURNS = (() => {
-  const raw = typeof Deno !== "undefined" ? Number(Deno.env.get("DEEPSEEK_SESSION_REUSE_TURNS") ?? "20") : 20;
+  const raw = typeof Deno !== "undefined"
+    ? Number(Deno.env.get("DEEPSEEK_SESSION_REUSE_TURNS") ?? "20")
+    : 20;
   return Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 20;
 })();
-type DeepSeekSessionSlot = { key: string; id: string; turns: number; cookies: string; auth: string };
+type DeepSeekSessionSlot = {
+  key: string;
+  id: string;
+  turns: number;
+  cookies: string;
+  auth: string;
+};
 let deepseekWebSessionSlot: DeepSeekSessionSlot | undefined;
-const deepseekWebState: any = { chatSessionId: null, cookies: "", mtime: null, auth: "", authMtime: null, headers: {}, headersMtime: null };
+const deepseekWebState: any = {
+  chatSessionId: null,
+  cookies: "",
+  mtime: null,
+  auth: "",
+  authMtime: null,
+  headers: {},
+  headersMtime: null,
+};
 
 function deepseekWebLoadCookies(): string {
   let st: Deno.FileInfo | null = null;
-  try { st = Deno.statSync(DEEPSEEK_WEB_COOKIE_FILE); } catch (e) { console.log("[deepseek-web] stat error:", e); return ""; }
-  if (!st?.isFile) { console.log("[deepseek-web] not a file"); return ""; }
+  try {
+    st = Deno.statSync(DEEPSEEK_WEB_COOKIE_FILE);
+  } catch (e) {
+    console.log("[deepseek-web] stat error:", e);
+    return "";
+  }
+  if (!st?.isFile) {
+    console.log("[deepseek-web] not a file");
+    return "";
+  }
   const mtime = st.mtime?.getTime() ?? 0;
   if (deepseekWebState.mtime === mtime) return deepseekWebState.cookies;
   let raw = "";
-  try { raw = Deno.readTextFileSync(DEEPSEEK_WEB_COOKIE_FILE).trim(); } catch {}
+  try {
+    raw = Deno.readTextFileSync(DEEPSEEK_WEB_COOKIE_FILE).trim();
+  } catch {}
   if (!raw) return "";
   // 支持 Netscape cookies.txt 格式
   if (raw.includes("\t")) {
-    raw = raw.split(String.fromCharCode(10)).filter((l) => l && l.includes("\t")).map((l) => {
+    raw = raw.split(String.fromCharCode(10)).filter((l) =>
+      l && l.includes("\t")
+    ).map((l) => {
       const c = l.split("\t");
       return c.length >= 7 ? c[5] + "=" + c[6] : "";
     }).filter(Boolean).join("; ");
@@ -69,7 +97,9 @@ function deepseekWebLoadAuth(): string {
     const mtime = st.mtime?.getTime() ?? 0;
     if (deepseekWebState.authMtime !== mtime) {
       const auth = Deno.readTextFileSync(DEEPSEEK_WEB_AUTH_FILE).trim();
-      if (auth && auth !== deepseekWebState.auth) deepseekWebState.chatSessionId = null;
+      if (auth && auth !== deepseekWebState.auth) {
+        deepseekWebState.chatSessionId = null;
+      }
       deepseekWebState.auth = auth;
       deepseekWebState.authMtime = mtime;
       console.log("[deepseek-web] loaded Bearer token from deepseek-auth.txt");
@@ -83,7 +113,12 @@ class DeepSeekWebError extends Error {
   retryAfterMs: number;
   kind: string;
 
-  constructor(message: string, status = 502, retryAfterMs = 0, kind = "upstream_error") {
+  constructor(
+    message: string,
+    status = 502,
+    retryAfterMs = 0,
+    kind = "upstream_error",
+  ) {
     super(message);
     this.name = "DeepSeekWebError";
     this.status = status;
@@ -100,54 +135,129 @@ function deepseekWebRetryAfterMs(value: string | null): number {
   return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : 0;
 }
 
-function deepseekWebHttpError(response: Response, text: string): DeepSeekWebError {
+function deepseekWebHttpError(
+  response: Response,
+  text: string,
+): DeepSeekWebError {
   const retry = deepseekWebRetryAfterMs(response.headers.get("retry-after"));
   const status = response.status;
-  const kind = status === 429 ? "rate_limit_exceeded" : (status === 401 || status === 403) ? "auth" : "upstream_error";
-  return new DeepSeekWebError(`DeepSeek HTTP ${status}: ${text.slice(0, 200)}`, status, retry, kind);
+  const kind = status === 429
+    ? "rate_limit_exceeded"
+    : (status === 401 || status === 403)
+    ? "auth"
+    : "upstream_error";
+  return new DeepSeekWebError(
+    `DeepSeek HTTP ${status}: ${text.slice(0, 200)}`,
+    status,
+    retry,
+    kind,
+  );
 }
 
 export function deepseekWebBusinessError(event: any): DeepSeekWebError | null {
-  const data = event?.data && typeof event.data === "object" ? event.data : event;
+  const data = event?.data && typeof event.data === "object"
+    ? event.data
+    : event;
   const outerCode = Number(event?.code ?? 0);
   const innerCode = Number(data?.biz_code ?? event?.biz_code ?? 0);
   const bizCode = outerCode !== 0 ? outerCode : innerCode;
-  const errorText = String(data?.biz_msg ?? data?.msg ?? event?.msg ?? event?.error?.message ?? "").trim();
-  const contentText = String(event?.content ?? event?.toast?.content ?? event?.toast?.message ?? "").trim();
+  const errorText = String(
+    data?.biz_msg ?? data?.msg ?? event?.msg ?? event?.error?.message ?? "",
+  ).trim();
+  const contentText = String(
+    event?.content ?? event?.toast?.content ?? event?.toast?.message ?? "",
+  ).trim();
   const message = errorText || contentText;
-  const hasErrorSignal = bizCode !== 0 || event?.type === "error" || event?.type === "toast" || Boolean(event?.error || event?.toast) || Boolean(errorText) || /invalid chat session/i.test(message);
+  const hasErrorSignal = bizCode !== 0 || event?.type === "error" ||
+    event?.type === "toast" || Boolean(event?.error || event?.toast) ||
+    Boolean(errorText) || /invalid chat session/i.test(message);
   if (bizCode === 0 && !message && !hasErrorSignal) return null;
   if (bizCode === 0 && data?.code === 0 && !hasErrorSignal) return null;
-  if (/invalid chat session/i.test(message)) return new DeepSeekWebError(message, 502, 0, "invalid_session");
-  if (bizCode === 40001 || bizCode === 40003) return new DeepSeekWebError(errorText || "DeepSeek authentication rejected", 403, 0, "auth");
-  if (bizCode === 429) return new DeepSeekWebError(errorText || "DeepSeek rate limited", 429, 30 * 60_000, "rate_limit_exceeded");
-  if (bizCode === 5 || /user is muted|account is muted|用户.*禁言|账号.*禁言/i.test(message)) {
-    const muteUntil = Number(data?.biz_data?.mute_until ?? data?.mute_until ?? 0);
-    const retryAfterMs = Number.isFinite(muteUntil) && muteUntil > Date.now() / 1000
-      ? Math.max(60_000, Math.ceil((muteUntil * 1000) - Date.now()))
-      : 2 * 60 * 60_000;
-    return new DeepSeekWebError(message || "DeepSeek account is muted", 429, retryAfterMs, "rate_limit_exceeded");
+  if (/invalid chat session/i.test(message)) {
+    return new DeepSeekWebError(message, 502, 0, "invalid_session");
   }
-  const classificationText = event?.type === "error" || event?.type === "toast" ? message : errorText;
-  if (/being generated|busy/i.test(classificationText)) return new DeepSeekWebError(classificationText, 429, 5_000, "busy");
-  if (/too frequent|too many|throttl|频繁|quota/i.test(classificationText)) return new DeepSeekWebError(classificationText, 429, 30_000, "rate_limit_exceeded");
-  if (hasErrorSignal) return new DeepSeekWebError(message || "DeepSeek stream error", 502, 0, "upstream_error");
+  if (bizCode === 40001 || bizCode === 40003) {
+    return new DeepSeekWebError(
+      errorText || "DeepSeek authentication rejected",
+      403,
+      0,
+      "auth",
+    );
+  }
+  if (bizCode === 429) {
+    return new DeepSeekWebError(
+      errorText || "DeepSeek rate limited",
+      429,
+      30 * 60_000,
+      "rate_limit_exceeded",
+    );
+  }
+  if (
+    bizCode === 5 ||
+    /user is muted|account is muted|用户.*禁言|账号.*禁言/i.test(message)
+  ) {
+    const muteUntil = Number(
+      data?.biz_data?.mute_until ?? data?.mute_until ?? 0,
+    );
+    const retryAfterMs =
+      Number.isFinite(muteUntil) && muteUntil > Date.now() / 1000
+        ? Math.max(60_000, Math.ceil((muteUntil * 1000) - Date.now()))
+        : 2 * 60 * 60_000;
+    return new DeepSeekWebError(
+      message || "DeepSeek account is muted",
+      429,
+      retryAfterMs,
+      "rate_limit_exceeded",
+    );
+  }
+  const classificationText = event?.type === "error" || event?.type === "toast"
+    ? message
+    : errorText;
+  if (/being generated|busy/i.test(classificationText)) {
+    return new DeepSeekWebError(classificationText, 429, 5_000, "busy");
+  }
+  if (/too frequent|too many|throttl|频繁|quota/i.test(classificationText)) {
+    return new DeepSeekWebError(
+      classificationText,
+      429,
+      30_000,
+      "rate_limit_exceeded",
+    );
+  }
+  if (hasErrorSignal) {
+    return new DeepSeekWebError(
+      message || "DeepSeek stream error",
+      502,
+      0,
+      "upstream_error",
+    );
+  }
   return null;
 }
 
-const DEEPSEEK_FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const DEEPSEEK_FALLBACK_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 function deepseekWebRequestHeaders(
   cookies: string,
   auth: string,
-  options: { pow?: string; referer?: string; accept?: string; json?: boolean } = {},
+  options: { pow?: string; referer?: string; accept?: string; json?: boolean } =
+    {},
 ): Headers {
   const headers = new Headers();
   const captured = deepseekWebLoadHeaders();
-  for (const [name, value] of Object.entries(captured)) headers.set(name, value);
-  if (!headers.has("user-agent")) headers.set("user-agent", DEEPSEEK_FALLBACK_UA);
-  if (!headers.has("accept-language")) headers.set("accept-language", "zh-CN,zh;q=0.9,en;q=0.8");
-  if (!headers.has("x-client-platform")) headers.set("x-client-platform", "web");
+  for (const [name, value] of Object.entries(captured)) {
+    headers.set(name, value);
+  }
+  if (!headers.has("user-agent")) {
+    headers.set("user-agent", DEEPSEEK_FALLBACK_UA);
+  }
+  if (!headers.has("accept-language")) {
+    headers.set("accept-language", "zh-CN,zh;q=0.9,en;q=0.8");
+  }
+  if (!headers.has("x-client-platform")) {
+    headers.set("x-client-platform", "web");
+  }
   if (options.accept) headers.set("accept", options.accept);
   if (options.json) headers.set("content-type", "application/json");
   if (options.pow) headers.set("x-ds-pow-response", options.pow);
@@ -164,10 +274,24 @@ function deepseekWebLoadHeaders(): Record<string, string> {
     if (!st.isFile) return deepseekWebState.headers || {};
     const mtime = st.mtime?.getTime() ?? 0;
     if (deepseekWebState.headersMtime !== mtime) {
-      const parsed = safeJsonParse(Deno.readTextFileSync(DEEPSEEK_WEB_HEADERS_FILE));
-      const allowed = ["x-hif-dliq", "x-hif-leim", "x-client-platform", "x-client-version", "x-app-version", "accept-language", "user-agent"];
+      const parsed = safeJsonParse(
+        Deno.readTextFileSync(DEEPSEEK_WEB_HEADERS_FILE),
+      );
+      const allowed = [
+        "x-hif-dliq",
+        "x-hif-leim",
+        "x-client-platform",
+        "x-client-version",
+        "x-app-version",
+        "accept-language",
+        "user-agent",
+      ];
       const source = parsed.error ? {} : (parsed.data || {});
-      deepseekWebState.headers = Object.fromEntries(allowed.filter((key) => typeof source[key] === "string").map((key) => [key, source[key]]));
+      deepseekWebState.headers = Object.fromEntries(
+        allowed.filter((key) => typeof source[key] === "string").map((
+          key,
+        ) => [key, source[key]]),
+      );
       deepseekWebState.headersMtime = mtime;
     }
   } catch {}
@@ -176,7 +300,9 @@ function deepseekWebLoadHeaders(): Record<string, string> {
 
 let deepseekWasmExports: any = null;
 
-async function deepseekSolvePow(challenge: DeepSeekPowChallenge): Promise<number> {
+async function deepseekSolvePow(
+  challenge: DeepSeekPowChallenge,
+): Promise<number> {
   if (!deepseekWasmExports) {
     const bytes = await Deno.readFile("./deepseek-sha3.wasm");
     const module = await WebAssembly.instantiate(bytes, {});
@@ -193,8 +319,17 @@ async function deepseekSolvePow(challenge: DeepSeekPowChallenge): Promise<number
   const stack = wasm.__wbindgen_add_to_stack_pointer(-16);
   try {
     const target = alloc(challenge.challenge);
-    const prefix = alloc(`${challenge.salt}_${challenge.expireAt ?? challenge.expire_at}_`);
-    wasm.wasm_solve(stack, target.ptr, target.len, prefix.ptr, prefix.len, challenge.difficulty);
+    const prefix = alloc(
+      `${challenge.salt}_${challenge.expireAt ?? challenge.expire_at}_`,
+    );
+    wasm.wasm_solve(
+      stack,
+      target.ptr,
+      target.len,
+      prefix.ptr,
+      prefix.len,
+      challenge.difficulty,
+    );
     const view = new DataView(wasm.memory.buffer);
     if (view.getInt32(stack, true) === 0) return -1;
     return view.getFloat64(stack + 8, true);
@@ -213,24 +348,55 @@ type DeepSeekPowChallenge = {
   expireAt?: number;
 };
 
-async function deepseekWebCreatePow(cookies: string, auth: string, targetPath: string): Promise<string> {
-  const r = await fetch(DEEPSEEK_WEB_API + "/api/v0/chat/create_pow_challenge", {
-    method: "POST",
-    headers: deepseekWebRequestHeaders(cookies, auth, { json: true, referer: DEEPSEEK_WEB_HOME }),
-    body: JSON.stringify({ target_path: targetPath }),
-  });
+async function deepseekWebCreatePow(
+  cookies: string,
+  auth: string,
+  targetPath: string,
+): Promise<string> {
+  const r = await fetch(
+    DEEPSEEK_WEB_API + "/api/v0/chat/create_pow_challenge",
+    {
+      method: "POST",
+      headers: deepseekWebRequestHeaders(cookies, auth, {
+        json: true,
+        referer: DEEPSEEK_WEB_HOME,
+      }),
+      body: JSON.stringify({ target_path: targetPath }),
+    },
+  );
   const text = await r.text();
   if (!r.ok) throw deepseekWebHttpError(r, text);
   const json = safeJsonParse(text);
-  if (json.error) throw new DeepSeekWebError("create PoW challenge failed: " + text.slice(0, 300), 502, 0, "upstream_error");
+  if (json.error) {
+    throw new DeepSeekWebError(
+      "create PoW challenge failed: " + text.slice(0, 300),
+      502,
+      0,
+      "upstream_error",
+    );
+  }
   const businessError = deepseekWebBusinessError(json);
   if (businessError) throw businessError;
-  if (!json.data) throw new DeepSeekWebError("create PoW challenge failed: " + text.slice(0, 300), 502, 0, "upstream_error");
-  const challenge = json.data.data?.biz_data?.challenge as DeepSeekPowChallenge | undefined;
-  if (!challenge || challenge.algorithm !== "DeepSeekHashV1") {
-    throw new Error("unsupported DeepSeek PoW challenge: " + text.slice(0, 300));
+  if (!json.data) {
+    throw new DeepSeekWebError(
+      "create PoW challenge failed: " + text.slice(0, 300),
+      502,
+      0,
+      "upstream_error",
+    );
   }
-  if (!Number.isSafeInteger(challenge.difficulty) || challenge.difficulty <= 0 || challenge.difficulty > 5_000_000) {
+  const challenge = json.data.data?.biz_data?.challenge as
+    | DeepSeekPowChallenge
+    | undefined;
+  if (!challenge || challenge.algorithm !== "DeepSeekHashV1") {
+    throw new Error(
+      "unsupported DeepSeek PoW challenge: " + text.slice(0, 300),
+    );
+  }
+  if (
+    !Number.isSafeInteger(challenge.difficulty) || challenge.difficulty <= 0 ||
+    challenge.difficulty > 5_000_000
+  ) {
     throw new Error("invalid DeepSeek PoW difficulty");
   }
   const answer = await deepseekSolvePow(challenge);
@@ -246,11 +412,18 @@ async function deepseekWebCreatePow(cookies: string, auth: string, targetPath: s
   return btoa(payload);
 }
 
-async function deepseekWebDeleteSession(cookies: string, auth: string, chatSessionId: string): Promise<void> {
+async function deepseekWebDeleteSession(
+  cookies: string,
+  auth: string,
+  chatSessionId: string,
+): Promise<void> {
   try {
     await fetch(DEEPSEEK_WEB_API + "/api/v0/chat_session/delete", {
       method: "POST",
-      headers: deepseekWebRequestHeaders(cookies, auth, { json: true, referer: DEEPSEEK_WEB_HOME }),
+      headers: deepseekWebRequestHeaders(cookies, auth, {
+        json: true,
+        referer: DEEPSEEK_WEB_HOME,
+      }),
       body: JSON.stringify({ chat_session_id: chatSessionId }),
     });
   } catch {
@@ -269,12 +442,20 @@ function deepseekWebAccountKey(cookies: string, auth: string): string {
 }
 
 function deepseekWebRetireSession(sessionId?: string): void {
-  if (!sessionId || deepseekWebSessionSlot?.id === sessionId) deepseekWebSessionSlot = undefined;
+  if (!sessionId || deepseekWebSessionSlot?.id === sessionId) {
+    deepseekWebSessionSlot = undefined;
+  }
 }
 
-async function deepseekWebLeaseSession(cookies: string, auth: string): Promise<{ id: string; reused: boolean }> {
+async function deepseekWebLeaseSession(
+  cookies: string,
+  auth: string,
+): Promise<{ id: string; reused: boolean }> {
   const key = deepseekWebAccountKey(cookies, auth);
-  if (DEEPSEEK_SESSION_REUSE_TURNS > 0 && deepseekWebSessionSlot?.key === key && deepseekWebSessionSlot.turns < DEEPSEEK_SESSION_REUSE_TURNS) {
+  if (
+    DEEPSEEK_SESSION_REUSE_TURNS > 0 && deepseekWebSessionSlot?.key === key &&
+    deepseekWebSessionSlot.turns < DEEPSEEK_SESSION_REUSE_TURNS
+  ) {
     deepseekWebSessionSlot.turns += 1;
     return { id: deepseekWebSessionSlot.id, reused: true };
   }
@@ -284,7 +465,13 @@ async function deepseekWebLeaseSession(cookies: string, auth: string): Promise<{
     deepseekWebSessionSlot = { key, id, turns: 1, cookies, auth };
     if (previous) {
       const delay = 60_000 + Math.floor(Math.random() * 60_000);
-      setTimeout(() => { void deepseekWebDeleteSession(previous.cookies, previous.auth, previous.id); }, delay);
+      setTimeout(() => {
+        void deepseekWebDeleteSession(
+          previous.cookies,
+          previous.auth,
+          previous.id,
+        );
+      }, delay);
     }
   } else {
     deepseekWebSessionSlot = undefined;
@@ -301,7 +488,9 @@ function deepseekWebCollectImages(messages: any[]): DeepSeekWebImage[] {
     const content = Array.isArray(message?.content) ? message.content : [];
     for (const part of content) {
       if (part?.type !== "image_url") continue;
-      const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+      const url = typeof part.image_url === "string"
+        ? part.image_url
+        : part.image_url?.url;
       if (typeof url !== "string" || !url.startsWith("data:image/")) continue;
       const match = url.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
       if (!match || seen.has(url)) continue;
@@ -310,34 +499,63 @@ function deepseekWebCollectImages(messages: any[]): DeepSeekWebImage[] {
         const binary = atob(match[2]);
         const data = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
-        images.push({ data, mediaType: match[1], name: `image-${images.length + 1}.${match[1].split("/")[1] || "png"}` });
+        images.push({
+          data,
+          mediaType: match[1],
+          name: `image-${images.length + 1}.${match[1].split("/")[1] || "png"}`,
+        });
       } catch {
         // 非法 base64 由上层返回明确错误。
       }
     }
   }
-  if (images.length > DEEPSEEK_MAX_REF_IMAGES) throw new Error(`DeepSeek accepts at most ${DEEPSEEK_MAX_REF_IMAGES} images per request`);
+  if (images.length > DEEPSEEK_MAX_REF_IMAGES) {
+    throw new Error(
+      `DeepSeek accepts at most ${DEEPSEEK_MAX_REF_IMAGES} images per request`,
+    );
+  }
   return images;
 }
 
-async function deepseekWebUploadImage(cookies: string, auth: string, image: DeepSeekWebImage): Promise<string> {
+async function deepseekWebUploadImage(
+  cookies: string,
+  auth: string,
+  image: DeepSeekWebImage,
+): Promise<string> {
   const targetPath = "/api/v0/file/upload_file";
   const powHeader = await deepseekWebCreatePow(cookies, auth, targetPath);
   const form = new FormData();
-  form.append("file", new Blob([image.data as unknown as BlobPart], { type: image.mediaType }), image.name);
+  form.append(
+    "file",
+    new Blob([image.data as unknown as BlobPart], { type: image.mediaType }),
+    image.name,
+  );
   const r = await fetch(DEEPSEEK_WEB_API + targetPath, {
     method: "POST",
-    headers: deepseekWebRequestHeaders(cookies, auth, { pow: powHeader, referer: DEEPSEEK_WEB_HOME, accept: "application/json, text/plain, */*" }),
+    headers: deepseekWebRequestHeaders(cookies, auth, {
+      pow: powHeader,
+      referer: DEEPSEEK_WEB_HOME,
+      accept: "application/json, text/plain, */*",
+    }),
     body: form,
   });
   const text = await r.text();
   if (!r.ok) throw deepseekWebHttpError(r, text);
   const json = safeJsonParse(text);
-  if (json.error) throw new Error(`image upload returned invalid JSON: ${json.error.message}`);
+  if (json.error) {
+    throw new Error(
+      `image upload returned invalid JSON: ${json.error.message}`,
+    );
+  }
   const businessError = deepseekWebBusinessError(json);
   if (businessError) throw businessError;
-  const id = json.data?.data?.biz_data?.id ?? json.data?.data?.id ?? json.data?.biz_data?.id ?? json.data?.id;
-  if (typeof id !== "string" || !id) throw new Error(`image upload did not return file id: ${text.slice(0, 300)}`);
+  const id = json.data?.data?.biz_data?.id ?? json.data?.data?.id ??
+    json.data?.biz_data?.id ?? json.data?.id;
+  if (typeof id !== "string" || !id) {
+    throw new Error(
+      `image upload did not return file id: ${text.slice(0, 300)}`,
+    );
+  }
   return id;
 }
 
@@ -356,12 +574,24 @@ function deepseekWebTools(tools: any): ToolSchemaLike[] {
 function deepseekWebProtocolMessages(messages: any[]): any[] {
   return messages.map((message: any) => {
     let content = message?.content;
-    if (typeof content === "string") content = [{ type: "text", text: content }];
-    if (!Array.isArray(content)) content = [{ type: "text", text: content == null ? "" : String(content) }];
+    if (typeof content === "string") {
+      content = [{ type: "text", text: content }];
+    }
+    if (!Array.isArray(content)) {
+      content = [{
+        type: "text",
+        text: content == null ? "" : String(content),
+      }];
+    }
     content = content.map((part: any) => {
       if (part?.type !== "image_url") return part;
-      const url = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
-      return { type: "image", attachment: { attachmentId: String(url || "image").slice(0, 256) } };
+      const url = typeof part.image_url === "string"
+        ? part.image_url
+        : part.image_url?.url;
+      return {
+        type: "image",
+        attachment: { attachmentId: String(url || "image").slice(0, 256) },
+      };
     });
     if (Array.isArray(message?.tool_calls)) {
       content = content.concat(message.tool_calls.map((call: any) => ({
@@ -371,28 +601,50 @@ function deepseekWebProtocolMessages(messages: any[]): any[] {
       })));
     }
     if (message?.role === "tool") {
-      content = [{ type: "tool-result", toolCallId: message.tool_call_id, content }];
+      content = [{
+        type: "tool-result",
+        toolCallId: message.tool_call_id,
+        content,
+      }];
     }
-    return { role: message?.role === "tool" ? "user" : (message?.role || "user"), content };
+    return {
+      role: message?.role === "tool" ? "user" : (message?.role || "user"),
+      content,
+    };
   });
 }
 
-function deepseekWebBuildPrompt(messages: any[], tools: any, reasoningEffort = "high"): string {
+function deepseekWebBuildPrompt(
+  messages: any[],
+  tools: any,
+  reasoningEffort = "high",
+): string {
   const toolSchemas = deepseekWebTools(tools);
   const prompt = serializePrompt({
-    system: `Reasoning effort: ${reasoningEffort}. Use the requested effort level, but never expose private reasoning in the answer.`,
+    system:
+      `Reasoning effort: ${reasoningEffort}. Use the requested effort level, but never expose private reasoning in the answer.`,
     messages: deepseekWebProtocolMessages(messages),
     tools: toolSchemas,
     maxChars: DEEPSEEK_MAX_PROMPT_CHARS,
   });
-  if (prompt.length > DEEPSEEK_MAX_PROMPT_CHARS) throw new Error(`DeepSeek prompt exceeds ${DEEPSEEK_MAX_PROMPT_CHARS} characters`);
+  if (prompt.length > DEEPSEEK_MAX_PROMPT_CHARS) {
+    throw new Error(
+      `DeepSeek prompt exceeds ${DEEPSEEK_MAX_PROMPT_CHARS} characters`,
+    );
+  }
   return prompt;
 }
 
-async function deepseekWebCreateSession(cookies: string, auth: string): Promise<string> {
+async function deepseekWebCreateSession(
+  cookies: string,
+  auth: string,
+): Promise<string> {
   const r = await fetch(DEEPSEEK_WEB_API + "/api/v0/chat_session/create", {
     method: "POST",
-    headers: deepseekWebRequestHeaders(cookies, auth, { json: true, referer: DEEPSEEK_WEB_HOME }),
+    headers: deepseekWebRequestHeaders(cookies, auth, {
+      json: true,
+      referer: DEEPSEEK_WEB_HOME,
+    }),
     body: "{}",
   });
   const text = await r.text();
@@ -400,16 +652,27 @@ async function deepseekWebCreateSession(cookies: string, auth: string): Promise<
   const json = JSON.parse(text);
   const businessError = deepseekWebBusinessError(json);
   if (businessError) throw businessError;
-  const sessionId = json.data?.biz_data?.id ?? json.data?.biz_data?.chat_session?.id;
+  const sessionId = json.data?.biz_data?.id ??
+    json.data?.biz_data?.chat_session?.id;
   if (json.code !== 0 || typeof sessionId !== "string" || !sessionId) {
-    throw new DeepSeekWebError("create session bad response: " + text.slice(0, 300), 502, 0, "upstream_error");
+    throw new DeepSeekWebError(
+      "create session bad response: " + text.slice(0, 300),
+      502,
+      0,
+      "upstream_error",
+    );
   }
   return sessionId;
 }
 
-function deepseekWebExtractToolCalls(content: string, tools: any): { content: string; toolCalls: ToolCallRequest[] } {
+function deepseekWebExtractToolCalls(
+  content: string,
+  tools: any,
+): { content: string; toolCalls: ToolCallRequest[] } {
   const knownTools = new Set(deepseekWebTools(tools).map((tool) => tool.name));
-  const filter = new ToolCallStreamFilter(knownTools.size ? knownTools : undefined);
+  const filter = new ToolCallStreamFilter(
+    knownTools.size ? knownTools : undefined,
+  );
   const first = filter.push(content);
   const last = filter.flush();
   return {
@@ -418,13 +681,23 @@ function deepseekWebExtractToolCalls(content: string, tools: any): { content: st
   };
 }
 
-function deepseekWebParseChatResponse(text: string, tools: any): { content: string; toolCalls: ToolCallRequest[] } {
+function deepseekWebParseChatResponse(
+  text: string,
+  tools: any,
+): { content: string; toolCalls: ToolCallRequest[] } {
   const trimmed = text.trim();
   if (trimmed.startsWith("{")) {
     const json = safeJsonParse(trimmed);
-    if (json.error) throw new Error("invalid DeepSeek chat response: " + json.error.message);
-    if (json.data?.code && json.data.code !== 0) throw new Error("DeepSeek chat error: " + trimmed.slice(0, 300));
-    return deepseekWebExtractToolCalls(String(json.data?.data?.biz_data?.content || ""), tools);
+    if (json.error) {
+      throw new Error("invalid DeepSeek chat response: " + json.error.message);
+    }
+    if (json.data?.code && json.data.code !== 0) {
+      throw new Error("DeepSeek chat error: " + trimmed.slice(0, 300));
+    }
+    return deepseekWebExtractToolCalls(
+      String(json.data?.data?.biz_data?.content || ""),
+      tools,
+    );
   }
   let content = "";
   let lastResponseFragmentId: string | null = null;
@@ -436,7 +709,10 @@ function deepseekWebParseChatResponse(text: string, tools: any): { content: stri
     const parsed = safeJsonParse(raw);
     if (parsed.error || !parsed.data) continue;
     const event = parsed.data;
-    if (event.p === "response/fragments" && event.o === "APPEND" && Array.isArray(event.v)) {
+    if (
+      event.p === "response/fragments" && event.o === "APPEND" &&
+      Array.isArray(event.v)
+    ) {
       for (const fragment of event.v) {
         if (fragment?.type !== "RESPONSE") continue;
         if (fragment.id != null) {
@@ -448,18 +724,26 @@ function deepseekWebParseChatResponse(text: string, tools: any): { content: stri
       }
       continue;
     }
-    if (event.p === "response/fragments/-1/content" && typeof event.v === "string" && lastResponseFragmentId !== null) {
+    if (
+      event.p === "response/fragments/-1/content" &&
+      typeof event.v === "string" && lastResponseFragmentId !== null
+    ) {
       content += event.v;
       continue;
     }
     if (typeof event.p === "string") {
       const match = event.p.match(/^response\/fragments\/([^/]+)\/content$/);
-      if (match && responseFragmentIds.has(match[1]) && typeof event.v === "string") content += event.v;
+      if (
+        match && responseFragmentIds.has(match[1]) &&
+        typeof event.v === "string"
+      ) content += event.v;
       continue;
     }
     // 新版网页端会用无 path 的 data: {"v":"..."} 续写最后一个 RESPONSE fragment。
     // 在 RESPONSE fragment 已建立后才接收，避免把 THINK 的前导续段误算进正文。
-    if (!event.p && lastResponseFragmentId !== null && typeof event.v === "string") content += event.v;
+    if (
+      !event.p && lastResponseFragmentId !== null && typeof event.v === "string"
+    ) content += event.v;
   }
   return deepseekWebExtractToolCalls(content, tools);
 }
@@ -476,7 +760,9 @@ function estimateDeepSeekTokens(text: string): number {
 
 type DeepSeekStreamEvent = { type: "thinking" | "text"; content: string };
 
-async function* deepseekWebReadEvents(response: Response): AsyncGenerator<DeepSeekStreamEvent> {
+async function* deepseekWebReadEvents(
+  response: Response,
+): AsyncGenerator<DeepSeekStreamEvent> {
   if (!response.body) return;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -487,7 +773,10 @@ async function* deepseekWebReadEvents(response: Response): AsyncGenerator<DeepSe
   let responseText = "";
   const responseIds = new Set<string>();
 
-  const append = (type: "thinking" | "text", value: string): DeepSeekStreamEvent[] => {
+  const append = (
+    type: "thinking" | "text",
+    value: string,
+  ): DeepSeekStreamEvent[] => {
     if (!value) return [];
     if (type === "thinking") thinkingText += value;
     else responseText += value;
@@ -509,7 +798,8 @@ async function* deepseekWebReadEvents(response: Response): AsyncGenerator<DeepSe
     if (!raw || raw === "[DONE]") return [];
     const parsed = safeJsonParse(raw);
     if (parsed.error || !parsed.data) return [];
-    const event = parsed.data && typeof parsed.data === "object" && eventName && !parsed.data.type
+    const event = parsed.data && typeof parsed.data === "object" && eventName &&
+        !parsed.data.type
       ? { ...parsed.data, type: eventName }
       : parsed.data;
     eventName = "";
@@ -522,12 +812,18 @@ async function* deepseekWebReadEvents(response: Response): AsyncGenerator<DeepSe
       for (const fragment of snapshot.fragments) {
         if (fragment?.type === "THINK" || fragment?.type === "REASONING") {
           sink = "thinking";
-          const delta = snapshotDelta(thinkingText, String(fragment.content || ""));
+          const delta = snapshotDelta(
+            thinkingText,
+            String(fragment.content || ""),
+          );
           out.push(...append("thinking", delta));
         } else if (fragment?.type === "RESPONSE") {
           sink = "text";
           if (fragment.id != null) responseIds.add(String(fragment.id));
-          const delta = snapshotDelta(responseText, String(fragment.content || ""));
+          const delta = snapshotDelta(
+            responseText,
+            String(fragment.content || ""),
+          );
           out.push(...append("text", delta));
         }
       }
@@ -536,21 +832,29 @@ async function* deepseekWebReadEvents(response: Response): AsyncGenerator<DeepSe
     if (event?.p === "response/fragments" && event?.o === "APPEND") {
       const fragments = Array.isArray(event.v) ? event.v : [event.v];
       for (const fragment of fragments) {
-        if (fragment?.type === "THINK" || fragment?.type === "REASONING") out.push(...append("thinking", String(fragment.content || "")));
-        else if (fragment?.type === "RESPONSE") {
+        if (fragment?.type === "THINK" || fragment?.type === "REASONING") {
+          out.push(...append("thinking", String(fragment.content || "")));
+        } else if (fragment?.type === "RESPONSE") {
           if (fragment.id != null) responseIds.add(String(fragment.id));
           out.push(...append("text", String(fragment.content || "")));
         }
       }
-    } else if (event?.p === "response/fragments/-1/content" && typeof event.v === "string") {
+    } else if (
+      event?.p === "response/fragments/-1/content" &&
+      typeof event.v === "string"
+    ) {
       out.push(...append(sink || "text", event.v));
-    } else if (event?.p === "response/thinking_content" && typeof event.v === "string") {
+    } else if (
+      event?.p === "response/thinking_content" && typeof event.v === "string"
+    ) {
       out.push(...append("thinking", event.v));
     } else if (event?.p === "response/content" && typeof event.v === "string") {
       out.push(...append("text", event.v));
     } else if (typeof event?.p === "string" && typeof event.v === "string") {
       const match = event.p.match(/^response\/fragments\/([^/]+)\/content$/);
-      if (match && responseIds.has(match[1])) out.push(...append("text", event.v));
+      if (match && responseIds.has(match[1])) {
+        out.push(...append("text", event.v));
+      }
     } else if (!event?.p && typeof event?.v === "string" && sink) {
       out.push(...append(sink, event.v));
     }
@@ -572,17 +876,32 @@ async function* deepseekWebReadEvents(response: Response): AsyncGenerator<DeepSe
     buffer += decoder.decode();
     for (const item of handleLine(buffer.replace(/\r$/, ""))) yield item;
   } finally {
-    try { reader.releaseLock(); } catch { /* ignore */ }
+    try {
+      reader.releaseLock();
+    } catch { /* ignore */ }
   }
 }
 
 async function deepseekWebProcess(
   response: Response,
   tools: any,
-  callbacks: { onThinking?: (content: string) => void; onText?: (output: any) => void } = {},
-): Promise<{ content: string; thinkingContent: string; toolCalls: ToolCallRequest[]; sawThinking: boolean; sawText: boolean }> {
+  callbacks: {
+    onThinking?: (content: string) => void;
+    onText?: (output: any) => void;
+  } = {},
+): Promise<
+  {
+    content: string;
+    thinkingContent: string;
+    toolCalls: ToolCallRequest[];
+    sawThinking: boolean;
+    sawText: boolean;
+  }
+> {
   const knownTools = new Set(deepseekWebTools(tools).map((tool) => tool.name));
-  const filter = new ToolCallStreamFilter(knownTools.size ? knownTools : undefined);
+  const filter = new ToolCallStreamFilter(
+    knownTools.size ? knownTools : undefined,
+  );
   const echoGuard = new TranscriptEchoGuard();
   let content = "";
   let thinkingContent = "";
@@ -627,31 +946,66 @@ function deepseekWebOpenAIStream(
       const id = "chatcmpl-" + Math.random().toString(36).slice(2);
       const created = Math.floor(Date.now() / 1000);
       let sentRole = false;
-      const send = (delta: any, finish: string | null = null, extra: any = {}) => {
-        const payload = { id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: finish }], ...extra };
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+      const send = (
+        delta: any,
+        finish: string | null = null,
+        extra: any = {},
+      ) => {
+        const payload = {
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model,
+          choices: [{ index: 0, delta, finish_reason: finish }],
+          ...extra,
+        };
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify(payload)}\n\n`),
+        );
       };
       let completed = false;
       try {
         const result = await deepseekWebProcess(response, tools, {
           onThinking: (content) => {
-            if (!sentRole) { send({ role: "assistant", content: "" }); sentRole = true; }
+            if (!sentRole) {
+              send({ role: "assistant", content: "" });
+              sentRole = true;
+            }
             send({ reasoning_content: content });
           },
           onText: (output) => {
             if (output.text) {
-              if (!sentRole) { send({ role: "assistant", content: "" }); sentRole = true; }
+              if (!sentRole) {
+                send({ role: "assistant", content: "" });
+                sentRole = true;
+              }
               send({ content: output.text });
             }
             for (const call of output.calls) {
-              if (!sentRole) { send({ role: "assistant", content: "" }); sentRole = true; }
-              send({ tool_calls: [{ index: 0, id: call.id, type: "function", function: { name: call.name, arguments: call.arguments } }] });
+              if (!sentRole) {
+                send({ role: "assistant", content: "" });
+                sentRole = true;
+              }
+              send({
+                tool_calls: [{
+                  index: 0,
+                  id: call.id,
+                  type: "function",
+                  function: { name: call.name, arguments: call.arguments },
+                }],
+              });
             }
           },
         });
         noteDeepSeekSuccess();
-        const finish = result.toolCalls.length ? "tool_calls" : result.sawText ? "stop" : "length";
-        const completionTokens = estimateDeepSeekTokens(result.content + result.thinkingContent);
+        const finish = result.toolCalls.length
+          ? "tool_calls"
+          : result.sawText
+          ? "stop"
+          : "length";
+        const completionTokens = estimateDeepSeekTokens(
+          result.content + result.thinkingContent,
+        );
         const usage = {
           prompt_tokens: estimateDeepSeekTokens(prompt),
           completion_tokens: completionTokens,
@@ -661,9 +1015,16 @@ function deepseekWebOpenAIStream(
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         completed = true;
       } catch (error: any) {
-        if (error instanceof DeepSeekWebError) deepseekWebTripCircuit(error.message, error.retryAfterMs, error.kind);
+        if (error instanceof DeepSeekWebError) {
+          deepseekWebTripCircuit(error.message, error.retryAfterMs, error.kind);
+        }
         try {
-          send({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }, "error");
+          send({
+            error: {
+              message: String(error?.message || error),
+              type: error?.kind || "upstream_error",
+            },
+          }, "error");
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         } catch {
           // 客户端可能已经取消；清理必须继续执行。
@@ -672,14 +1033,24 @@ function deepseekWebOpenAIStream(
         try {
           await cleanup(!completed);
         } finally {
-          try { controller.close(); } catch { /* 客户端已取消 */ }
+          try {
+            controller.close();
+          } catch { /* 客户端已取消 */ }
         }
       }
     },
   });
 }
 
-async function deepseekWebChat(cookies: string, auth: string, chatSessionId: string, prompt: string, model: string, thinkingEnabled: boolean, refFileIds: string[]): Promise<Response> {
+async function deepseekWebChat(
+  cookies: string,
+  auth: string,
+  chatSessionId: string,
+  prompt: string,
+  model: string,
+  thinkingEnabled: boolean,
+  refFileIds: string[],
+): Promise<Response> {
   const body = JSON.stringify({
     chat_session_id: chatSessionId,
     parent_message_id: null,
@@ -691,7 +1062,11 @@ async function deepseekWebChat(cookies: string, auth: string, chatSessionId: str
     action: null,
     preempt: false,
   });
-  const powHeader = await deepseekWebCreatePow(cookies, auth, "/api/v0/chat/completion");
+  const powHeader = await deepseekWebCreatePow(
+    cookies,
+    auth,
+    "/api/v0/chat/completion",
+  );
   const r = await fetch(DEEPSEEK_WEB_API + "/api/v0/chat/completion", {
     method: "POST",
     headers: deepseekWebRequestHeaders(cookies, auth, {
@@ -720,18 +1095,48 @@ async function deepseekWebChat(cookies: string, auth: string, chatSessionId: str
   }
   const text = await readInspectedText(inspected);
   const parsed = safeJsonParse(text);
-  if (parsed.error) throw new DeepSeekWebError(`DeepSeek non-SSE response: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
+  if (parsed.error) {
+    throw new DeepSeekWebError(
+      `DeepSeek non-SSE response: ${text.slice(0, 300)}`,
+      502,
+      0,
+      "upstream_error",
+    );
+  }
   const envelope = parsed.data?.data ? parsed.data : parsed;
   const businessError = deepseekWebBusinessError(envelope);
   if (businessError) throw businessError;
-  const content = String(envelope?.data?.biz_data?.content ?? envelope?.biz_data?.content ?? "");
-  if (!content) throw new DeepSeekWebError(`DeepSeek non-SSE response did not contain content: ${text.slice(0, 300)}`, 502, 0, "upstream_error");
+  const content = String(
+    envelope?.data?.biz_data?.content ?? envelope?.biz_data?.content ?? "",
+  );
+  if (!content) {
+    throw new DeepSeekWebError(
+      `DeepSeek non-SSE response did not contain content: ${
+        text.slice(0, 300)
+      }`,
+      502,
+      0,
+      "upstream_error",
+    );
+  }
   const sse = [
-    `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content }, finish_reason: null }] })}\n\n`,
-    `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } })}\n\n`,
+    `data: ${
+      JSON.stringify({
+        choices: [{ index: 0, delta: { content }, finish_reason: null }],
+      })
+    }\n\n`,
+    `data: ${
+      JSON.stringify({
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+      })
+    }\n\n`,
     "data: [DONE]\n\n",
   ].join("");
-  return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+  return new Response(sse, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
 }
 
 function deepseekWebRiskHeaders(): Record<string, string> {
@@ -748,43 +1153,85 @@ function deepseekWebLoadCooldown(): number {
   if (deepseekWebBlockedUntil > Date.now()) return deepseekWebBlockedUntil;
   if (deepseekWebBlockedUntil > 0) deepseekWebBlockedUntil = 0;
   try {
-    const parsed = safeJsonParse(Deno.readTextFileSync(DEEPSEEK_WEB_COOLDOWN_FILE));
+    const parsed = safeJsonParse(
+      Deno.readTextFileSync(DEEPSEEK_WEB_COOLDOWN_FILE),
+    );
     const until = Number(parsed.data?.blockedUntil || 0);
-    if (Number.isFinite(until) && until > Date.now()) deepseekWebBlockedUntil = until;
-    else if (until) Deno.removeSync(DEEPSEEK_WEB_COOLDOWN_FILE);
+    if (Number.isFinite(until) && until > Date.now()) {
+      deepseekWebBlockedUntil = until;
+    } else if (until) Deno.removeSync(DEEPSEEK_WEB_COOLDOWN_FILE);
   } catch {}
   return deepseekWebBlockedUntil > Date.now() ? deepseekWebBlockedUntil : 0;
 }
 
 function deepseekWebSaveCooldown(reason: string): void {
   try {
-    Deno.writeTextFileSync(DEEPSEEK_WEB_COOLDOWN_FILE, JSON.stringify({ blockedUntil: deepseekWebBlockedUntil, reason, updatedAt: new Date().toISOString() }));
+    Deno.writeTextFileSync(
+      DEEPSEEK_WEB_COOLDOWN_FILE,
+      JSON.stringify({
+        blockedUntil: deepseekWebBlockedUntil,
+        reason,
+        updatedAt: new Date().toISOString(),
+      }),
+    );
   } catch {}
 }
 
-function deepseekWebTripCircuit(message: string, durationMs?: number, kind = ""): void {
+function deepseekWebTripCircuit(
+  message: string,
+  durationMs?: number,
+  kind = "",
+): void {
   const text = String(message || "");
   if (/being generated|busy/i.test(text) || kind === "busy") return;
-  const isRateLimit = kind === "rate_limit_exceeded" || /\b429\b|muted|mute|throttl|too frequent|too many|频繁|quota/i.test(text);
+  const isRateLimit = kind === "rate_limit_exceeded" ||
+    /\b429\b|muted|mute|throttl|too frequent|too many|频繁|quota/i.test(text);
   const isAuthFailure = kind === "auth" || /\b401\b|\b403\b/i.test(text);
   if (!isRateLimit && !isAuthFailure && !(Number(durationMs) > 0)) return;
   const fallback = isAuthFailure ? 2 * 60 * 60_000 : 30 * 60_000;
   const requested = Number(durationMs);
-  const duration = Math.max(Number.isFinite(requested) && requested > 0 ? requested : fallback, fallback);
-  deepseekWebBlockedUntil = Math.max(deepseekWebLoadCooldown(), Date.now() + duration);
+  const duration = Math.max(
+    Number.isFinite(requested) && requested > 0 ? requested : fallback,
+    fallback,
+  );
+  deepseekWebBlockedUntil = Math.max(
+    deepseekWebLoadCooldown(),
+    Date.now() + duration,
+  );
   deepseekWebSaveCooldown(text.slice(0, 160));
   noteDeepSeekRestriction(text.slice(0, 120), duration);
-  console.warn(`[deepseek-web] upstream refused request; pausing this account for ${Math.round(duration / 60_000)} minutes`);
+  console.warn(
+    `[deepseek-web] upstream refused request; pausing this account for ${
+      Math.round(duration / 60_000)
+    } minutes`,
+  );
 }
 
 function deepseekWebErrorResponse(error: any): Response {
   const status = Number(error?.status) || 502;
   const cooldownMs = Math.max(0, deepseekWebLoadCooldown() - Date.now());
-  const rawRetryAfterMs = Number(error?.retryAfterMs) > 0 ? Number(error.retryAfterMs) : 0;
-  const retryAfterMs = status === 401 || status === 403 || status === 429 ? Math.max(rawRetryAfterMs, cooldownMs) : rawRetryAfterMs;
-  const headers: Record<string, string> = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
-  if (retryAfterMs > 0) headers["Retry-After"] = String(Math.ceil(retryAfterMs / 1000));
-  return new Response(JSON.stringify({ error: { message: String(error?.message || error), type: error?.kind || "upstream_error" } }), { status, headers });
+  const rawRetryAfterMs = Number(error?.retryAfterMs) > 0
+    ? Number(error.retryAfterMs)
+    : 0;
+  const retryAfterMs = status === 401 || status === 403 || status === 429
+    ? Math.max(rawRetryAfterMs, cooldownMs)
+    : rawRetryAfterMs;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+  };
+  if (retryAfterMs > 0) {
+    headers["Retry-After"] = String(Math.ceil(retryAfterMs / 1000));
+  }
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: String(error?.message || error),
+        type: error?.kind || "upstream_error",
+      },
+    }),
+    { status, headers },
+  );
 }
 
 function deepseekWebCurrentRisk(): any {
@@ -800,8 +1247,12 @@ function deepseekWebCurrentRisk(): any {
 }
 
 function deepseekWebReasoningEffort(body: any, model: string): string {
-  const modelEffort = String(model).toLowerCase().match(/-(off|low|high|max)$/)?.[1] || "";
-  const raw = String(body?.reasoning_effort ?? body?.reasoning?.effort ?? body?.thinking_level ?? modelEffort).toLowerCase();
+  const modelEffort =
+    String(model).toLowerCase().match(/-(off|low|high|max)$/)?.[1] || "";
+  const raw = String(
+    body?.reasoning_effort ?? body?.reasoning?.effort ?? body?.thinking_level ??
+      modelEffort,
+  ).toLowerCase();
   if (["off", "none", "disabled"].includes(raw)) return "off";
   if (["low", "minimal"].includes(raw)) return "low";
   if (["high"].includes(raw)) return "high";
@@ -811,8 +1262,19 @@ function deepseekWebReasoningEffort(body: any, model: string): string {
   return model.includes("reasoner") ? "high" : "off";
 }
 
-export async function handleDeepseekWeb(path: string, request: Request, url: URL): Promise<Response> {
-  console.log("[deepseek-web] handle:", path, request.method);
+export async function handleDeepseekWeb(
+  path: string,
+  request: Request,
+  url: URL,
+): Promise<Response> {
+  // Log the routes that are asked for, but not the model listing. The panel polls
+  // the roster every ten seconds and this channel is listed, so one unconditional
+  // line here produced one entry per poll and buried everything else - including
+  // the entries that matter, like a cooldown being entered. The listing answers
+  // identically every time, so it carries no news.
+  if (!path.endsWith("/models")) {
+    console.log("[deepseek-web] handle:", path, request.method);
+  }
   if (path.endsWith("/responses") && request.method === "POST") {
     const chatUrl = new URL(request.url);
     chatUrl.pathname = "/deepseek-web/v1/chat/completions";
@@ -822,7 +1284,11 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(chatBody),
       });
-      return await handleDeepseekWeb("/deepseek-web/v1/chat/completions", chatRequest, chatUrl);
+      return await handleDeepseekWeb(
+        "/deepseek-web/v1/chat/completions",
+        chatRequest,
+        chatUrl,
+      );
     });
   }
   if (path.endsWith("/risk.txt") && request.method === "GET") {
@@ -836,12 +1302,20 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       risk.disclaimer,
     ].join("\n") + "\n";
     return new Response(text, {
-      headers: { "Content-Type": "text/plain; charset=utf-8", "Access-Control-Allow-Origin": "*", ...deepseekWebRiskHeaders() },
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        ...deepseekWebRiskHeaders(),
+      },
     });
   }
   if (path.endsWith("/risk") && request.method === "GET") {
     return new Response(JSON.stringify(deepseekWebCurrentRisk()), {
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...deepseekWebRiskHeaders() },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        ...deepseekWebRiskHeaders(),
+      },
     });
   }
   // 模型列表（静态返回，DeepSeek 网页版主要就两个模型）
@@ -852,7 +1326,12 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       { id: "high", name: "High", description: "开启思考" },
       { id: "max", name: "Max", description: "开启思考（网页端等同 High）" },
     ];
-    const model = (id: string, name: string, defaultEffort: string, maxOutputTokens: number) => ({
+    const model = (
+      id: string,
+      name: string,
+      defaultEffort: string,
+      maxOutputTokens: number,
+    ) => ({
       id,
       object: "model",
       created: 0,
@@ -867,120 +1346,257 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       object: "list",
       data: [
         model("deepseek-chat", "DeepSeek 网页 · 快速模式", "off", 16_384),
-        model("deepseek-chat-off", "DeepSeek 网页 · 快速模式 Off", "off", 16_384),
+        model(
+          "deepseek-chat-off",
+          "DeepSeek 网页 · 快速模式 Off",
+          "off",
+          16_384,
+        ),
         model("deepseek-chat-low", "DeepSeek 网页 · 思考 Low", "low", 16_384),
-        model("deepseek-chat-high", "DeepSeek 网页 · 思考 High", "high", 16_384),
+        model(
+          "deepseek-chat-high",
+          "DeepSeek 网页 · 思考 High",
+          "high",
+          16_384,
+        ),
         model("deepseek-chat-max", "DeepSeek 网页 · 思考 Max", "max", 16_384),
         model("deepseek-reasoner", "DeepSeek 网页 · 深度思考", "high", 32_768),
-        model("deepseek-reasoner-off", "DeepSeek 网页 · 深度思考 Off", "off", 32_768),
-        model("deepseek-reasoner-low", "DeepSeek 网页 · 深度思考 Low", "low", 32_768),
-        model("deepseek-reasoner-high", "DeepSeek 网页 · 深度思考 High", "high", 32_768),
-        model("deepseek-reasoner-max", "DeepSeek 网页 · 深度思考 Max", "max", 32_768),
+        model(
+          "deepseek-reasoner-off",
+          "DeepSeek 网页 · 深度思考 Off",
+          "off",
+          32_768,
+        ),
+        model(
+          "deepseek-reasoner-low",
+          "DeepSeek 网页 · 深度思考 Low",
+          "low",
+          32_768,
+        ),
+        model(
+          "deepseek-reasoner-high",
+          "DeepSeek 网页 · 深度思考 High",
+          "high",
+          32_768,
+        ),
+        model(
+          "deepseek-reasoner-max",
+          "DeepSeek 网页 · 深度思考 Max",
+          "max",
+          32_768,
+        ),
       ],
     };
     return new Response(JSON.stringify(data), {
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
     });
   }
 
   if (path.endsWith("/chat/completions") && request.method === "POST") {
     let bodyText: string;
-    try { bodyText = await request.text(); }
-    catch (e: any) {
-      return new Response(JSON.stringify({ error: "Failed to read body", detail: e.message }), {
-        status: 400,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
+    try {
+      bodyText = await request.text();
+    } catch (e: any) {
+      return new Response(
+        JSON.stringify({ error: "Failed to read body", detail: e.message }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
     }
     const p = safeJsonParse(bodyText);
     if (p.error) {
       console.log("[deepseek-web] invalid json:", p.error.message);
-      return new Response(JSON.stringify({ error: "Invalid JSON", detail: p.error.message }), {
-        status: 400,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
+      return new Response(
+        JSON.stringify({ error: "Invalid JSON", detail: p.error.message }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
     }
     const openaiBody = p.data || {};
     const model = String(openaiBody.model || "deepseek-chat");
-    const messages = Array.isArray(openaiBody.messages) ? openaiBody.messages : [];
+    const messages = Array.isArray(openaiBody.messages)
+      ? openaiBody.messages
+      : [];
     console.log("[deepseek-web] model:", model, "messages:", messages.length);
 
     // 网页端每轮只接收一段 prompt；保留 DSH 传入的完整上下文。
     const reasoningEffort = deepseekWebReasoningEffort(openaiBody, model);
     let prompt: string;
-    try { prompt = deepseekWebBuildPrompt(messages, openaiBody.tools, reasoningEffort); }
-    catch (e: any) {
-      return new Response(JSON.stringify({ error: "Invalid messages", detail: e.message }), {
-        status: 400,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
+    try {
+      prompt = deepseekWebBuildPrompt(
+        messages,
+        openaiBody.tools,
+        reasoningEffort,
+      );
+    } catch (e: any) {
+      return new Response(
+        JSON.stringify({ error: "Invalid messages", detail: e.message }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
     }
-    console.log("[deepseek-web] prompt chars:", prompt.length, "reasoning:", reasoningEffort);
+    console.log(
+      "[deepseek-web] prompt chars:",
+      prompt.length,
+      "reasoning:",
+      reasoningEffort,
+    );
 
     const cookies = deepseekWebLoadCookies();
-    console.log("[deepseek-web] cookies loaded:", cookies ? "yes (" + cookies.length + ")" : "no");
+    console.log(
+      "[deepseek-web] cookies loaded:",
+      cookies ? "yes (" + cookies.length + ")" : "no",
+    );
     if (!cookies) {
-      return new Response(JSON.stringify({ error: "deepseek-cookies.txt missing", detail: "Run .tmp-extract-deepseek-cookies.ts to capture the DeepSeek login state" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
+      return new Response(
+        JSON.stringify({
+          error: "deepseek-cookies.txt missing",
+          detail:
+            "Run .tmp-extract-deepseek-cookies.ts to capture the DeepSeek login state",
+        }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
     }
     const auth = deepseekWebLoadAuth();
     if (!auth) {
-      return new Response(JSON.stringify({ error: "deepseek-auth.txt missing", detail: "Run .tmp-extract-deepseek-cookies.ts again to capture the DeepSeek Bearer token" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
+      return new Response(
+        JSON.stringify({
+          error: "deepseek-auth.txt missing",
+          detail:
+            "Run .tmp-extract-deepseek-cookies.ts again to capture the DeepSeek Bearer token",
+        }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
     }
     const cooldownMs = deepseekWebLoadCooldown() - Date.now();
     if (cooldownMs > 0) {
-      return new Response(JSON.stringify({ error: { message: "DeepSeek cooling down", type: "rate_limit_exceeded" }, retry_after_ms: cooldownMs }), {
-        status: 429,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Retry-After": String(Math.ceil(cooldownMs / 1000)) },
-      });
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "DeepSeek cooling down",
+            type: "rate_limit_exceeded",
+          },
+          retry_after_ms: cooldownMs,
+        }),
+        {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Retry-After": String(Math.ceil(cooldownMs / 1000)),
+          },
+        },
+      );
     }
 
     let releaseGate: (() => void) | null = null;
-    try { releaseGate = await acquireDeepseekGate(); }
-    catch (e: any) {
-      return new Response(JSON.stringify({ error: "DeepSeek gate unavailable", detail: e.message }), {
-        status: 503,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
+    try {
+      releaseGate = await acquireDeepseekGate();
+    } catch (e: any) {
+      return new Response(
+        JSON.stringify({
+          error: "DeepSeek gate unavailable",
+          detail: e.message,
+        }),
+        {
+          status: 503,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
     }
     const postGateCooldownMs = deepseekWebLoadCooldown() - Date.now();
     if (postGateCooldownMs > 0) {
       releaseGate?.();
-      return new Response(JSON.stringify({ error: { message: "DeepSeek cooling down", type: "rate_limit_exceeded" }, retry_after_ms: postGateCooldownMs }), {
-        status: 429,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Retry-After": String(Math.ceil(postGateCooldownMs / 1000)) },
-      });
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "DeepSeek cooling down",
+            type: "rate_limit_exceeded",
+          },
+          retry_after_ms: postGateCooldownMs,
+        }),
+        {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "Retry-After": String(Math.ceil(postGateCooldownMs / 1000)),
+          },
+        },
+      );
     }
 
     noteDeepSeekRequest(prompt.length);
 
     let images: DeepSeekWebImage[];
-    try { images = deepseekWebCollectImages(messages); }
-    catch (e: any) {
+    try {
+      images = deepseekWebCollectImages(messages);
+    } catch (e: any) {
       releaseGate?.();
-      return new Response(JSON.stringify({ error: "Invalid image input", detail: e.message }), {
-        status: 400,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-      });
+      return new Response(
+        JSON.stringify({ error: "Invalid image input", detail: e.message }),
+        {
+          status: 400,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
     }
     const refFileIds: string[] = [];
     try {
-      for (const image of images) refFileIds.push(await deepseekWebUploadImage(cookies, auth, image));
+      for (const image of images) {
+        refFileIds.push(await deepseekWebUploadImage(cookies, auth, image));
+      }
     } catch (e: any) {
-      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+      if (e instanceof DeepSeekWebError) {
+        deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+      }
       releaseGate?.();
       return deepseekWebErrorResponse(e);
     }
 
     let sessionLease: { id: string; reused: boolean };
-    try { sessionLease = await deepseekWebLeaseSession(cookies, auth); }
-    catch (e: any) {
-      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+    try {
+      sessionLease = await deepseekWebLeaseSession(cookies, auth);
+    } catch (e: any) {
+      if (e instanceof DeepSeekWebError) {
+        deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+      }
       releaseGate?.();
       return deepseekWebErrorResponse(e);
     }
@@ -998,7 +1614,15 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     };
     let upstream: Response;
     try {
-      upstream = await deepseekWebChat(cookies, auth, chatSessionId, prompt, model, reasoningEffort !== "off", refFileIds);
+      upstream = await deepseekWebChat(
+        cookies,
+        auth,
+        chatSessionId,
+        prompt,
+        model,
+        reasoningEffort !== "off",
+        refFileIds,
+      );
     } catch (e: any) {
       if (e instanceof DeepSeekWebError && e.kind === "invalid_session") {
         deepseekWebRetireSession(chatSessionId);
@@ -1006,38 +1630,65 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
         try {
           sessionLease = await deepseekWebLeaseSession(cookies, auth);
           chatSessionId = sessionLease.id;
-          upstream = await deepseekWebChat(cookies, auth, chatSessionId, prompt, model, reasoningEffort !== "off", refFileIds);
+          upstream = await deepseekWebChat(
+            cookies,
+            auth,
+            chatSessionId,
+            prompt,
+            model,
+            reasoningEffort !== "off",
+            refFileIds,
+          );
         } catch (retryError: any) {
-          if (retryError instanceof DeepSeekWebError) deepseekWebTripCircuit(retryError.message, retryError.retryAfterMs, retryError.kind);
+          if (retryError instanceof DeepSeekWebError) {
+            deepseekWebTripCircuit(
+              retryError.message,
+              retryError.retryAfterMs,
+              retryError.kind,
+            );
+          }
           await cleanup(true);
           return deepseekWebErrorResponse(retryError);
         }
       } else {
-        if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+        if (e instanceof DeepSeekWebError) {
+          deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+        }
         await cleanup(true);
         return deepseekWebErrorResponse(e);
       }
     }
 
     if (openaiBody.stream === true) {
-      return new Response(deepseekWebOpenAIStream(upstream, model, openaiBody.tools, prompt, cleanup), {
-        status: 200,
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-          "Access-Control-Allow-Origin": "*",
-          "X-Accel-Buffering": "no",
-          ...deepseekWebRiskHeaders(),
+      return new Response(
+        deepseekWebOpenAIStream(
+          upstream,
+          model,
+          openaiBody.tools,
+          prompt,
+          cleanup,
+        ),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "X-Accel-Buffering": "no",
+            ...deepseekWebRiskHeaders(),
+          },
         },
-      });
+      );
     }
 
     let result: Awaited<ReturnType<typeof deepseekWebProcess>>;
     try {
       result = await deepseekWebProcess(upstream, openaiBody.tools);
     } catch (e: any) {
-      if (e instanceof DeepSeekWebError) deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+      if (e instanceof DeepSeekWebError) {
+        deepseekWebTripCircuit(e.message, e.retryAfterMs, e.kind);
+      }
       await cleanup(true);
       return deepseekWebErrorResponse(e);
     } finally {
@@ -1047,11 +1698,17 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
     noteDeepSeekSuccess();
     const content = result.content;
     const toolCalls = result.toolCalls;
-    const finishReason = toolCalls.length ? "tool_calls" : content ? "stop" : "length";
+    const finishReason = toolCalls.length
+      ? "tool_calls"
+      : content
+      ? "stop"
+      : "length";
     const responseId = "chatcmpl-" + Math.random().toString(36).slice(2);
     const created = Math.floor(Date.now() / 1000);
     const message: any = { role: "assistant", content };
-    if (result.thinkingContent) message.reasoning_content = result.thinkingContent;
+    if (result.thinkingContent) {
+      message.reasoning_content = result.thinkingContent;
+    }
     if (toolCalls.length) {
       message.tool_calls = toolCalls.map((call: ToolCallRequest) => ({
         id: call.id,
@@ -1068,19 +1725,29 @@ export async function handleDeepseekWeb(path: string, request: Request, url: URL
       choices: [{ index: 0, message, finish_reason: finishReason }],
       usage: {
         prompt_tokens: estimateDeepSeekTokens(prompt),
-        completion_tokens: estimateDeepSeekTokens(content + result.thinkingContent),
-        total_tokens: estimateDeepSeekTokens(prompt) + estimateDeepSeekTokens(content + result.thinkingContent),
+        completion_tokens: estimateDeepSeekTokens(
+          content + result.thinkingContent,
+        ),
+        total_tokens: estimateDeepSeekTokens(prompt) +
+          estimateDeepSeekTokens(content + result.thinkingContent),
       },
     };
 
     return new Response(JSON.stringify(responseBody), {
       status: 200,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", ...deepseekWebRiskHeaders() },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        ...deepseekWebRiskHeaders(),
+      },
     });
   }
 
   return new Response(JSON.stringify({ error: "Not found" }), {
     status: 404,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
   });
 }
