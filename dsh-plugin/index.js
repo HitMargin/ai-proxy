@@ -529,6 +529,28 @@ function textOf(content) {
   }).join('');
 }
 
+/**
+ * Project the harness's provider-neutral history onto the OpenAI chat shape.
+ *
+ * Two things were wrong here, and both only showed up under agentic work.
+ *
+ * Every message that was not an assistant became a `user` message, so a tool
+ * result reached the model as something the *user* had said, with its
+ * `tool_call_id` dropped. The assistant turn that had requested it was flattened
+ * to its text too, so the model never saw a `tool_calls` entry at all.
+ *
+ * The upstream therefore saw:
+ *
+ *     user:      fix OnGui.cs
+ *     assistant: no match, reading the file:    <- no tool_calls
+ *     user:      <the file contents>             <- the tool result, as a user turn
+ *
+ * A model reading that has no idea it is mid-task. It answers the message in
+ * front of it and stops - which is the reported "it just stopped instead of doing
+ * the thing", and why a config-listed model on the same upstream never did it:
+ * that path goes through the harness's own client, which serializes `tool_calls`
+ * and `tool` messages properly.
+ */
 function toOpenAiMessages(options) {
   const output = [];
   if (typeof options.system === 'string' && options.system !== '') {
@@ -536,9 +558,52 @@ function toOpenAiMessages(options) {
   }
   for (const message of Array.isArray(options.messages) ? options.messages : []) {
     if (!isRecord(message)) continue;
-    const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const role = message.role;
     const content = message.content;
-    if (role === 'user' && Array.isArray(content)) {
+
+    if (role === 'tool') {
+      // An empty result still keeps its id: dropping it would leave an
+      // unanswered tool call, which is a protocol error rather than a tidy
+      // transcript.
+      const callId = typeof message.toolCallId === 'string' ? message.toolCallId : '';
+      if (callId === '') continue;
+      output.push({
+        role: 'tool',
+        tool_call_id: callId,
+        content: textOf(content),
+      });
+      continue;
+    }
+
+    if (role === 'assistant') {
+      const text = [];
+      const calls = [];
+      for (const part of Array.isArray(content) ? content : []) {
+        if (!isRecord(part)) continue;
+        if (part.type === 'text' && typeof part.text === 'string') {
+          text.push(part.text);
+        } else if (part.type === 'tool-call' && typeof part.id === 'string') {
+          const args = typeof part.arguments === 'string'
+            ? part.arguments
+            : JSON.stringify(part.arguments ?? {});
+          calls.push({
+            id: part.id,
+            type: 'function',
+            function: { name: String(part.name ?? ''), arguments: args },
+          });
+        }
+        // Reasoning blocks are dropped on the way out: replaying them needs the
+        // upstream's own signature format, and a stale signature is a 400.
+      }
+      output.push({
+        role: 'assistant',
+        content: text.join(''),
+        ...(calls.length > 0 ? { tool_calls: calls } : {}),
+      });
+      continue;
+    }
+
+    if (Array.isArray(content)) {
       const parts = [];
       for (const part of content) {
         if (!isRecord(part)) continue;
@@ -553,10 +618,10 @@ function toOpenAiMessages(options) {
           });
         }
       }
-      output.push({ role, content: parts });
+      output.push({ role: role === 'system' ? 'system' : 'user', content: parts });
       continue;
     }
-    output.push({ role, content: textOf(content) });
+    output.push({ role: role === 'system' ? 'system' : 'user', content: textOf(content) });
   }
   return output;
 }

@@ -6,6 +6,7 @@ const originalFetch = globalThis.fetch;
 let modelCalls = 0;
 let chatCalls = 0;
 let lastRequestHeaders = new Headers();
+let lastChatBody = null;
 // Controls the shape of the streamed reply so the terminal-marker handling can be
 // exercised: a complete stream, one cut mid-answer, and one cut with nothing sent.
 let streamMode = 'normal';
@@ -219,6 +220,7 @@ globalThis.fetch = async (input, init = {}) => {
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
   chatCalls++;
+  lastChatBody = init.body ? JSON.parse(String(init.body)) : null;
   if (streamMode === 'cut') {
     return new Response([
       'data: {"choices":[{"delta":{"content":"half an ans"},"finish_reason":null}]}\n\n',
@@ -480,6 +482,36 @@ try {
     maxTokens: 32,
   }, resolved)) doneEvents.push(event);
   assert.equal(doneEvents.find((e) => e.type === 'finish')?.reason?.kind, 'stop');
+
+  // The harness history is provider-neutral: a tool result is `role: 'tool'`
+  // with a `toolCallId`, and an assistant turn holds `tool-call` blocks. Both
+  // used to be flattened into plain user/assistant text, so the model was told a
+  // tool had spoken and had no tool_calls of its own - it answered whatever was
+  // in front of it and stopped, which is the whole reported symptom.
+  const toolResolved = await adapter.resolveModel('ai-proxy', 'deepseek/test');
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'fix OnGui.cs' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'reading the file:' },
+          { type: 'tool-call', id: 'call_1', name: 'edit', arguments: '{"path":"OnGui.cs"}' },
+        ],
+      },
+      { role: 'tool', toolCallId: 'call_1', content: [{ type: 'text', text: '<file contents>' }] },
+    ],
+    maxTokens: 32,
+  }, toolResolved)) { /* shape asserted below */ }
+  const sent = lastChatBody?.messages ?? [];
+  assert.equal(sent[1].role, 'assistant');
+  assert.equal(sent[1].tool_calls?.[0]?.id, 'call_1');
+  assert.equal(sent[1].tool_calls?.[0]?.function?.name, 'edit');
+  assert.equal(sent[2].role, 'tool');
+  assert.equal(sent[2].tool_call_id, 'call_1');
+  assert.equal(sent[2].content, '<file contents>');
+  assert.equal(sent.filter((m) => m.role === 'user').length, 1, 'the tool result must not arrive as a user turn');
   assert.equal(panelRoute.path, '/api/ai-proxy-commandcode');
   let panelBody = '';
   let panelStatus = 0;
