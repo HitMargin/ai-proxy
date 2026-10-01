@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
         calls: '调用', failed: '失败', speed: '输出速度', firstToken: '首帧延迟', avgOutput: '平均输出',
         heatmap: 'Token 热力图', trend: '总量曲线', modelUsage: '模型用量', today: '今日',
         localOnly: '数据只在本机统计，不会上传。', noUsage: '还没有调用记录，在 DSH 里发一条消息后就会出现。',
+        usageFailed: '读取用量失败',
         speedNote: '输出速度只统计解码窗口 ≥250ms 且速率 ≤250 tok/s 的调用；窗口太短的一次性回答不算速度。',
       },
       en: {
@@ -52,6 +53,7 @@ window.__ModuleLoader__.load({
         calls: 'Calls', failed: 'Failed', speed: 'Output speed', firstToken: 'First token', avgOutput: 'Avg output',
         heatmap: 'Token heatmap', trend: 'Cumulative', modelUsage: 'Per model', today: 'Today',
         localOnly: 'Counted on this machine only; nothing is uploaded.', noUsage: 'No calls recorded yet — send a message in DSH and this fills in.',
+        usageFailed: 'Could not read usage',
         speedNote: 'Output speed only counts calls whose decode window is ≥250ms and whose rate is ≤250 tok/s; a one-shot answer is not evidence of speed.',
       },
     }
@@ -283,6 +285,7 @@ window.__ModuleLoader__.load({
       const [data, setData] = useState(null)
       const [settings, setSettings] = useState(null)
       const [usage, setUsage] = useState(null)
+      const [usageError, setUsageError] = useState('')
       const [error, setError] = useState('')
       const [notice, setNotice] = useState('')
       const [busy, setBusy] = useState(false)
@@ -296,11 +299,21 @@ window.__ModuleLoader__.load({
       const loadRef = useRef(() => {})
 
       const load = () => {
-        Promise.all([api('/panel'), api('/settings'), api('/usage').catch(() => null)])
+        // A failing /usage must not be swallowed into a null that renders as
+        // "no calls recorded": that is indistinguishable from a genuine empty
+        // history, and it is exactly the confusion this dashboard is meant to
+        // avoid. The error is kept and shown separately.
+        Promise.all([api('/panel'), api('/settings'), api('/usage').catch((reason) => ({ failed: reason }))])
           .then(([panel, nextSettings, usage]) => {
             setData(panel)
             setSettings(nextSettings)
-            if (usage) setUsage(usage)
+            if (usage && usage.failed) {
+              setUsageError(usage.failed instanceof Error ? usage.failed.message : String(usage.failed))
+              setUsage(null)
+            } else if (usage) {
+              setUsageError('')
+              setUsage(usage)
+            }
             setError('')
           })
           .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
@@ -342,8 +355,27 @@ window.__ModuleLoader__.load({
           while (!cancelled) {
             await new Promise((resolve) => setTimeout(resolve, 10000))
             if (cancelled) return
-            try { await api('/panel').then((panel) => { if (!cancelled) setData(panel) }) }
-            catch (reason) { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)) }
+            // Usage is polled with the panel. Leaving it out made the dashboard
+            // read the single snapshot taken when the settings page opened, so
+            // a call made after that first load never appeared: the tab kept
+            // reporting "no calls recorded" no matter how many turns ran.
+            try {
+              const [panel, usage] = await Promise.all([
+                api('/panel'),
+                api('/usage').catch((reason) => ({ failed: reason })),
+              ])
+              if (cancelled) return
+              setData(panel)
+              if (usage && usage.failed) {
+                setUsageError(usage.failed instanceof Error ? usage.failed.message : String(usage.failed))
+                setUsage(null)
+              } else if (usage) {
+                setUsageError('')
+                setUsage(usage)
+              }
+            } catch (reason) {
+              if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason))
+            }
           }
         }
         void poll()
@@ -536,7 +568,13 @@ window.__ModuleLoader__.load({
       // growing: the roster and health answer "what can I use", this answers
       // "what did it cost".
       const usageSummary = usage?.summary ?? null
-      const usageCard = !usageSummary || usageSummary.requests === 0
+      // An unreachable endpoint and a genuinely empty history look identical
+      // if both render as "no calls", so they are told apart here.
+      const usageCard = usageError
+        ? h('div', { className: 'apx_card' },
+          h('div', { className: 'apx_sechead' }, h('h3', null, t('usage'))),
+          h('div', { className: 'apx_callout' }, `${t('usageFailed')}: ${usageError}`))
+        : !usageSummary || usageSummary.requests === 0
         ? h('div', { className: 'apx_card' }, h('div', { className: 'apx_empty' }, t('noUsage')))
         : h(React.Fragment, null,
           h('div', { className: 'apx_card' },
