@@ -1,5 +1,21 @@
 import assert from 'node:assert/strict';
-import { apply, AiProxyAdapter, healthIndex } from './index.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+// Settings live in a file under the DSH home, so without this the suite reads the
+// real ~/.dsh/ai-proxy-dsh-bridge/settings.json and its results depend on whatever
+// the user last saved in the panel. It already did once: a hand-written
+// hiddenChannels turned a blocked-channel assertion red on a machine whose state
+// had nothing to do with the code under test. Redirected before the import so the
+// module's first settings read already lands in the sandbox.
+const sandboxHome = path.join(os.tmpdir(), `ai-proxy-self-test-${process.pid}`);
+process.env.DSH_HOME = sandboxHome;
+process.on('exit', () => {
+  try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
+});
+
+const { apply, AiProxyAdapter, healthIndex } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -719,6 +735,18 @@ try {
   // quietly presenting a shorter roster.
   assert.equal(panel.projectModels.some((model) => model.id.startsWith('deepseek-web/')), false);
   assert.equal(panel.blockedModelCount > 0, true);
+  // Every channel the proxy serves needs a switch, whether or not it currently
+  // answers. Deriving the list from the roster plus the hidden set meant a
+  // channel that was on but silent - openrouter with no key, deepseek-web with no
+  // login state - fell out of both, and the only way to switch it back off was to
+  // edit settings.json by hand.
+  for (const channel of ['kilo', 'zen', 'commandcode', 'cnb', 'openrouter', 'deepseek-web', 'tokenharbor']) {
+    assert.ok(
+      panel.allChannels.includes(channel),
+      `${channel} must keep its switch whether or not it lists models right now`,
+    );
+  }
+  assert.equal(panel.hiddenChannels.includes('deepseek-web'), true);
   // The panel only shows 可用/限流/不可用 if the per-model verdicts are joined
   // onto the rows: /health keys samples by provider + unprefixed id, while the
   // roster uses `kilo/…`.

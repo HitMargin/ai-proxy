@@ -55,6 +55,27 @@ const IMAGE_TOKEN_ESTIMATE = 1600;
 //
 // Matched against the first path segment, which is the channel this proxy
 // routes by — see isBlockedModelId for why a substring test is not enough.
+/**
+ * Every channel the proxy serves, listed so the panel can offer a switch for all
+ * of them.
+ *
+ * Deriving this from the roster does not work. A channel that is switched on but
+ * contributes no models - openrouter with no key, deepseek-web with no login state
+ * - is in neither the roster nor the hidden list, so the control vanished the moment
+ * it was turned on, and the only way to get it back was to edit settings.json by
+ * hand. The set of channels the proxy serves does not depend on which of them
+ * happen to answer today, so it is written down.
+ */
+const KNOWN_CHANNELS = [
+  'commandcode',
+  'cnb',
+  'deepseek-web',
+  'kilo',
+  'openrouter',
+  'tokenharbor',
+  'zen',
+];
+
 const DEFAULT_HIDDEN_CHANNELS = [
   'openrouter',
   'deepseek-web',
@@ -342,6 +363,8 @@ const DEFAULT_SETTINGS = {
   denoPath: 'deno',
   externalUrl: '',
   apiKeyEnv: 'LOCAL_AGGREGATION_API_KEY',
+  // A stored file with no `hiddenChannels` predates the panel switches, so the
+  // defaults apply and nothing that was reachable becomes reachable by accident.
   hiddenChannels: DEFAULT_HIDDEN_CHANNELS,
   openRouterKey: '',
 };
@@ -1750,7 +1773,13 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
     // built from `channels` alone could only ever turn channels off. The union is
     // what the panel needs to offer both directions.
     hiddenChannels: [...BLOCKED_CHANNELS],
-    allChannels: [...new Set([...Object.keys(channels), ...BLOCKED_CHANNELS])].sort(),
+    // KNOWN_CHANNELS is the base, not the roster: a channel that is on but silent
+    // must still have a switch, or turning it on is a one-way trip.
+    allChannels: [...new Set([
+      ...KNOWN_CHANNELS,
+      ...Object.keys(channels),
+      ...BLOCKED_CHANNELS,
+    ])].sort(),
     // What deepseek-web still needs, and whether its capture is already running.
     deepseekWeb: {
       ...deepseekWebStatus(runtime.settings),
