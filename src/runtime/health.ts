@@ -1,3 +1,125 @@
+export type CatalogState = "ok" | "failed";
+
+/**
+
+ * What happened when the aggregate went to a member for its model list.
+
+ *
+
+ * This is separate from {@link ProviderHealthSnapshot} on purpose. A probe answers
+
+ * "can this gateway serve a turn", and it only runs when someone asks for one. A
+
+ * listing failure answers something else and more urgent — "this channel is missing
+
+ * from the picker right now" — and it used to leave no trace at all: the member was
+
+ * dropped from the response, so a roster quietly lost a channel with no error, no
+
+ * log line and nothing in the health snapshot to explain it.
+
+ */
+
+export interface CatalogStatus {
+  state: CatalogState;
+
+  checkedAt: number | null;
+
+  /** Rows the upstream returned, before the provider filter ran. */
+
+  listedModels: number;
+
+  /** Rows that survived the filter, which is what a picker can actually use. */
+
+  keptModels: number;
+
+  reason?: string;
+
+  status?: number;
+}
+
+const EMPTY_CATALOG: CatalogStatus = {
+  state: "ok",
+
+  checkedAt: null,
+
+  listedModels: 0,
+
+  keptModels: 0,
+};
+
+/** Records one member listing outcome per aggregate request. */
+
+export class CatalogRegistry {
+  private readonly records = new Map<string, CatalogStatus>();
+
+  ok(
+    provider: string,
+    listedModels: number,
+    keptModels: number,
+    now = Date.now(),
+  ): void {
+    this.records.set(provider, {
+      state: "ok",
+
+      checkedAt: now,
+
+      listedModels,
+
+      keptModels,
+    });
+  }
+
+  failed(
+    provider: string,
+    reason: string,
+    now = Date.now(),
+    extra: { status?: number; listedModels?: number; keptModels?: number } = {},
+  ): void {
+    this.records.set(provider, {
+      state: "failed",
+
+      checkedAt: now,
+
+      listedModels: extra.listedModels ?? 0,
+
+      keptModels: extra.keptModels ?? 0,
+
+      reason,
+
+      ...(extra.status === undefined ? {} : { status: extra.status }),
+    });
+  }
+
+  get(provider: string): CatalogStatus {
+    // A copy, like HealthRegistry.get: a caller that kept the reference could edit
+    // the record, and a panel row reading its verdict would rewrite the snapshot.
+    const status = this.records.get(provider);
+    return status ? { ...status } : { ...EMPTY_CATALOG };
+  }
+
+  all(): Record<string, CatalogStatus> {
+    const result: Record<string, CatalogStatus> = {};
+
+    for (const [provider, status] of this.records) {
+      result[provider] = { ...status };
+    }
+
+    return result;
+  }
+
+  /** Providers whose last listing did not come back whole. */
+
+  failures(): Record<string, CatalogStatus> {
+    const result: Record<string, CatalogStatus> = {};
+
+    for (const [provider, status] of this.records) {
+      if (status.state === "failed") result[provider] = { ...status };
+    }
+
+    return result;
+  }
+}
 export type HealthState =
   | "available"
   | "degraded"

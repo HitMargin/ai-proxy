@@ -29,6 +29,17 @@ globalThis.fetch = async (input, init = {}) => {
           'kilo-auto/free': { state: 'degraded', latencyMs: 300, reason: 'HTTP 429' },
         },
       },
+      // A member whose listing failed is absent from the channel roster, so the
+      // panel needs the proxy to name it or a shrinking roster looks uneventful.
+      catalogIssues: {
+        tokenharbor: {
+          state: 'failed',
+          checkedAt: 1,
+          listedModels: 0,
+          keptModels: 0,
+          reason: 'listing request failed: connection reset',
+        },
+      },
     }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -421,6 +432,10 @@ try {
   assert.equal(throttled.reason, 'HTTP 429');
   assert.equal(panel.modelHealth.available, 1);
   assert.equal(panel.modelHealth.degraded, 1);
+  // The failed member has to reach the panel under its own name, or the channel
+  // chips just get shorter and nothing says why.
+  assert.equal(panel.catalogIssues.tokenharbor.state, 'failed');
+  assert.equal(panel.catalogIssues.tokenharbor.reason, 'listing request failed: connection reset');
   assert.equal(panel.modelHealth.total, 2);
   // An unprobed channel must stay visible rather than being counted as broken.
   const unprobed = panel.projectModels.find((model) => model.id === 'deepseek/test');

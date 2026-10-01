@@ -20,7 +20,7 @@ window.__ModuleLoader__.load({
         mode: '模式', local: '本地 Deno', external: '已有代理',
         projectRoot: '项目目录', denoPath: 'Deno', port: '端口', externalUrl: '外部地址', apiKeyEnv: 'Key 环境变量',
         start: '启动', stop: '停止', restart: '重启', save: '保存', logs: '运行日志', empty: '暂无模型',
-        search: '搜索模型…', uptime: '已运行', state: '状态', excluded: '已从列表移除',
+        search: '搜索模型…', uptime: '已运行', state: '状态', excluded: '已从列表移除', listingFailed: '列表拉取失败',
         available: '可用', throttled: '限流', unavailable: '不可用', unprobed: '未探测',
         check: '检查状态', checking: '检查中…', checkAll: '全部渠道', checkDone: '已检查 {0} 个模型',
         checkFailed: '检查失败', checkHint: '每个模型会发一次最小请求，占用对应渠道的免费额度。',
@@ -45,7 +45,7 @@ window.__ModuleLoader__.load({
         mode: 'Mode', local: 'Local Deno', external: 'Existing proxy',
         projectRoot: 'Project', denoPath: 'Deno', port: 'Port', externalUrl: 'External URL', apiKeyEnv: 'Key env',
         start: 'Start', stop: 'Stop', restart: 'Restart', save: 'Save', logs: 'Logs', empty: 'No models',
-        search: 'Search models…', uptime: 'Uptime', state: 'State', excluded: 'Removed from the list',
+        search: 'Search models…', uptime: 'Uptime', state: 'State', excluded: 'Removed from the list', listingFailed: 'listing failed',
         available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
         check: 'Check status', checking: 'Checking…', checkAll: 'All channels', checkDone: 'Checked {0} models',
         checkFailed: 'Check failed', checkHint: 'Each model sends one minimal request and uses that channel’s free quota.',
@@ -574,6 +574,14 @@ window.__ModuleLoader__.load({
             h('span', { className: 'apx_chip', key }, h('i', { className: 'apx_dot' }), key, h('b', null, String(count))))),
         Number(data?.blockedModelCount ?? 0) > 0
           ? h('div', { className: 'apx_callout warn' }, `${t('excluded')}: ${data.blockedModelCount}`)
+          : null,
+        // A channel missing from the chips above is missing *because* its listing
+        // failed, so the roster can look shorter with no hint why. Name it here
+        // rather than letting it read as "that channel is gone".
+        Object.keys(data?.catalogIssues ?? {}).length > 0
+          ? h('div', { className: 'apx_callout warn' },
+            Object.entries(data.catalogIssues).map(([key, issue]) =>
+              h('div', { key }, `${t('listingFailed')} · ${key}: ${String(issue?.reason ?? '')}`)))
           : null,
       )
 

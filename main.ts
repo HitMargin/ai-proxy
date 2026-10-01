@@ -11,6 +11,7 @@ import {
   tryParseResponse,
 } from "./src/core.ts";
 export { ENV } from "./src/core.ts";
+import { CatalogRegistry } from "./src/runtime/health.ts";
 import { CNB_MODELS, handleCnb } from "./src/cnb.ts";
 import { readJsonBodyLimited } from "./src/deepseek-responses.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
@@ -168,6 +169,15 @@ function v1ResolveModel(model: string): { key: string; raw: string } | null {
   return null;
 }
 
+/**
+ * What each aggregate member returned the last time it was asked for a model list.
+ *
+ * Separate from the probe registry on purpose: a probe answers whether a gateway can
+ * serve a turn and only runs on demand, while this answers whether the channel is
+ * *in the picker right now*, which is the question a shrinking roster raises.
+ */
+const catalog = new CatalogRegistry();
+
 async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
   const out: Record<string, any[]> = {};
   const now = Date.now();
@@ -180,20 +190,41 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
   });
   await Promise.allSettled(V1_AGGREGATE_MEMBERS.map(async (key) => {
     if (key === "zen") {
-      out[key] = await fetchZenModels();
+      const models = await fetchZenModels();
+      out[key] = models;
+      if (models.length > 0) catalog.ok(key, models.length, models.length, now);
+      else {
+        const reason = "Zen returned no free models";
+        catalog.failed(key, reason, now);
+        console.warn(`[v1] ${key}: ${reason}`);
+      }
       return;
     }
     if (key === "cnb") {
       out[key] = CNB_MODELS;
+      catalog.ok(key, CNB_MODELS.length, CNB_MODELS.length, now);
       return;
     }
     if (key === "commandcode") {
-      out[key] = await getCommandCodeModels();
+      const models = await getCommandCodeModels();
+      out[key] = models;
+      if (models.length > 0) catalog.ok(key, models.length, models.length, now);
+      else {
+        const reason = "CommandCode returned no models";
+        catalog.failed(key, reason, now);
+        console.warn(`[v1] ${key}: ${reason}`);
+      }
       return;
     }
     const fresh = cache.data[key];
     if (fresh && now - fresh.timestamp < cache.TTL) {
       out[key] = fresh.data?.data || [];
+      catalog.ok(
+        key,
+        (fresh.data?.data || []).length,
+        (fresh.data?.data || []).length,
+        now,
+      );
       return;
     }
     const p: any = (providers as any)[key];
@@ -205,14 +236,51 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
         headers.set(k, v as string);
       }
     }
-    const resp = await fetch(p.baseUrl + modelsPath, { headers });
+    let resp: Response;
+    try {
+      resp = await fetch(p.baseUrl + modelsPath, { headers });
+    } catch (error) {
+      // A member that cannot be reached used to vanish from the roster with no
+      // trace: the response simply omitted it, so the picker quietly showed one
+      // channel fewer and nothing said why. Record it instead of swallowing it.
+      const reason = error instanceof Error ? error.message : String(error);
+      catalog.failed(key, `listing request failed: ${reason}`, now);
+      console.warn(`[v1] ${key} model list failed: ${reason}`);
+      return;
+    }
     const parsed = await tryParseResponse(resp);
-    if (parsed.error || !parsed.data) return;
+    if (parsed.error || !parsed.data) {
+      const reason = parsed.error
+        ? `upstream answered ${JSON.stringify(parsed.error).slice(0, 160)}`
+        : "upstream returned no model list";
+      catalog.failed(key, reason, now, { status: resp.status });
+      console.warn(
+        `[v1] ${key} model list unusable (HTTP ${resp.status}): ${reason}`,
+      );
+      return;
+    }
+    const listed = Array.isArray(parsed.data?.data)
+      ? parsed.data.data.length
+      : 0;
     let filtered = parsed.data;
     if (p.filterModels) filtered = p.filterModels(parsed.data);
     const arr = filtered?.data || [];
     if (arr.length) cache.data[key] = { timestamp: now, data: filtered }; // 顺手暖成员缓存（裸 id 解析要用）
     out[key] = arr;
+    if (arr.length === 0 && listed > 0) {
+      // Not an outage: the upstream answered and its filter removed everything.
+      // Still worth saying out loud, because a provider renaming a field turns
+      // into a silently empty channel rather than an error anyone can read.
+      const reason =
+        `all ${listed} listed models were removed by the provider filter`;
+      catalog.failed(key, reason, now, {
+        status: resp.status,
+        listedModels: listed,
+      });
+      console.warn(`[v1] ${key}: ${reason}`);
+      return;
+    }
+    catalog.ok(key, listed, arr.length, now);
   }));
   return out;
 }
@@ -399,6 +467,10 @@ export async function handler(request: Request): Promise<Response> {
       const states = Object.values(providerHealth).map((value: any) =>
         value?.state
       );
+      // A member whose listing did not come back whole is missing from the picker,
+      // which is a different question from whether it can serve a turn. Reported
+      // separately so a shrinking roster can say why instead of just being smaller.
+      const catalogIssues = catalog.failures();
       return new Response(
         JSON.stringify({
           status: states.includes("available")
@@ -414,6 +486,8 @@ export async function handler(request: Request): Promise<Response> {
           // refused, so the individual verdicts travel with the snapshot. A
           // picker labels each row from these instead of re-probing.
           models: modelHealth,
+          catalog: catalog.all(),
+          ...(Object.keys(catalogIssues).length > 0 ? { catalogIssues } : {}),
         }),
         {
           headers: {

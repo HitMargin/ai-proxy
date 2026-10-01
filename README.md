@@ -76,6 +76,10 @@ deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 
 CommandCode 已接入 abort/timeout 分类；DeepSeek 网页端和 cnb 已接入响应体嗅探。
 
+**渠道清单拉取失败不再静默。** `GET /v1/models` 的聚合过去在某个成员拉取失败时直接跳过它，于是整个渠道从选择器里消失——没有报错、没有日志、`/health` 里也什么都看不到，界面只表现为「渠道变少了」。实测出现过 kilo 的 17 个模型整条消失、面板只剩两个渠道却无人知道原因。
+
+现在每种结果都会被记录（`src/runtime/health.ts` 的 `CatalogRegistry`）：请求抛错、上游返回不可用的列表、以及**上游正常返回但被 provider 过滤器清空**（第三种最隐蔽——kilo 的 `isFree` 字段若改名，渠道会静默变空而不是报错）。失败写日志，并出现在 `GET /health` 的 `catalog` 与 `catalogIssues` 里；插件把它们带到面板的渠道区，标为「列表拉取失败」。
+
 **Zen 现在也接入了截断检测。** reader 报 `done` 并不等于回答写完了——Zen 在匿名额度中途耗尽、或传输失败时都会直接关连接，而这两者过去都会给客户端留下一个 `finish_reason: stop` 和半句没写完的话，和「模型自己决定停止」完全无法区分。agent loop 于是判定回合正常结束、标记目标完成、起下一个目标，故障在任何地方都不留痕迹。
 
 现在**由各 wire 自己的终止帧判定是否完成**，而不是由 reader：`[DONE]`（chat）、`response.completed` / `failed` / `incomplete`（responses）、`message_stop`（messages）。没有终止帧就结束 = 截断，会先补一帧 `{"error":{"code":"stream_cut"…}}` 再收尾——插件会把这种帧变成可见的错误。客户端主动取消**不算故障**（走 `StreamAbort`，静默结束），否则用户点停止也会被报成上游问题。

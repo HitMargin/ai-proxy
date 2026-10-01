@@ -1200,6 +1200,10 @@ async function projectPanelSnapshot(adapter, projectAdapter) {
     channels,
     health,
     modelHealth: counts,
+    // A member whose model list did not come back whole is absent from `channels`
+    // precisely because it failed, so the count alone cannot explain a roster that
+    // got shorter. The proxy names the ones it could not fetch.
+    catalogIssues: isRecord(health?.catalogIssues) ? health.catalogIssues : {},
   };
 }
 
