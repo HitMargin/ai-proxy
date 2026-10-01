@@ -110,6 +110,21 @@ globalThis.fetch = async (input, init = {}) => {
             context_length: 256000,
           },
           {
+            // Kilo appends a scheduling note to the name. It is the upstream
+            // telling the user something they need, so it is passed through
+            // verbatim — stripping it to tidy a list would hide a warning.
+            id: 'kilo/retiring-model',
+            name: 'Retiring Model (retires Oct 5)',
+            architecture: { input_modalities: ['text'] },
+            context_length: 256000,
+          },
+          {
+            // CommandCode's suffixes name the variant, so they must survive.
+            id: 'commandcode/deepseek/deepseek-v4-flash',
+            name: 'DeepSeek V4 Flash (latest)',
+            context_window: 1000000,
+          },
+          {
             // Zen publishes only `id`; the display name used to collapse to the
             // raw prefixed id, which is what made the roster read as
             // `zen/jev-1.13-free` instead of a readable label.
@@ -196,6 +211,18 @@ try {
   const zenModel = models.find((model) => model.id === 'zen/jev-1.13-free');
   assert.equal(zenModel.name, 'Jev 1.13');
   assert.equal(zenModel.name.startsWith('zen/'), false);
+  // Every upstream name is passed through verbatim, including Kilo's
+  // retirement note. The note is the upstream warning the user needs; removing
+  // it to tidy a list would hide information the user was deliberately given.
+  assert.equal(
+    models.find((model) => model.id === 'kilo/retiring-model').name,
+    'Retiring Model (retires Oct 5)',
+  );
+  // CommandCode's variant suffix is part of the name and survives the same way.
+  assert.equal(
+    models.find((model) => model.id === 'commandcode/deepseek/deepseek-v4-flash').name,
+    'DeepSeek V4 Flash (latest)',
+  );
   const blockedEvents = [];
   const blockedResolved = await adapter.resolveModel('ai-proxy', 'openrouter/paid/model');
   for await (const event of adapter.stream({

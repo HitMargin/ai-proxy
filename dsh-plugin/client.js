@@ -624,7 +624,11 @@ window.__ModuleLoader__.load({
                   h('th', null, t('outputTokens')),
                   h('th', null, t('failed')))),
                 h('tbody', null, usage.models.map((row) => h('tr', { key: row.model },
-                  h('td', { className: 'apx_mono' }, row.model),
+                  // Name first, id underneath: Zen publishes only an id, so the
+                  // id alone is what a reader would otherwise be shown.
+                  h('td', null,
+                    h('div', null, row.name || row.model),
+                    h('div', { className: 'apx_mono' }, row.model)),
                   h('td', null, String(row.calls)),
                   h('td', null, row.speed === null ? '—' : `${row.speed} tok/s`),
                   h('td', null, formatMs(row.firstTokenMs)),
@@ -635,7 +639,8 @@ window.__ModuleLoader__.load({
 
       const runtimeCard = h('div', { className: 'apx_card' },
         h('div', { className: 'apx_sechead' }, h('h3', null, t('runtime'))),
-        h('div', { className: 'apx_grid' },          h('div', { className: 'apx_stat' }, h('span', null, t('state')), h('b', { className: `apx_state ${tone}` }, runtime.state || 'unknown')),
+        h('div', { className: 'apx_grid' },
+          h('div', { className: 'apx_stat' }, h('span', null, t('state')), h('b', { className: `apx_state ${tone}` }, runtime.state || 'unknown')),
           h('div', { className: 'apx_stat' }, h('span', null, 'PID'), h('b', null, String(runtime.pid ?? '—'))),
           h('div', { className: 'apx_stat' }, h('span', null, t('mode')), h('b', null, runtime.mode || '—')),
           h('div', { className: 'apx_stat' }, h('span', null, t('accounts')), h('b', null, String(accounts.length)))),

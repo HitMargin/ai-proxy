@@ -20,6 +20,7 @@ import {
   byModel,
   emptyState,
   heatmap,
+  StatsStore,
   summarize,
   trend,
 } from './stats.mjs'
@@ -78,6 +79,13 @@ const MODALITY_WORDS = ['text', 'image', 'video', 'audio'];
 // prefixed id (`zen/jev-1.13-free`). Recover a readable label from the id's
 // last segment; `owned_by: opencode` also means the model is anonymous and has
 // no vendor name to show, so the id is the only honest source.
+//
+// An upstream name is used verbatim. Kilo appends a scheduling note to it
+// (`Space Bunny Alpha (retires Oct 5)`) and that note is the user being told
+// something they need; quietly stripping it would hide an upstream warning to
+// make a list look tidier. Parentheticals that are part of the name —
+// CommandCode's `(latest)` and `(exp)`, Kilo's `(free)` — are identity and
+// were never at risk.
 function readName(row) {
   if (typeof row.name === 'string' && row.name.trim() !== '') return row.name;
   const id = String(row.id ?? '');
@@ -491,19 +499,34 @@ function mapUsage(usage) {
 // Usage is recorded here rather than in the proxy: the harness is the only
 // layer that sees both the token counts an upstream reported and the wall
 // clock around the stream, so no channel needs its own instrumentation.
-let usageState = emptyState();
+//
+// The store is a file under the harness home, not a harness service: the
+// settings seam differs between kernel lines and the storage domain may not be
+// mounted, and usage history is high-cardinality telemetry that does not belong
+// in a configuration document. Without the file a DSH restart wiped the
+// dashboard, which is what made it look permanently empty.
+const usageStore = new StatsStore();
+
+/** Display names for usage rows, filled from the catalog as it is discovered. */
+const usageLabels = new Map();
 
 function recordUsage(record) {
-  usageState = applyRecord(usageState, record);
+  usageStore.set(applyRecord(usageStore.get(), record));
 }
 
 export function usageSnapshot(now = Date.now()) {
+  const state = usageStore.get();
   return {
-    summary: summarize(usageState, now),
-    models: byModel(usageState),
-    heatmap: heatmap(usageState, 119, now),
-    trend: trend(usageState),
+    summary: summarize(state, now),
+    models: byModel(state, usageLabels),
+    heatmap: heatmap(state, 119, now),
+    trend: trend(state),
   };
+}
+
+/** Flush pending usage to disk; called when the plugin is torn down. */
+export function flushUsage() {
+  usageStore.flush();
 }
 
 function finishKind(reason) {
@@ -636,6 +659,14 @@ export class AiProxyAdapter {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       models.push(model);
+    }
+    // Remembered so the usage table can show a model's name instead of its id:
+    // Zen publishes only an id, so `space-bunny-free` would otherwise be the
+    // only label a user ever sees.
+    for (const model of models) {
+      if (typeof model.name === 'string' && model.name !== '' && model.name !== model.id) {
+        usageLabels.set(model.id, model.name);
+      }
     }
     return models;
   }
@@ -1177,5 +1208,9 @@ export function apply(ctx, config = {}) {
   return () => {
     void runtime.stop();
     registration?.dispose?.();
+    // A pending usage write is coalesced for 800ms, so a teardown right after
+    // a turn would otherwise drop it. Flushing here makes the last call before a
+    // restart survive it.
+    flushUsage();
   };
 }

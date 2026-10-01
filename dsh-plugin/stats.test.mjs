@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   applyRecord,
   byModel,
@@ -9,9 +12,18 @@ import {
   heatmap,
   MAX_CREDIBLE_TPS,
   MIN_DECODE_MS,
+  StatsStore,
+  statsFilePath,
   summarize,
   trend,
 } from './stats.mjs';
+
+/** A scratch directory that cleans itself up. */
+function scratchDir(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apx-stats-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
 
 const DAY = new Date('2026-10-01T12:00:00Z').getTime();
 
@@ -186,4 +198,105 @@ test('old day buckets are pruned', () => {
     state = applyRecord(state, call({ at }), 10);
   }
   assert.ok(Object.keys(state.days).length <= 10, `buckets should be trimmed, got ${Object.keys(state.days).length}`);
+});
+
+test('history survives a restart', (t) => {
+  const file = path.join(scratchDir(t), 'stats.json');
+  const first = new StatsStore(file);
+  first.set(applyRecord(first.get(), call({ model: 'kilo/alpha' })));
+  first.set(applyRecord(first.get(), call({ model: 'kilo/alpha' })));
+  first.flush();
+  first.dispose();
+
+  // A fresh store is what the next DSH launch constructs. Without the file the
+  // dashboard came back empty after every restart, which read as "the counter
+  // is broken" rather than "the history was in memory".
+  const second = new StatsStore(file);
+  const summary = summarize(second.get(), DAY);
+  assert.equal(summary.requests, 2);
+  assert.equal(summary.totalTokens, 600);
+  assert.equal(byModel(second.get())[0].model, 'kilo/alpha');
+  second.dispose();
+});
+
+test('a missing file is a normal first run', (t) => {
+  const store = new StatsStore(path.join(scratchDir(t), 'nested', 'stats.json'));
+  assert.equal(store.get().requests, 0);
+  store.dispose();
+});
+
+test('a damaged file is kept, not overwritten', (t) => {
+  const dir = scratchDir(t);
+  const file = path.join(dir, 'stats.json');
+  fs.writeFileSync(file, '{ this is not json');
+  const store = new StatsStore(file);
+  assert.equal(store.get().requests, 0, 'a damaged file falls back to the default');
+  store.set(applyRecord(store.get(), call()));
+  store.flush();
+  // The next flush renames a fresh document over the file, so the damaged one is
+  // only recoverable if a copy was kept at load time.
+  const backups = fs.readdirSync(dir).filter((name) => name.includes('.corrupt-'));
+  assert.equal(backups.length, 1, `expected one backup, got ${JSON.stringify(backups)}`);
+  store.dispose();
+});
+
+test('a file from another stats version is refused wholesale', (t) => {
+  const file = path.join(scratchDir(t), 'stats.json');
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    days: { '2026-10-01': { total: 999999, models: {} } },
+    requests: 4242,
+    samples: [],
+  }));
+  const store = new StatsStore(file);
+  // Merging a day bucket whose meaning changed would report a total that no
+  // longer matches its rows, so an unrecognised version is dropped whole.
+  assert.equal(store.get().requests, 0);
+  assert.deepEqual(store.get().days, {});
+  store.dispose();
+});
+
+test('writes are coalesced and leave no temp file behind', (t) => {
+  const dir = scratchDir(t);
+  const file = path.join(dir, 'stats.json');
+  const store = new StatsStore(file);
+  let state = store.get();
+  for (let i = 0; i < 5; i += 1) state = applyRecord(state, call());
+  store.set(state);
+  assert.equal(fs.existsSync(file), false, 'the write is deferred, not immediate');
+  store.flush();
+  assert.equal(fs.existsSync(file), true);
+  assert.equal(
+    fs.readdirSync(dir).some((name) => name.includes('.tmp')),
+    false,
+    'a temp file must not survive a completed write',
+  );
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).requests, 5);
+  store.dispose();
+});
+
+test('dispose flushes what the timer had not written yet', (t) => {
+  const file = path.join(scratchDir(t), 'stats.json');
+  const store = new StatsStore(file);
+  store.set(applyRecord(store.get(), call()));
+  // A teardown right after a turn must not drop the last 800ms of history.
+  store.dispose();
+  const reopened = new StatsStore(file);
+  assert.equal(reopened.get().requests, 1);
+  reopened.dispose();
+});
+
+test('usage rows carry a display name when the catalog knows one', () => {
+  let state = emptyState();
+  state = applyRecord(state, call({ model: 'zen/space-bunny-free' }));
+  const labels = new Map([['zen/space-bunny-free', 'Space Bunny']]);
+  const [named] = byModel(state, labels);
+  assert.equal(named.name, 'Space Bunny');
+  const [bare] = byModel(state);
+  assert.equal(bare.name, 'zen/space-bunny-free', 'an unknown model falls back to its id');
+});
+
+test('the stats file lives under the harness home', () => {
+  const file = statsFilePath('/tmp/dsh-home');
+  assert.equal(file, path.join('/tmp/dsh-home', 'ai-proxy-dsh-bridge', 'stats.json'));
 });

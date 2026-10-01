@@ -11,12 +11,145 @@
 // evidence of speed, so it is excluded rather than averaged in. A model that
 // reports reasoning tokens would otherwise dominate the rate with tokens the
 // user never waited for.
+//
+// History is persisted to a file under the harness home for the same reason
+// that plugin keeps its own: the settings seam differs between kernel lines and
+// the storage domain may not be mounted at all, and usage history is
+// high-cardinality telemetry that does not belong in a configuration document.
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 export const STATS_VERSION = 2;
 export const MIN_DECODE_MS = 250;
 export const MAX_CREDIBLE_TPS = 250;
 const MAX_SAMPLES = 400;
 const DEFAULT_KEEP_DAYS = 120;
+
+/** Same resolution the harness uses: `$DSH_HOME` else `~/.dsh`. */
+export function resolveDshHome() {
+  const fromEnv = process.env.DSH_HOME;
+  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv.trim();
+  return path.join(os.homedir(), ".dsh");
+}
+
+export function statsFilePath(home = resolveDshHome()) {
+  return path.join(home, "ai-proxy-dsh-bridge", "stats.json");
+}
+
+/**
+ * A JSON file the plugin owns, written through a temp file and renamed.
+ *
+ * A crash mid-write must not leave a truncated store, and a damaged store must
+ * be kept rather than overwritten: the next scheduled flush renames a fresh
+ * default over it, and the history is then gone with nothing on disk to recover
+ * from and nothing in a log to explain it.
+ */
+export class StatsStore {
+  constructor(file = statsFilePath(), initial = emptyState()) {
+    this.file = file;
+    this.value = initial;
+    this.dirty = false;
+    this.timer = undefined;
+    this.disposed = false;
+    this.load();
+  }
+
+  load() {
+    let raw;
+    try {
+      raw = fs.readFileSync(this.file, "utf8");
+    } catch {
+      // Absent is the normal first-run case.
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (isPlainObject(parsed)) this.value = normalizeState(parsed, this.value);
+    } catch {
+      try {
+        if (fs.existsSync(this.file)) {
+          fs.copyFileSync(this.file, `${this.file}.corrupt-${Date.now()}`);
+        }
+      } catch {
+        // A home we cannot write to is not this file's problem.
+      }
+    }
+  }
+
+  get() {
+    return this.value;
+  }
+
+  /** Replace the state and schedule a write. */
+  set(next) {
+    if (this.disposed) return this.value;
+    this.value = next;
+    this.schedule();
+    return this.value;
+  }
+
+  schedule(delayMs = 800) {
+    if (this.disposed) return;
+    this.dirty = true;
+    if (this.timer !== undefined) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.flush();
+    }, delayMs);
+    // Telemetry must never hold the process open.
+    this.timer.unref?.();
+  }
+
+  flush() {
+    if (!this.dirty || this.disposed) return;
+    this.dirty = false;
+    try {
+      fs.mkdirSync(path.dirname(this.file), { recursive: true });
+      const temp = `${this.file}.${process.pid}.tmp`;
+      fs.writeFileSync(temp, JSON.stringify(this.value, undefined, 2), { mode: 0o600 });
+      fs.renameSync(temp, this.file);
+    } catch {
+      // Fail-soft: the next mutation retries and nothing depends on this.
+    }
+  }
+
+  dispose() {
+    if (this.timer !== undefined) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+    // Persist first, then lock: a late callback from a disposed generation must
+    // never write over its successor's state.
+    this.flush();
+    this.disposed = true;
+    this.dirty = false;
+  }
+}
+
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Accept a stored document only in the shape this version understands.
+ *
+ * A file written by a different build, or hand-edited into something else, is
+ * dropped back to the default rather than merged field by field: a partially
+ * recognised day bucket would report a total that no longer matches its rows.
+ */
+function normalizeState(parsed, fallback) {
+  if (parsed.version !== STATS_VERSION) return fallback;
+  if (!isPlainObject(parsed.days) || !Array.isArray(parsed.samples)) return fallback;
+  return {
+    version: STATS_VERSION,
+    days: parsed.days,
+    models: isPlainObject(parsed.models) ? parsed.models : {},
+    requests: Number.isFinite(parsed.requests) ? parsed.requests : 0,
+    samples: parsed.samples,
+  };
+}
 
 /**
  * Classify one call's decode window.
@@ -188,8 +321,16 @@ export function summarize(state, now = Date.now()) {
   };
 }
 
-/** Per-model rollup across every retained day, for the panel's model table. */
-export function byModel(state) {
+/**
+ * Per-model rollup across every retained day, for the panel's model table.
+ *
+ * `labels` maps a model id to its display name. Zen publishes only an id, so
+ * without it the table would read `space-bunny-free` where the catalog knows
+ * the model as "Space Bunny".
+ */
+export function byModel(state, labels) {
+  const nameOf = (id) =>
+    labels && typeof labels.get === "function" ? labels.get(id) ?? id : id;
   const acc = new Map();
   for (const bucket of Object.values(state.days)) {
     for (const [model, row] of Object.entries(bucket.models)) {
@@ -223,6 +364,7 @@ export function byModel(state) {
   return [...acc.values()]
     .map((row) => ({
       model: row.model,
+      name: nameOf(row.model),
       calls: row.calls,
       failed: row.failed,
       input: row.input,
