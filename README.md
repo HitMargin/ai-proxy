@@ -76,6 +76,10 @@ deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 
 CommandCode 已接入 abort/timeout 分类；DeepSeek 网页端和 cnb 已接入响应体嗅探。
 
+**Zen 现在也接入了截断检测。** reader 报 `done` 并不等于回答写完了——Zen 在匿名额度中途耗尽、或传输失败时都会直接关连接，而这两者过去都会给客户端留下一个 `finish_reason: stop` 和半句没写完的话，和「模型自己决定停止」完全无法区分。agent loop 于是判定回合正常结束、标记目标完成、起下一个目标，故障在任何地方都不留痕迹。
+
+现在**由各 wire 自己的终止帧判定是否完成**，而不是由 reader：`[DONE]`（chat）、`response.completed` / `failed` / `incomplete`（responses）、`message_stop`（messages）。没有终止帧就结束 = 截断，会先补一帧 `{"error":{"code":"stream_cut"…}}` 再收尾——插件会把这种帧变成可见的错误。客户端主动取消**不算故障**（走 `StreamAbort`，静默结束），否则用户点停止也会被报成上游问题。
+
 ---
 
 ## 快速开始

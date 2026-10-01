@@ -517,3 +517,171 @@ Deno.test("no effort asked for means no reasoning key at all", async () => {
     restore();
   }
 });
+
+// ---------- upstream cut detection ----------
+
+function sseText(frames: string[]): string {
+  return frames.join("");
+}
+
+async function readAll(body: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = body.getReader();
+  const dec = new TextDecoder();
+  let out = "";
+  while (true) {
+    const r = await reader.read();
+    if (r.done) return out;
+    out += dec.decode(r.value, { stream: true });
+  }
+}
+
+function chunkStream(chunks: string[]): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder();
+  let i = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (i >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(enc.encode(chunks[i++]));
+    },
+  });
+}
+
+function throwingStream(reason: unknown): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder();
+  let sent = false;
+  return new ReadableStream({
+    pull(controller) {
+      if (!sent) {
+        sent = true;
+        controller.enqueue(
+          enc.encode('data: {"choices":[{"delta":{"content":"half"}}]}\n\n'),
+        );
+        return;
+      }
+      controller.error(reason);
+    },
+  });
+}
+
+Deno.test("a chat stream that ends with [DONE] reports no cut", async () => {
+  const body = chunkStream([
+    'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+    "data: [DONE]\n\n",
+  ]);
+  const text = await readAll(restoreChatStream(body, new Map()));
+  if (text.includes("stream_cut")) {
+    throw new Error(`a completed stream was reported as cut: ${text}`);
+  }
+  if (!text.includes("[DONE]")) {
+    throw new Error("the passthrough dropped [DONE]");
+  }
+});
+
+Deno.test("a chat stream cut mid-answer is reported instead of a clean stop", async () => {
+  const body = chunkStream([
+    'data: {"choices":[{"delta":{"content":"the sentence stops "}}]}\n\n',
+  ]);
+  const text = await readAll(restoreChatStream(body, new Map()));
+  const frame = text.split("\n\n").find((f) => f.includes("stream_cut"));
+  if (!frame) throw new Error(`a cut stream was reported as complete: ${text}`);
+  const payload = JSON.parse(frame.slice(5).trim());
+  assertEquals(payload.error.code, "stream_cut");
+  if (!payload.error.message.includes("after partial output")) {
+    throw new Error(
+      `the message should say output had been delivered: ${payload.error.message}`,
+    );
+  }
+});
+
+Deno.test("a reader that throws mid-stream is reported with its reason", async () => {
+  const body = throwingStream(new Error("socket hang up"));
+  const text = await readAll(restoreChatStream(body, new Map()));
+  if (!text.includes("stream_cut")) {
+    throw new Error(`a read failure was swallowed: ${text}`);
+  }
+  if (!text.includes("socket hang up")) {
+    throw new Error(`the upstream reason was dropped: ${text}`);
+  }
+});
+
+Deno.test("a cancellation is never reported as an upstream cut", async () => {
+  // Two routes to the same verdict: the signal is aborted, and the reader
+  // fails with an AbortError while the signal is still live. Either way the
+  // client walked away and nothing about it is the gateway's fault.
+  const aborted = new AbortController();
+  aborted.abort();
+  const viaSignal = await readAll(
+    restoreChatStream(
+      throwingStream(new Error("cancelled")),
+      new Map(),
+      [aborted.signal],
+    ),
+  );
+  if (viaSignal.includes("stream_cut")) {
+    throw new Error(`an aborted signal was reported as a fault: ${viaSignal}`);
+  }
+  const viaError = await readAll(
+    restoreChatStream(
+      throwingStream(new DOMException("cancelled", "AbortError")),
+      new Map(),
+      [new AbortController().signal],
+    ),
+  );
+  if (viaError.includes("stream_cut")) {
+    throw new Error(`an AbortError was reported as a fault: ${viaError}`);
+  }
+});
+
+Deno.test("the Responses wire reports a cut when response.completed never arrives", async () => {
+  const originalFetch = globalThis.fetch;
+  const enc = new TextEncoder();
+  let sent = false;
+  globalThis.fetch = (async () =>
+    new Response(
+      new ReadableStream({
+        pull(c) {
+          if (!sent) {
+            sent = true;
+            c.enqueue(enc.encode(
+              'data: {"type":"response.output_text.delta","delta":"partial"}' +
+                "\n\n",
+            ));
+            return;
+          }
+          c.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as typeof fetch;
+  try {
+    const request = new Request("http://local/zen/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-session-id": "dsh-session",
+      },
+      body: JSON.stringify({
+        model: "muse-spark-1.3-contributor-free",
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+    const response = await handleZen(
+      "/zen/v1/responses",
+      request,
+      new URL(request.url),
+    );
+    const text = response.body ? await readAll(response.body) : "";
+    if (!text.includes("stream_cut")) {
+      throw new Error(`a Responses cut was reported as complete: ${text}`);
+    }
+    if (!text.includes("response.completed")) {
+      throw new Error(`the reason should name the missing frame: ${text}`);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

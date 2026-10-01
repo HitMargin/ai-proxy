@@ -1,6 +1,7 @@
 // deno-lint-ignore-file no-explicit-any
 import { ENV } from "./core.ts";
 import { compactIfNeeded, fallbackTruncate } from "./zen-compaction.ts";
+import { classifyStreamFailure } from "./runtime/stream-normalizer.ts";
 import {
   ensureZenCatalog,
   zenCatalogEnabled,
@@ -762,21 +763,144 @@ function chatFrame(
   }));
 }
 
+/**
+ * Make a silent upstream cut visible.
+ *
+ * A reader reporting `done` is not evidence the answer finished. Zen closes the
+ * connection when its anonymous quota runs out part-way through a generation, and
+ * on transport failures, and every one of those used to leave the client holding a
+ * `stop` finish_reason and a sentence that stops mid-word — indistinguishable from
+ * the model choosing to stop. The agent loop reads that as a finished turn, marks
+ * the goal complete and starts the next one, so the failure never surfaces at all.
+ *
+ * Each wire format ends with its own frame, so completion is decided by that frame
+ * rather than by the reader. Ending without one is a cut, and it is reported through
+ * an `error` frame — the shape the DSH bridge already turns into a visible failure.
+ * Client cancellation is not a cut and stays silent: `cancel` stops the stream
+ * without another pull, so nothing is emitted on that path.
+ */
+interface StreamCompletion {
+  /** Mark the upstream’s own end-of-stream frame. */
+  complete(): void;
+  /** Record that output reached the client, which decides how a cut reads. */
+  delivered(): void;
+  /** The frame to emit before closing, or "" when the stream finished properly. */
+  cutFrame(reason: string): string;
+}
+
+function streamCompletion(
+  wire: "responses" | "messages" | "chat",
+): StreamCompletion {
+  let complete = false;
+  let delivered = false;
+  return {
+    complete() {
+      complete = true;
+    },
+    delivered() {
+      delivered = true;
+    },
+    cutFrame(reason: string): string {
+      if (complete) return "";
+      const where = delivered
+        ? "after partial output had already been delivered"
+        : "before any output";
+      return sseData(JSON.stringify({
+        error: {
+          type: "upstream_error",
+          code: "stream_cut",
+          message: `Zen closed the ${wire} stream ${where}: ${reason}`,
+        },
+      }));
+    },
+  };
+}
+
+/**
+ * Whether a frame is the upstream saying it finished. `raw === "[DONE]"` covers the
+ * chat wire; the other two name their own terminal event.
+ */
+function isTerminalFrame(
+  wire: "responses" | "messages" | "chat",
+  event: Json | undefined,
+  raw: string,
+): boolean {
+  if (raw === "[DONE]") return true;
+  if (!event || typeof event !== "object") return false;
+  const type = String((event as Json).type || "");
+  if (wire === "responses") {
+    return type === "response.completed" || type === "response.failed" ||
+      type === "response.incomplete";
+  }
+  if (wire === "messages") return type === "message_stop";
+  return false;
+}
+
+/**
+ * Read the next chunk, turning a read failure into a reported reason.
+ *
+ * `classifyStreamFailure` is what keeps a client cancellation from being counted as
+ * an upstream fault — the same reason CommandCode calls it.
+ */
+async function readChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  abortSignals: (AbortSignal | undefined)[],
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  try {
+    return await reader.read();
+  } catch (error) {
+    const failure = classifyStreamFailure(error, {
+      abortedSignals: abortSignals,
+    });
+    throw failure === "aborted"
+      ? new StreamAbort(error instanceof Error ? error.message : String(error))
+      : new StreamCutError(
+        `${failure}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+  }
+}
+
+/** A client went away; the stream ends without anything being reported. */
+class StreamAbort extends Error {}
+/** The upstream failed mid-stream and the reason should reach the client. */
+class StreamCutError extends Error {}
 function responsesEventsToChat(
   body: ReadableStream<Uint8Array>,
   model: string,
+  abortSignals: (AbortSignal | undefined)[] = [],
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  const completion = streamCompletion("responses");
   let buffer = "";
   let sentText = false;
   let toolIndex = 0;
   return new ReadableStream({
     async pull(controller) {
       while (true) {
-        const result = await reader.read();
+        let result: ReadableStreamReadResult<Uint8Array>;
+        try {
+          result = await readChunk(reader, abortSignals);
+        } catch (error) {
+          if (error instanceof StreamAbort) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(encoder.encode(
+            completion.cutFrame(
+              error instanceof Error ? error.message : String(error),
+            ),
+          ));
+          controller.enqueue(encoder.encode(sseData("[DONE]")));
+          controller.close();
+          return;
+        }
         if (result.done) {
+          const cut = completion.cutFrame(
+            "the connection ended without response.completed",
+          );
+          if (cut) controller.enqueue(encoder.encode(cut));
           controller.enqueue(encoder.encode(sseData("[DONE]")));
           controller.close();
           return;
@@ -797,16 +921,19 @@ function responsesEventsToChat(
               continue;
             }
             const type = String(event.type || "");
+            if (isTerminalFrame("responses", event, raw)) completion.complete();
             if (
               type === "response.output_text.delta" &&
               typeof event.delta === "string"
             ) {
               sentText = true;
+              completion.delivered();
               output += chatFrame({ model, content: event.delta });
             } else if (
               type === "response.output_item.added" &&
               event.item?.type === "function_call"
             ) {
+              completion.delivered();
               output += chatFrame({
                 model,
                 tool_calls: [{
@@ -858,17 +985,39 @@ function responsesEventsToChat(
 function claudeEventsToChat(
   body: ReadableStream<Uint8Array>,
   model: string,
+  abortSignals: (AbortSignal | undefined)[] = [],
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  const completion = streamCompletion("messages");
   let buffer = "";
   let toolIndex = 0;
   return new ReadableStream({
     async pull(controller) {
       while (true) {
-        const result = await reader.read();
+        let result: ReadableStreamReadResult<Uint8Array>;
+        try {
+          result = await readChunk(reader, abortSignals);
+        } catch (error) {
+          if (error instanceof StreamAbort) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(encoder.encode(
+            completion.cutFrame(
+              error instanceof Error ? error.message : String(error),
+            ),
+          ));
+          controller.enqueue(encoder.encode(sseData("[DONE]")));
+          controller.close();
+          return;
+        }
         if (result.done) {
+          const cut = completion.cutFrame(
+            "the connection ended without message_stop",
+          );
+          if (cut) controller.enqueue(encoder.encode(cut));
           controller.enqueue(encoder.encode(sseData("[DONE]")));
           controller.close();
           return;
@@ -888,10 +1037,12 @@ function claudeEventsToChat(
             } catch {
               continue;
             }
+            if (isTerminalFrame("messages", event, raw)) completion.complete();
             if (
               event.type === "content_block_start" &&
               event.content_block?.type === "text"
             ) {
+              completion.delivered();
               output += chatFrame({
                 model,
                 content: String(event.content_block.text || ""),
@@ -900,6 +1051,7 @@ function claudeEventsToChat(
               event.type === "content_block_delta" &&
               event.delta?.type === "text_delta"
             ) {
+              completion.delivered();
               output += chatFrame({
                 model,
                 content: String(event.delta.text || ""),
@@ -962,17 +1114,40 @@ function claudeEventsToChat(
 export function restoreChatStream(
   body: ReadableStream<Uint8Array>,
   map: Map<string, string>,
+  abortSignals: (AbortSignal | undefined)[] = [],
 ): ReadableStream<Uint8Array> {
-  if (map.size === 0) return body;
+  // Wrapped even when there is nothing to rename: the passthrough used to return
+  // the body untouched, which is also the path with no way to notice that the
+  // upstream stopped mid-answer. Frame text is passed through byte for byte.
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  const completion = streamCompletion("chat");
   let buffer = "";
   return new ReadableStream({
     async pull(controller) {
       while (true) {
-        const result = await reader.read();
+        let result: ReadableStreamReadResult<Uint8Array>;
+        try {
+          result = await readChunk(reader, abortSignals);
+        } catch (error) {
+          if (error instanceof StreamAbort) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(encoder.encode(
+            completion.cutFrame(
+              error instanceof Error ? error.message : String(error),
+            ),
+          ));
+          controller.close();
+          return;
+        }
         if (result.done) {
+          const cut = completion.cutFrame(
+            "the connection ended without [DONE]",
+          );
+          if (cut) controller.enqueue(encoder.encode(cut));
           controller.close();
           return;
         }
@@ -990,15 +1165,22 @@ export function restoreChatStream(
               continue;
             }
             const raw = line.slice(5).trim();
-            if (!raw || raw === "[DONE]") {
+            if (!raw) {
+              mapped.push(line);
+              continue;
+            }
+            if (raw === "[DONE]") {
+              completion.complete();
               mapped.push(line);
               continue;
             }
             try {
+              const event = JSON.parse(raw);
+              if (event?.choices?.[0]?.delta?.content !== undefined) {
+                completion.delivered();
+              }
               mapped.push(
-                `data: ${
-                  JSON.stringify(restoreToolNames(JSON.parse(raw), map))
-                }`,
+                `data: ${JSON.stringify(restoreToolNames(event, map))}`,
               );
             } catch {
               mapped.push(line);
@@ -1264,11 +1446,14 @@ export async function handleZen(
     if (!response.body) {
       return jsonResponse({ error: "Zen returned an empty stream" }, 502);
     }
+    // The abort signal is what keeps a client that walked away from being
+    // reported as an upstream cut.
+    const abortSignals = [request.signal];
     const converted = wire === "responses"
-      ? responsesEventsToChat(response.body, model)
+      ? responsesEventsToChat(response.body, model, abortSignals)
       : wire === "messages"
-      ? claudeEventsToChat(response.body, model)
-      : restoreChatStream(response.body, renameMap);
+      ? claudeEventsToChat(response.body, model, abortSignals)
+      : restoreChatStream(response.body, renameMap, abortSignals);
     return new Response(converted, {
       status: response.status,
       headers: {
