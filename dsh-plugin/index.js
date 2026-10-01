@@ -127,21 +127,45 @@ function isBlockedModelId(modelId) {
  * camelCase, so both spellings have to be accepted here. Reading only one of them
  * is what turned 33 image-capable CommandCode models into text-only rows.
  */
-const EFFORT_ORDER = ['off', 'low', 'medium', 'high', 'xhigh', 'max'];
+// `minimal` sits below `low`, and the Zen catalog publishes it for muse spark.
+const EFFORT_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
  * Keep the efforts a channel actually published, in ladder order.
  *
+ * Both spellings reach here, and reading only one broke the provider outright.
+ * CommandCode publishes bare strings (`["off","high","max"]`); the Zen models
+ * endpoint publishes objects (`[{id, name}]`, the shape `/v1/models` documents for
+ * `reasoning_efforts`). Filtering for strings alone returned an empty set for
+ * every Zen model, and an empty `efforts` array is rejected by the harness with
+ * `INVALID_MODEL_REASONING` - the whole `ai-proxy` provider failed to load over a
+ * shape difference, not a capability problem.
+ *
  * CommandCode models do not all offer the same rungs (some publish only
  * off/high/max), and offering one a channel never advertised produced the
- * harness's duplicate-effort rejection.
+ * harness's duplicate-effort rejection. An id outside this order is kept after
+ * the ordered ones instead of being dropped: the ladder is what the upstream
+ * said, not what this table expected.
  */
 function pickEfforts(published) {
   if (!Array.isArray(published) || published.length === 0) {
     return ['off', 'low', 'high', 'max'];
   }
-  const seen = new Set(published.filter((value) => typeof value === 'string'));
-  return EFFORT_ORDER.filter((effort) => seen.has(effort));
+  const seen = new Set();
+  const publishedOrder = [];
+  for (const value of published) {
+    const id = typeof value === 'string'
+      ? value
+      : isRecord(value) && typeof value.id === 'string'
+      ? value.id
+      : '';
+    if (id === '' || seen.has(id)) continue;
+    seen.add(id);
+    publishedOrder.push(id);
+  }
+  const ordered = EFFORT_ORDER.filter((effort) => seen.has(effort));
+  const unordered = publishedOrder.filter((id) => !EFFORT_ORDER.includes(id));
+  return [...ordered, ...unordered];
 }
 
 const MODALITY_WORDS = ['text', 'image', 'video', 'audio'];

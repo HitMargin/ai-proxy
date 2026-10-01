@@ -112,6 +112,24 @@ globalThis.fetch = async (input, init = {}) => {
             reasoning_efforts: ['off', 'high', 'max'],
           },
           {
+            // The shape /v1/models documents for `reasoning_efforts`, which is
+            // what the Zen models endpoint returns. Reading only strings made
+            // this come back empty and took the whole provider down with
+            // INVALID_MODEL_REASONING.
+            id: 'zen/object-shape',
+            name: 'Zen object shape',
+            context_window: 1048576,
+            max_output_tokens: 131072,
+            input_modalities: ['text'],
+            reasoning_efforts: [
+              { id: 'minimal', name: 'minimal' },
+              { id: 'low', name: 'low' },
+              { id: 'medium', name: 'medium' },
+              { id: 'high', name: 'high' },
+              { id: 'xhigh', name: 'xhigh' },
+            ],
+          },
+          {
             // Kilo publishes the models.models.dev shape, not the flat OpenAI
             // one: modalities nest under `architecture` and context under
             // `top_provider`. Reading only flat keys turned this into text-only.
@@ -381,6 +399,15 @@ try {
   // upstream never offered is what produced the duplicate-effort rejection.
   assert.deepEqual(projectResolved.reasoning.efforts.map((effort) => effort.id), ['off', 'high', 'max']);
   assert.equal(new Set(projectResolved.reasoning.efforts.map((effort) => effort.id)).size, 3);
+  // The object spelling must yield the same treatment, ladder order included, and
+  // `minimal` - which the Zen catalog publishes for muse spark - has to survive.
+  const objectResolved = await adapter.resolveModel('ai-proxy', 'zen/object-shape');
+  assert.deepEqual(
+    objectResolved.reasoning.efforts.map((effort) => effort.id),
+    ['minimal', 'low', 'medium', 'high', 'xhigh'],
+  );
+  assert.equal(objectResolved.reasoning.defaultEffort, 'high');
+  assert.ok(objectResolved.reasoning.efforts.length > 0);
   // The display name is the id the upstream published. Inventing spellings
   // (e.g. `Very high`) advertised a rung no channel serves, and a translated
   // label reads wrong outside that locale.
