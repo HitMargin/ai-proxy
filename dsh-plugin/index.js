@@ -608,6 +608,34 @@ function installImageResolver(ctx, logger) {
     }
   };
 }
+/**
+ * The thinking text in one streaming delta, whichever field this gateway calls it.
+ *
+ * There is no single name. DeepSeek streams `reasoning_content`, OpenRouter and
+ * kilo stream `reasoning`, and others use `thinking`. Reading only the first meant
+ * every kilo turn threw its thinking away: measured against space-bunny-alpha,
+ * the model produced 126 tokens of reasoning under `delta.reasoning` while
+ * `delta.reasoning_content` never appeared once. The composer showed no thinking
+ * block at all, and the usage panel reported zero reasoning tokens - which I had
+ * read as "kilo returns none" instead of "the plugin never looked".
+ *
+ * Only one of them is taken per delta. A gateway that sets two is not concatenating
+ * them; it is describing the same thinking twice.
+ */
+function reasoningTextOf(delta) {
+  for (const key of ['reasoning_content', 'reasoning', 'thinking']) {
+    const value = delta[key];
+    if (typeof value === 'string' && value !== '') return value;
+    // Some gateways ship an array of typed reasoning parts.
+    if (Array.isArray(value)) {
+      const joined = value
+        .map((part) => (typeof part === 'string' ? part : isRecord(part) ? String(part.text ?? part.content ?? '') : ''))
+        .join('');
+      if (joined !== '') return joined;
+    }
+  }
+  return '';
+}
 function toOpenAiMessages(options, resolveImage, supportsImages, warnings) {
   const output = [];
   if (typeof options.system === 'string' && options.system !== '') {
@@ -1138,13 +1166,14 @@ export class AiProxyAdapter {
           text += delta.content;
           yield { type: 'text-delta', index: textIndex, text: delta.content };
         }
-        if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
+        const thinking = reasoningTextOf(delta);
+        if (thinking !== '') {
           if (reasoningIndex === undefined) {
             reasoningIndex = 1;
             yield { type: 'block-start', index: reasoningIndex, blockType: 'reasoning' };
           }
-          reasoning += delta.reasoning_content;
-          yield { type: 'reasoning-delta', index: reasoningIndex, text: delta.reasoning_content };
+          reasoning += thinking;
+          yield { type: 'reasoning-delta', index: reasoningIndex, text: thinking };
         }
         for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
           if (!isRecord(call)) continue;

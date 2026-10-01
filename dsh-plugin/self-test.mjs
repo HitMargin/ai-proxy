@@ -226,6 +226,14 @@ globalThis.fetch = async (input, init = {}) => {
       'data: {"choices":[{"delta":{"content":"half an ans"},"finish_reason":null}]}\n\n',
     ].join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }
+  if (streamMode === 'reasoning-kilo') {
+    return new Response([
+      'data: {"choices":[{"delta":{"reasoning":"kilo spells it "},"finish_reason":null}]}\n\n',
+      'data: {"choices":[{"delta":{"reasoning":"reasoning"},"finish_reason":null}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ].join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }
   if (streamMode === 'cut-empty') {
     return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }
@@ -597,6 +605,24 @@ try {
   assert.equal(withImage[0].content, '(see attached images)');
   assert.equal(withImage[1].role, 'user');
   assert.ok(withImage[1].content.some((part) => part.type === 'image_url'));
+
+  // Thinking arrives under whichever field the gateway chose. Measured against
+  // space-bunny-alpha: 126 tokens under `reasoning`, and `reasoning_content`
+  // never appeared once - so reading only the DeepSeek spelling discarded every
+  // kilo turn's thinking without a trace.
+  streamMode = 'reasoning-kilo';
+  let reasoningText = '';
+  let reasoningBlocks = 0;
+  for await (const event of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'think' }] }],
+    maxTokens: 32,
+  }, toolResolved)) {
+    if (event.type === 'reasoning-delta') reasoningText += event.text;
+    if (event.type === 'block-start' && event.blockType === 'reasoning') reasoningBlocks++;
+  }
+  assert.equal(reasoningBlocks, 1, 'the reasoning block must open exactly once');
+  assert.equal(reasoningText, 'kilo spells it reasoning');
   assert.equal(panelRoute.path, '/api/ai-proxy-commandcode');
   let panelBody = '';
   let panelStatus = 0;
