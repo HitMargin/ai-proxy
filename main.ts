@@ -37,7 +37,13 @@ function checkAuth(request: Request) {
 }
 
 // ---------- 缓存 ----------
-const cache: any = { data: {}, TTL: 5 * 60 * 1000 };
+// How long a complete roster is kept, and how long an incomplete one is. The short
+// window recovers from a startup race without re-polling every member on every request.
+const cache: any = {
+  data: {},
+  TTL: 5 * 60 * 1000,
+  DEGRADED_TTL: 15 * 1000,
+};
 
 // ---------- 主处理 ----------
 // 反向代理模式：BACKEND_URL 有值时纯转发（流式进出，不解析），重活由后端干
@@ -301,10 +307,20 @@ async function handleAggregateV1(
 
   if (path.endsWith("/models") && request.method === "GET") {
     const now = Date.now();
-    if (
-      !cache.data["v1-aggregate"] ||
-      now - cache.data["v1-aggregate"].timestamp >= cache.TTL
-    ) {
+    // A roster that came back short is served for a moment, not for the full TTL.
+    //
+    // The proxy is spawned and immediately asked for models, at a point where the
+    // host's networking may not have settled - on this machine every outbound
+    // listing failed on the first request two seconds after start. Caching that
+    // empty answer for the full window turned a startup race into a five minute
+    // outage that survived restarts, because each restart raced again and cached
+    // again. Restarting could not clear it, and the per-channel endpoints kept
+    // working the whole time because they do not read this cache at all.
+    const previous = cache.data["v1-aggregate"];
+    const ttl = previous?.degraded === true
+      ? Math.min(cache.TTL, cache.DEGRADED_TTL)
+      : cache.TTL;
+    if (!previous || now - previous.timestamp >= ttl) {
       const members = await v1FetchMemberModels();
       const data: any[] = [];
       for (const key of V1_AGGREGATE_MEMBERS) {
@@ -312,8 +328,21 @@ async function handleAggregateV1(
           data.push({ ...m, id: `${key}/${m.id}`, owned_by: key });
         }
       }
+      // Degraded means any member is absent or came back empty. One channel
+      // failing while the rest answer is precisely the case that used to hide:
+      // the roster looked healthy, only shorter, and stayed that way for the
+      // whole window.
+      const degraded = V1_AGGREGATE_MEMBERS.some((key) =>
+        !Array.isArray(members[key]) || members[key].length === 0
+      );
+      if (degraded && previous?.degraded !== true) {
+        console.warn(
+          `[v1] roster is incomplete (${data.length} models); retrying sooner than the full TTL`,
+        );
+      }
       cache.data["v1-aggregate"] = {
         timestamp: now,
+        degraded,
         data: { object: "list", data },
       };
     }
