@@ -226,6 +226,15 @@ globalThis.fetch = async (input, init = {}) => {
       'data: {"choices":[{"delta":{"content":"half an ans"},"finish_reason":null}]}\n\n',
     ].join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }
+  if (streamMode === 'usage-cached') {
+    return new Response(
+      [
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":880,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":149,"cache_write_tokens":12},"completion_tokens_details":{"reasoning_tokens":0}}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
   if (streamMode === 'reasoning-kilo') {
     return new Response([
       'data: {"choices":[{"delta":{"reasoning":"kilo spells it "},"finish_reason":null}]}\n\n',
@@ -563,6 +572,22 @@ try {
     purpose: 'session-title',
   }, toolResolved)) { /* asserted below */ }
   assert.equal(lastChatBody.reasoning_effort, undefined, 'a session title must not spend reasoning tokens');
+
+  // TokenUsage carries cacheReadTokens / cacheWriteTokens, and mapUsage used to
+  // drop both - so a call that really did read 149 of 880 tokens from cache was
+  // reported to the composer as a 0% hit rate.
+  streamMode = 'usage-cached';
+  let cachedUsage = null;
+  for await (const event of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    maxTokens: 32,
+  }, toolResolved)) {
+    if (event.type === 'usage') cachedUsage = event.usage;
+  }
+  assert.equal(cachedUsage.inputTokens, 880);
+  assert.equal(cachedUsage.cacheReadTokens, 149, 'a reported cache read must survive into TokenUsage');
+  assert.equal(cachedUsage.cacheWriteTokens, 12, 'a reported cache write must survive into TokenUsage');
 
   // Images reach the wire now. The block shape is { type:'image', attachment }
   // - the old code read `part.source`, which does not exist in the harness, so

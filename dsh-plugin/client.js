@@ -49,6 +49,8 @@ window.__ModuleLoader__.load({
         available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
         check: 'Check status', checking: 'Checking…', checkAll: 'All channels', checkDone: 'Checked {0} models',
         checkFailed: 'Check failed', checkHint: 'Each model sends one minimal request and uses that channel’s free quota.',
+        rosterNow: 'Model list after restart', rosterFailed: 'Could not read the model list',
+        rosterNow: 'Model list after restart', rosterFailed: 'Could not read the model list',
         usage: 'Usage', totalTokens: 'Tokens', outputTokens: 'Output', reasoningTokens: 'Reasoning',
         calls: 'Calls', failed: 'Failed', speed: 'Output speed', firstToken: 'First token', avgOutput: 'Avg output',
         heatmap: 'Token heatmap', trend: 'Cumulative', modelUsage: 'Per model', today: 'Today',
@@ -299,6 +301,7 @@ window.__ModuleLoader__.load({
       const [usage, setUsage] = useState(null)
       const [usageError, setUsageError] = useState('')
       const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
       const [notice, setNotice] = useState('')
       const [busy, setBusy] = useState(false)
       const [checking, setChecking] = useState(false)
@@ -396,8 +399,21 @@ window.__ModuleLoader__.load({
 
       const act = (path, body) => {
         setBusy(true)
+        setNotice('')
         api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined })
-          .then((next) => { if (next && next.state) setSettings(next) })
+          .then((next) => {
+          if (next && next.state) setSettings(next)
+          // A restart now reports what the proxy can see, per channel. Without
+          // this the button looks like a no-op whenever a channel is down.
+          if (next?.roster) {
+            const r = next.roster
+            setNotice(
+              r.error
+                ? `${t('rosterFailed')}: ${r.error}`
+                : `${t('rosterNow')}: ${r.count}${r.added?.length ? ` · +${r.added.length}` : ''}${r.removed?.length ? ` · -${r.removed.length}` : ''}`,
+            )
+          }
+        })
           .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
           .finally(() => { setBusy(false); loadRef.current() })
       }

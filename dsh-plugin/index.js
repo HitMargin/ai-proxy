@@ -790,10 +790,27 @@ function mapUsage(usage) {
   const completion = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
   if (!Number.isFinite(prompt) && !Number.isFinite(completion)) return undefined;
   const details = isRecord(usage.completion_tokens_details) ? usage.completion_tokens_details : {};
+  // TokenUsage is { inputTokens, outputTokens, totalTokens?, cacheReadTokens?,
+  // cacheWriteTokens?, reasoningTokens? }. Only the first two and reasoning were
+  // ever populated, so every gateway's prompt-cache accounting arrived as zero:
+  // a call that really did read 138 of 167 tokens from cache reported a 0% hit
+  // rate. The upstream numbers were there the whole time, under the OpenAI
+  // spelling; Anthropic-style gateways spell it cache_read_input_tokens.
+  const promptDetails = isRecord(usage.prompt_tokens_details) ? usage.prompt_tokens_details : {};
+  const cacheRead = Number(
+    promptDetails.cached_tokens ?? usage.cache_read_input_tokens ?? usage.cached_tokens ?? 0,
+  ) || 0;
+  const cacheWrite = Number(
+    promptDetails.cache_write_tokens ?? usage.cache_creation_input_tokens ?? 0,
+  ) || 0;
   return {
     inputTokens: Math.max(0, prompt),
     outputTokens: Math.max(0, completion),
     reasoningTokens: Math.max(0, Number(details.reasoning_tokens ?? 0) || 0),
+    // Omitted rather than zeroed: a gateway that does not report a cache is
+    // saying nothing, and 0 is a claim.
+    ...(cacheRead > 0 ? { cacheReadTokens: cacheRead } : {}),
+    ...(cacheWrite > 0 ? { cacheWriteTokens: cacheWrite } : {}),
   };
 }
 
@@ -932,6 +949,8 @@ export class AiProxyAdapter {
     // later and a one-shot read would disable images for the whole process with
     // nothing logged.
     this.resolveImage = options.resolveImage;
+    // Ids seen by the last roster read, so a restart can report what moved.
+    this.lastRoster = [];
     this.blockedModelCount = 0;
   }
 
@@ -997,6 +1016,8 @@ export class AiProxyAdapter {
 
   async listProjectModels() {
     const discovered = await this.listModels();
+    // Remembered so a restart can say what changed. The roster itself is never
+    // cached - every call reads it fresh, which is what makes the panel's list live.
     const models = [];
     const seen = new Set();
     let blocked = 0;
@@ -1051,6 +1072,7 @@ export class AiProxyAdapter {
         usageLabels.set(model.id, model.name);
       }
     }
+    this.lastRoster = models.map((model) => model.id);
     return models;
   }
 
@@ -1669,9 +1691,39 @@ function apiHandler(adapter, runtime, projectAdapter) {
         return sendJson(res, 200, runtime.snapshot());
       }
       if (method === 'POST' && route === '/restart') {
+        const before = Array.isArray(projectAdapter?.lastRoster) ? projectAdapter.lastRoster : [];
         await runtime.stop();
         await runtime.start();
-        return sendJson(res, 200, runtime.snapshot());
+        // Re-read the roster right away. Restarting is exactly when someone wants
+        // to know what the proxy can see now, and the roster is never cached, so
+        // this is one fresh read rather than an invalidation dance.
+        //
+        // It cannot push the harness's own selector to re-discover: that catalog
+        // is loaded once per Host generation and only reset by a connection
+        // reset, and the event that would refresh it is emitted by the host, not
+        // by a plugin. What this does buy is the answer to "is the channel back"
+        // without waiting for a DSH restart.
+        let roster = [];
+        let rosterError = '';
+        try {
+          roster = projectAdapter ? await projectAdapter.listProjectModels() : [];
+        } catch (error) {
+          rosterError = error instanceof Error ? error.message : String(error);
+        }
+        const ids = roster.map((model) => model.id);
+        const added = before.length === 0 ? [] : ids.filter((id) => !before.includes(id));
+        const removed = before.length === 0 ? [] : before.filter((id) => !ids.includes(id));
+        if (added.length > 0 || removed.length > 0) {
+          runtime.record(
+            `roster after restart: ${ids.length} models, +${added.length} -${removed.length}` +
+              (added.length ? ` added ${added.slice(0, 3).join(', ')}` : '') +
+              (removed.length ? ` lost ${removed.slice(0, 3).join(', ')}` : ''),
+          );
+        }
+        return sendJson(res, 200, {
+          ...runtime.snapshot(),
+          roster: { count: ids.length, added, removed, error: rosterError },
+        });
       }
       return sendJson(res, 404, { error: 'not found' });
     } catch (error) {
