@@ -28,6 +28,10 @@ import {
 const ROUTE = 'ai-proxy-commandcode';
 const PROJECT_ROUTE = 'ai-proxy';
 const DEFAULT_MAX_TOKENS = 64000;
+// Still listed here even when blocked, so a blocked channel is filtered by the
+// same rule as every other blocked prefix rather than by not looking. Dropping
+// it here would have made the block invisible: the count would read zero and
+// the roster would have no record of what was withheld.
 const EXTRA_MODEL_ROUTES = [
   { prefix: 'deepseek-web', basePath: '/deepseek-web/v1' },
   { prefix: 'tokenharbor', basePath: '/tokenharbor/v1' },
@@ -37,7 +41,62 @@ const EXTRA_MODEL_ROUTES = [
 // and Gemini need per-user keys this proxy never holds, and their listings
 // answered with an empty or error body; keeping them out of the model list is
 // what stops the picker from offering models that can only fail.
-const BLOCKED_MODEL_PREFIXES = ['openrouter/', 'anthropic/', 'gemini/'];
+//
+// deepseek-web is blocked at the user's request rather than for being broken:
+// it answers correctly (measured HTTP 200 with real text), so this is a choice
+// to stop it appearing in the picker, not a capability claim. Its route is also
+// unreachable from the aggregate entry, since V1_AGGREGATE_MEMBERS in main.ts
+// lists only kilo/zen/cnb/commandcode.
+//
+// cnb needs an account this machine does not have: the upstream answers
+// `401 [NOT_LOGIN]` and the two listed models are unusable until a login
+// cookie is pasted into cnb-login.txt.
+//
+// Matched against the first path segment, which is the channel this proxy
+// routes by — see isBlockedModelId for why a substring test is not enough.
+const BLOCKED_CHANNELS = new Set([
+  'openrouter',
+  'anthropic',
+  'gemini',
+  'deepseek-web',
+  'cnb',
+]);
+
+/** Why a channel is withheld, so the refusal can say something true. */
+const BLOCK_REASON = {
+  openrouter:
+    'this channel needs a per-user upstream key and is not served by ai-proxy',
+  anthropic:
+    'this channel needs a per-user upstream key and is not served by ai-proxy',
+  gemini:
+    'this channel needs a per-user upstream key and is not served by ai-proxy',
+  'deepseek-web': 'deepseek-web is switched off in the ai-proxy panel',
+  cnb: 'cnb needs a login cookie; paste one into cnb-login.txt to re-enable it',
+};
+
+function blockReasonFor(modelId) {
+  const id = String(modelId ?? '');
+  const channel = (id.includes('/') ? id.slice(0, id.indexOf('/')) : id).toLowerCase();
+  return BLOCK_REASON[channel] ?? `${channel} is not served by ai-proxy`;
+}
+
+/**
+ * Whether an id belongs to a blocked channel.
+ *
+ * A plain `startsWith` test only catches a block named at the front of the id. A
+ * per-channel listing prefixes the same model again, so `tokenharbor/` answering
+ * with a copy of the aggregate produced `tokenharbor/openrouter/paid/model` — a
+ * blocked channel laundered back in through a different discovery path.
+ *
+ * The test is therefore on the *first* path segment, which is the channel this
+ * proxy routes by. Matching any segment would also catch `kilo/openrouter/free`,
+ * a real Kilo-hosted model whose name happens to say OpenRouter.
+ */
+function isBlockedModelId(modelId) {
+  const id = String(modelId ?? '');
+  const channel = (id.includes('/') ? id.slice(0, id.indexOf('/')) : id).toLowerCase();
+  return BLOCKED_CHANNELS.has(channel);
+}
 
 /**
  * Read one listing row into the shape the harness adapter expects.
@@ -625,7 +684,7 @@ export class AiProxyAdapter {
     const seen = new Set();
     let blocked = 0;
     for (const model of discovered) {
-      if (BLOCKED_MODEL_PREFIXES.some((prefix) => model.id.startsWith(prefix))) {
+      if (isBlockedModelId(model.id)) {
         blocked += 1;
         continue;
       }
@@ -633,7 +692,6 @@ export class AiProxyAdapter {
       seen.add(model.id);
       models.push(model);
     }
-    this.blockedModelCount = blocked;
     const extras = await Promise.all(EXTRA_MODEL_ROUTES.map(async (route) => {
       try {
         const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
@@ -656,10 +714,18 @@ export class AiProxyAdapter {
       }
     }));
     for (const model of extras.flat()) {
+      // A channel added by prefix is filtered by the same rule as one that
+      // arrived through the aggregate route, so withholding it cannot be
+      // undone by which discovery path happened to find it.
+      if (isBlockedModelId(model.id)) {
+        blocked += 1;
+        continue;
+      }
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       models.push(model);
     }
+    this.blockedModelCount = blocked;
     // Remembered so the usage table can show a model's name instead of its id:
     // Zen publishes only an id, so `space-bunny-free` would otherwise be the
     // only label a user ever sees.
@@ -726,14 +792,20 @@ export class AiProxyAdapter {
   }
 
   async *stream(options, resolved) {
+    // Two ids, because they answer different questions. `modelId` is what goes
+    // on the wire: routing has already stripped the channel prefix, so
+    // `deepseek-web/deepseek-chat` arrives as `deepseek-chat`. The block must be
+    // judged on the caller's id instead, or the prefix test would pass and the
+    // channel would be reachable.
     const modelId = String(resolved.wireModel ?? resolved.id ?? '');
-    if (BLOCKED_MODEL_PREFIXES.some((prefix) => modelId.startsWith(prefix))) {
+    const requestedId = String(resolved.id ?? options.model ?? '');
+    if (isBlockedModelId(requestedId)) {
       yield {
         type: 'finish',
         reason: {
           kind: 'error',
           failure: {
-            message: 'this channel needs a per-user upstream key and is not served by ai-proxy',
+            message: blockReasonFor(requestedId),
             code: 'CONFIG_DISABLED',
           },
         },

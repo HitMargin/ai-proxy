@@ -23,12 +23,20 @@ DSH 中的 `ai-proxy` Provider 会从本地代理读取完整模型目录：
 
 - `kilo/*`：Kilo 免费模型；
 - `zen/*`：Zen 免费模型（代理会补 OpenCode 指纹和 session；上游拒绝时返回明确错误）；
-- `cnb/*`：CNB 通道；
 - `commandcode/*`：CommandCode Go 通道；
-- `deepseek-web/*`：DeepSeek 网页端；
 - `tokenharbor/*`：TokenHarbor 通道（可用时）。
 
-`openrouter/*`、`anthropic/*`、`gemini/*` 依赖各自的 per-user key，本代理从不持有，因此不进入模型列表；即使旧会话仍缓存着这些 ID，调用也会立刻以 `CONFIG_DISABLED` 拒绝，不会消耗一轮请求。
+以下渠道不进入模型列表，即使旧会话仍缓存着这些 ID，调用也会立刻以 `CONFIG_DISABLED` 拒绝，不会消耗一轮请求：
+
+| 渠道 | 原因 |
+| --- | --- |
+| `openrouter/*` | 依赖 per-user key，本代理从不持有 |
+| `anthropic/*` | 同上 |
+| `gemini/*` | 同上 |
+| `deepseek-web/*` | 按使用者要求关闭。**它本身是可用的**（实测 HTTP 200 并返回真实文本），所以这不是能力问题，只是不再出现在选择器里 |
+| `cnb/*` | 上游要求登录，实测 `401 [NOT_LOGIN]`。把 Cookie 粘进 `cnb-login.txt` 后可恢复 |
+
+屏蔽按**首个路径段**（即本代理用来路由的渠道名）判断，不是子串匹配。所以 `tokenharbor/openrouter/…` 同样被拦下，而 `kilo/openrouter/free`（Kilo 自己托管的免费路由模型）不受影响。
 
 聚合入口本身是：
 
@@ -41,11 +49,11 @@ DSH 中的 `ai-proxy` Provider 会从本地代理读取完整模型目录：
 ```text
 kilo/...          → /v1
 commandcode/...   → /v1
-cnb/...           → /v1
 zen/...           → /v1
-deepseek-web/...  → /deepseek-web/v1
 tokenharbor/...   → /tokenharbor/v1
 ```
+
+被屏蔽的渠道仍保留路由（`cnb/... → /v1`、`deepseek-web/... → /deepseek-web/v1`），但请求在发出前就会被 `CONFIG_DISABLED` 拦下，所以这两条不会真正被用到；留着是为了将来在设置里恢复某个渠道时不必改路由表。
 
 插件不保存任何上游 key、OAuth 文件或 Cookie；凭据、额度、冷却、协议转换和多账号调度全部由原始 `ai-proxy` 负责。对 `zen/*` 请求，插件会把 DSH 的 `options.sessionId` 作为 `x-session-id` 传给代理，由代理生成稳定的 OpenCode canonical session。
 

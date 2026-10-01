@@ -67,10 +67,21 @@ globalThis.fetch = async (input, init = {}) => {
         headers: { 'content-type': 'application/json' },
       });
     }
+    if (url.includes('/deepseek-web/')) {
+      // The per-channel route answers with bare ids; the panel prefixes them.
+      return new Response(JSON.stringify({
+        data: [
+          { id: 'deepseek-chat', name: 'DeepSeek 网页 · 快速模式', context_window: 1048576, max_output_tokens: 16384 },
+          { id: 'deepseek-reasoner', name: 'DeepSeek 网页 · 深度思考', context_window: 1048576, max_output_tokens: 32768 },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
     if (url.includes('/v1/models')) {
       return new Response(JSON.stringify({
         data: [
           { id: 'openrouter/paid/model', name: 'Paid', context_window: 128000, max_output_tokens: 32000 },
+          { id: 'cnb/deepseek-v4-flash', name: 'CNB Flash', context_window: 131072, max_output_tokens: 8192 },
+          { id: 'cnb/deepseek-v4-pro', name: 'CNB Pro', context_window: 131072, max_output_tokens: 8192 },
           {
             id: 'deepseek/test',
             name: 'DeepSeek Test',
@@ -100,6 +111,15 @@ globalThis.fetch = async (input, init = {}) => {
             name: 'Auto Free',
             architecture: { input_modalities: ['text'] },
             context_length: 256000,
+          },
+          {
+            // A blocked word inside a channel's own model name is not a blocked
+            // channel. Kilo really does host this router, and a block that
+            // matched any path segment would take a working model out.
+            id: 'kilo/openrouter/free',
+            name: 'OpenRouter Free Models Router',
+            architecture: { input_modalities: ['text'] },
+            context_length: 200000,
           },
           {
             // No modality list at all: the `modality` shorthand is the only
@@ -140,6 +160,14 @@ globalThis.fetch = async (input, init = {}) => {
         status: 200,
         headers: { 'content-type': 'application/json' },
       });
+    }
+    if (url.includes('/tokenharbor/')) {
+      // One row, as the real channel answers. Letting it fall through to the
+      // default branch would hand it a copy of the whole aggregate listing,
+      // which is how a blocked channel can look discovered twice.
+      return new Response(JSON.stringify({
+        data: [{ id: 'token-test', name: 'Token Test', context_window: 32768, max_output_tokens: 4096 }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
     return new Response(JSON.stringify({
       data: [{
@@ -233,6 +261,72 @@ try {
   assert.equal(blockedEvents.length, 1);
   assert.equal(blockedEvents[0].reason.kind, 'error');
   assert.equal(blockedEvents[0].reason.failure.code, 'CONFIG_DISABLED');
+
+  // A channel reached through its own base path has already had its prefix
+  // stripped by the time the block is checked, so the test has to run on the
+  // caller's id. Judged on `wireModel` it passed, and the channel stayed
+  // reachable behind a block that looked like it was holding.
+  const dwResolved = await adapter.resolveModel('ai-proxy', 'deepseek-web/deepseek-chat');
+  assert.equal(dwResolved.wireModel, 'deepseek-chat', 'routing strips the prefix');
+  const dwEvents = [];
+  for await (const event of adapter.stream({
+    model: dwResolved.id,
+    messages: [{ role: 'user', content: 'ping' }],
+    maxTokens: 32,
+  }, dwResolved)) dwEvents.push(event);
+  assert.equal(dwEvents.length, 1, 'a blocked channel must not reach the upstream');
+  assert.equal(dwEvents[0].reason.failure.code, 'CONFIG_DISABLED');
+  assert.equal(
+    dwEvents[0].reason.failure.message,
+    'deepseek-web is switched off in the ai-proxy panel',
+    'the refusal must name the real reason, not a missing-key story',
+  );
+  assert.equal(
+    blockedEvents[0].reason.failure.message.includes('per-user upstream key'),
+    true,
+    'a key-only channel still gets the key explanation',
+  );
+  // Blocked rows found through the per-channel path are counted too, or the
+  // panel would report the roster as complete while withholding models. In this
+  // fixture that is 3 rows inside the aggregate listing (1 openrouter, 2 cnb)
+  // plus the 2 deepseek-web rows its own channel answers with.
+  assert.equal(adapter.blockedModelCount, 5);
+  for (const prefix of ['deepseek-web/', 'cnb/', 'openrouter/']) {
+    assert.equal(
+      models.some((model) => model.id.startsWith(prefix)),
+      false,
+      `${prefix} must not reach the roster`,
+    );
+  }
+  // A blocked channel must not come back under another channel's prefix: the
+  // block is read off the first path segment, so a row whose *channel* is
+  // blocked is withheld however many prefixes were stacked in front of it.
+  assert.equal(
+    models.some((model) => ['openrouter', 'cnb', 'deepseek-web']
+      .includes(String(model.id).split('/')[0])),
+    false,
+    'a blocked channel must not be laundered through another prefix',
+  );
+  // The converse also holds: a blocked word inside a channel's own model name is
+  // not a blocked channel. `kilo/openrouter/free` is a real Kilo-hosted router
+  // and must survive the block.
+  assert.ok(
+    models.some((model) => model.id === 'kilo/openrouter/free'),
+    'a working model whose name contains a blocked word must stay in the roster',
+  );
+
+  // cnb needs a login cookie, which is a different remedy from a missing key,
+  // so the refusal has to name the one that would actually re-enable it.
+  const cnbResolved = await adapter.resolveModel('ai-proxy', 'cnb/deepseek-v4-flash');
+  const cnbEvents = [];
+  for await (const event of adapter.stream({
+    model: cnbResolved.id,
+    messages: [{ role: 'user', content: 'ping' }],
+    maxTokens: 8,
+  }, cnbResolved)) cnbEvents.push(event);
+  assert.equal(cnbEvents.length, 1);
+  assert.equal(cnbEvents[0].reason.failure.code, 'CONFIG_DISABLED');
+  assert.match(cnbEvents[0].reason.failure.message, /cnb-login\.txt/);
   const resolved = await adapter.resolveModel('ai-proxy-commandcode', 'deepseek/test');
   const projectResolved = await adapter.resolveModel('ai-proxy', 'deepseek/test');
   // Only the efforts the channel actually published may be declared; a rung the
@@ -278,7 +372,11 @@ try {
   assert.equal(panel.panelSource, 'status-fallback');
   assert.equal(panel.accounts[0].keyName, undefined);
   assert.ok(Object.keys(panel.channels).length >= 2);
-  assert.ok(panel.projectModels.some((model) => model.id.startsWith('deepseek-web/')));
+  // deepseek-web is listed by the channel and then withheld, so it must be
+  // absent here — and the panel must say it withheld ten rows rather than
+  // quietly presenting a shorter roster.
+  assert.equal(panel.projectModels.some((model) => model.id.startsWith('deepseek-web/')), false);
+  assert.equal(panel.blockedModelCount > 0, true);
   // The panel only shows 可用/限流/不可用 if the per-model verdicts are joined
   // onto the rows: /health keys samples by provider + unprefixed id, while the
   // roster uses `kilo/…`.
