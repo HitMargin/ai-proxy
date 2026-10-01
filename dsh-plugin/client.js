@@ -29,6 +29,7 @@ window.__ModuleLoader__.load({
         heatmap: 'Token 热力图', trend: '总量曲线', modelUsage: '模型用量', today: '今日',
         localOnly: '数据只在本机统计，不会上传。', noUsage: '还没有调用记录，在 DSH 里发一条消息后就会出现。',
         usageFailed: '读取用量失败',
+        efforts: '推理档位', noEfforts: '—',
         speedNote: '输出速度只统计解码窗口 ≥250ms 且速率 ≤250 tok/s 的调用；窗口太短的一次性回答不算速度。',
       },
       en: {
@@ -46,6 +47,7 @@ window.__ModuleLoader__.load({
         projectRoot: 'Project', denoPath: 'Deno', port: 'Port', externalUrl: 'External URL', apiKeyEnv: 'Key env',
         start: 'Start', stop: 'Stop', restart: 'Restart', save: 'Save', logs: 'Logs', empty: 'No models',
         search: 'Search models…', uptime: 'Uptime', state: 'State', excluded: 'Removed from the list', listingFailed: 'listing failed',
+        efforts: 'Efforts', noEfforts: '—',
         available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
         check: 'Check status', checking: 'Checking…', checkAll: 'All channels', checkDone: 'Checked {0} models',
         checkFailed: 'Check failed', checkHint: 'Each model sends one minimal request and uses that channel’s free quota.',
@@ -116,6 +118,8 @@ window.__ModuleLoader__.load({
 .apx_mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--dsw-alias-label-tertiary);overflow-wrap:break-word;word-break:normal}
 .apx_table tr:last-child td{border-bottom:0}
 .apx_tag{display:inline-flex;padding:2px 8px;border-radius:7px;font-size:10.5px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);white-space:nowrap}
+.apx_efforts{white-space:nowrap}
+.apx_muted{color:var(--dsw-alias-label-tertiary)}
 .apx_dot{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-tertiary);flex:none;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 18%,transparent)}
 .apx_state{display:inline-flex;align-items:center;gap:7px;font-size:12px}
 .apx_state.ok{color:var(--dsw-alias-state-success-primary)}
@@ -557,7 +561,8 @@ window.__ModuleLoader__.load({
             h('table', { className: 'apx_table' },
               h('thead', null, h('tr', null,
                 h('th', null, 'ID'), h('th', null, 'Name'), h('th', null, t('state')),
-                h('th', null, 'Context'), h('th', null, 'Max'), h('th', null, 'Input'))),
+                h('th', null, 'Context'), h('th', null, 'Max'), h('th', null, 'Input'),
+                h('th', null, t('efforts')))),
               h('tbody', null, filtered.map((row) => h('tr', { key: row.id },
                 h('td', { className: 'apx_mono apx_id' }, row.id),
                 h('td', null, row.name || ''),
@@ -570,7 +575,14 @@ window.__ModuleLoader__.load({
                   row.latencyMs > 0 ? h('em', { className: 'apx_lat' }, `${row.latencyMs}ms`) : null)),
                 h('td', null, formatTokens(row.contextWindow)),
                 h('td', null, formatTokens(row.maxTokens)),
-                h('td', null, h('span', { className: 'apx_tag' }, (row.inputModalities || ['text']).join('+')))))))),
+                h('td', null, h('span', { className: 'apx_tag' }, (row.inputModalities || ['text']).join('+'))),
+                // The ladder the upstream actually published. Shown because a
+                // wrong one is invisible until a turn is rejected: a picker can
+                // offer a rung no channel serves and the request just 400s.
+                h('td', { className: 'apx_efforts' },
+                  Array.isArray(row.reasoningEfforts) && row.reasoningEfforts.length > 0
+                    ? h('span', { className: 'apx_tag' }, row.reasoningEfforts.map((effort) => (typeof effort === 'string' ? effort : effort?.id)).filter(Boolean).join(' '))
+                    : h('span', { className: 'apx_muted' }, t('noEfforts')))))))),
         healthCounts.total > 0
           ? h('div', { className: 'apx_legend' },
             h('span', null, `${t('models')}: ${healthCounts.available} ${t('available')}`),
