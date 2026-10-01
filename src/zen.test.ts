@@ -1,5 +1,6 @@
 import {
   applyZenFingerprint,
+  collectChatStreamText,
   handleZen,
   mintZenRequestId,
   restoreChatStream,
@@ -73,6 +74,28 @@ Deno.test("Zen fingerprint promotes pwsh and fills the quartet", () => {
   assertEquals(names.includes("grep"), true);
   assertEquals(names.includes("read"), true);
   assertEquals(map.get("bash"), "pwsh");
+});
+
+Deno.test("Zen fingerprint fills the quartet even with no client tools", () => {
+  // The free tier answers "only from within OpenCode" unless the quartet is
+  // present. Measured live: streaming without it is 403, so a request that
+  // carries no client tools still needs the quartet to be admitted at all.
+  const body: Record<string, unknown> = {
+    model: "mimo-v2.6-flash-free",
+    messages: [{ role: "user", content: "summarise this" }],
+  };
+  const map = applyZenFingerprint(body, false);
+  const tools = body.tools as Array<
+    { function?: { name?: string }; name?: string }
+  >;
+  const names = tools.map((tool) => String(tool.function?.name || tool.name));
+  // Compared as a joined string: this suite's assertEquals uses Object.is, which
+  // would compare array identity rather than contents.
+  assertEquals(names.sort().join(","), "bash,glob,grep,read");
+  // Nothing was promoted, so the response needs no renaming.
+  assertEquals(map.size, 0);
+  // And a request that brings no tools of its own must not invite a call.
+  assertEquals(body.tool_choice, "none");
 });
 
 Deno.test("Zen selects the model-specific upstream endpoint", () => {
@@ -243,6 +266,21 @@ Deno.test("Zen restores promoted tool names in a chat SSE stream", async () => {
     restoreChatStream(source, new Map([["bash", "Bash"]])),
   ).text();
   assertStringIncludes(restored, '"name":"Bash"');
+});
+
+Deno.test("Zen reassembles a summary out of streamed deltas", async () => {
+  // The summary path streams because the gateway refuses non-streaming turns,
+  // so the text has to be rebuilt from the frames before it can be used.
+  const response = sseResponse([
+    'data: {"choices":[{"delta":{"content":"## Objective"}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"\\n- keep going"}}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bash","arguments":"{}"}}]}}]}\n\n',
+    "data: [DONE]\n\n",
+  ]);
+  assertEquals(
+    await collectChatStreamText(response),
+    "## Objective\n- keep going",
+  );
 });
 
 function assertMatch(value: string, pattern: RegExp): void {
