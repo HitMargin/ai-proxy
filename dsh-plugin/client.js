@@ -96,11 +96,23 @@ window.__ModuleLoader__.load({
 .apx_chips{display:flex;gap:8px;flex-wrap:wrap}
 .apx_chip{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);font-size:12px;color:var(--dsw-alias-label-secondary)}
 .apx_chip b{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;font-weight:620}
-.apx_table{width:100%;border-collapse:collapse}
+.apx_table{width:100%;border-collapse:collapse;table-layout:auto}
+/* A six-column roster of long ids does not fit a narrow panel. Scrolling the
+   table sideways keeps every column readable, where squeezing them turned the
+   id into one character per line. */
+.apx_scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -2px}
+/* The id is the row's identity and must stay on one line; min-width is what
+   stops the auto layout from trading it away for the other columns, which is
+   what put it on three lines in the first place. */
+.apx_table .apx_id{white-space:nowrap;min-width:15em}
 .apx_table th{text-align:left;font-weight:520;font-size:11px;color:var(--dsw-alias-label-tertiary);padding:0 10px 7px;border-bottom:1px solid var(--dsw-alias-border-l1);white-space:nowrap}
 .apx_table td{padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12.5px;vertical-align:middle}
+/* Long ids broke one character per line: overflow-wrap:anywhere lets the
+   browser shrink a column to nothing, and it then wins the width contest
+   against every other column. Break only at the channel separator instead,
+   and let the id keep its natural width. */
+.apx_mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--dsw-alias-label-tertiary);overflow-wrap:break-word;word-break:normal}
 .apx_table tr:last-child td{border-bottom:0}
-.apx_mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
 .apx_tag{display:inline-flex;padding:2px 8px;border-radius:7px;font-size:10.5px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);white-space:nowrap}
 .apx_dot{width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-tertiary);flex:none;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 18%,transparent)}
 .apx_state{display:inline-flex;align-items:center;gap:7px;font-size:12px}
@@ -112,7 +124,7 @@ window.__ModuleLoader__.load({
 .apx_logs{max-height:240px;overflow:auto;padding:11px 13px;border-radius:12px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;line-height:1.7;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;overflow-wrap:anywhere}
 .apx_empty{padding:26px;text-align:center;font-size:12.5px;color:var(--dsw-alias-label-tertiary);border:1px dashed var(--dsw-alias-border-l2);border-radius:13px}
 .apx_skel{height:12px;border-radius:6px;background:linear-gradient(90deg,var(--dsw-alias-bg-layer-2),var(--dsw-alias-bg-layer-1),var(--dsw-alias-bg-layer-2));background-size:200% 100%;animation:apx-skel 1.2s linear infinite}
-.apx_badge{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:999px;font-size:11px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+.apx_badge{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:999px;font-size:10.5px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);white-space:nowrap;color:var(--dsw-alias-label-secondary)}
 .apx_badge .apx_dot{background:currentColor;box-shadow:none}
 .apx_badge.ok{color:var(--dsw-alias-state-success-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 40%,transparent)}
 .apx_badge.warn{color:var(--dsw-alias-state-warning-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-warning-primary) 40%,transparent)}
@@ -526,23 +538,24 @@ window.__ModuleLoader__.load({
         }),
         filtered.length === 0
           ? h('div', { className: 'apx_empty' }, projectRows.length === 0 ? t('empty') : t('search'))
-          : h('table', { className: 'apx_table' },
-            h('thead', null, h('tr', null,
-              h('th', null, 'ID'), h('th', null, 'Name'), h('th', null, t('state')),
-              h('th', null, 'Context'), h('th', null, 'Max'), h('th', null, 'Input'))),
-            h('tbody', null, filtered.map((row) => h('tr', { key: row.id },
-              h('td', { className: 'apx_mono' }, row.id),
-              h('td', null, row.name || ''),
-              h('td', null, h('span', {
-                className: `apx_badge ${modelStateClass(row.state)}`,
-                title: row.reason || '',
-              },
-                h('i', { className: 'apx_dot' }),
-                modelStateLabel(row.state, t),
-                row.latencyMs > 0 ? h('em', { className: 'apx_lat' }, `${row.latencyMs}ms`) : null)),
-              h('td', null, formatTokens(row.contextWindow)),
-              h('td', null, formatTokens(row.maxTokens)),
-              h('td', null, h('span', { className: 'apx_tag' }, (row.inputModalities || ['text']).join('+'))))))),
+          : h('div', { className: 'apx_scroll' },
+            h('table', { className: 'apx_table' },
+              h('thead', null, h('tr', null,
+                h('th', null, 'ID'), h('th', null, 'Name'), h('th', null, t('state')),
+                h('th', null, 'Context'), h('th', null, 'Max'), h('th', null, 'Input'))),
+              h('tbody', null, filtered.map((row) => h('tr', { key: row.id },
+                h('td', { className: 'apx_mono apx_id' }, row.id),
+                h('td', null, row.name || ''),
+                h('td', null, h('span', {
+                  className: `apx_badge ${modelStateClass(row.state)}`,
+                  title: row.reason || '',
+                },
+                  h('i', { className: 'apx_dot' }),
+                  modelStateLabel(row.state, t),
+                  row.latencyMs > 0 ? h('em', { className: 'apx_lat' }, `${row.latencyMs}ms`) : null)),
+                h('td', null, formatTokens(row.contextWindow)),
+                h('td', null, formatTokens(row.maxTokens)),
+                h('td', null, h('span', { className: 'apx_tag' }, (row.inputModalities || ['text']).join('+')))))))),
         healthCounts.total > 0
           ? h('div', { className: 'apx_legend' },
             h('span', null, `${t('models')}: ${healthCounts.available} ${t('available')}`),
