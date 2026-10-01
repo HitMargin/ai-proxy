@@ -32,6 +32,11 @@ const DEFAULT_MAX_TOKENS = 64000;
 // budget is never squeezed below.
 const CONTEXT_HEADROOM_TOKENS = 2048;
 const MIN_OUTPUT_TOKENS = 1024;
+// What one image costs when the gateway cannot tell us. Vision pricing runs from
+// roughly 1,100 tokens for a large photo to about 1,600 at high detail, and the
+// exact figure depends on the model's tiling - so this is deliberately the high
+// end, because under-counting here is what overflows the window.
+const IMAGE_TOKEN_ESTIMATE = 1600;
 // The DSH picker groups strictly by provider route, so a channel that cannot
 // serve a real turn does not belong in the roster at all. OpenRouter, Anthropic
 // and Gemini need per-user keys this proxy never holds, and their listings
@@ -842,23 +847,30 @@ const CONTEXT_OVERFLOW = /maximum context length|context_length_exceeded|context
  * Rough prompt size in tokens. The chars/4 approximation is the one this project
  * already uses for Zen compaction; it is only ever used to leave headroom, never
  * to claim a precise budget.
+ *
+ * Images cost a flat estimate rather than nothing. A base64 string is not prose, so
+ * counting its characters would inflate this wildly - but counting it as zero
+ * under-counts just as badly, because the gateway bills a vision model by pixels
+ * and not by bytes. Skipping them entirely is what made the first clamp fail to
+ * clamp: a session carrying 13,005 tokens of image input was estimated 13,005
+ * tokens light, so the budget that appeared to fit still overflowed.
  */
 function estimateMessageTokens(messages) {
   let chars = 0;
+  let images = 0;
   const walk = (value) => {
     if (typeof value === 'string') { chars += value.length; return; }
     if (Array.isArray(value)) { for (const item of value) walk(item); return; }
     if (isRecord(value)) {
       for (const [key, item] of Object.entries(value)) {
-        // A base64 image is bytes, not prose, and is billed by the gateway's own
-        // accounting; counting its characters would inflate the estimate hugely.
-        if (key === 'image_url' || key === 'url') continue;
+        if (key === 'image_url') { images += 1; continue; }
+        if (key === 'url') continue;
         walk(item);
       }
     }
   };
   walk(messages);
-  return Math.ceil(chars / 4);
+  return Math.ceil(chars / 4) + images * IMAGE_TOKEN_ESTIMATE;
 }
 
 /**
