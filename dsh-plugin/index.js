@@ -600,7 +600,11 @@ export function flushUsage() {
   usageStore.flush();
 }
 
-function finishKind(reason) {
+/**
+ * Only reached for a stream that carried its terminal marker: the cut case is
+ * handled before this, so an absent `finish_reason` here means the gateway ended
+ * a complete stream without naming a reason, not that the connection died.
+ */function finishKind(reason) {
   if (reason === 'tool_calls' || reason === 'tool_use') return 'tool-calls';
   if (reason === 'length' || reason === 'max_tokens') return 'max-tokens';
   return 'stop';
@@ -876,10 +880,15 @@ export class AiProxyAdapter {
     let reasoning = '';
     let usage;
     let finish;
+    // The terminal marker. A stream that ends without it was cut, and saying
+    // `stop` for that is what made a dead connection look like a finished turn:
+    // the agent loop read the answer as complete, marked the goal done and moved
+    // on, so a mid-sentence stop was indistinguishable from the model choosing to.
+    let sawDone = false;
     const toolBlocks = new Map();
     try {
       for await (const data of readSse(response)) {
-        if (data === '[DONE]') break;
+        if (data === '[DONE]') { sawDone = true; break; }
         let payload;
         try { payload = JSON.parse(data); } catch { continue; }
         if (payload?.error) {
@@ -939,6 +948,51 @@ export class AiProxyAdapter {
         truncated: true,
       });
       yield { type: 'finish', reason: { kind: options.signal?.aborted ? 'aborted' : 'error', failure: { message: error.message, code: 'TRANSPORT' } } };
+      return;
+    }
+    if (!sawDone) {
+      // Cut. The partial blocks are still closed so whatever arrived stays visible,
+      // but the turn is reported as the failure it is instead of a clean stop.
+      const delivered = textIndex !== undefined || reasoningIndex !== undefined ||
+        toolBlocks.size > 0;
+      recordUsage({
+        at: startedAt,
+        model: modelId,
+        effort: typeof options.reasoningEffort === 'string' ? options.reasoningEffort : '',
+        ok: false,
+        input: usage?.inputTokens ?? 0,
+        output: usage?.outputTokens ?? 0,
+        reasoning: usage?.reasoningTokens ?? 0,
+        decodeTokens: Math.max(0, (usage?.outputTokens ?? 0) - (usage?.reasoningTokens ?? 0)),
+        ttftMs: firstDeltaAt === undefined ? undefined : firstDeltaAt - startedAt,
+        decodeMs: firstDeltaAt === undefined ? undefined : Date.now() - firstDeltaAt,
+        origin: 'harness',
+        truncated: true,
+      });
+      if (textIndex !== undefined) {
+        yield { type: 'block-end', index: textIndex, block: { type: 'text', text } };
+      }
+      if (reasoningIndex !== undefined) {
+        yield { type: 'block-end', index: reasoningIndex, block: { type: 'reasoning', text: reasoning } };
+      }
+      for (const block of toolBlocks.values()) {
+        yield { type: 'block-end', index: block.index, block: { type: 'tool-call', id: block.id, name: block.name, arguments: block.args } };
+      }
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: delivered
+              ? 'ai-proxy stream ended before [DONE] after partial output was delivered'
+              : 'ai-proxy stream ended before [DONE] with no output delivered',
+            // Replaying a turn that already produced output would duplicate the
+            // work and pay for it twice, so only the empty case is retryable. The
+            // empty one is exactly the case a retry can help.
+            code: delivered ? 'stream_cut' : 'TRANSPORT',
+          },
+        },
+      };
       return;
     }
     if (textIndex !== undefined) {

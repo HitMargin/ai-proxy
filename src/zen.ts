@@ -94,10 +94,22 @@ export function mintZenRequestId(): string {
   return `msg_${stamp}${base62(random)}`;
 }
 
+/**
+ * The client's User-Agent, with the current OpenCode client stamped onto it.
+ *
+ * Any `opencode/<version>` the client already carried is dropped first. Keeping it
+ * was a trap: Zen gates on the client version and answers an old one with
+ * `426 UpgradeRequired` ("OpenCode 1.18.0 or newer"), so a client that advertised
+ * `opencode/1.1.55` had its own header forwarded verbatim and the gateway saw a
+ * version four years behind. Whatever the client sends, the gateway must be told
+ * the version this proxy actually speaks.
+ */
 function combinedUserAgent(incoming: string | null): string {
   const value = String(incoming || "").trim();
-  if (!value) return CLIENT_UA;
-  return value.includes("opencode/") ? value : `${value} ${CLIENT_UA}`;
+  const withoutClient = value
+    .replace(/\s*\bopencode\/[\w.-]+/gi, "")
+    .trim();
+  return withoutClient ? `${withoutClient} ${CLIENT_UA}` : CLIENT_UA;
 }
 
 // ---------- egress pool ----------

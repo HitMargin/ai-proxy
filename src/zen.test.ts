@@ -685,3 +685,35 @@ Deno.test("the Responses wire reports a cut when response.completed never arrive
     globalThis.fetch = originalFetch;
   }
 });
+
+Deno.test("a client that advertises an old OpenCode version cannot downgrade the UA", () => {
+  // Zen answers a stale client with 426 UpgradeRequired, so forwarding the
+  // client's own opencode/ token let it pin the gateway to a version this proxy
+  // does not speak.
+  const stale = zenGatewayHeaders(
+    new Request("http://zen.local/", {
+      headers: { "user-agent": "some-client/2.0 opencode/1.1.55" },
+    }),
+    "ses_0123456789abZYXWVUT987654",
+    "msg_0123456789abZYXWVUT987654",
+    true,
+  );
+  const agent = stale.get("user-agent") || "";
+  if (agent.includes("1.1.55")) {
+    throw new Error(`the stale version survived: ${agent}`);
+  }
+  assertStringIncludes(agent, "some-client/2.0");
+  assertStringIncludes(agent, "opencode/1.18.31");
+});
+
+Deno.test("a client with no opencode token still gets the client stamped on", () => {
+  const headers = zenGatewayHeaders(
+    new Request("http://zen.local/", {
+      headers: { "user-agent": "curl/8.5.0" },
+    }),
+    "ses_0123456789abZYXWVUT987654",
+    "msg_0123456789abZYXWVUT987654",
+    true,
+  );
+  assertEquals(headers.get("user-agent"), "curl/8.5.0 opencode/1.18.31");
+});

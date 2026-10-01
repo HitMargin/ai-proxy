@@ -6,6 +6,9 @@ const originalFetch = globalThis.fetch;
 let modelCalls = 0;
 let chatCalls = 0;
 let lastRequestHeaders = new Headers();
+// Controls the shape of the streamed reply so the terminal-marker handling can be
+// exercised: a complete stream, one cut mid-answer, and one cut with nothing sent.
+let streamMode = 'normal';
 // Which listing routes were asked for, so a test can assert that a channel the
 // user switched off is not being polled at all.
 const modelCallsByPath = {};
@@ -198,6 +201,14 @@ globalThis.fetch = async (input, init = {}) => {
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
   chatCalls++;
+  if (streamMode === 'cut') {
+    return new Response([
+      'data: {"choices":[{"delta":{"content":"half an ans"},"finish_reason":null}]}\n\n',
+    ].join(''), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }
+  if (streamMode === 'cut-empty') {
+    return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  }
   return new Response([
     'data: {"choices":[{"delta":{"content":"pong"},"finish_reason":null}]}\n\n',
     'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n',
@@ -400,6 +411,48 @@ try {
   assert.ok(events.some((event) => event.type === 'text-delta' && event.text === 'pong'));
   assert.ok(events.some((event) => event.type === 'usage'));
   assert.deepEqual(events.at(-1), { type: 'finish', reason: { kind: 'stop' } });
+
+  // A stream that dies mid-answer used to report finish: stop, because the loop
+  // ended normally and `finish` stayed undefined. The agent loop read that as a
+  // finished turn and moved on, so the cut left no trace anywhere.
+  streamMode = 'cut';
+  const cutEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'do the thing' }],
+    maxTokens: 32,
+  }, resolved)) cutEvents.push(event);
+  const cutFinish = cutEvents.find((e) => e.type === 'finish');
+  assert.equal(cutFinish?.reason?.kind, 'error');
+  assert.equal(cutFinish?.reason?.failure?.code, 'stream_cut');
+  assert.match(cutFinish?.reason?.failure?.message ?? '', /after partial output/);
+  // Whatever arrived is still closed out, so the text is not thrown away with
+  // the failure.
+  assert.ok(cutEvents.some((e) => e.type === 'block-end' && e.block?.text === 'half an ans'));
+
+  // A cut before anything was produced is the one a retry can actually help, so
+  // it keeps the retryable code rather than claiming the turn was partial.
+  streamMode = 'cut-empty';
+  const emptyEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'do the thing' }],
+    maxTokens: 32,
+  }, resolved)) emptyEvents.push(event);
+  const emptyFinish = emptyEvents.find((e) => e.type === 'finish');
+  assert.equal(emptyFinish?.reason?.kind, 'error');
+  assert.equal(emptyFinish?.reason?.failure?.code, 'TRANSPORT');
+  assert.match(emptyFinish?.reason?.failure?.message ?? '', /no output delivered/);
+
+  // A stream that carried its terminal marker is still reported as a stop.
+  streamMode = 'normal';
+  const doneEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'ping' }],
+    maxTokens: 32,
+  }, resolved)) doneEvents.push(event);
+  assert.equal(doneEvents.find((e) => e.type === 'finish')?.reason?.kind, 'stop');
   assert.equal(panelRoute.path, '/api/ai-proxy-commandcode');
   let panelBody = '';
   let panelStatus = 0;

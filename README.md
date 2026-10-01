@@ -82,7 +82,9 @@ CommandCode 已接入 abort/timeout 分类；DeepSeek 网页端和 cnb 已接入
 
 **Zen 现在也接入了截断检测。** reader 报 `done` 并不等于回答写完了——Zen 在匿名额度中途耗尽、或传输失败时都会直接关连接，而这两者过去都会给客户端留下一个 `finish_reason: stop` 和半句没写完的话，和「模型自己决定停止」完全无法区分。agent loop 于是判定回合正常结束、标记目标完成、起下一个目标，故障在任何地方都不留痕迹。
 
-现在**由各 wire 自己的终止帧判定是否完成**，而不是由 reader：`[DONE]`（chat）、`response.completed` / `failed` / `incomplete`（responses）、`message_stop`（messages）。没有终止帧就结束 = 截断，会先补一帧 `{"error":{"code":"stream_cut"…}}` 再收尾——插件会把这种帧变成可见的错误。客户端主动取消**不算故障**（走 `StreamAbort`，静默结束），否则用户点停止也会被报成上游问题。
+**插件侧同样如此。** `dsh-plugin/index.js` 的 `readSse` 是插件注入模型独有的手写 SSE 读取器（配置里手写的模型走 DSH 内置的 OpenAI 客户端，不经过它），过去同样不检查 `[DONE]` 是否到达：流提前断开时循环正常退出、`finish` 保持 `undefined`，而 `finishKind(undefined)` 返回 `'stop'`——被掐断的流和正常结束的流对 agent loop 完全一样，于是它判定这一轮说完、标记目标完成、起下一个。这就是「所有供应商的插件注入模型都有概率要干活却直接停止，而配置里手写的没有」的原因。现在缺终止帧即报失败，并区分两种情况：**已经输出过内容的**用非重试码 `stream_cut`（重放会重复执行并二次付费），**一个字都还没输出**的用 `TRANSPORT`（这是重试真正有意义的唯一情形）。已到达的部分照常收尾，文字不会随失败一起丢掉；统计记 `ok: false / truncated: true`，截断第一次在用量面板里变得可见。
+
+Zen 侧**由各 wire 自己的终止帧判定是否完成**，而不是由 reader：`[DONE]`（chat）、`response.completed` / `failed` / `incomplete`（responses）、`message_stop`（messages）。没有终止帧就结束 = 截断，会先补一帧 `{"error":{"code":"stream_cut"…}}` 再收尾——插件会把这种帧变成可见的错误。客户端主动取消**不算故障**（走 `StreamAbort`，静默结束），否则用户点停止也会被报成上游问题。
 
 ---
 
