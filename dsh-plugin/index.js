@@ -128,7 +128,15 @@ const GENERIC_BLOCK_REASON = 'this channel is switched off in the ai-proxy panel
  * arrives from the aggregate listing, so nothing reaches it either way.
  */
 const EXTRA_MODEL_ROUTES = [
-  { prefix: 'tokenharbor', basePath: '/tokenharbor/v1' },
+  // tokenharbor is a keyed channel that currently has no way to be given one:
+  // upstream answers 401, and its own filterModels drops every model whose id does
+  // not end in `:free`, so the 401 becomes an empty list rather than an error. That
+  // is why the panel shows it at zero. The honest fix is a key field of its own -
+  // openrouter's would be the wrong key - and until then the zero is a masked 401
+  // rather than a channel with nothing in it.
+  { prefix: 'tokenharbor', basePath: '/tokenharbor/v1', requiresKey: true },
+  // Gated on the login state by listProjectModels, for the reason stated there.
+  { prefix: 'deepseek-web', basePath: '/deepseek-web/v1', requiresDeepseekLogin: true },
 ];
 
 /**
@@ -366,22 +374,39 @@ const DEFAULT_SETTINGS = {
   // A stored file with no `hiddenChannels` predates the panel switches, so the
   // defaults apply and nothing that was reachable becomes reachable by accident.
   hiddenChannels: DEFAULT_HIDDEN_CHANNELS,
-  openRouterKey: '',
+  channelKeys: {},
 };
+
+/**
+ * Channels the panel can supply a key for, with the variable the proxy reads it
+ * from.
+ *
+ * One entry per upstream. They used to share `DEFAULT_BEARER_TOKEN`, which means a
+ * key for one silently becomes the key for the other - the failure is a 401 at the
+ * second channel with nothing in the logs to explain it. `envToken` on the provider
+ * is the same name, so the two sides cannot drift.
+ */
+const KEYED_CHANNELS = [
+  { channel: 'openrouter', envToken: 'OPENROUTER_API_KEY' },
+  { channel: 'tokenharbor', envToken: 'TOKENHARBOR_API_KEY' },
+];
 
 /**
  * Environment for the proxy process, carrying the keys the panel collected.
  *
  * The proxy reads credentials from the environment and nothing else, so a value
  * typed into the panel has to arrive here to reach an upstream. Empty values are
- * left out entirely rather than exported as empty strings: an empty
- * `DEFAULT_BEARER_TOKEN` is falsy to the consumer either way, but exporting it
- * would override a real value the process inherited from its own environment.
+ * left out entirely rather than exported as empty strings: an empty variable is
+ * falsy to the consumer either way, but exporting it would override a real value the
+ * process inherited from its own environment.
  */
 function credentialEnv(settings) {
   const env = {};
-  if (typeof settings.openRouterKey === 'string' && settings.openRouterKey.trim() !== '') {
-    env.DEFAULT_BEARER_TOKEN = settings.openRouterKey.trim();
+  for (const entry of KEYED_CHANNELS) {
+    const value = settings.channelKeys?.[entry.channel];
+    if (typeof value === 'string' && value.trim() !== '') {
+      env[entry.envToken] = value.trim();
+    }
   }
   return env;
 }
@@ -506,10 +531,14 @@ export class ProxyRuntime {
       denoPath: this.settings.denoPath,
       apiKeyEnv: this.settings.apiKeyEnv,
       hiddenChannels: [...BLOCKED_CHANNELS],
-      // Presence only. The value is write-only from the panel's point of view:
-      // echoing a credential back into a page that renders in a browser is how
-      // one ends up in a screenshot.
-      openRouterKeySet: typeof this.settings.openRouterKey === 'string' && this.settings.openRouterKey !== '',
+      // Presence only, per channel. The values are write-only from the panel's
+      // point of view: echoing a credential back into a page that renders in a
+      // browser is how one ends up in a screenshot.
+      channelKeySet: Object.fromEntries(KEYED_CHANNELS.map((entry) => [
+        entry.channel,
+        typeof this.settings.channelKeys?.[entry.channel] === 'string' &&
+        this.settings.channelKeys[entry.channel] !== '',
+      ])),
       externalUrl: this.settings.mode === 'external' ? this.settings.externalUrl : null,
       baseUrl: this.baseUrl(),
       originUrl: this.originUrl(),
@@ -1159,7 +1188,30 @@ export class AiProxyAdapter {
       seen.add(model.id);
       models.push(model);
     }
+    // deepseek-web is listed only once its login state exists. The proxy serves the
+    // listing either way - a fixed set of variants, not a read of the account - so
+    // without this gate the panel would offer ten models whose every call answers
+    // 400 "deepseek-cookies.txt missing". An unusable row is the dead control this
+    // project has been removing all evening.
     const extras = await Promise.all(EXTRA_MODEL_ROUTES.map(async (route) => {
+      // Two conditions, and both have to hold before this listing is worth a
+      // request: the channel is switched on, and it can actually answer. A hidden
+      // channel's rows would be discarded, so polling it every snapshot was pure
+      // log noise; an unconfigured one would list models that 400 on use.
+      if (isBlockedModelId(`${route.prefix}/x`)) return [];
+      if (route.requiresDeepseekLogin && !deepseekWebStatus(this.runtime?.settings ?? {}).configured) {
+        return [];
+      }
+      // A keyed channel with no key. Without this the panel showed tokenharbor at
+      // zero forever: upstream answers 401, and that channel's own filter drops every
+      // id without a `:free` suffix, so a 401 comes back as an empty list - exactly
+      // what a working channel with no free models looks like. Held back the same way
+      // openrouter is, keyed on its own variable.
+      if (route.requiresKey) {
+        const keys = this.runtime?.settings?.channelKeys;
+        if (!keys?.[route.prefix]?.trim()) return [];
+      }
+
       try {
         const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
         const payload = await response.json();
@@ -1595,7 +1647,16 @@ function cleanSettings(values) {
   // A channel name reaches a URL path segment, so it is validated rather than
   // trusted: the panel posts a list, and anything that is not a plain lowercase
   // segment is dropped instead of being written to settings and matched later.
-  if (typeof values.openRouterKey === 'string' && values.openRouterKey.length <= 512) next.openRouterKey = values.openRouterKey.trim();
+  // Per channel, and each name is checked against the list the panel offers, so a
+  // post cannot introduce a channel the proxy has no variable for.
+  if (isRecord(values.channelKeys)) {
+    const keys = {};
+    for (const entry of KEYED_CHANNELS) {
+      const value = values.channelKeys[entry.channel];
+      if (typeof value === 'string' && value.length <= 512) keys[entry.channel] = value.trim();
+    }
+    next.channelKeys = keys;
+  }
   if (Array.isArray(values.hiddenChannels)) {
     next.hiddenChannels = [...new Set(values.hiddenChannels
       .filter((entry) => typeof entry === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(entry.trim().toLowerCase()))
@@ -1780,6 +1841,9 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
       ...Object.keys(channels),
       ...BLOCKED_CHANNELS,
     ])].sort(),
+    // The channels the panel offers a key for, each naming the variable the proxy
+    // reads, so the field can say which one it is writing.
+    keyedChannels: KEYED_CHANNELS,
     // What deepseek-web still needs, and whether its capture is already running.
     deepseekWeb: {
       ...deepseekWebStatus(runtime.settings),

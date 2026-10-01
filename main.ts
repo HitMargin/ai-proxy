@@ -174,7 +174,14 @@ function hasChannelCredential(key: string, provider: any): boolean {
   const auth = provider?.auth;
   if (!auth || auth.type === "none") return true;
   if (auth.type === "bearer") {
-    return Boolean(auth.defaultToken || ENV.DEFAULT_BEARER_TOKEN);
+    // Per-provider first, shared fallback last: a provider that names its own
+    // variable is expected to have been given one, and DEFAULT_BEARER_TOKEN is the
+    // single-channel setup that must not silently serve the wrong upstream.
+    return Boolean(
+      auth.defaultToken ||
+        (auth.envToken ? ENV[auth.envToken] : undefined) ||
+        ENV.DEFAULT_BEARER_TOKEN,
+    );
   }
   if (auth.type === "api-key") {
     const name = auth.header || "x-api-key";

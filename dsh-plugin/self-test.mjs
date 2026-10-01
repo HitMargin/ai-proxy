@@ -313,9 +313,15 @@ try {
   // The aggregate listing plus the one channel that has its own route and is
   // not blocked. deepseek-web used to be the third, which is what the poller's
   // log was full of.
-  assert.equal(modelCalls, 2);
-  assert.equal(modelCallsByPath['/tokenharbor/v1/models'], 1);
+  assert.equal(modelCalls, 1, `paths: ${JSON.stringify(modelCallsByPath)}`);
+  // tokenharbor is held back with no key. Its filterModels drops every id without
+  // a `:free` suffix, so a 401 came back as an empty list and the panel read it as
+  // "no free models here" - the same thing a working channel looks like.
+  assert.equal(modelCallsByPath['/tokenharbor/v1/models'], undefined);
+  // Hidden, so not fetched - the log-noise rule. The panel's switch decides this,
+  // which is the test that follows.
   assert.equal(modelCallsByPath['/deepseek-web/v1/models'], undefined);
+  dispose();
   // The aggregate route answers in snake_case; reading only the camelCase
   // spelling silently downgraded every image-capable model to text-only.
   const listed = models.find((model) => model.id === 'deepseek/test');
@@ -392,11 +398,11 @@ try {
     true,
     'a key-only channel still gets the key explanation',
   );
-  // The withheld count describes rows that were actually seen and dropped: the
-  // 3 blocked rows inside the aggregate listing (1 openrouter, 2 cnb). A
-  // blocked channel that has its own route is never fetched at all, so it
-  // contributes nothing here — asking the proxy for a listing whose rows would
-  // all be discarded cost one request per poll for nothing.
+  // The withheld count describes rows that were actually seen and dropped: the 3
+  // blocked rows inside the aggregate listing (1 openrouter, 2 cnb). A blocked
+  // channel that has its own route is never fetched at all, so it contributes
+  // nothing here - asking the proxy for a listing whose rows would all be discarded
+  // cost one request per poll for nothing.
   assert.equal(adapter.blockedModelCount, 3);
   for (const prefix of ['deepseek-web/', 'cnb/', 'openrouter/']) {
     assert.equal(
@@ -846,6 +852,37 @@ try {
   assert.equal(both.get('kilo/kilo-auto/free').state, 'degraded');
   assert.equal(both.get('kilo/stealth/space-bunny-alpha').state, 'available');
 
+  // Switching the channel on has to actually put its models in the roster.
+  // deepseek-web sat in no listing path at all, so its switch in the panel showed
+  // 0 models whatever the switch was set to - the one thing a user cannot fix from
+  // the panel. A second apply with the channel left visible is the only way to
+  // exercise that, because the default is hidden.
+  let enabledDiscovery;
+  const enabledCtx = {
+    ...ctx,
+    llm: {
+      ...ctx.llm,
+      registerModelDiscovery(_id, callback) { enabledDiscovery = callback; },
+    },
+  };
+  const disposeEnabled = apply(enabledCtx, {
+    mode: 'external',
+    externalUrl: 'http://127.0.0.1:8000/commandcode/v1',
+    apiKeyEnv: 'TEST_BRIDGE_KEY',
+    hiddenChannels: ['cnb', 'openrouter'],
+    channelKeys: { tokenharbor: 'test-tokenharbor-key' },
+  });
+  const afterSwitch = await enabledDiscovery();
+  assert.equal(modelCallsByPath['/deepseek-web/v1/models'], 1, 'a visible channel must be listed');
+  // A key is what lifts the hold, and it is the channel's own key: sharing one
+  // variable across keyed channels means a key for one is silently used for the
+  // other, which fails as a 401 at the far end with nothing in the logs.
+  assert.equal(modelCallsByPath['/tokenharbor/v1/models'], 1, 'a keyed channel must be listed once keyed');
+  assert.ok(
+    afterSwitch.some((model) => model.id.startsWith('deepseek-web/')),
+    'enabling the channel must put its models in the roster',
+  );
+  disposeEnabled();
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;

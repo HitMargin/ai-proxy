@@ -31,10 +31,9 @@ window.__ModuleLoader__.load({
         usageFailed: '读取用量失败',
         efforts: '推理档位', noEfforts: '—',
         channels: '渠道显示', channelsHint: '取消勾选的渠道不会出现在模型列表里。保存后立即生效。',
-        openRouterKey: 'OpenRouter API Key',
-        openRouterKeySet: '已设置。留空保存不会清除它。',
-        openRouterKeyHint: '未设置。没有 key 时该渠道不显示模型。',
         clearKey: '清除',
+        keySet: '已设置（{what}）。留空保存不会清除它。',
+        keyMissing: '未设置。没有 key 时该渠道不列模型。',
         deepseekSetup: '一键配置',
         deepseekRunning: '正在配置…',
         deepseekReady: '登录态已就绪。',
@@ -59,10 +58,9 @@ window.__ModuleLoader__.load({
         search: 'Search models…', uptime: 'Uptime', state: 'State', excluded: 'Removed from the list', listingFailed: 'listing failed',
         efforts: 'Efforts', noEfforts: '—',
         channels: 'Channels', channelsHint: 'Unchecked channels are withheld from the model list. Takes effect on save.',
-        openRouterKey: 'OpenRouter API Key',
-        openRouterKeySet: 'Set. Saving with the field empty leaves it alone.',
-        openRouterKeyHint: 'Not set. Without a key the channel lists no models.',
         clearKey: 'Clear',
+        keySet: 'Set ({what}). Saving with the field empty leaves it alone.',
+        keyMissing: 'Not set. Without a key the channel lists no models.',
         deepseekSetup: 'Set up',
         deepseekRunning: 'Setting up…',
         deepseekReady: 'Login state is ready.',
@@ -461,10 +459,17 @@ window.__ModuleLoader__.load({
           ? hiddenNow.filter((entry) => entry !== channel)
           : [...hiddenNow, channel],
       )
-      // The key is write-only from here: the server reports whether one is set and
-      // never sends the value back, so the field starts empty every time and an
-      // empty submission leaves whatever is stored alone.
-      const [openRouterKey, setOpenRouterKey] = useState('')
+      // Keys are write-only from here: the server reports whether one is set and
+      // never sends the value back, so a field starts empty every time and an empty
+      // submission leaves whatever is stored alone. One per channel - a shared
+      // variable would hand one upstream's key to another.
+      const [channelKeys, setChannelKeys] = useState({})
+      const keyedList = Array.isArray(data?.keyedChannels) ? data.keyedChannels : []
+      const setChannelKey = (channel, value) => setChannelKeys((prev) => ({ ...prev, [channel]: value }))
+      const clearChannelKey = (channel) => {
+        setChannelKeys((prev) => ({ ...prev, [channel]: '' }))
+        act('/settings', { channelKeys: { [channel]: '' } })
+      }
       const deepseek = data?.deepseekWeb || { configured: false, missing: [], running: false }
       const save = () => act('/settings', {
         mode: settings?.mode,
@@ -474,10 +479,9 @@ window.__ModuleLoader__.load({
         externalUrl: settings?.externalUrl,
         apiKeyEnv: settings?.apiKeyEnv,
         hiddenChannels: hiddenNow,
-        ...(openRouterKey.trim() !== '' ? { openRouterKey } : {}),
+        channelKeys,
       })
       const setUpDeepseek = () => act('/deepseek-web/setup')
-      const clearOpenRouterKey = () => act('/settings', { openRouterKey: '' })
 
       const rows = useMemo(() => (Array.isArray(data?.models) ? data.models : []), [data])
       const projectRows = useMemo(
@@ -587,26 +591,29 @@ window.__ModuleLoader__.load({
             ))),
           )
           : null,
-        h('label', { className: 'apx_field' },
-          h('span', null, t('openRouterKey')),
+        // One field per keyed channel. Each names the variable the proxy reads,
+        // so it is clear that these are separate credentials and not one shared
+        // secret that happens to be typed twice.
+        ...keyedList.map((entry) => h('label', { key: entry.channel, className: 'apx_field' },
+          h('span', null, entry.label ?? entry.channel),
           h('p', { className: 'apx_tag' },
-            data?.openRouterKeySet
-              ? t('openRouterKeySet')
-              : t('openRouterKeyHint'),
+            data?.channelKeySet?.[entry.channel]
+              ? t('keySet', { what: entry.envToken })
+              : t('keyMissing'),
           ),
           h('div', { className: 'apx_row' },
             h('input', {
               className: 'apx_input',
               type: 'password',
-              placeholder: data?.openRouterKeySet ? '••••••••' : '',
-              value: openRouterKey,
-              onChange: (event) => setOpenRouterKey(event.target.value),
+              placeholder: data?.channelKeySet?.[entry.channel] ? '••••••••' : '',
+              value: channelKeys[entry.channel] ?? '',
+              onChange: (event) => setChannelKey(entry.channel, event.target.value),
             }),
-            data?.openRouterKeySet
-              ? h('button', { className: 'apx_btn', type: 'button', onClick: clearOpenRouterKey, disabled: busy }, t('clearKey'))
+            data?.channelKeySet?.[entry.channel]
+              ? h('button', { className: 'apx_btn', type: 'button', onClick: () => clearChannelKey(entry.channel), disabled: busy }, t('clearKey'))
               : null,
           ),
-        ),
+        )),
         h('div', { className: 'apx_field' },
           h('span', null, 'deepseek-web'),
           h('p', { className: 'apx_tag' },

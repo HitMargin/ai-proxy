@@ -98,7 +98,13 @@ export function cloneHeadersForUpstream(
       /^Bearer\s+/i,
       "",
     );
-    const token = userToken || auth.defaultToken || env.DEFAULT_BEARER_TOKEN;
+    // A per-provider variable, so two keyed channels do not overwrite each other
+    // through the shared fallback. `DEFAULT_BEARER_TOKEN` stays last: it is the
+    // one-channel setup, and a provider that names its own variable means the
+    // operator is expected to keep them apart.
+    const own = auth.envToken ? env[auth.envToken] : undefined;
+    const token = userToken || auth.defaultToken || own ||
+      env.DEFAULT_BEARER_TOKEN;
     if (token) headers.set("Authorization", `Bearer ${token}`);
   } else if (auth.type === "api-key") {
     const headerName = auth.header || "x-api-key";
@@ -174,7 +180,11 @@ export const providers: Record<string, any> = {
   openrouter_responses: {
     prefix: "/openrouter/v1/responses",
     baseUrl: "https://openrouter.ai/api/v1",
-    auth: { type: "bearer", defaultToken: "" },
+    auth: {
+      type: "bearer",
+      defaultToken: "",
+      envToken: "OPENROUTER_API_KEY",
+    },
     pathRewrite: (path: string) =>
       path.replace(/^\/openrouter\/v1\/responses/, "/responses"),
     endpoints: { chat: "/responses" },
@@ -184,7 +194,11 @@ export const providers: Record<string, any> = {
   openrouter: {
     prefix: "/openrouter/v1",
     baseUrl: "https://openrouter.ai/api/v1",
-    auth: { type: "bearer", defaultToken: "" },
+    auth: {
+      type: "bearer",
+      defaultToken: "",
+      envToken: "OPENROUTER_API_KEY",
+    },
     pathRewrite: (path: string) => path.replace(/^\/openrouter\/v1/, ""),
     endpoints: { models: "/models", chat: "/chat/completions" },
     adapter: adapters.passthrough,
@@ -232,7 +246,11 @@ export const providers: Record<string, any> = {
   tokenharbor: {
     prefix: "/tokenharbor/v1",
     baseUrl: "https://tokenharbor.ai/v1",
-    auth: { type: "bearer", defaultToken: "" },
+    auth: {
+      type: "bearer",
+      defaultToken: "",
+      envToken: "TOKENHARBOR_API_KEY",
+    },
     pathRewrite: (path: string) => path.replace(/^\/tokenharbor\/v1/, ""),
     endpoints: { models: "/models", chat: "/chat/completions" },
     adapter: adapters.passthrough,
