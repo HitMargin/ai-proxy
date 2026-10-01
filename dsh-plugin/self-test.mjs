@@ -865,10 +865,20 @@ try {
       registerModelDiscovery(_id, callback) { enabledDiscovery = callback; },
     },
   };
+  // deepseek-web is held back until its login state exists, and that is read from
+  // the project directory - so the fixture supplies one. Without this the suite's
+  // result depended on whether the checkout it ran from happened to have those
+  // files, which is how a passing run in the repo failed in the installed copy.
+  const fixtureRoot = path.join(sandboxHome, 'project');
+  fs.mkdirSync(fixtureRoot, { recursive: true });
+  for (const name of ['deepseek-cookies.txt', 'deepseek-auth.txt', 'deepseek-headers.json']) {
+    fs.writeFileSync(path.join(fixtureRoot, name), 'fixture');
+  }
   const disposeEnabled = apply(enabledCtx, {
     mode: 'external',
     externalUrl: 'http://127.0.0.1:8000/commandcode/v1',
     apiKeyEnv: 'TEST_BRIDGE_KEY',
+    projectRoot: fixtureRoot,
     hiddenChannels: ['cnb', 'openrouter'],
     channelKeys: { tokenharbor: 'test-tokenharbor-key' },
   });
