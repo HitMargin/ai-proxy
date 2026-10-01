@@ -8,6 +8,7 @@ import {
   zenGatewayHeaders,
   zenSessionId,
 } from "./zen.ts";
+import { __setZenCatalogForTest, type ZenCatalogEntry } from "./zen-catalog.ts";
 
 function sseResponse(frames: string[]): Response {
   return new Response(frames.join(""), {
@@ -295,12 +296,224 @@ function assertEquals<T>(actual: T, expected: T): void {
   }
 }
 
+/** The local assertEquals is Object.is, so arrays and objects need this. */
+function assertDeepEquals(actual: unknown, expected: unknown): void {
+  const a = JSON.stringify(actual);
+  const b = JSON.stringify(expected);
+  if (a !== b) throw new Error(`Expected ${b}, got ${a}`);
+}
+
 function assertNotEquals<T>(actual: T, expected: T): void {
   if (Object.is(actual, expected)) throw new Error("Values should differ");
 }
 
+// ---------- models.dev capability metadata ----------
+
+function stubCatalog(entries: Record<string, any>): () => void {
+  const index = new Map<string, ZenCatalogEntry>();
+  for (const [id, value] of Object.entries(entries)) {
+    index.set(id, {
+      id,
+      context: 0,
+      output: 0,
+      inputModalities: [],
+      reasoning: false,
+      efforts: [],
+      toggleOnly: false,
+      ...value,
+    } as ZenCatalogEntry);
+  }
+  __setZenCatalogForTest(index);
+  return () => __setZenCatalogForTest(null);
+}
+
+async function listZenModels(ids: string[]): Promise<any[]> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        object: "list",
+        data: ids.map((id) => ({
+          id,
+          object: "model",
+          created: 1,
+          owned_by: "opencode",
+        })),
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )) as typeof fetch;
+  try {
+    const response = await handleZen(
+      "/zen/v1/models",
+      new Request("http://local/zen/v1/models"),
+      new URL("http://local/zen/v1/models"),
+    );
+    return (await response.json()).data;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+Deno.test("the model listing carries the catalog capabilities Zen omits", async () => {
+  const restore = stubCatalog({
+    "space-bunny-free": {
+      context: 1048576,
+      output: 524288,
+      inputModalities: ["text", "image", "video"],
+      reasoning: true,
+      efforts: ["low", "medium", "high", "xhigh", "max"],
+    },
+  });
+  try {
+    const [row] = await listZenModels(["space-bunny-free"]);
+    assertEquals(row.context_window, 1048576);
+    assertEquals(row.max_output_tokens, 524288);
+    assertDeepEquals(row.input_modalities, ["text", "image", "video"]);
+    assertDeepEquals(
+      row.reasoning_efforts.map((e: any) => e.id),
+      ["low", "medium", "high", "xhigh", "max"],
+    );
+    assertEquals(row.reasoning_efforts[0].name, "low");
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("a model the catalog misses is returned exactly as Zen sent it", async () => {
+  const restore = stubCatalog({});
+  try {
+    const [row] = await listZenModels(["jev-1.13-free"]);
+    assertDeepEquals(row, {
+      id: "jev-1.13-free",
+      object: "model",
+      created: 1,
+      owned_by: "opencode",
+    });
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("a toggle-only model gets no ladder and no invented off", async () => {
+  const restore = stubCatalog({
+    "longcat-2.5-preview-free": {
+      context: 1000000,
+      output: 131072,
+      reasoning: true,
+      toggleOnly: true,
+    },
+  });
+  try {
+    const [row] = await listZenModels(["longcat-2.5-preview-free"]);
+    assertEquals(row.context_window, 1000000);
+    assertEquals("reasoning_efforts" in row, false);
+  } finally {
+    restore();
+  }
+});
 function assertStringIncludes(value: string, needle: string): void {
   if (!value.includes(needle)) {
     throw new Error(`Expected ${value} to include ${needle}`);
   }
 }
+
+/** Capture the body the proxy would send upstream for a Responses-shaped call. */
+async function upstreamResponsesBody(
+  model: string,
+  body: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const originalFetch = globalThis.fetch;
+  let seen: Record<string, unknown> = {};
+  globalThis.fetch = (async (_input: unknown, init: RequestInit = {}) => {
+    seen = JSON.parse(String(init.body || "{}"));
+    return new Response(JSON.stringify({ output: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    const request = new Request("http://local/zen/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-session-id": "dsh-session",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "hi" }],
+        ...body,
+      }),
+    });
+    await handleZen("/zen/v1/responses", request, new URL(request.url));
+    return seen;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+Deno.test("a published effort survives the Responses conversion", async () => {
+  const restore = stubCatalog({
+    "muse-spark-1.3-contributor-free": {
+      reasoning: true,
+      efforts: ["minimal", "low", "medium", "high", "xhigh"],
+    },
+  });
+  try {
+    const seen = await upstreamResponsesBody(
+      "muse-spark-1.3-contributor-free",
+      { reasoning_effort: "high" },
+    );
+    assertDeepEquals(seen.reasoning, { effort: "high" });
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("an effort the model never published is not sent upstream", async () => {
+  const restore = stubCatalog({
+    "muse-spark-1.3-contributor-free": {
+      reasoning: true,
+      efforts: ["minimal", "low", "medium", "high", "xhigh"],
+    },
+  });
+  try {
+    const seen = await upstreamResponsesBody(
+      "muse-spark-1.3-contributor-free",
+      { reasoning_effort: "max" },
+    );
+    assertEquals("reasoning" in seen, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("an effort for a model the catalog missed is not invented", async () => {
+  const restore = stubCatalog({});
+  try {
+    const seen = await upstreamResponsesBody(
+      "muse-spark-9.9-contributor-free",
+      { reasoning_effort: "high" },
+    );
+    assertEquals("reasoning" in seen, false);
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("no effort asked for means no reasoning key at all", async () => {
+  const restore = stubCatalog({
+    "muse-spark-1.3-contributor-free": {
+      reasoning: true,
+      efforts: ["minimal", "low", "medium", "high", "xhigh"],
+    },
+  });
+  try {
+    const seen = await upstreamResponsesBody(
+      "muse-spark-1.3-contributor-free",
+      {},
+    );
+    assertEquals("reasoning" in seen, false);
+  } finally {
+    restore();
+  }
+});

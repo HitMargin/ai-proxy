@@ -2,6 +2,13 @@
 import { ENV } from "./core.ts";
 import { compactIfNeeded, fallbackTruncate } from "./zen-compaction.ts";
 import {
+  ensureZenCatalog,
+  zenCatalogEnabled,
+  type ZenCatalogEntry,
+  zenCatalogEntry,
+  zenCatalogLoaded,
+} from "./zen-catalog.ts";
+import {
   DEFAULT_EGRESS_COOLDOWN_MS,
   EgressPool,
   parseProxyList,
@@ -140,10 +147,71 @@ export function zenEgressStatus(): {
 // ---------- session compaction ----------
 
 const ZEN_MODEL_LIMITS: Record<string, { context: number; output: number }> =
-  {};
+  parseZenModelLimitOverrides();
 
+/**
+ * `ZEN_MODEL_LIMITS='{"jev-1.13-free":{"context":200000,"output":32000}}'`
+ *
+ * For the models the catalog does not cover. The catalog is missing at least one
+ * live id (`jev-1.13-free`), and guessing its ceiling would put compaction back on
+ * the wrong denominator, so the operator states it instead.
+ */
+function parseZenModelLimitOverrides(): Record<
+  string,
+  { context: number; output: number }
+> {
+  const raw = String(ENV.ZEN_MODEL_LIMITS || "").trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const out: Record<string, { context: number; output: number }> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, any>)) {
+      const context = Number((value as any)?.context);
+      const output = Number((value as any)?.output);
+      if (
+        Number.isSafeInteger(context) && context > 0 &&
+        Number.isSafeInteger(output) && output > 0
+      ) {
+        out[key] = { context, output };
+      }
+    }
+    return out;
+  } catch {
+    console.warn("[zen] ZEN_MODEL_LIMITS is not valid JSON; ignoring it");
+    return {};
+  }
+}
+
+/**
+ * Context and output ceilings for a Zen model.
+ *
+ * The gateway publishes neither — its `/models` is four bare fields — so these
+ * come from the models.dev entry for the model, which names this same gateway as
+ * its api. The fixed fallback is reached only when the catalog is off, failed, or
+ * silent about this model, and it is a guess rather than a claim: one pair for
+ * eleven models whose real output caps span 32k to 524k is wrong for most of
+ * them, and compaction divides by this number, so a miss is logged, not absorbed.
+ */
+let warnedMissingLimits = false;
 function zenModelLimits(model: string): { context: number; output: number } {
-  return ZEN_MODEL_LIMITS[model] ?? { context: 1_000_000, output: 64_000 };
+  const id = String(model || "").split("/").pop() || "";
+  const entry = zenCatalogEntry(id);
+  if (entry && entry.context > 0 && entry.output > 0) {
+    return { context: entry.context, output: entry.output };
+  }
+  const override = ZEN_MODEL_LIMITS[id];
+  if (override) return override;
+  if (!warnedMissingLimits && zenCatalogEnabled()) {
+    console.warn(
+      `[zen] no catalog entry for model "${id}"; falling back to 1M/64k. ` +
+        "Set ZEN_MODEL_LIMITS to state its real ceilings.",
+    );
+    warnedMissingLimits = true;
+  }
+  return { context: 1_000_000, output: 64_000 };
 }
 
 /**
@@ -464,6 +532,42 @@ function chatContentText(content: any): string {
   }).join("");
 }
 
+/**
+ * The effort this request asked for, if this model publishes it.
+ *
+ * Both converters below rebuild the body from a fixed set of fields, so an
+ * effort that arrived on the request used to be dropped on the floor rather than
+ * refused — the caller saw a successful turn that silently ignored it.
+ *
+ * Relaying is gated on the catalog: `reasoning: { effort }` is only sent for a
+ * value the model actually publishes. Passing an unknown rung through would
+ * either invent a capability or earn a 400 on a request that works today, and
+ * dropping it silently is what caused the bug. An unrecognised rung is logged
+ * instead, which is the one thing the old path never did.
+ */
+let warnedEffort = "";
+function zenRequestedEffort(model: string, body: Json): string | null {
+  const requested = String(
+    body?.reasoning_effort ?? (body?.reasoning as Json | undefined)?.effort ??
+      "",
+  ).toLowerCase().trim();
+  if (!requested) return null;
+  const id = String(model || "").split("/").pop() || "";
+  const entry = zenCatalogEntry(id);
+  if (entry && entry.efforts.includes(requested)) return requested;
+  const why = entry
+    ? `publishes ${entry.efforts.join("/") || "no effort ladder"}`
+    : zenCatalogLoaded()
+    ? "is not in the catalog"
+    : "was asked for before the catalog loaded";
+  const line =
+    `[zen] ${id} was asked for effort "${requested}" but ${why}; not sent`;
+  if (line !== warnedEffort) {
+    console.warn(line);
+    warnedEffort = line;
+  }
+  return null;
+}
 function chatToResponses(body: Json): Json {
   const input = (Array.isArray(body.messages) ? body.messages : []).map((
     message: Json,
@@ -483,6 +587,7 @@ function chatToResponses(body: Json): Json {
       };
     },
   );
+  const effort = zenRequestedEffort(String(body.model ?? ""), body);
   return {
     model: body.model,
     input: input.length > 0 ? input : [{
@@ -497,9 +602,21 @@ function chatToResponses(body: Json): Json {
     ),
     ...(tools.length > 0 ? { tools } : {}),
     ...(body.tool_choice ? { tool_choice: body.tool_choice } : {}),
+    ...(effort ? { reasoning: { effort } } : {}),
   };
 }
 
+/**
+ * The Anthropic Messages shape, used for `union-alpha`.
+ *
+ * No effort is mapped here, and that is a decision rather than an omission.
+ * Anthropic expresses extended thinking as `thinking: { type, budget_tokens }` —
+ * a token count, not a named rung — so every effort id would need a budget this
+ * proxy would have to invent, and a wrong budget silently changes how long the
+ * model thinks. The catalog carries no budget either, so there is nothing here to
+ * read it from. An effort that arrives is therefore reported and dropped rather
+ * than guessed at; the `chat` wire passes the original field through untouched.
+ */
 function chatToClaude(body: Json): Json {
   const messages: Json[] = [];
   let system = "";
@@ -523,6 +640,8 @@ function chatToClaude(body: Json): Json {
       };
     },
   );
+  // Reported so the caller learns it was ignored; see the note above.
+  zenRequestedEffort(String(body.model ?? ""), body);
   return {
     model: body.model,
     messages,
@@ -947,6 +1066,59 @@ function zenFailure(response: Response, text: string): Response {
   );
 }
 
+/**
+ * Attach the capabilities the gateway leaves out.
+ *
+ * Zen answers `{ id, object, created, owned_by }` and nothing else, so a picker
+ * reading context, output cap, modalities or reasoning has nothing to read and
+ * falls back to its own defaults. These values come from the catalog entry for
+ * the same model id, which names this gateway as its api.
+ *
+ * Only what the catalog states is published. A model it does not cover is
+ * returned exactly as Zen sent it rather than padded with a guess, and an
+ * effort ladder is never invented: no upstream ladder contains an "off", so none
+ * is added, and the ids are republished verbatim rather than prettified.
+ *
+ * Toggle-only models get no ladder on purpose. The catalog marks longcat and ling
+ * as `type: "toggle"`, which is an Anthropic-shaped control; an OpenAI request
+ * has no way to express one, so offering it would be a control that silently does
+ * nothing. They are named in the log instead so the gap is visible.
+ */
+function zenModelRow(model: Json, entry: ZenCatalogEntry | null): Json {
+  if (!entry) return model;
+  const row: Json = { ...model };
+  if (entry.context > 0) row.context_window = entry.context;
+  if (entry.output > 0) row.max_output_tokens = entry.output;
+  if (entry.inputModalities.length > 0) {
+    row.input_modalities = entry.inputModalities;
+  }
+  if (entry.reasoning && entry.efforts.length > 0) {
+    row.reasoning_efforts = entry.efforts.map((id: string) => ({
+      id,
+      name: id,
+    }));
+  }
+  return row;
+}
+
+/**
+ * Name the models whose reasoning control cannot be expressed, once per listing.
+ */
+let warnedToggleOnly = "";
+function warnToggleOnly(entries: (ZenCatalogEntry | null)[]): void {
+  const names = entries
+    .filter((entry): entry is ZenCatalogEntry =>
+      !!entry && !!entry.reasoning && entry.toggleOnly
+    )
+    .map((entry) => entry.id)
+    .join(", ");
+  if (!names || names === warnedToggleOnly) return;
+  warnedToggleOnly = names;
+  console.warn(
+    `[zen] toggle-only reasoning, no effort ladder published (an OpenAI-shaped ` +
+      "request cannot express a toggle): " + names,
+  );
+}
 async function handleModels(): Promise<Response> {
   const session = await zenSessionId("zen:catalog");
   const requestId = mintZenRequestId();
@@ -968,10 +1140,20 @@ async function handleModels(): Promise<Response> {
       return jsonResponse({ error: "Zen returned non-JSON model list" }, 502);
     }
     const data = Array.isArray(payload.data) ? payload.data : [];
+    // The catalog is ~5 MB, so it is refreshed in the background and a cold
+    // cache costs a bare listing rather than a fetch inside the request.
+    ensureZenCatalog();
+    const free = data.filter((model: Json) =>
+      typeof model?.id === "string" && model.id.endsWith("-free")
+    );
+    const entries = free.map((model: Json) =>
+      zenCatalogEntry(String(model.id))
+    );
+    warnToggleOnly(entries);
     return jsonResponse({
       ...payload,
-      data: data.filter((model: Json) =>
-        typeof model?.id === "string" && model.id.endsWith("-free")
+      data: free.map((model: Json, index: number) =>
+        zenModelRow(model, entries[index])
       ),
     });
   } catch (error) {

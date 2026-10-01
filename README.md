@@ -156,6 +156,8 @@ deno task test
 | `COMMANDCODE_TIMEOUT_MS` | 否 | 单次 CommandCode 请求总超时，默认 `600000` |
 | `COMMANDCODE_SESSION_SALT` | 否 | 显式会话头哈希的服务端盐；不设时每进程随机，重启后亲和性改变 |
 | `COMMANDCODE_ALLOW_REMOTE_IMAGES` | 否 | 设为 `1/true/yes` 才允许代理下载 HTTP(S) 图片；默认关闭以避免 SSRF |
+| `ZEN_CATALOG` | 否 | 从 models.dev 读取 Zen 模型能力元数据；设为 `off` 跳过（该目录约 5 MB，见下） |
+| `ZEN_MODEL_LIMITS` | 否 | 目录未收录模型的上下限，如 `{"jev-1.13-free":{"context":200000,"output":32000}}` |
 
 ### DeepSeek 网页端反代（`/deepseek-web/v1`）
 1. 运行自动登录与凭证捕获脚本：
@@ -240,6 +242,28 @@ commandcode:
 ### 可选 DSH Provider 桥接插件
 
 `/zen/v1` 现在由 `src/zen.ts` 处理：它补齐 OpenCode 客户端 User-Agent、DSH session 派生的 `x-opencode-session`/`x-opencode-request`、canonical session、工具 quartet、Muse Spark 的 Responses 转换和 FreeTier/Region 错误分类。实测非流式请求会触发 `FreeTierError`，DSH 路径必须保持 `stream: true`。可用 `ZEN_BASE_URL` 和 `ZEN_BEARER_TOKEN` 覆盖默认上游；原始项目代码仍是唯一实现。
+
+### Zen 模型能力元数据（`src/zen-catalog.ts`）
+
+Zen 的 `GET /models` 只返回 `{ id, object, created, owned_by }`，没有上下文窗口、输出上限、模态，也没有推理档位。代理因此改从 [models.dev](https://models.dev) 读取——它的 `opencode` 条目把 `https://opencode.ai/zen/v1` 列为 api，描述的正是同一个网关：
+
+| 模型 | 档位 | ctx | output |
+|---|---|---|---|
+| `space-bunny-free` | low/medium/high/xhigh/max | 1,048,576 | 524,288 |
+| `muse-spark-1.3-contributor-free` | minimal/low/medium/high/xhigh | 1,048,576 | 131,072 |
+| `deepseek-v4-flash-free` | low/high/max | 200,000 | 128,000 |
+| `longcat-2.5-preview-free` | 仅开关 | 1,000,000 | 131,072 |
+| `mimo-v2.6-flash-free` | 不可调 | 200,000 | 32,000 |
+
+阶梯**逐模型不同**，所以不能自己编一套统一的；也没有任何一条阶梯包含 `off`，因此不会凭空补一个「关闭」档。
+
+三点实现约束：
+
+- **目录约 5 MB，不进请求路径**。首次访问只排一次后台刷新并返回当前快照，冷缓存的代价是一次「裸列表」而不是把 5 MB 拉进用户回合。TTL 12 小时，失败降级为上一份快照，`ZEN_CATALOG=off` 可完全关闭。
+- **目录没覆盖的模型原样返回**，不补猜测值（目前 `jev-1.13-free` 属于这类，可用 `ZEN_MODEL_LIMITS` 显式指定）。
+- **只在目录确认该模型发布了这个档位时才转发 effort**。透传未知档位要么是编造能力，要么给本来能通的请求换来一个 400；不认识的档位改为记日志——这是旧路径从来不做的事。
+
+在此之前，代理对全部 11 个模型使用同一个 `{ context: 1,000,000, output: 64,000 }` 兜底值，而压缩正是在拿这个数字做分母。真实输出上限从 32,000 到 524,288 不等，旧值对目录覆盖的 10 个模型**全都错**：mimo 高估 2 倍，`space-bunny-free` 低估 8.2 倍。
 
 `dsh-plugin/` 现在是整个项目的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。它注册一个 `ai-proxy` Provider，动态发现 `/v1` 聚合模型以及 DeepSeek 网页端、TokenHarbor 等可用渠道，并按模型前缀把请求路由回原始代理；`openrouter/*`、`anthropic/*`、`gemini/*` 依赖 per-user key，本代理不持有，因此不进入模型列表。浏览器侧是一个现代设置面板：每秒走动的运行时长、10 秒刷新的全渠道快照、可搜索的模型表、渠道统计、账号池状态、启停和日志；账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
 
@@ -474,6 +498,7 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 | `src/cnb.ts` | cnb.cool CSRF、登录态、工具调用、Responses API |
 | `src/deepseek-web.ts` | DeepSeek 登录态、PoW、完整上下文、SSE、思考和工具调用 |
 | `src/commandcode/` | CommandCode Go 模型发现、私有协议、多账号池、OAuth、额度与 OpenAI 转换 |
+| `src/zen-catalog.ts` | Zen 模型能力元数据（来自 models.dev），Zen 网关自己不返回 |
 | `third_party/dsh-deepseek-web-login/` | Apache-2.0 工具协议派生代码及许可证 |
 | `third_party/dsh-cmdgo-provider/` | dsh-cmdgo-provider 的 MIT 许可证与移植说明 |
 | `worker.ts` | Cloudflare Workers 入口 shim（把 `vars`/secrets 注入 `main.ts` 的模块级 `ENV`） |

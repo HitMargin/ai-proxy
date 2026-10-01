@@ -42,6 +42,10 @@ export const ENV: Record<string, string> = {
   ZEN_COMPACTION_BUFFER: getEnv("ZEN_COMPACTION_BUFFER"),
   ZEN_COMPACTION_MAX_SUMMARY: getEnv("ZEN_COMPACTION_MAX_SUMMARY"),
   ZEN_COMPACTION_SUMMARY_MODEL: getEnv("ZEN_COMPACTION_SUMMARY_MODEL"),
+  // Capability metadata for Zen models, read from the models.dev catalog
+  // because the gateway's own /models carries none. "off" skips the fetch.
+  ZEN_CATALOG: getEnv("ZEN_CATALOG"),
+  ZEN_MODEL_LIMITS: getEnv("ZEN_MODEL_LIMITS"),
   COMMANDCODE_API_KEY: getEnv("COMMANDCODE_API_KEY"),
   COMMANDCODE_BASE_URL: getEnv("COMMANDCODE_BASE_URL"),
   COMMANDCODE_VERSION: getEnv("COMMANDCODE_VERSION"),
