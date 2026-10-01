@@ -28,6 +28,10 @@ import {
 const ROUTE = 'ai-proxy-commandcode';
 const PROJECT_ROUTE = 'ai-proxy';
 const DEFAULT_MAX_TOKENS = 64000;
+// Slack left when fitting the request into the window, and the floor an output
+// budget is never squeezed below.
+const CONTEXT_HEADROOM_TOKENS = 2048;
+const MIN_OUTPUT_TOKENS = 1024;
 // The DSH picker groups strictly by provider route, so a channel that cannot
 // serve a real turn does not belong in the roster at all. OpenRouter, Anthropic
 // and Gemini need per-user keys this proxy never holds, and their listings
@@ -831,6 +835,53 @@ export function flushUsage() {
   return 'stop';
 }
 
+/** Gateways word the overflow several ways; they all mean the same thing. */
+const CONTEXT_OVERFLOW = /maximum context length|context_length_exceeded|context window|too many tokens|reduce the length/i;
+
+/**
+ * Rough prompt size in tokens. The chars/4 approximation is the one this project
+ * already uses for Zen compaction; it is only ever used to leave headroom, never
+ * to claim a precise budget.
+ */
+function estimateMessageTokens(messages) {
+  let chars = 0;
+  const walk = (value) => {
+    if (typeof value === 'string') { chars += value.length; return; }
+    if (Array.isArray(value)) { for (const item of value) walk(item); return; }
+    if (isRecord(value)) {
+      for (const [key, item] of Object.entries(value)) {
+        // A base64 image is bytes, not prose, and is billed by the gateway's own
+        // accounting; counting its characters would inflate the estimate hugely.
+        if (key === 'image_url' || key === 'url') continue;
+        walk(item);
+      }
+    }
+  };
+  walk(messages);
+  return Math.ceil(chars / 4);
+}
+
+/**
+ * Keep `input + max_tokens` inside the model's context window.
+ *
+ * A model's output ceiling is not a request size. kilo publishes
+ * `top_provider.max_completion_tokens: 524288` against a 1,000,000 window, so the
+ * ceiling alone left 475,712 for a conversation that had already used 475,845 -
+  and the gateway answered 400 with the arithmetic laid out: 467,563 text input +
+  8,282 tool input + 524,288 output = 1,000,133.
+ *
+ * The turn then failed *twice* more: the thrown Error was reported as a transport
+  failure, which is in the retry set, so it replayed an over-budget request until
+  the budget ran out.
+ */
+function clampOutputBudget(body, contextWindow) {
+  if (!Number.isSafeInteger(contextWindow) || contextWindow <= 0) return;
+  const input = estimateMessageTokens(body.messages);
+  const room = contextWindow - input - CONTEXT_HEADROOM_TOKENS;
+  if (room >= body.max_tokens) return;
+  body.max_tokens = Math.max(MIN_OUTPUT_TOKENS, room);
+  body.max_tokensClamped = true;
+}
 async function* readSse(response) {
   if (!response.body) throw new Error('ai-proxy returned an empty stream');
   const reader = response.body.getReader();
@@ -889,7 +940,19 @@ export class AiProxyAdapter {
     });
     if (!response.ok) {
       const text = await response.text().catch(() => '');
-      throw new Error(`ai-proxy ${basePath}${path} returned HTTP ${response.status}: ${text.slice(0, 240)}`);
+      const error = new Error(`ai-proxy ${basePath}${path} returned HTTP ${response.status}: ${text.slice(0, 240)}`);
+      // The retry decision is made on the code, and a thrown Error arrives at the
+      // caller as a generic transport failure - which is retryable. A context
+      // overflow is a 400 that fails identically forever, so replaying it only
+      // burns quota before failing the same way. Naming it with the code the
+      // harness recognises keeps it out of the retry set and lets the harness's
+      // own overflow recovery see it.
+      error.status = response.status;
+      if (response.status === 400 && CONTEXT_OVERFLOW.test(text)) error.code = 'CONTEXT_WINDOW_EXCEEDED';
+      else if (response.status === 429) error.code = 'RATE_LIMIT';
+      else if (response.status >= 500) error.code = 'SERVER';
+      else error.code = 'CONFIG_DISABLED';
+      throw error;
     }
     return response;
   }
@@ -1070,6 +1133,16 @@ export class AiProxyAdapter {
       stream: true,
       max_tokens: Number(options.maxTokens ?? resolved.defaultMaxTokens ?? DEFAULT_MAX_TOKENS),
     };
+    clampOutputBudget(body, resolved.context?.contextWindow);
+    if (body.max_tokensClamped) {
+      // Never silent: a request that used to be rejected should say it was
+      // narrowed, or the shorter answers look like a model change.
+      const clamped = body.max_tokens;
+      delete body.max_tokensClamped;
+      this.runtime?.record?.(
+        `${requestedId}: output budget clamped to ${clamped} to fit a ${resolved.context.contextWindow} window`,
+      );
+    }
     const tools = toOpenAiTools(options.tools);
     if (tools) body.tools = tools;
     if (imageWarnings.length > 0) {

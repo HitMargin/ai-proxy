@@ -623,6 +623,28 @@ try {
   }
   assert.equal(reasoningBlocks, 1, 'the reasoning block must open exactly once');
   assert.equal(reasoningText, 'kilo spells it reasoning');
+
+  // A model's output ceiling is not a request size. kilo publishes
+  // top_provider.max_completion_tokens = 524288 against a 1,000,000 window, so the
+  // ceiling alone left less room than the conversation had already used - the
+  // gateway answered 400 with 467563 + 8282 + 524288 = 1000133.
+  const tightResolved = {
+    ...toolResolved,
+    context: { contextWindow: 1000 },
+    defaultMaxTokens: 524288,
+  };
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(3200) }] }],
+  }, tightResolved)) { /* asserted below */ }
+  const fitInput = Math.ceil('x'.repeat(3200).length / 4);
+  assert.ok(lastChatBody.max_tokens < 524288, 'the output ceiling must not be sent as the request size');
+  assert.equal(
+    lastChatBody.max_tokens,
+    Math.max(1024, 1000 - fitInput - 2048),
+    `clamped budget must be window minus input minus headroom (input=${fitInput})`,
+  );
+  assert.equal(lastChatBody.max_tokensClamped, undefined, 'the marker must not reach the wire');
   assert.equal(panelRoute.path, '/api/ai-proxy-commandcode');
   let panelBody = '';
   let panelStatus = 0;
