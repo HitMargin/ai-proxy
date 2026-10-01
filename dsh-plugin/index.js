@@ -14,7 +14,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   applyRecord,
   byModel,
@@ -567,10 +567,17 @@ function toOpenAiMessages(options) {
       // transcript.
       const callId = typeof message.toolCallId === 'string' ? message.toolCallId : '';
       if (callId === '') continue;
+      // A bare empty string told the model nothing. It could not tell a tool
+      // that failed from one that legitimately produced nothing, and would
+      // answer a question the transcript never answered. The harness client
+      // marks both cases, so the shapes match again.
+      let body = textOf(content);
+      if (body === '') body = '(no tool output)';
+      if (message.isError === true) body = `[tool error] ${body}`;
       output.push({
         role: 'tool',
         tool_call_id: callId,
-        content: textOf(content),
+        content: body,
       });
       continue;
     }
@@ -595,9 +602,15 @@ function toOpenAiMessages(options) {
         // Reasoning blocks are dropped on the way out: replaying them needs the
         // upstream's own signature format, and a stale signature is a 400.
       }
+      const joined = text.join('');
+      // Dropping reasoning blocks upstream can leave a turn with neither prose
+      // nor a call - the model thought and said nothing. "Some providers require
+      // either content or tool_calls, but not none", which is why the harness
+      // client skips these; sending one is what a strict channel answers 400.
+      if (joined === '' && calls.length === 0) continue;
       output.push({
         role: 'assistant',
-        content: text.join(''),
+        content: joined,
         ...(calls.length > 0 ? { tool_calls: calls } : {}),
       });
       continue;
@@ -894,8 +907,8 @@ export class AiProxyAdapter {
   }
 
   async prepareCall(provider, model) {
-    const resolved = await this.resolveModel(provider, model);
-    return { model: resolved, stream: (options) => this.stream(options, resolved) };
+    const resolved = await HOT.resolveModel.call(this, provider, model);
+    return { model: resolved, stream: (options) => HOT.stream.call(this, options, resolved) };
   }
 
   async *stream(options, resolved) {
@@ -927,8 +940,22 @@ export class AiProxyAdapter {
     };
     const tools = toOpenAiTools(options.tools);
     if (tools) body.tools = tools;
-    if (typeof options.reasoningEffort === 'string') body.reasoning_effort = options.reasoningEffort;
+    // OpenAI defaults this to true, which asks the gateway to retain the
+    // conversation server-side. The harness client sends false explicitly and
+    // a config-listed model on the same upstream therefore did too; omitting
+    // it left the plugin path asking for retention nobody wanted.
+    body.store = false;
+    // A session title is not worth thinking about. The built-in client forces
+    // the effort off for purpose 'session-title', so without this every
+    // auto-named conversation spent reasoning tokens on a title.
+    const purpose = typeof options.purpose === 'string' ? options.purpose : '';
+    if (purpose === 'session-title') {
+      delete body.reasoning_effort;
+    } else if (typeof options.reasoningEffort === 'string') {
+      body.reasoning_effort = options.reasoningEffort;
+    }
     if (typeof options.temperature === 'number') body.temperature = options.temperature;
+    if (Array.isArray(options.stop) && options.stop.length > 0) body.stop = options.stop;
 
     // Timings are taken here so the dashboard can report the real first-token
     // latency and decode speed the user actually experienced, rather than a
@@ -937,15 +964,22 @@ export class AiProxyAdapter {
     let firstDeltaAt;
 
     const requestHeaders = { 'content-type': 'application/json' };
+    // Session affinity. The built-in client sends a whole set of these whenever
+    // the route opts in, and the gateway uses them to keep the prompt cache
+    // warm across a conversation. The plugin sent none of them, so a
+    // plugin-routed model was paying full price on cache misses that a
+    // config-listed model on the same upstream did not.
+    const sessionId = typeof options.sessionId === 'string' ? options.sessionId : '';
+    if (sessionId) {
+      requestHeaders.prompt_cache_key = sessionId;
+      requestHeaders.session_id = sessionId;
+      requestHeaders['x-session-affinity'] = sessionId;
+    }
     const isZenAggregate = modelId.startsWith('zen/') && resolved.basePath === '/v1';
     if (isZenAggregate) {
-      const sessionId = typeof options.sessionId === 'string' ? options.sessionId : '';
       if (sessionId) {
         requestHeaders['x-session-id'] = sessionId;
         requestHeaders['x-conversation-id'] = sessionId;
-      }
-      if (typeof options.requestId === 'string' && options.requestId) {
-        requestHeaders['x-request-id'] = options.requestId;
       }
       requestHeaders['user-agent'] = 'deepseek-harness/0.1.7 (+https://github.com/deepseek-ai/deepseek-harness) opencode/1.18.31';
     }
@@ -1010,6 +1044,16 @@ export class AiProxyAdapter {
             block = { index: 100 + key, id: call.id, name: call.function?.name, args: '' };
             toolBlocks.set(key, block);
             yield { type: 'block-start', index: block.index, blockType: 'tool-call' };
+          } else if (block.id === undefined && typeof call.id === 'string' && call.id !== '') {
+            // OpenAI-compatible gateways commonly open a tool call with only
+            // `index` and send the id on a later frame. Reading it once at the
+            // start left block.id undefined for the rest of the turn, and the
+            // closing block-end then carried an id the harness types as
+            // required - so the result could never be matched back.
+            block.id = call.id;
+          }
+          if (block.name === undefined && typeof call.function?.name === 'string') {
+            block.name = call.function.name;
           }
           if (typeof call.function?.arguments === 'string' && call.function.arguments !== '') {
             block.args += call.function.arguments;
@@ -1412,6 +1456,104 @@ function apiHandler(adapter, runtime, projectAdapter) {
   };
 }
 
+/**
+ * The two methods a reload has to reach.
+ *
+ * DSH keeps the adapter *instance* for the life of the process, and `prepareCall`
+ * already hands it a closure over `this.stream`. Re-importing the module would
+ * therefore change nothing for a running session - the instance's methods were
+ * bound at construction. Swapping the prototype entries that `prepareCall` and
+ * `resolveModel` call through is what makes an edit actually reach the live
+ * adapter.
+ */
+const HOT = {
+  stream: AiProxyAdapter.prototype.stream,
+  resolveModel: AiProxyAdapter.prototype.resolveModel,
+};
+
+/**
+ * Watch the installed copy and the repository, sync one to the other, and swap
+ * the prototype entries above.
+ *
+ * Watching both matters because they are different kinds of install: `web` is a
+ * junction onto the repo, `desktop` is a real copy, and the copy is the one in
+ * daily use. Editing either one now takes effect without restarting DSH.
+ *
+ * Debounced because an editor that saves via write-then-rename emits more than
+ * one event per save, and re-importing on each would reload a half-written file.
+ */
+function installHotReload(config = {}) {
+  const dirs = new Set([PLUGIN_DIR]);
+  // The project root is already configured (the panel's 项目目录 field), and the
+  // repository keeps the plugin under `<projectRoot>/dsh-plugin`. That is the
+  // directory an edit actually lands in, so it is the one worth watching.
+  const root = process.env.AI_PROXY_PLUGIN_REPO || config.projectRoot || '';
+  const repo = root ? path.join(path.resolve(root), 'dsh-plugin') : '';
+  if (repo && fs.existsSync(repo)) dirs.add(repo);
+  const SYNCED = ['index.js', 'client.js', 'self-test.mjs', 'stats.mjs', 'stats.test.mjs', 'package.json', 'cordis.patch.yml'];
+  let timer = null;
+  let applying = false;
+  const self = path.join(PLUGIN_DIR, 'index.js');
+
+  const reload = async () => {
+    if (applying) return;
+    applying = true;
+    try {
+      // Keep the two installs identical first: a reload that picked up the copy
+      // while the repo still held new code would undo the edit.
+      if (repo && dirs.has(repo)) {
+        const from = await findNewest(SYNCED.map((f) => path.join(repo, f)));
+        if (from) {
+          for (const file of SYNCED) {
+            const src = path.join(repo, file);
+            const dst = path.join(PLUGIN_DIR, file);
+            if (!fs.existsSync(src) || src === dst) continue;
+            if (fs.readFileSync(src, 'utf8') === fs.readFileSync(dst, 'utf8')) continue;
+            fs.copyFileSync(src, dst);
+          }
+        }
+      }
+      const mod = await import(pathToFileURL(self).href + '?hot=' + Date.now());
+      const next = mod.AiProxyAdapter?.prototype;
+      if (!next?.stream) throw new Error('reloaded module has no AiProxyAdapter.stream');
+      HOT.stream = next.stream;
+      HOT.resolveModel = next.resolveModel;
+      HOT.at = Date.now();
+      HOT.status = `reloaded ${new Date().toLocaleTimeString()}`;
+    } catch (error) {
+      HOT.status = `reload failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      applying = false;
+    }
+  };
+
+  const schedule = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; void reload(); }, 250);
+    if (typeof timer.unref === 'function') timer.unref();
+  };
+
+  for (const dir of dirs) {
+    try {
+      fs.watch(dir, { persistent: false }, (_event, filename) => {
+        if (!filename || String(filename).endsWith('.js') || String(filename).endsWith('.mjs')) schedule();
+      });
+    } catch { /* a profile that is not there yet is not worth failing over */ }
+  }
+}
+
+/** Which of the given files was written most recently, if any exist. */
+async function findNewest(files) {
+  let best = null;
+  for (const file of files) {
+    try {
+      const mtime = (await fs.promises.stat(file)).mtimeMs;
+      if (!best || mtime > best.mtime) best = { file, mtime };
+    } catch { /* absent files do not win the comparison */ }
+  }
+  return best;
+}
+
 export function apply(ctx, config = {}) {
   const runtime = new ProxyRuntime(config);
   const adapter = new AiProxyAdapter({ runtime });
@@ -1438,6 +1580,7 @@ export function apply(ctx, config = {}) {
   };
   if (typeof ctx.effect === 'function') ctx.effect(start, 'ai-proxy bridge: proxy lifecycle');
   else start();
+  installHotReload(config);
   return () => {
     void runtime.stop();
     registration?.dispose?.();

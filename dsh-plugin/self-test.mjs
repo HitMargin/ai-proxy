@@ -512,6 +512,49 @@ try {
   assert.equal(sent[2].tool_call_id, 'call_1');
   assert.equal(sent[2].content, '<file contents>');
   assert.equal(sent.filter((m) => m.role === 'user').length, 1, 'the tool result must not arrive as a user turn');
+
+  // An empty or failed tool result used to arrive as a bare empty string, so
+  // the model could not tell a failed tool from one that had nothing to say.
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'go' }] },
+      { role: 'tool', toolCallId: 'call_empty', content: [] },
+      { role: 'tool', toolCallId: 'call_err', content: [], isError: true },
+      { role: 'assistant', content: [{ type: 'reasoning', text: 'thinking only' }] },
+    ],
+    maxTokens: 32,
+  }, toolResolved)) { /* asserted below */ }
+  const marked = lastChatBody.messages;
+  assert.equal(marked.find((m) => m.tool_call_id === 'call_empty')?.content, '(no tool output)');
+  assert.match(marked.find((m) => m.tool_call_id === 'call_err')?.content ?? '', /^\[tool error\]/);
+  // Reasoning-only turns produce neither prose nor a call once reasoning is
+  // dropped, and 'either content or tool_calls, but not none' is what a strict
+  // channel rejects.
+  assert.equal(marked.some((m) => m.role === 'assistant'), false, 'an empty assistant turn must be skipped');
+
+  // store defaults to true on OpenAI, asking the gateway to retain the
+  // conversation; the built-in client sends false and so must this one.
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+    maxTokens: 32,
+    sessionId: 'dsh-session-abc',
+  }, toolResolved)) { /* asserted below */ }
+  assert.equal(lastChatBody.store, false);
+  assert.equal(lastRequestHeaders.get('x-session-affinity'), 'dsh-session-abc');
+  assert.equal(lastRequestHeaders.get('prompt_cache_key'), 'dsh-session-abc');
+
+  // A title is not worth reasoning about, and the built-in client forces the
+  // effort off for this purpose.
+  for await (const _e of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'go' }] }],
+    maxTokens: 32,
+    reasoningEffort: 'high',
+    purpose: 'session-title',
+  }, toolResolved)) { /* asserted below */ }
+  assert.equal(lastChatBody.reasoning_effort, undefined, 'a session title must not spend reasoning tokens');
   assert.equal(panelRoute.path, '/api/ai-proxy-commandcode');
   let panelBody = '';
   let panelStatus = 0;
