@@ -14,7 +14,8 @@
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./stats": "./stats.mjs"
   },
   "engines": {
     "node": ">=22"
@@ -22,6 +23,7 @@
   "files": [
     "index.js",
     "client.js",
+    "stats.mjs",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -36,7 +38,7 @@
     }
   },
   "scripts": {
-    "self-test": "node self-test.mjs"
+    "self-test": "node self-test.mjs && node --test stats.test.mjs"
   },
   "license": "GPL-3.0"
 }

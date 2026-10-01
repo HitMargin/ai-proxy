@@ -58,7 +58,9 @@ jobs:
         run: |
           node --check dsh-plugin/index.js
           node --check dsh-plugin/client.js
+          node --check dsh-plugin/stats.mjs
           node dsh-plugin/self-test.mjs
+          node --test dsh-plugin/stats.test.mjs
 
       - name: Compile executable
         run: deno compile --allow-env --allow-net --output ./ai-proxy-ci main.ts

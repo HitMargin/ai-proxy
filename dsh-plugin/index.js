@@ -15,6 +15,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import {
+  applyRecord,
+  byModel,
+  emptyState,
+  heatmap,
+  summarize,
+  trend,
+} from './stats.mjs'
 
 const ROUTE = 'ai-proxy-commandcode';
 const PROJECT_ROUTE = 'ai-proxy';
@@ -472,7 +480,30 @@ function mapUsage(usage) {
   const prompt = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
   const completion = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
   if (!Number.isFinite(prompt) && !Number.isFinite(completion)) return undefined;
-  return { inputTokens: Math.max(0, prompt), outputTokens: Math.max(0, completion) };
+  const details = isRecord(usage.completion_tokens_details) ? usage.completion_tokens_details : {};
+  return {
+    inputTokens: Math.max(0, prompt),
+    outputTokens: Math.max(0, completion),
+    reasoningTokens: Math.max(0, Number(details.reasoning_tokens ?? 0) || 0),
+  };
+}
+
+// Usage is recorded here rather than in the proxy: the harness is the only
+// layer that sees both the token counts an upstream reported and the wall
+// clock around the stream, so no channel needs its own instrumentation.
+let usageState = emptyState();
+
+function recordUsage(record) {
+  usageState = applyRecord(usageState, record);
+}
+
+export function usageSnapshot(now = Date.now()) {
+  return {
+    summary: summarize(usageState, now),
+    models: byModel(usageState),
+    heatmap: heatmap(usageState, 119, now),
+    trend: trend(usageState),
+  };
 }
 
 function finishKind(reason) {
@@ -689,6 +720,12 @@ export class AiProxyAdapter {
     if (typeof options.reasoningEffort === 'string') body.reasoning_effort = options.reasoningEffort;
     if (typeof options.temperature === 'number') body.temperature = options.temperature;
 
+    // Timings are taken here so the dashboard can report the real first-token
+    // latency and decode speed the user actually experienced, rather than a
+    // number re-derived from token counts.
+    const startedAt = Date.now();
+    let firstDeltaAt;
+
     const requestHeaders = { 'content-type': 'application/json' };
     const isZenAggregate = modelId.startsWith('zen/') && resolved.basePath === '/v1';
     if (isZenAggregate) {
@@ -765,10 +802,25 @@ export class AiProxyAdapter {
           }
         }
         if (choice?.finish_reason != null) finish = choice.finish_reason;
+        // The first frame that carries visible output is what the user waits
+        // for, so that is the timestamp latency is measured from.
+        if (firstDeltaAt === undefined && (text !== '' || reasoning !== '')) firstDeltaAt = Date.now();
         const mappedUsage = mapUsage(payload?.usage);
         if (mappedUsage) usage = mappedUsage;
       }
     } catch (error) {
+      recordUsage({
+        at: startedAt,
+        model: modelId,
+        effort: typeof options.reasoningEffort === 'string' ? options.reasoningEffort : '',
+        ok: false,
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        decodeTokens: 0,
+        origin: 'harness',
+        truncated: true,
+      });
       yield { type: 'finish', reason: { kind: options.signal?.aborted ? 'aborted' : 'error', failure: { message: error.message, code: 'TRANSPORT' } } };
       return;
     }
@@ -782,6 +834,22 @@ export class AiProxyAdapter {
       yield { type: 'block-end', index: block.index, block: { type: 'tool-call', id: block.id, name: block.name, arguments: block.args || '{}' } };
     }
     if (usage) yield { type: 'usage', usage };
+    recordUsage({
+      at: startedAt,
+      model: modelId,
+      effort: typeof options.reasoningEffort === 'string' ? options.reasoningEffort : '',
+      ok: true,
+      input: usage?.inputTokens ?? 0,
+      output: usage?.outputTokens ?? 0,
+      reasoning: usage?.reasoningTokens ?? 0,
+      // Reasoning tokens are not something the user waited for, so they are
+      // excluded from the decode window that produces the speed figure.
+      decodeTokens: Math.max(0, (usage?.outputTokens ?? 0) - (usage?.reasoningTokens ?? 0)),
+      ttftMs: firstDeltaAt === undefined ? undefined : firstDeltaAt - startedAt,
+      decodeMs: firstDeltaAt === undefined ? undefined : Date.now() - firstDeltaAt,
+      origin: 'harness',
+      noUsage: usage === undefined,
+    });
     yield { type: 'finish', reason: { kind: finishKind(finish) } };
   }
 }
@@ -1034,6 +1102,9 @@ function apiHandler(adapter, runtime, projectAdapter) {
       }
       if (method === 'GET' && route === '/logs') {
         return sendJson(res, 200, { logs: runtime.snapshot().logs });
+      }
+      if (method === 'GET' && route === '/usage') {
+        return sendJson(res, 200, usageSnapshot());
       }
       if (method === 'POST' && route === '/probe') {
         // Status checking is an explicit user action, not a side effect of

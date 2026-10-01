@@ -136,13 +136,19 @@ DSH 设置 → ai-proxy
 
 ```text
 GET  /api/ai-proxy/panel
+GET  /api/ai-proxy/usage
 GET  /api/ai-proxy/settings
 GET  /api/ai-proxy/logs
 POST /api/ai-proxy/settings
+POST /api/ai-proxy/probe
 POST /api/ai-proxy/start
 POST /api/ai-proxy/stop
 POST /api/ai-proxy/restart
 ```
+
+`GET /api/ai-proxy/usage` 返回 `{ summary, models, heatmap, trend }`：`summary` 是面板顶部的
+指标，`models` 是按模型聚合的行，`heatmap` 是 119 天的日 token，`trend` 是累计曲线采样点。
+插件重启后统计归零——数据只在内存里。
 
 旧路径 `/api/ai-proxy-commandcode/*` 仍保留兼容。
 
@@ -155,9 +161,48 @@ POST /api/ai-proxy/restart
 - 全项目模型数量；
 - 各渠道模型数量；
 - 模型搜索表（ID、名称、**可用状态**、上下文、最长输出、输入模态）；
+- 用量看板（见下节）；
 - CommandCode 账号池摘要；
 - 本地/远程运行状态与 Deno 进程 PID；
 - 最近日志。
+
+## 用量看板
+
+`用量` 标签页统计本插件经手过的每一次对话调用。数据只存在插件进程内存里，不写磁盘、不上传。
+
+| 指标 | 口径 |
+| --- | --- |
+| Token | 输入 + 输出总和，保留在最近 400 次采样内 |
+| 输出 Token | 上游 usage 帧的 `completion_tokens` |
+| 推理 Token | `completion_tokens_details.reasoning_tokens` |
+| 调用 / 失败 | 成功与失败次数；流中途断开记为失败 |
+| 输出速度 | 等待的输出 token ÷ 解码窗口，**只统计可信窗口** |
+| 首帧延迟 | 从发出请求到收到第一个可见 token 的毫秒数 |
+| 平均输出 | 单次成功回答的平均输出 token |
+| 今日 | 当天（本地时区）的 token 总量 |
+
+另外还有：
+
+- **Token 热力图** — 最近 119 天，格深按非零天的四分位分档；
+- **总量曲线** — 累计 token 的面积图；
+- **模型用量表** — 每个模型的调用数、速度、首帧延迟、输出量与失败数。
+
+### 速度为什么经常显示「—」
+
+判定规则沿用参考插件 `dsh-our-free-model` 的 `src/store.js`：
+
+```text
+解码窗口 < 250ms   → 不计入
+速率 > 250 tok/s   → 不计入
+```
+
+只回十几个 token 的短回答，解码窗口往往不到 250ms，速度没有统计意义。宁可显示「—」，也不把一次性回答算成几千 tok/s。**推理 token 不计入解码窗口**——用户并没有等待那些 token。
+
+首帧延迟同理：失败调用的整段耗时不是首帧延迟，不会进入平均值。速度由「累计 token ÷ 累计窗口」得出，不是各次速率的平均，否则一次长回答会和一百次短回答等权。
+
+### 刷新时机
+
+用量随面板快照一起拉取（每 10 秒一次）；每秒走的只有「已运行」时钟。
 
 ## 模型可用状态
 
@@ -190,10 +235,11 @@ POST /api/ai-proxy/restart
 ## 自检
 
 ```bash
-node dsh-plugin/self-test.mjs
+node dsh-plugin/self-test.mjs      # 桥接接线
+node --test dsh-plugin/stats.test.mjs   # 用量统计口径
 ```
 
-自检使用 fake `fetch`，验证：
+桥接自检使用 fake `fetch`，验证：
 
 - Provider 注册；
 - 聚合与多渠道模型发现；
@@ -202,8 +248,13 @@ node dsh-plugin/self-test.mjs
 - 模型前缀路由；
 - SSE 转换；
 - 面板和兼容回退；
+- 逐模型状态 join（含带斜杠的 kilo id 与两种拼写）；
+- 主动状态检查不扩散到全量探测；
 - 设置读取；
 - 启动/停止路由。
+
+统计自检验证：解码窗口的可信性门槛、失败调用不计入延迟、速度按累计窗口而非速率均值、
+推理 token 不计入速度、空状态诚实返回 `null`、热力图跨度、趋势的累计基数、采样环有界、旧日桶裁剪。
 
 ## 当前边界
 

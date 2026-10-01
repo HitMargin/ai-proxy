@@ -24,6 +24,11 @@ window.__ModuleLoader__.load({
         available: '可用', throttled: '限流', unavailable: '不可用', unprobed: '未探测',
         check: '检查状态', checking: '检查中…', checkAll: '全部渠道', checkDone: '已检查 {0} 个模型',
         checkFailed: '检查失败', checkHint: '每个模型会发一次最小请求，占用对应渠道的免费额度。',
+        usage: '用量', totalTokens: 'Token', outputTokens: '输出 Token', reasoningTokens: '推理 Token',
+        calls: '调用', failed: '失败', speed: '输出速度', firstToken: '首帧延迟', avgOutput: '平均输出',
+        heatmap: 'Token 热力图', trend: '总量曲线', modelUsage: '模型用量', today: '今日',
+        localOnly: '数据只在本机统计，不会上传。', noUsage: '还没有调用记录，在 DSH 里发一条消息后就会出现。',
+        speedNote: '输出速度只统计解码窗口 ≥250ms 且速率 ≤250 tok/s 的调用；窗口太短的一次性回答不算速度。',
       },
       en: {
         nav: 'ai-proxy', tagline: 'Runtime panel for the local multi-provider proxy',
@@ -43,6 +48,11 @@ window.__ModuleLoader__.load({
         available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
         check: 'Check status', checking: 'Checking…', checkAll: 'All channels', checkDone: 'Checked {0} models',
         checkFailed: 'Check failed', checkHint: 'Each model sends one minimal request and uses that channel’s free quota.',
+        usage: 'Usage', totalTokens: 'Tokens', outputTokens: 'Output', reasoningTokens: 'Reasoning',
+        calls: 'Calls', failed: 'Failed', speed: 'Output speed', firstToken: 'First token', avgOutput: 'Avg output',
+        heatmap: 'Token heatmap', trend: 'Cumulative', modelUsage: 'Per model', today: 'Today',
+        localOnly: 'Counted on this machine only; nothing is uploaded.', noUsage: 'No calls recorded yet — send a message in DSH and this fills in.',
+        speedNote: 'Output speed only counts calls whose decode window is ≥250ms and whose rate is ≤250 tok/s; a one-shot answer is not evidence of speed.',
       },
     }
 
@@ -108,6 +118,23 @@ window.__ModuleLoader__.load({
 .apx_badge.idle{color:var(--dsw-alias-label-tertiary)}
 .apx_lat{font-style:normal;opacity:.7;font-variant-numeric:tabular-nums}
 .apx_legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
+.apx_heat{display:grid;grid-template-rows:repeat(7,1fr);grid-auto-flow:column;grid-auto-columns:1fr;gap:3px;overflow-x:auto;padding-bottom:2px}
+.apx_cell{aspect-ratio:1;border-radius:3px;background:var(--dsw-alias-bg-layer-1);min-width:9px}
+.apx_cell.l1{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 22%,transparent)}
+.apx_cell.l2{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 42%,transparent)}
+.apx_cell.l3{background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 66%,transparent)}
+.apx_cell.l4{background:var(--dsw-alias-state-business-primary)}
+.apx_scale{display:flex;align-items:center;gap:4px;font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
+.apx_scale i{width:9px;height:9px;border-radius:3px;display:block}
+.apx_spark{width:100%;height:78px;display:block;overflow:visible}
+.apx_spark .apx_area{fill:color-mix(in srgb,var(--dsw-alias-state-business-primary) 18%,transparent)}
+.apx_spark .apx_line{fill:none;stroke:var(--dsw-alias-state-business-primary);stroke-width:1.6;stroke-linejoin:round;vector-effect:non-scaling-stroke}
+.apx_spark .apx_base{stroke:var(--dsw-alias-border-l1);stroke-width:1;stroke-dasharray:3 4}
+.apx_metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+.apx_metric{display:flex;flex-direction:column;gap:2px;padding:10px 12px;border-radius:12px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1)}
+.apx_metric span{font-size:10.5px;letter-spacing:.02em;text-transform:uppercase;color:var(--dsw-alias-label-tertiary)}
+.apx_metric b{font-size:17px;font-weight:640;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.apx_metric em{font-style:normal;font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
 @keyframes apx-skel{from{background-position:200% 0}to{background-position:-200% 0}}
 `
 
@@ -127,6 +154,84 @@ window.__ModuleLoader__.load({
       if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(tokens % 1_000_000 === 0 ? 0 : 1)}M`
       if (tokens >= 1000) return `${Math.round(tokens / 1000)}K`
       return String(tokens)
+    }
+
+    /**
+     * Bucket a day's tokens onto a five-step scale.
+     *
+     * The cut points are quartiles of the non-zero days rather than a fixed
+     * ceiling: a fixed one makes a light week look empty and a heavy one
+     * saturate, and the grid is the only place the shape of usage is visible.
+     */
+    function heatLevel(value, cuts) {
+      if (!(value > 0)) return ''
+      for (let i = 0; i < cuts.length; i += 1) if (value <= cuts[i]) return `l${i + 1}`
+      return 'l4'
+    }
+
+    function heatCuts(cells) {
+      const positive = cells.map((cell) => cell.tokens).filter((value) => value > 0).sort((a, b) => a - b)
+      if (positive.length === 0) return []
+      const at = (fraction) => positive[Math.min(positive.length - 1, Math.floor(positive.length * fraction))]
+      return [at(0.25), at(0.5), at(0.75)]
+    }
+
+    function Heatmap(props) {
+      const cells = props.cells
+      if (!Array.isArray(cells) || cells.length === 0) return null
+      const cuts = heatCuts(cells)
+      // The grid is column-per-week with seven rows, oldest column first, so
+      // a day always lands on the weekday it fell on.
+      const cellsByDay = h('div', { className: 'apx_heat' }, cells.map((cell) => h('div', {
+        key: cell.day,
+        className: `apx_cell ${heatLevel(cell.tokens, cuts)}`,
+        title: `${cell.day} · ${formatTokens(cell.tokens)}`,
+      })))
+      return h(React.Fragment, null,
+        cellsByDay,
+        h('div', { className: 'apx_row', style: { justifyContent: 'flex-end', marginTop: '6px' } },
+          h('span', { className: 'apx_scale' }, '少',
+            h('i', { className: 'apx_cell' }),
+            h('i', { className: 'apx_cell l1' }),
+            h('i', { className: 'apx_cell l2' }),
+            h('i', { className: 'apx_cell l3' }),
+            h('i', { className: 'apx_cell l4' }),
+            '多')),
+      )
+    }
+
+    /** Cumulative-token area chart. A single point draws as a flat line. */
+    function Sparkline(props) {
+      const points = props.points
+      if (!Array.isArray(points) || points.length < 2) return null
+      const width = 100
+      const height = 30
+      const pad = 1
+      const max = Math.max(...points.map((p) => p.tokens), 1)
+      const min = Math.min(...points.map((p) => p.tokens))
+      const span = max - min || 1
+      const x = (i) => pad + (i * (width - pad * 2)) / Math.max(1, points.length - 1)
+      const y = (value) => height - pad - ((value - min) * (height - pad * 2)) / span
+      const line = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(2)},${y(p.tokens).toFixed(2)}`).join(' ')
+      const area = `${line} L${x(points.length - 1).toFixed(2)},${height} L${x(0).toFixed(2)},${height} Z`
+      const last = points[points.length - 1]
+      return h('svg', {
+        className: 'apx_spark',
+        viewBox: `0 0 ${width} ${height}`,
+        preserveAspectRatio: 'none',
+        role: 'img',
+      },
+        h('line', { className: 'apx_base', x1: 0, x2: width, y1: height, y2: height }),
+        h('path', { className: 'apx_area', d: area }),
+        h('path', { className: 'apx_line', d: line }),
+        h('title', null, `${formatTokens(last.tokens)} tokens`),
+      )
+    }
+
+    function formatMs(value) {
+      const ms = Number(value)
+      if (!Number.isFinite(ms) || ms <= 0) return '—'
+      return ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${Math.round(ms)} ms`
     }
 
     function toneOf(state) {
@@ -177,6 +282,7 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = useState('overview')
       const [data, setData] = useState(null)
       const [settings, setSettings] = useState(null)
+      const [usage, setUsage] = useState(null)
       const [error, setError] = useState('')
       const [notice, setNotice] = useState('')
       const [busy, setBusy] = useState(false)
@@ -190,8 +296,13 @@ window.__ModuleLoader__.load({
       const loadRef = useRef(() => {})
 
       const load = () => {
-        Promise.all([api('/panel'), api('/settings')])
-          .then(([panel, nextSettings]) => { setData(panel); setSettings(nextSettings); setError('') })
+        Promise.all([api('/panel'), api('/settings'), api('/usage').catch(() => null)])
+          .then(([panel, nextSettings, usage]) => {
+            setData(panel)
+            setSettings(nextSettings)
+            if (usage) setUsage(usage)
+            setError('')
+          })
           .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
           .finally(() => setTick(Date.now()))
       }
@@ -317,7 +428,7 @@ window.__ModuleLoader__.load({
       )
 
       const tabs = h('div', { className: 'apx_tabs', role: 'tablist' },
-        ['overview', 'models', 'channels', 'runtime', 'settings'].map((key) =>
+        ['overview', 'usage', 'models', 'channels', 'runtime', 'settings'].map((key) =>
           h('button', {
             key,
             type: 'button',
@@ -421,10 +532,72 @@ window.__ModuleLoader__.load({
           : null,
       )
 
+      // Usage lives in its own tab because it is the only section that keeps
+      // growing: the roster and health answer "what can I use", this answers
+      // "what did it cost".
+      const usageSummary = usage?.summary ?? null
+      const usageCard = !usageSummary || usageSummary.requests === 0
+        ? h('div', { className: 'apx_card' }, h('div', { className: 'apx_empty' }, t('noUsage')))
+        : h(React.Fragment, null,
+          h('div', { className: 'apx_card' },
+            h('div', { className: 'apx_sechead' },
+              h('h3', null, t('usage')),
+              h('em', null, t('localOnly'))),
+            h('div', { className: 'apx_metrics' },
+              h('div', { className: 'apx_metric' },
+                h('span', null, t('totalTokens')), h('b', null, formatTokens(usageSummary.totalTokens))),
+              h('div', { className: 'apx_metric' },
+                h('span', null, t('outputTokens')), h('b', null, formatTokens(usageSummary.outputTokens))),
+              h('div', { className: 'apx_metric' },
+                h('span', null, t('reasoningTokens')), h('b', null, formatTokens(usageSummary.reasoningTokens))),
+              h('div', { className: 'apx_metric' },
+                h('span', null, t('calls')), h('b', null, String(usageSummary.requests)),
+                usageSummary.failed > 0 ? h('em', null, `${t('failed')} ${usageSummary.failed}`) : null),
+              h('div', { className: 'apx_metric' },
+                h('span', null, t('speed')),
+                h('b', null, usageSummary.outputSpeed === null ? '—' : `${usageSummary.outputSpeed}`),
+                h('em', null, 'tok/s')),
+              h('div', { className: 'apx_metric' },
+                h('span', null, t('firstToken')), h('b', null, formatMs(usageSummary.firstTokenMs))),
+              h('div', { className: 'apx_metric' },
+                h('span', null, t('avgOutput')), h('b', null, formatTokens(usageSummary.avgOutputTokens))),
+              h('div', { className: 'apx_metric' },
+                h('span', null, t('today')), h('b', null, formatTokens(usageSummary.today)))),
+            h('div', { className: 'apx_legend' }, t('speedNote'))),
+          h('div', { className: 'apx_card' },
+            h('div', { className: 'apx_sechead' }, h('h3', null, t('heatmap'))),
+            h(Heatmap, { cells: usage?.heatmap })),
+          usage?.trend && usage.trend.length > 1
+            ? h('div', { className: 'apx_card' },
+              h('div', { className: 'apx_sechead' },
+                h('h3', null, t('trend')),
+                h('em', null, formatTokens(usageSummary.totalTokens))),
+              h(Sparkline, { points: usage.trend }))
+            : null,
+          (Array.isArray(usage?.models) ? usage.models : []).length > 0
+            ? h('div', { className: 'apx_card' },
+              h('div', { className: 'apx_sechead' }, h('h3', null, t('modelUsage'))),
+              h('table', { className: 'apx_table' },
+                h('thead', null, h('tr', null,
+                  h('th', null, t('models')),
+                  h('th', null, t('calls')),
+                  h('th', null, t('speed')),
+                  h('th', null, t('firstToken')),
+                  h('th', null, t('outputTokens')),
+                  h('th', null, t('failed')))),
+                h('tbody', null, usage.models.map((row) => h('tr', { key: row.model },
+                  h('td', { className: 'apx_mono' }, row.model),
+                  h('td', null, String(row.calls)),
+                  h('td', null, row.speed === null ? '—' : `${row.speed} tok/s`),
+                  h('td', null, formatMs(row.firstTokenMs)),
+                  h('td', null, formatTokens(row.output)),
+                  h('td', { className: row.failed > 0 ? 'apx_state err' : null },
+                    row.failed > 0 ? String(row.failed) : '—'))))))
+            : null)
+
       const runtimeCard = h('div', { className: 'apx_card' },
         h('div', { className: 'apx_sechead' }, h('h3', null, t('runtime'))),
-        h('div', { className: 'apx_grid' },
-          h('div', { className: 'apx_stat' }, h('span', null, t('state')), h('b', { className: `apx_state ${tone}` }, runtime.state || 'unknown')),
+        h('div', { className: 'apx_grid' },          h('div', { className: 'apx_stat' }, h('span', null, t('state')), h('b', { className: `apx_state ${tone}` }, runtime.state || 'unknown')),
           h('div', { className: 'apx_stat' }, h('span', null, 'PID'), h('b', null, String(runtime.pid ?? '—'))),
           h('div', { className: 'apx_stat' }, h('span', null, t('mode')), h('b', null, runtime.mode || '—')),
           h('div', { className: 'apx_stat' }, h('span', null, t('accounts')), h('b', null, String(accounts.length)))),
@@ -451,6 +624,7 @@ window.__ModuleLoader__.load({
                       h('i', { className: 'apx_dot' }), account.cooling ? 'cooling' : account.enabled ? 'enabled' : 'disabled'),
                     h('td', null, h('span', { className: 'apx_tag' }, account.source || '—')))))))
               : null)),
+        usage: usageCard,
         models: modelsCard,
         channels: channelsCard,
         runtime: runtimeCard,
