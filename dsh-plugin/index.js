@@ -57,8 +57,6 @@ const IMAGE_TOKEN_ESTIMATE = 1600;
 // routes by — see isBlockedModelId for why a substring test is not enough.
 const DEFAULT_HIDDEN_CHANNELS = [
   'openrouter',
-  'anthropic',
-  'gemini',
   'deepseek-web',
   'cnb',
 ];
@@ -345,8 +343,25 @@ const DEFAULT_SETTINGS = {
   externalUrl: '',
   apiKeyEnv: 'LOCAL_AGGREGATION_API_KEY',
   hiddenChannels: DEFAULT_HIDDEN_CHANNELS,
+  openRouterKey: '',
 };
 
+/**
+ * Environment for the proxy process, carrying the keys the panel collected.
+ *
+ * The proxy reads credentials from the environment and nothing else, so a value
+ * typed into the panel has to arrive here to reach an upstream. Empty values are
+ * left out entirely rather than exported as empty strings: an empty
+ * `DEFAULT_BEARER_TOKEN` is falsy to the consumer either way, but exporting it
+ * would override a real value the process inherited from its own environment.
+ */
+function credentialEnv(settings) {
+  const env = {};
+  if (typeof settings.openRouterKey === 'string' && settings.openRouterKey.trim() !== '') {
+    env.DEFAULT_BEARER_TOKEN = settings.openRouterKey.trim();
+  }
+  return env;
+}
 function dataDir() {
   const home = envValue('DSH_HOME') || path.join(os.homedir(), '.dsh');
   return path.join(home, 'ai-proxy-dsh-bridge');
@@ -379,6 +394,35 @@ function saveSettings(settings) {
   fs.renameSync(temporary, file);
 }
 
+/**
+ * Whether deepseek-web has the three files it reads, and which are missing.
+ *
+ * It is a logged-in web channel, not an API-key channel: the proxy reads a cookie,
+ * a bearer token and a captured browser header set from the project directory. So
+ * the panel's job is to say which of the three is absent and offer to run the
+ * capture, rather than offering a key field that would not help.
+ */
+function deepseekWebStatus(settings) {
+  const roots = projectCandidates(settings);
+  const wanted = [
+    { file: 'deepseek-cookies.txt', what: 'cookie' },
+    { file: 'deepseek-auth.txt', what: 'bearer token' },
+    { file: 'deepseek-headers.json', what: 'browser headers' },
+  ];
+  const found = [];
+  const missing = [];
+  for (const entry of wanted) {
+    const present = roots.some((root) => {
+      try {
+        return fs.statSync(path.join(root, entry.file)).size > 0;
+      } catch {
+        return false;
+      }
+    });
+    (present ? found : missing).push(entry.what);
+  }
+  return { configured: missing.length === 0, found, missing };
+}
 function projectCandidates(settings) {
   const candidates = [
     settings.projectRoot,
@@ -439,6 +483,10 @@ export class ProxyRuntime {
       denoPath: this.settings.denoPath,
       apiKeyEnv: this.settings.apiKeyEnv,
       hiddenChannels: [...BLOCKED_CHANNELS],
+      // Presence only. The value is write-only from the panel's point of view:
+      // echoing a credential back into a page that renders in a browser is how
+      // one ends up in a screenshot.
+      openRouterKeySet: typeof this.settings.openRouterKey === 'string' && this.settings.openRouterKey !== '',
       externalUrl: this.settings.mode === 'external' ? this.settings.externalUrl : null,
       baseUrl: this.baseUrl(),
       originUrl: this.originUrl(),
@@ -525,7 +573,7 @@ export class ProxyRuntime {
       this.child = spawn(deno, ['run', '-A', 'main.ts'], {
         cwd: root,
         windowsHide: true,
-        env: { ...process.env, PORT: String(this.settings.port), DENO_NO_UPDATE_CHECK: '1' },
+        env: { ...process.env, ...credentialEnv(this.settings), PORT: String(this.settings.port), DENO_NO_UPDATE_CHECK: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       this.owned = true;
@@ -1524,6 +1572,7 @@ function cleanSettings(values) {
   // A channel name reaches a URL path segment, so it is validated rather than
   // trusted: the panel posts a list, and anything that is not a plain lowercase
   // segment is dropped instead of being written to settings and matched later.
+  if (typeof values.openRouterKey === 'string' && values.openRouterKey.length <= 512) next.openRouterKey = values.openRouterKey.trim();
   if (Array.isArray(values.hiddenChannels)) {
     next.hiddenChannels = [...new Set(values.hiddenChannels
       .filter((entry) => typeof entry === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(entry.trim().toLowerCase()))
@@ -1654,7 +1703,7 @@ export function healthIndex(payload) {
   return index;
 }
 
-async function projectPanelSnapshot(adapter, projectAdapter) {
+async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
   let base = {};
   try {
     base = await panelSnapshot(adapter);
@@ -1702,6 +1751,11 @@ async function projectPanelSnapshot(adapter, projectAdapter) {
     // what the panel needs to offer both directions.
     hiddenChannels: [...BLOCKED_CHANNELS],
     allChannels: [...new Set([...Object.keys(channels), ...BLOCKED_CHANNELS])].sort(),
+    // What deepseek-web still needs, and whether its capture is already running.
+    deepseekWeb: {
+      ...deepseekWebStatus(runtime.settings),
+      running: Boolean(runtime.deepseekSetup),
+    },
     channels,
     health,
     modelHealth: counts,
@@ -1720,7 +1774,7 @@ function apiHandler(adapter, runtime, projectAdapter) {
     if (!sameOrigin(req)) return sendJson(res, 403, { error: 'forbidden' });
     try {
       if (method === 'GET' && (route === '/' || route === '/panel')) {
-        const panel = await projectPanelSnapshot(adapter, projectAdapter);
+        const panel = await projectPanelSnapshot(adapter, projectAdapter, runtime);
         return sendJson(res, 200, { ...panel, runtime: runtime.snapshot() });
       }
       if (method === 'GET' && route === '/settings') {
@@ -1768,7 +1822,66 @@ function apiHandler(adapter, runtime, projectAdapter) {
         if (Array.isArray(body.hiddenChannels)) applyHiddenChannels(body.hiddenChannels);
         return sendJson(res, 200, next);
       }
-      if (method === 'POST' && route === '/start') {
+      if (method === 'POST' && route === '/deepseek-web/setup') {
+        const root = resolveProjectRoot(runtime.settings);
+        if (!root) {
+          sendJson(res, 400, { error: 'project directory not found; set it in the settings above' });
+          return;
+        }
+        const before = deepseekWebStatus(runtime.settings);
+        if (before.configured) {
+          sendJson(res, 200, { ...before, started: false, alreadyConfigured: true });
+          return;
+        }
+        // The capture opens a browser and waits for a QR scan, so it cannot be
+        // awaited here. It runs detached and reports through the log tab, which is
+        // the only place a user can act on it.
+        if (runtime.deepseekSetup) {
+          sendJson(res, 409, { ...before, started: false, alreadyRunning: true });
+          return;
+        }
+        const script = path.join(root, '.tmp-extract-deepseek-cookies.ts');
+        if (!fs.existsSync(script)) {
+          sendJson(res, 400, {
+            error: 'capture script not found at .tmp-extract-deepseek-cookies.ts',
+            root,
+          });
+          return;
+        }
+        const deno = runtime.settings.denoPath || 'deno';
+        const child = spawn(deno, ['run', '-A', '.tmp-extract-deepseek-cookies.ts'], {
+          cwd: root,
+          // Visible: the browser it opens has to come up in front of the user, and
+          // a hidden console window on Windows makes the QR flow look broken.
+          windowsHide: false,
+          env: { ...process.env, DENO_NO_UPDATE_CHECK: '1' },
+          stdio: 'inherit',
+        });
+        runtime.deepseekSetup = child;
+        runtime.record(
+          `deepseek-web: capturing login state in ${root} — scan the code when the browser opens`,
+        );
+        child.on('exit', (code) => {
+          runtime.deepseekSetup = null;
+          const after = deepseekWebStatus(runtime.settings);
+          runtime.record(
+            after.configured
+              ? 'deepseek-web: capture finished; the channel is ready'
+              : `deepseek-web: capture exited ${code} without completing (missing ${after.missing.join(', ')})`,
+          );
+          if (after.configured) {
+            // Show it: the channel works, and leaving it hidden after the user just
+            // set it up would be a second thing to figure out.
+            applyHiddenChannels([...BLOCKED_CHANNELS].filter((name) => name !== 'deepseek-web'));
+          }
+        });
+        child.on('error', (error) => {
+          runtime.deepseekSetup = null;
+          runtime.record(`deepseek-web: capture failed to start: ${error.message}`);
+        });
+        sendJson(res, 202, { ...before, started: true, alreadyConfigured: false });
+        return;
+      }      if (method === 'POST' && route === '/start') {
         await runtime.start();
         return sendJson(res, 200, runtime.snapshot());
       }

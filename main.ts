@@ -150,8 +150,38 @@ async function proxyToBackend(request: Request): Promise<Response> {
 // ---------- /v1 聚合端点：一个入口用多个上游（kilo / zen / cnb / commandcode） ----------
 // 模型 id 带命名空间前缀，GET /v1/models 聚合列出全部成员模型；POST 按前缀重写后
 // 递归走成员 handler。裸 id 保持旧优先级，列表冷启动需先 GET 一次 /v1/models 暖缓存。
-const V1_AGGREGATE_MEMBERS = ["kilo", "zen", "cnb", "commandcode"];
+// openrouter is a member but withholds itself until a key is configured: an
+// unauthenticated listing answers 401, and a channel that shows up and then 401s
+// is worse than one that says it needs a key. `openrouterConfigured` is what the
+// panel reports back so the switch and the roster agree.
+const V1_AGGREGATE_MEMBERS = [
+  "kilo",
+  "zen",
+  "cnb",
+  "commandcode",
+  "openrouter",
+];
 
+/**
+ * Whether a channel has the credential its auth block asks for.
+ *
+ * The panel writes keys into settings and the plugin passes them to this process
+ * as environment variables, so "configured" is answered here rather than inferred
+ * from a failed request: a 401 from an unauthenticated listing is indistinguishable
+ * from a dead upstream in the log, and the two need different fixes.
+ */
+function hasChannelCredential(key: string, provider: any): boolean {
+  const auth = provider?.auth;
+  if (!auth || auth.type === "none") return true;
+  if (auth.type === "bearer") {
+    return Boolean(auth.defaultToken || ENV.DEFAULT_BEARER_TOKEN);
+  }
+  if (auth.type === "api-key") {
+    const name = auth.header || "x-api-key";
+    return Boolean(ENV[name.toUpperCase().replace(/-/g, "_")]);
+  }
+  return true;
+}
 function v1MemberModelIds(key: string): string[] {
   if (key === "cnb") return CNB_MODELS.map((m: any) => m.id);
   if (key === "commandcode") {
@@ -234,6 +264,15 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
       return;
     }
     const p: any = (providers as any)[key];
+    // A channel that needs a credential it does not have is reported as needing
+    // one, not as a listing that failed. Without this the log says "fetch
+    // failed" for a 401 the user could have fixed by pasting a key, which is the
+    // same message a dead upstream produces.
+    if (!hasChannelCredential(key, p)) {
+      const reason = `${key} needs an API key; set it in the ai-proxy panel`;
+      catalog.failed(key, reason, now);
+      return;
+    }
     let modelsPath = p.endpoints.models;
     if (p.pathRewrite) modelsPath = p.pathRewrite(p.prefix + "/models");
     const headers = cloneHeadersForUpstream(shimReq, p, ENV);
@@ -516,6 +555,15 @@ export async function handler(request: Request): Promise<Response> {
           // picker labels each row from these instead of re-probing.
           models: modelHealth,
           catalog: catalog.all(),
+          // Which channels hold a credential the panel can set. The panel reads this
+          // to explain a channel that is present but has nothing behind it, rather
+          // than leaving the user to infer it from an empty model list.
+          credentials: Object.fromEntries(
+            Object.entries(providers).map(([key, value]: [string, any]) => [
+              key,
+              { configured: hasChannelCredential(key, value) },
+            ]),
+          ),
           ...(Object.keys(catalogIssues).length > 0 ? { catalogIssues } : {}),
         }),
         {

@@ -31,6 +31,15 @@ window.__ModuleLoader__.load({
         usageFailed: '读取用量失败',
         efforts: '推理档位', noEfforts: '—',
         channels: '渠道显示', channelsHint: '取消勾选的渠道不会出现在模型列表里。保存后立即生效。',
+        openRouterKey: 'OpenRouter API Key',
+        openRouterKeySet: '已设置。留空保存不会清除它。',
+        openRouterKeyHint: '未设置。没有 key 时该渠道不显示模型。',
+        clearKey: '清除',
+        deepseekSetup: '一键配置',
+        deepseekRunning: '正在配置…',
+        deepseekReady: '登录态已就绪。',
+        deepseekMissing: '缺少：{what}',
+        deepseekHint: '会打开浏览器，扫码登录后自动保存 cookie / token / 浏览器头。过程见「日志」。',
         speedNote: '输出速度只统计解码窗口 ≥250ms 且速率 ≤250 tok/s 的调用；窗口太短的一次性回答不算速度。',
       },
       en: {
@@ -50,6 +59,15 @@ window.__ModuleLoader__.load({
         search: 'Search models…', uptime: 'Uptime', state: 'State', excluded: 'Removed from the list', listingFailed: 'listing failed',
         efforts: 'Efforts', noEfforts: '—',
         channels: 'Channels', channelsHint: 'Unchecked channels are withheld from the model list. Takes effect on save.',
+        openRouterKey: 'OpenRouter API Key',
+        openRouterKeySet: 'Set. Saving with the field empty leaves it alone.',
+        openRouterKeyHint: 'Not set. Without a key the channel lists no models.',
+        clearKey: 'Clear',
+        deepseekSetup: 'Set up',
+        deepseekRunning: 'Setting up…',
+        deepseekReady: 'Login state is ready.',
+        deepseekMissing: 'Missing: {what}',
+        deepseekHint: 'Opens a browser, waits for a QR scan, then saves the cookie, token and header set. Progress is in the log.',
         available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
         check: 'Check status', checking: 'Checking…', checkAll: 'All channels', checkDone: 'Checked {0} models',
         checkFailed: 'Check failed', checkHint: 'Each model sends one minimal request and uses that channel’s free quota.',
@@ -443,6 +461,11 @@ window.__ModuleLoader__.load({
           ? hiddenNow.filter((entry) => entry !== channel)
           : [...hiddenNow, channel],
       )
+      // The key is write-only from here: the server reports whether one is set and
+      // never sends the value back, so the field starts empty every time and an
+      // empty submission leaves whatever is stored alone.
+      const [openRouterKey, setOpenRouterKey] = useState('')
+      const deepseek = data?.deepseekWeb || { configured: false, missing: [], running: false }
       const save = () => act('/settings', {
         mode: settings?.mode,
         projectRoot: settings?.projectRoot,
@@ -451,7 +474,10 @@ window.__ModuleLoader__.load({
         externalUrl: settings?.externalUrl,
         apiKeyEnv: settings?.apiKeyEnv,
         hiddenChannels: hiddenNow,
+        ...(openRouterKey.trim() !== '' ? { openRouterKey } : {}),
       })
+      const setUpDeepseek = () => act('/deepseek-web/setup')
+      const clearOpenRouterKey = () => act('/settings', { openRouterKey: '' })
 
       const rows = useMemo(() => (Array.isArray(data?.models) ? data.models : []), [data])
       const projectRows = useMemo(
@@ -561,6 +587,43 @@ window.__ModuleLoader__.load({
             ))),
           )
           : null,
+        h('label', { className: 'apx_field' },
+          h('span', null, t('openRouterKey')),
+          h('p', { className: 'apx_tag' },
+            data?.openRouterKeySet
+              ? t('openRouterKeySet')
+              : t('openRouterKeyHint'),
+          ),
+          h('div', { className: 'apx_row' },
+            h('input', {
+              className: 'apx_input',
+              type: 'password',
+              placeholder: data?.openRouterKeySet ? '••••••••' : '',
+              value: openRouterKey,
+              onChange: (event) => setOpenRouterKey(event.target.value),
+            }),
+            data?.openRouterKeySet
+              ? h('button', { className: 'apx_btn', type: 'button', onClick: clearOpenRouterKey, disabled: busy }, t('clearKey'))
+              : null,
+          ),
+        ),
+        h('div', { className: 'apx_field' },
+          h('span', null, 'deepseek-web'),
+          h('p', { className: 'apx_tag' },
+            deepseek.configured
+              ? t('deepseekReady')
+              : t('deepseekMissing', { what: deepseek.missing.join(', ') }),
+          ),
+          h('div', { className: 'apx_row' },
+            h('button', {
+              className: 'apx_btn',
+              type: 'button',
+              onClick: setUpDeepseek,
+              disabled: busy || deepseek.running,
+            }, deepseek.running ? t('deepseekRunning') : t('deepseekSetup')),
+            h('span', { className: 'apx_muted' }, t('deepseekHint')),
+          ),
+        ),
         h('div', { className: 'apx_row' },
           h('button', { className: 'apx_btn primary', type: 'button', onClick: save, disabled: busy }, t('save')),
           h('button', { className: 'apx_btn', type: 'button', onClick: () => act('/start'), disabled: busy }, t('start')),
