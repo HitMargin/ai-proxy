@@ -189,6 +189,48 @@ globalThis.fetch = async (input, init = {}) => {
             context_length: 200000,
           },
           {
+            // kilo's rungs are named `instant`/`thinking` while the effort each one
+            // actually sends is `none`/`high`. Publishing the key put
+            // `reasoning_effort: "instant"` on the wire, and kilo's validator answers
+            // that with `Invalid option: expected one of
+            // "max"|"xhigh"|"high"|"medium"|"low"|"minimal"|"none"` - so every turn on
+            // those models failed. The name and the wire value are separate facts.
+            id: 'kilo/poolside/laguna-s-2.1:free',
+            name: 'Laguna S 2.1 (free)',
+            architecture: { input_modalities: ['text'] },
+            context_length: 262144,
+            opencode: {
+              variants: {
+                instant: { reasoning: { enabled: false, effort: 'none' } },
+                thinking: { reasoning: { enabled: true, effort: 'high' } },
+              },
+            },
+          },
+          {
+            // Says nothing about reasoning: no `reasoning_efforts`, no
+            // `opencode.variants`. The adapter must declare no ladder rather than
+            // invent one - an invented rung is a control that either does nothing or
+            // is rejected by the upstream.
+            id: 'kilo/silent-about-reasoning',
+            name: 'Silent About Reasoning',
+            architecture: { input_modalities: ['text'] },
+            context_length: 128000,
+          },
+          {
+            // The channel states which rung applies when the caller names none.
+            // Defaulting to `high` instead overrode it.
+            id: 'zen/default-off',
+            name: 'Default Off',
+            context_window: 1048576,
+            max_output_tokens: 16384,
+            reasoning_efforts: [
+              { id: 'off', name: 'Off' },
+              { id: 'low', name: 'Low' },
+              { id: 'high', name: 'High' },
+            ],
+            default_reasoning_effort: 'off',
+          },
+          {
             // No modality list at all: the `modality` shorthand is the only
             // signal, so it has to be parsed rather than defaulted to text.
             id: 'kilo/shorthand-only',
@@ -495,6 +537,73 @@ try {
   );
   assert.deepEqual(projectResolved.inputModalities, ['text', 'image']);
   assert.equal(projectResolved.context.contextWindow, 1000000);
+
+  // kilo's variant keys are labels and the effort inside each one is the wire
+  // value. Collapsing them sent the label: `reasoning_effort: "instant"`, which
+  // kilo's validator refuses outright. The picker keeps naming the rung
+  // `instant`/`thinking` because that is what kilo calls it.
+  const variantResolved = await adapter.resolveModel('ai-proxy', 'kilo/poolside/laguna-s-2.1:free');
+  assert.deepEqual(
+    variantResolved.reasoning.efforts.map((effort) => effort.id),
+    ['none', 'high'],
+    'the wire value must be the effort kilo validates, not the variant name',
+  );
+  assert.deepEqual(
+    variantResolved.reasoning.efforts.map((effort) => effort.name),
+    ['instant', 'thinking'],
+    'the picker keeps the variant name the upstream published',
+  );
+  assert.equal(variantResolved.reasoning.defaultEffort, 'high');
+
+  // A channel that published no ladder gets no ladder. This used to hand every
+  // silent model `off/low/high/max`, an invented table whose `off` is not in the
+  // vocabulary kilo accepts at all.
+  const silentResolved = await adapter.resolveModel('ai-proxy', 'kilo/silent-about-reasoning');
+  assert.equal(
+    silentResolved.reasoning,
+    undefined,
+    'no published ladder means no reasoning metadata, not an invented one',
+  );
+
+  // The rung the channel says applies when the caller names none is the one that
+  // applies. Picking `high` regardless turned a model whose default is `off` into
+  // one that thinks on every turn.
+  const defaultedResolved = await adapter.resolveModel('ai-proxy', 'zen/default-off');
+  assert.equal(defaultedResolved.reasoning.defaultEffort, 'off');
+  assert.deepEqual(
+    defaultedResolved.reasoning.efforts.map((effort) => effort.id),
+    ['off', 'low', 'high'],
+  );
+
+  // One malformed model takes the whole provider group down: the harness resolves
+  // every model with no per-item catch and drops the group on the first throw. So
+  // the shape it validates is asserted for the whole roster, not for samples -
+  // a single non-string effort id is exactly the failure a spot check misses.
+  let checkedModels = 0;
+  for (const model of models) {
+    const resolvedModel = await adapter.resolveModel('ai-proxy', model.id);
+    const reasoning = resolvedModel.reasoning;
+    if (reasoning === undefined) continue;
+    checkedModels += 1;
+    assert.ok(reasoning.efforts.length > 0, `${model.id}: an empty ladder is rejected outright`);
+    const ids = new Set();
+    for (const effort of reasoning.efforts) {
+      assert.equal(typeof effort.id, 'string', `${model.id}: effort id must be a string`);
+      assert.notEqual(effort.id, '', `${model.id}: effort id must not be empty`);
+      assert.equal(typeof effort.name, 'string', `${model.id}: effort name must be a string`);
+      assert.notEqual(effort.name, '', `${model.id}: effort name must not be empty`);
+      assert.equal(ids.has(effort.id), false, `${model.id}: duplicate effort "${effort.id}"`);
+      ids.add(effort.id);
+    }
+    if (reasoning.defaultEffort !== undefined) {
+      assert.equal(
+        ids.has(reasoning.defaultEffort),
+        true,
+        `${model.id}: defaultEffort "${reasoning.defaultEffort}" is not in the ladder`,
+      );
+    }
+  }
+  assert.ok(checkedModels >= 4, 'the roster sweep must actually reach the models with a ladder');
 
   // The token meter reaches `adapter.imageRequestPricing(...)` during compaction.
   // That optional chain guards a route that is not registered, not a method that

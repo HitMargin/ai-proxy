@@ -189,7 +189,9 @@ function isBlockedModelId(modelId) {
  * is what turned 33 image-capable CommandCode models into text-only rows.
  */
 // `minimal` sits below `low`, and the Zen catalog publishes it for muse spark.
-const EFFORT_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+// `none` is kilo's spelling for the same choice `off` names elsewhere - it is what
+// the `instant` variant actually puts on the wire - so it sorts next to `off`.
+const EFFORT_ORDER = ['off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
  * Keep the efforts a channel actually published, in ladder order.
@@ -207,13 +209,23 @@ const EFFORT_ORDER = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
  * harness's duplicate-effort rejection. An id outside this order is kept after
  * the ordered ones instead of being dropped: the ladder is what the upstream
  * said, not what this table expected.
+ *
+ * The id and the name are two different facts. The harness persists and sends the
+ * `id`; the picker shows the `name`. kilo is the reason they can differ: its
+ * variants are called `instant`/`thinking` while the effort they put on the wire is
+ * `none`/`high`. Collapsing the two sent the variant's *name* as the effort, which
+ * kilo's own validator rejects - see `publishedEfforts`.
+ *
+ * A channel that published nothing gets no ladder at all rather than a table this
+ * file made up. Inventing one was the "hardcoded four rungs for every model" the
+ * metadata normalisation was supposed to have removed, and the invented rungs were
+ * not even the vocabulary the upstream accepts.
  */
 function pickEfforts(published) {
-  if (!Array.isArray(published) || published.length === 0) {
-    return ['off', 'low', 'high', 'max'];
-  }
+  if (!Array.isArray(published) || published.length === 0) return [];
   const seen = new Set();
   const publishedOrder = [];
+  const names = new Map();
   for (const value of published) {
     const id = typeof value === 'string'
       ? value
@@ -223,10 +235,14 @@ function pickEfforts(published) {
     if (id === '' || seen.has(id)) continue;
     seen.add(id);
     publishedOrder.push(id);
+    const name = isRecord(value) && typeof value.name === 'string' && value.name !== ''
+      ? value.name
+      : id;
+    names.set(id, name);
   }
   const ordered = EFFORT_ORDER.filter((effort) => seen.has(effort));
   const unordered = publishedOrder.filter((id) => !EFFORT_ORDER.includes(id));
-  return [...ordered, ...unordered];
+  return [...ordered, ...unordered].map((id) => ({ id, name: names.get(id) ?? id }));
 }
 
 const MODALITY_WORDS = ['text', 'image', 'video', 'audio'];
@@ -305,7 +321,20 @@ export function normalizeModel(provider, row) {
     ),
     inputModalities: modalities,
     reasoningEfforts: publishedEfforts(row),
+    // deepseek-web states which rung it uses when the caller names none
+    // (`off` for the fast model, `high` for the reasoner, and each `-off/-low/…`
+    // variant pins one). Choosing one here instead overrode that: a model whose
+    // published default is `off` was silently made to think.
+    defaultReasoningEffort: readDefaultEffort(row),
   };
+}
+
+function readDefaultEffort(row) {
+  for (const key of ['defaultReasoningEffort', 'default_reasoning_effort']) {
+    const value = row[key];
+    if (typeof value === 'string' && value !== '') return value;
+  }
+  return undefined;
 }
 
 /**
@@ -324,6 +353,17 @@ export function normalizeModel(provider, row) {
  *
  * Both shapes feed one reader, and `pickEfforts` dedupes them, so a gateway that
  * publishes both loses nothing.
+ *
+ * The variant's key and its `reasoning.effort` are two different facts and only
+ * one of them is the wire value. kilo calls the rungs `instant`/`thinking` and
+ * `low`/`medium`/…; the effort each one sends is `none`/`high`/`low`/…. Publishing
+ * the key sent `reasoning_effort: "instant"`, which the gateway's own validator
+ * refuses - measured against Poolside and Cohere it answers
+ * `reasoning_effort: Invalid option: expected one of
+ * "max"|"xhigh"|"high"|"medium"|"low"|"minimal"|"none"` in ~400 ms, so every turn
+ * on those models failed. The variant's own `enabled: false` is not a missing rung
+ * either: it is the rung that turns reasoning off (`instant`/`none`), and dropping
+ * it removed the only no-thinking option from half the catalogue.
  */
 function publishedEfforts(row) {
   const sources = [];
@@ -331,11 +371,16 @@ function publishedEfforts(row) {
   if (Array.isArray(row.reasoning_efforts)) sources.push(row.reasoning_efforts);
   const variants = isRecord(row.opencode) ? row.opencode.variants : undefined;
   if (isRecord(variants)) {
-    // `enabled: false` is not a missing rung - it is the rung that turns reasoning
-    // off. kilo names it `instant` or `none` and pairs it with `thinking`, so the
-    // two are the same choice seen from both sides. Filtering those out dropped
-    // the only no-thinking option from half the catalogue.
-    sources.push(Object.keys(variants));
+    // `{id, name}`: id is the effort kilo validates, name is the variant it shows.
+    // A variant that carries no effort falls back to its own key, which is what
+    // the field looked like before this reader existed.
+    sources.push(Object.entries(variants).map(([key, variant]) => {
+      const reasoning = isRecord(variant) && isRecord(variant.reasoning) ? variant.reasoning : undefined;
+      const effort = typeof reasoning?.effort === 'string' && reasoning.effort !== ''
+        ? reasoning.effort
+        : key;
+      return { id: effort, name: key };
+    }));
   }
   return sources.length > 0 ? sources.flat() : undefined;
 }
@@ -1371,6 +1416,16 @@ export class AiProxyAdapter {
       };
     }
     const efforts = pickEfforts(row.reasoningEfforts);
+    // Omitted entirely when the channel published no ladder. The harness accepts
+    // `reasoning === undefined` and then offers no effort control; an empty
+    // `efforts` array is the one shape it rejects outright. Inventing a table here
+    // is what put rungs no upstream serves into the picker.
+    const advertised = row.defaultReasoningEffort;
+    const defaultEffort = efforts.some((effort) => effort.id === advertised)
+      ? advertised
+      : efforts.some((effort) => effort.id === 'high')
+      ? 'high'
+      : efforts[0]?.id;
     return {
       provider,
       id: row.id,
@@ -1378,15 +1433,15 @@ export class AiProxyAdapter {
       inputModalities: row.inputModalities,
       context: { contextWindow: row.contextWindow },
       defaultMaxTokens: row.maxTokens,
-      reasoning: {
-        // The name is the id the upstream published — `off`, `low`, … `max`.
-        // Inventing friendlier spellings (e.g. `Very high`) told the picker a
-        // rung exists that no channel serves, and a translated `name` reads
-        // wrong outside that locale. There is no description: inventing one is
-        // how "The default thinking budget" got written for a lane that has no
-        // default rung.
-        efforts: efforts.map((id) => ({ id, name: id })),
-        defaultEffort: efforts.includes('high') ? 'high' : efforts[0],
+      // The id is what the harness persists and what this adapter puts on the wire
+      // as `reasoning_effort`; the name is what the picker shows. kilo's variants
+      // are called `instant`/`thinking` while the effort they actually send is
+      // `none`/`high`, so the two are kept apart rather than collapsed.
+      ...efforts.length === 0 ? {} : {
+        reasoning: {
+          efforts,
+          ...defaultEffort === undefined ? {} : { defaultEffort },
+        },
       },
       basePath: route.basePath,
       wireModel: route.wireModel,

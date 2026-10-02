@@ -798,7 +798,11 @@ window.__ModuleLoader__.load({
                 // offer a rung no channel serves and the request just 400s.
                 h('td', { className: 'apx_efforts' },
                   Array.isArray(row.reasoningEfforts) && row.reasoningEfforts.length > 0
-                    ? h('span', { className: 'apx_tag' }, row.reasoningEfforts.map((effort) => (typeof effort === 'string' ? effort : effort?.id)).filter(Boolean).join(' · '))
+                    // The name is what the picker shows, so the panel shows it too.
+                    // For a channel that names its rungs differently from the effort
+                    // each one sends (kilo: instant/thinking -> none/high) the two
+                    // columns would otherwise disagree about the same ladder.
+                    ? h('span', { className: 'apx_tag' }, row.reasoningEfforts.map((effort) => (typeof effort === 'string' ? effort : effort?.name ?? effort?.id)).filter(Boolean).join(' · '))
                     : h('span', { className: 'apx_muted' }, t('noEfforts')))))))),
         healthCounts.total > 0
           ? h('div', { className: 'apx_legend' },
