@@ -15,6 +15,7 @@ commandcode-models.generated.yml
 *.key
 
 # --- local tool state ---
+.dsh-meow/
 .wrangler/
 .cloudflared/
 ai-proxy-dsh-bridge-*.tgz
