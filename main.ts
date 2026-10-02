@@ -29,6 +29,12 @@ import {
   readTraeCredential,
   refreshTraeIfNeeded,
 } from "./src/trae-account.ts";
+import {
+  fetchTraeCatalog,
+  handleTraeChat,
+  toModelCard,
+  type TraeModel,
+} from "./src/trae.ts";
 // The credential sits next to the project sources, like the deepseek login state.
 // Resolved per request rather than once at import so a restart is not needed after
 // the capture script writes it.
@@ -178,6 +184,10 @@ const V1_AGGREGATE_MEMBERS = [
   // this aggregate, not from the plugin's separate project listing. Left out here,
   // the panel showed all ten of its models while the picker had none of them.
   "deepseek-web",
+  // TRAE joins for the same reason, plus one more: its catalog is read from the
+  // account's remote listing, so leaving it out would report a channel whose
+  // models the harness cannot see at all.
+  "trae",
 ];
 
 /**
@@ -267,6 +277,152 @@ async function v1FetchOwnListing(prefix: string): Promise<any[]> {
   }
 }
 
+/** 模块级 JSON 响应。TRAE handler 在模块作用域，所以不能复用 handler 内的闭包。 */
+function jsonResponse(obj: unknown, status = 200): Response {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
+
+/**
+ * TRAE 目录缓存。
+ *
+ * 目录来自账号的远端列表，而**推理派发需要目录里的通道**（模型只在列出它的
+ * 通道里可调用）。所以这份目录不是锦上添花的元数据，而是路由表的一部分 ——
+ * 拉不到目录就没有正确路由，本代理宁可拒绝也不猜通道。
+ *
+ * 5 分钟窗口：面板要活列表，但每次派发都打一次上游会把免费额度换成请求数。
+ */
+const traeCatalog = {
+  models: [] as TraeModel[],
+  at: 0,
+  loading: null as Promise<TraeModel[]> | null,
+};
+
+async function loadTraeCatalog(force = false): Promise<TraeModel[]> {
+  const now = Date.now();
+  if (
+    !force && traeCatalog.models.length > 0 && now - traeCatalog.at < 300_000
+  ) {
+    return traeCatalog.models;
+  }
+  // 在飞请求共享一个 Promise：面板每 10 秒轮询一次，不共享就是每次都打上游。
+  if (traeCatalog.loading !== null) return await traeCatalog.loading;
+  const pending = (async () => {
+    const credential = await readTraeCredential(TRAE_ROOT);
+    if (credential === undefined) {
+      throw new Error(
+        "no TRAE credential. run: deno run -A .tmp-trae-login.ts",
+      );
+    }
+    try {
+      await refreshTraeIfNeeded(TRAE_ROOT, credential);
+    } catch (error) {
+      console.warn(
+        "[trae] token refresh failed:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+    const models = await fetchTraeCatalog(credential);
+    // 一个模型都没有 = 上游没答上来，不是「这里什么都没有」。
+    // 保留上一份目录，否则一次坏读会让整个渠道消失 5 秒。
+    if (models.length === 0) {
+      throw new Error(
+        traeCatalog.models.length > 0
+          ? "the remote listing came back empty (kept the previous one)"
+          : "no TRAE models are available for this account",
+      );
+    }
+    traeCatalog.models = models;
+    traeCatalog.at = Date.now();
+    console.log("[trae] catalog: " + models.length + " model(s) loaded");
+    return models;
+  })();
+  traeCatalog.loading = pending;
+  try {
+    return await pending;
+  } finally {
+    // 无论成败都要清空，否则一次失败会把闸门永久卡住。
+    traeCatalog.loading = null;
+  }
+}
+
+async function handleTrae(path: string, request: Request): Promise<Response> {
+  if (path === "/trae/v1/models") {
+    try {
+      const models = await loadTraeCatalog(
+        request.url.includes("refresh=true"),
+      );
+      return jsonResponse({ object: "list", data: models.map(toModelCard) });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[trae] catalog failed: " + message);
+      return jsonResponse({ error: message }, 502);
+    }
+  }
+
+  if (path === "/trae/v1/chat/completions" && request.method === "POST") {
+    const parsed = await readJsonBodyLimited(request);
+    // It answers {ok, value} / {ok:false, message, status} - not the body
+    // itself. Treating the envelope as the body made every request look like it
+    // had no model.
+    if (!parsed.ok) {
+      return jsonResponse({ error: parsed.message }, parsed.status);
+    }
+    const body = parsed.value as Record<string, unknown>;
+    const requested = typeof body?.model === "string" ? String(body.model) : "";
+    if (requested.length === 0) {
+      return jsonResponse({ error: "model is required" }, 400);
+    }
+
+    let models: TraeModel[];
+    try {
+      models = await loadTraeCatalog();
+    } catch (error) {
+      return jsonResponse(
+        { error: error instanceof Error ? error.message : String(error) },
+        502,
+      );
+    }
+    const model = models.find((entry) => entry.id === requested);
+    if (model === undefined) {
+      return jsonResponse({
+        error: "Unknown TRAE model: " + requested,
+        // 报出可选值而不是一句「未知」：前缀式路由剥掉 trae/ 后如果拿到的是
+        // 别处的 id，这里是唯一能看出「少了前缀」的地方。
+        available: models.map((entry) => entry.id).slice(0, 40),
+      }, 400);
+    }
+
+    const credential = await readTraeCredential(TRAE_ROOT);
+    if (credential === undefined) {
+      return jsonResponse({ error: "no TRAE credential" }, 409);
+    }
+    try {
+      await refreshTraeIfNeeded(TRAE_ROOT, credential);
+    } catch (error) {
+      // 非致命：让上游决定。过期 token 和没有 token 失败方式一样，
+      // 而把一个换成另一个只会掩盖真正的原因。
+      console.warn(
+        "[trae] pre-chat refresh failed:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+    try {
+      return await handleTraeChat(credential, model, body);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[trae] chat failed for " + requested + ": " + message);
+      return jsonResponse({ error: message }, 502);
+    }
+  }
+
+  return jsonResponse({ error: "Unknown TRAE route" }, 404);
+}
 async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
   const out: Record<string, any[]> = {};
   const now = Date.now();
@@ -308,6 +464,24 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
         // roster that is quietly short.
         const reason =
           "deepseek-web has no login state yet (cookie, token, headers)";
+        catalog.failed(key, reason, now);
+        console.warn(`[v1] ${key}: ${reason}`);
+      }
+      return;
+    }
+    if (key === "trae") {
+      // Asked of the account's remote listing, not a local table: the set of
+      // models AND their channels both come from upstream, and the channel is
+      // what the dispatcher needs.
+      try {
+        const models = await loadTraeCatalog();
+        out[key] = models.map(toModelCard);
+        catalog.ok(key, models.length, models.length, now);
+      } catch (error) {
+        // Empty here means "not readable right now", not "there is nothing".
+        // Reporting it that way is the difference between a fixable message and
+        // a channel that quietly went missing.
+        const reason = error instanceof Error ? error.message : String(error);
         catalog.failed(key, reason, now);
         console.warn(`[v1] ${key}: ${reason}`);
       }
@@ -901,6 +1075,9 @@ export async function handler(request: Request): Promise<Response> {
     }
     if (provider.customHandler === "deepseek-web") {
       return await handleDeepseekWeb(path, request, url);
+    }
+    if (provider.customHandler === "trae") {
+      return await handleTrae(path, request);
     }
     if (provider.customHandler === "commandcode") {
       return await handleCommandCode(path, request, url);

@@ -243,6 +243,23 @@ export const providers: Record<string, any> = {
     filterModels: null,
     customHandler: "deepseek-web",
   },
+  // TRAE speaks a translated protocol on its own host, so every path is served
+  // by handleTrae: the baseUrl and endpoints are placeholders that are never
+  // fetched. Declaring them keeps the prefix recognisable, which is what the
+  // aggregator dispatches on.
+  trae: {
+    prefix: "/trae/v1",
+    baseUrl: "https://trae-api-cn.mchost.guru",
+    auth: { type: "none" },
+    pathRewrite: (path: string) => path.replace(/^\/trae\/v1/, ""),
+    endpoints: {
+      models: "/api/ide/v1/batch_get_detail_param",
+      chat: "/api/agent/v3/llm_utils_chat",
+    },
+    adapter: adapters.passthrough,
+    filterModels: null,
+    customHandler: "trae",
+  },
   tokenharbor: {
     prefix: "/tokenharbor/v1",
     baseUrl: "https://tokenharbor.ai/v1",

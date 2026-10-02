@@ -73,6 +73,7 @@ const KNOWN_CHANNELS = [
   'kilo',
   'openrouter',
   'tokenharbor',
+  'trae',
   'zen',
 ];
 
@@ -112,6 +113,7 @@ const BLOCK_REASON = {
     'this channel needs a per-user upstream key and is not served by ai-proxy',
   'deepseek-web': 'this channel is switched off in the ai-proxy panel',
   cnb: 'cnb needs a login cookie; paste one into cnb-login.txt to re-enable it',
+  trae: 'TRAE needs a captured credential; run deno run -A .tmp-trae-login.ts to capture one',
 };
 
 /** Fallback text for a channel the user switched off that has no specific reason. */
@@ -137,6 +139,11 @@ const EXTRA_MODEL_ROUTES = [
   { prefix: 'tokenharbor', basePath: '/tokenharbor/v1', requiresKey: true },
   // Gated on the login state by listProjectModels, for the reason stated there.
   { prefix: 'deepseek-web', basePath: '/deepseek-web/v1', requiresDeepseekLogin: true },
+  // TRAE is listed from the account's own remote catalog, which the proxy serves
+  // on this prefix. It is not an aggregate-only channel, so it needs its own
+  // panel listing like deepseek-web does - otherwise the panel shows a channel the
+  // picker has never heard of, which is the mismatch this list exists to prevent.
+  { prefix: 'trae', basePath: '/trae/v1' },
 ];
 
 /**

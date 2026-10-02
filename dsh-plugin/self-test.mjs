@@ -407,10 +407,21 @@ try {
   assert.equal(models[0].id, 'deepseek/test');
   assert.equal(models.some((model) => model.id.startsWith('openrouter/')), false);
   assert.equal(models.some((model) => model.id === 'blocked/channel'), false);
-  // The aggregate listing plus the one channel that has its own route and is
-  // not blocked. deepseek-web used to be the third, which is what the poller's
-  // log was full of.
-  assert.equal(modelCalls, 1, `paths: ${JSON.stringify(modelCallsByPath)}`);
+  // TRAE must reach the panel AND keep a switch. A channel listed from the
+  // account's own catalog still needs to be switchable off, or turning it off is
+  // a settings.json edit by hand.
+  assert.ok(
+    models.some((model) => model.id.startsWith('trae/')),
+    'TRAE rows must reach the panel listing',
+  );
+  assert.equal(modelCallsByPath['/trae/v1/models'] > 0, true, 'the TRAE listing must actually be fetched');
+  // The aggregate listing plus each unblocked channel that has its own route.
+  //
+  // This count is load-bearing and it moves whenever a channel is added: it is what
+  // caught TRAE's listing being fetched on every 10-second poll. Two channels have
+  // their own route and are not blocked - deepseek-web and TRAE - so the expected
+  // number is written out rather than kept as "however many there are now".
+  assert.equal(modelCalls, 2, `paths: ${JSON.stringify(modelCallsByPath)}`);
   // tokenharbor is held back with no key. Its filterModels drops every id without
   // a `:free` suffix, so a 401 came back as an empty list and the panel read it as
   // "no free models here" - the same thing a working channel looks like.
@@ -936,7 +947,7 @@ try {
   // channel that was on but silent - openrouter with no key, deepseek-web with no
   // login state - fell out of both, and the only way to switch it back off was to
   // edit settings.json by hand.
-  for (const channel of ['kilo', 'zen', 'commandcode', 'cnb', 'openrouter', 'deepseek-web', 'tokenharbor']) {
+  for (const channel of ['kilo', 'zen', 'commandcode', 'cnb', 'openrouter', 'deepseek-web', 'tokenharbor', 'trae']) {
     assert.ok(
       panel.allChannels.includes(channel),
       `${channel} must keep its switch whether or not it lists models right now`,
