@@ -3,7 +3,7 @@ window.__ModuleLoader__.load({
   id: 'ai-proxy-dsh-bridge',
   factory: (require) => {
     const React = require('react')
-    const { createElement: h, useEffect, useMemo, useRef, useState } = React
+    const { createElement: h, useCallback, useEffect, useMemo, useRef, useState } = React
     const NS = 'settings.aiProxyBridge'
     const DICT = {
       zh: {
@@ -39,6 +39,18 @@ window.__ModuleLoader__.load({
     deepseekRecaptureConfirm: '重新配置会覆盖现有的 cookie / token / 浏览器头。确定继续？',
         deepseekRunning: '正在配置…',
         deepseekReady: '登录态已就绪。',
+    traeCheckin: '每日签到 +100',
+    traeCheckedIn: '今日已签到',
+    traeCheckedInToday: '今日已签到。',
+    traeCheckinAvailable: '今日未签到，签到可得 {credits} 积分。',
+    traeClaimed: '签到成功，+{credits} 积分。',
+    traeBalance: '积分余额 {total}',
+    traeBalanceUnknown: '积分余额读取失败（不是 0）。',
+    traeNotSignedIn: '未登录。运行 deno run -A .tmp-trae-login.ts 抓取凭据。',
+    traeExpired: '凭据已过期，请重新运行登录脚本。',
+    traeLoading: '读取账号状态…',
+    traeRefresh: '刷新',
+    traeHint: '积分是免费的：每月 500 + 每天签到 150。按钮不消耗推理额度；上游高峰限流（9074）会自动退避重试。',
     commandcodeLogin: '一键登录',
     commandcodeWaiting: '等待浏览器回调…（最多 10 分钟）',
     commandcodeSignedIn: '已登录。账号已写入 commandcode-accounts.json。',
@@ -76,6 +88,18 @@ window.__ModuleLoader__.load({
       'Re-capturing replaces the current cookie / token / browser headers. Continue?',
         deepseekRunning: 'Setting up…',
         deepseekReady: 'Login state is ready.',
+    traeCheckin: 'Daily check-in',
+    traeCheckedIn: 'Checked in today',
+    traeCheckedInToday: 'Checked in today.',
+    traeCheckinAvailable: 'Not checked in today; {credits} credits available.',
+    traeClaimed: 'Checked in, +{credits} credits.',
+    traeBalance: 'Credit balance {total}',
+    traeBalanceUnknown: 'Balance lookup failed (this is not 0).',
+    traeNotSignedIn: 'Not signed in. Run: deno run -A .tmp-trae-login.ts',
+    traeExpired: 'Credential expired; run the sign-in script again.',
+    traeLoading: 'Reading account state…',
+    traeRefresh: 'Refresh',
+    traeHint: 'Credits are free: 500 a month plus 150 a day for checking in. The button spends no inference quota; a peak-hour limit (9074) is retried with backoff.',
     commandcodeLogin: 'Sign in',
     commandcodeWaiting: 'Waiting for the browser callback… (up to 10 minutes)',
     commandcodeSignedIn: 'Signed in. The account was written to commandcode-accounts.json.',
@@ -107,6 +131,11 @@ window.__ModuleLoader__.load({
 .apx_head{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap;position:relative}
 .apx_title{margin:0;font-size:19px;font-weight:650;letter-spacing:-.01em}
 .apx_tag{margin:2px 0 0;font-size:12.5px;color:var(--dsw-alias-label-secondary)}
+// The TRAE card reports a claim outcome in colour, so the two states need a
+// rule. Without them the tags render in the default muted grey and a failed
+// check-in is indistinguishable from a hint line.
+.apx_tag.ok{color:var(--dsw-alias-state-success-primary)}
+.apx_tag.danger{color:var(--dsw-alias-state-error-primary)}
 .apx_actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
 .apx_stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;position:relative}
 .apx_stat{display:flex;flex-direction:column;gap:3px;padding:11px 13px;border-radius:13px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1)}
@@ -500,6 +529,55 @@ window.__ModuleLoader__.load({
         hiddenChannels: hiddenNow,
         channelKeys,
       })
+      // ---- TRAE: daily check-in ----
+      //
+      // The account is not fetched with the ten-second panel snapshot: a claim is
+      // rate limited per device and every poll that raced a click would show a
+      // stale balance. It is read when the card mounts and again after a claim, so
+      // the number on screen is always the number the last request returned.
+      const [trae, setTrae] = useState({ loading: true, data: null, claim: null })
+      const loadTrae = useCallback(async () => {
+        try {
+          const response = await fetch('/api/ai-proxy/trae/status')
+          const payload = await response.json()
+          setTrae((prev) => ({ ...prev, loading: false, data: payload }))
+        } catch (reason) {
+          setTrae((prev) => ({
+            ...prev,
+            loading: false,
+            data: { configured: false, error: reason instanceof Error ? reason.message : String(reason) },
+          }))
+        }
+      }, [])
+      useEffect(() => {
+        // Only when the settings card is open, so a proxy that is not running yet
+        // is not asked for an account on every page load.
+        if (tab === 'settings') loadTrae()
+      }, [tab, loadTrae])
+      const runTraeCheckin = async () => {
+        setBusy(true)
+        setError('')
+        try {
+          const response = await fetch('/api/ai-proxy/trae/checkin', { method: 'POST' })
+          const payload = await response.json()
+          setTrae((prev) => ({ ...prev, claim: payload }))
+          // The claim response carries the refreshed balance, so the total updates
+          // without a second round trip that could answer a different number.
+          const balance = payload && typeof payload.balance === 'object' ? payload.balance : null
+          if (balance) {
+            setTrae((prev) => ({
+              ...prev,
+              data: prev.data ? { ...prev.data, balance, balanceKnown: true } : prev.data,
+            }))
+          } else {
+            await loadTrae()
+          }
+        } catch (reason) {
+          setError(reason instanceof Error ? reason.message : String(reason))
+        } finally {
+          setBusy(false)
+        }
+      }
       const setUpDeepseek = () => {
         // Re-capturing replaces working credentials. The originals are copied aside
         // first and put back if the capture does not finish, so the worst case is a
@@ -689,6 +767,67 @@ window.__ModuleLoader__.load({
               : null,
           ),
         )),
+        h('div', { className: 'apx_field' },
+          h('span', null, 'TRAE'),
+          h('p', { className: 'apx_tag' },
+            trae.loading
+              ? t('traeLoading')
+              : !trae.data?.configured
+              ? t('traeNotSignedIn')
+              : trae.data.expired
+              ? t('traeExpired')
+              : ((trae.data.checkin?.checkedIn ?? trae.claim?.alreadyClaimed) ?? false)
+              ? t('traeCheckedInToday')
+              : t('traeCheckinAvailable', {
+                credits: String(trae.data.checkin?.credits ?? trae.claim?.credits ?? '?'),
+              }),
+          ),
+          h('div', { className: 'apx_row' },
+            h('button', {
+              className: 'apx_btn primary',
+              type: 'button',
+              onClick: runTraeCheckin,
+              // Disabled once claimed, not hidden: a button that disappears is a
+              // control the user has to hunt for again tomorrow.
+              disabled: busy || trae.loading || !trae.data?.configured ||
+                ((trae.data.checkin?.checkedIn ?? trae.claim?.alreadyClaimed) ?? false),
+            }, (trae.data?.checkin?.checkedIn ?? trae.claim?.alreadyClaimed) ?? false
+              ? t('traeCheckedIn')
+              : t('traeCheckin')),
+            h('button', {
+              className: 'apx_btn',
+              type: 'button',
+              onClick: loadTrae,
+              disabled: busy || trae.loading,
+            }, t('traeRefresh')),
+          ),
+          // The balance is advisory, so a failed lookup says so rather than
+          // showing 0 - which would read as "you have nothing".
+          trae.data?.balanceKnown
+            ? h('p', { className: 'apx_muted' },
+              t('traeBalance', {
+                total: String(Math.round(Number(trae.data.balance?.total ?? 0) * 100) / 100),
+              }),
+              Array.isArray(trae.data.balance?.packs) && trae.data.balance.packs.length > 0
+                ? ' · ' + trae.data.balance.packs
+                    .map((pack) => `${pack.name} ${pack.remaining}/${pack.total}`)
+                    .join(' · ')
+                : '')
+            : trae.data?.configured
+            ? h('p', { className: 'apx_muted' }, t('traeBalanceUnknown'))
+            : null,
+          // A failed claim says why. 9074 in particular looks like a broken
+          // button unless the panel explains that it is a peak-hour limit.
+          trae.claim && trae.claim.ok === false
+            ? h('p', { className: 'apx_tag danger' }, trae.claim.message)
+            : null,
+          trae.claim && trae.claim.ok && !trae.claim.alreadyClaimed
+            ? h('p', { className: 'apx_tag ok' }, t('traeClaimed', {
+                credits: String(trae.claim.credits ?? '?'),
+              }))
+            : null,
+          h('span', { className: 'apx_muted' }, t('traeHint')),
+        ),
         h('div', { className: 'apx_field' },
           h('span', null, 'deepseek-web'),
           h('p', { className: 'apx_tag' },

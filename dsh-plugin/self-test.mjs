@@ -21,6 +21,12 @@ process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
 let modelCalls = 0;
 let loginCalls = 0;
+// The TRAE account routes. A counter per call is what makes the assertions
+// falsifiable: "the button posts once and the status read is not a POST" cannot
+// pass by accident if the fake records which one was called.
+let traeAccountCalls = 0;
+let traeCheckinCalls = 0;
+let traeCheckinOk = true;
 let chatCalls = 0;
 let lastRequestHeaders = new Headers();
 let lastChatBody = null;
@@ -78,6 +84,32 @@ globalThis.fetch = async (input, init = {}) => {
       status: 200,
       headers: { 'content-type': 'application/json' },
     });
+  }
+  if (url.endsWith('/trae/v1/account')) {
+    traeAccountCalls++;
+    return new Response(JSON.stringify({
+      configured: true,
+      uid: '2971347912497099',
+      nickname: '(1761121491907',
+      expired: false,
+      balance: { total: 500, packs: [{ name: 'every month', total: 500, used: 0, remaining: 500, expires: '2026-10-31' }] },
+      balanceKnown: true,
+      checkin: { checkedIn: false, credits: 100, enabled: true },
+      checkinKnown: true,
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url.endsWith('/trae/v1/checkin')) {
+    traeCheckinCalls++;
+    return new Response(JSON.stringify({
+      ok: traeCheckinOk,
+      code: traeCheckinOk ? 0 : 9074,
+      message: traeCheckinOk ? 'success' : 'too many users right now',
+      credits: traeCheckinOk ? 100 : null,
+      throttled: traeCheckinOk ? 0 : 4,
+      alreadyClaimed: false,
+      balance: { total: traeCheckinOk ? 600 : 500, packs: [] },
+      balanceKnown: true,
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
   if (url.endsWith('/panel')) {
     return new Response(JSON.stringify({ error: 'Command Code route not found' }), {
@@ -955,6 +987,70 @@ try {
   // The panel only shows 可用/限流/不可用 if the per-model verdicts are joined
   // onto the rows: /health keys samples by provider + unprefixed id, while the
   // roster uses `kilo/…`.
+  // ---- TRAE account routes ----
+  //
+  // Two things have to hold, and neither is visible from the panel side alone:
+  // the account read must be a GET to /trae/v1/account, and the claim must be a
+  // POST to /trae/v1/checkin that is not answered with a non-2xx. The proxy answers
+  // a business failure with 200 on purpose - a 5xx would invite a caller to retry,
+  // and replaying a claim is the one thing that must not happen on its own.
+  const beforeAccount = traeAccountCalls;
+  const traeStatus = await (async () => {
+    let status = 0;
+    let payload = '';
+    await panelRoute.handler({ method: 'GET', url: '/api/ai-proxy-commandcode/trae/status', headers: { host: 'dsh.local' } }, {
+      writeHead(value) { status = value; },
+      end(value) { payload = value; },
+    });
+    assert.equal(status, 200);
+    return JSON.parse(payload);
+  })();
+  assert.equal(traeAccountCalls, beforeAccount + 1, 'the status read must reach the proxy account route');
+  assert.equal(traeStatus.configured, true);
+  assert.equal(traeStatus.balanceKnown, true);
+  assert.equal(traeStatus.balance.total, 500);
+  assert.equal(traeStatus.checkin.checkedIn, false);
+  assert.equal(traeStatus.checkin.credits, 100);
+  // A token must never travel to the panel: this response is rendered.
+  assert.equal('access_token' in traeStatus, false);
+  assert.equal('refresh_token' in traeStatus, false);
+  assert.equal('device_id' in traeStatus, false);
+
+  const beforeCheckin = traeCheckinCalls;
+  const traeClaim = await (async () => {
+    let status = 0;
+    let payload = '';
+    await panelRoute.handler({ method: 'POST', url: '/api/ai-proxy-commandcode/trae/checkin', headers: { host: 'dsh.local' } }, {
+      writeHead(value) { status = value; },
+      end(value) { payload = value; },
+    });
+    assert.equal(status, 200);
+    return JSON.parse(payload);
+  })();
+  assert.equal(traeCheckinCalls, beforeCheckin + 1, 'the button must actually claim');
+  assert.equal(traeClaim.ok, true);
+  assert.equal(traeClaim.credits, 100);
+  // The balance rides along so the panel does not have to ask again and render a
+  // different number than the one the claim just produced.
+  assert.equal(traeClaim.balance.total, 600);
+
+  // A throttled claim is still 200: the transport worked, the business did not.
+  // The panel renders ok:false with the reason rather than showing a crash.
+  traeCheckinOk = false;
+  const throttledClaim = await (async () => {
+    let status = 0;
+    let payload = '';
+    await panelRoute.handler({ method: 'POST', url: '/api/ai-proxy-commandcode/trae/checkin', headers: { host: 'dsh.local' } }, {
+      writeHead(value) { status = value; },
+      end(value) { payload = value; },
+    });
+    assert.equal(status, 200, 'a business failure must not be reported as a transport error');
+    return JSON.parse(payload);
+  })();
+  assert.equal(throttledClaim.ok, false);
+  assert.equal(throttledClaim.code, 9074);
+  assert.equal(typeof throttledClaim.message, 'string');
+  traeCheckinOk = true;
   const probed = panel.projectModels.find((model) => model.id === 'kilo/stealth/space-bunny-alpha');
   assert.equal(probed.state, 'available');
   assert.equal(probed.latencyMs, 1247);

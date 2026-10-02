@@ -21,6 +21,19 @@ import {
   handleCommandCode,
   peekCommandCodeModels,
 } from "./src/commandcode/handler.ts";
+import {
+  claimTraeDailyCheckin,
+  fetchTraeBalance,
+  fetchTraeCheckinStatus,
+  isTraeExpired,
+  readTraeCredential,
+  refreshTraeIfNeeded,
+} from "./src/trae-account.ts";
+// The credential sits next to the project sources, like the deepseek login state.
+// Resolved per request rather than once at import so a restart is not needed after
+// the capture script writes it.
+const TRAE_ROOT = new URL(".", import.meta.url).pathname.replace(/\/+$/, "")
+  .replace(/^\/(?:[A-Za-z]:)/, (m) => m.slice(1));
 // ---------- 鉴权 ----------
 function checkAuth(request: Request) {
   const authHeader = request.headers.get("authorization");
@@ -571,6 +584,131 @@ export async function handler(request: Request): Promise<Response> {
         {
           headers: {
             "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
+    }
+
+    // ---------- TRAE 账号：签到与积分余额 ----------
+    //
+    // These sit outside the /v1 aggregate on purpose. The account endpoints are
+    // not a model route: they answer "is this account signed in, does it have
+    // credits, has today's check-in been claimed" - questions the panel asks, not
+    // the DSH picker.
+    if (
+      (path === "/trae/v1/account" && request.method === "GET") ||
+      (path === "/trae/v1/checkin" && request.method === "POST")
+    ) {
+      const credential = await readTraeCredential(TRAE_ROOT);
+      if (credential === undefined) {
+        return new Response(
+          JSON.stringify({
+            configured: false,
+            error:
+              "no TRAE credential. run: deno run -A .tmp-trae-login.ts (opens a browser)",
+          }),
+          {
+            status: 409,
+            headers: {
+              "Content-Type": "application/json",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+      }
+      // Refresh a day before expiry, so a long-idle proxy does not answer every
+      // call with 401. A failure here is not fatal: keep the current credential
+      // and let the upstream decide - replacing it with nothing hides the reason.
+      try {
+        await refreshTraeIfNeeded(TRAE_ROOT, credential);
+      } catch (error) {
+        console.warn(
+          "[trae] token refresh failed:",
+          error instanceof Error ? error.message : error,
+        );
+      }
+      if (path === "/trae/v1/account") {
+        // An expired token is reported, not treated as "signed out": the panel
+        // can still show the balance, and the refresh above has already tried.
+        const expired = isTraeExpired(credential);
+        const [balance, checkin] = await Promise.all([
+          fetchTraeBalance(credential).catch((error) => {
+            console.warn(
+              "[trae] balance lookup failed:",
+              error instanceof Error ? error.message : error,
+            );
+            return undefined;
+          }),
+          fetchTraeCheckinStatus(credential).catch((error) => {
+            console.warn(
+              "[trae] checkin status failed:",
+              error instanceof Error ? error.message : error,
+            );
+            return undefined;
+          }),
+        ]);
+        return new Response(
+          JSON.stringify({
+            configured: true,
+            // Never the tokens themselves. This response is rendered in a panel
+            // and a screenshot is one keystroke away.
+            uid: credential.uid,
+            nickname: credential.nickname ?? "",
+            expired,
+            balance: balance ?? { total: 0, packs: [] },
+            balanceKnown: balance !== undefined,
+            checkin: checkin ?? null,
+            checkinKnown: checkin !== undefined,
+          }),
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "no-store",
+              "Access-Control-Allow-Origin": "*",
+            },
+          },
+        );
+      }
+      const result = await claimTraeDailyCheckin(credential, fetch, {
+        onThrottle: (attempt, waitMs) =>
+          console.warn(
+            `[trae] check-in throttled (9074), retry ${attempt} in ${waitMs}ms`,
+          ),
+      });
+      if (result.throttled > 0) {
+        console.log(
+          `[trae] check-in succeeded after ${result.throttled} throttle(s)`,
+        );
+      }
+      // The balance comes back with the claim so the panel can show the new
+      // total without a second round trip - a second request is where a
+      // "credited 100 but still shows 500" report comes from.
+      const balance = await fetchTraeBalance(credential).catch(() => undefined);
+      if (!result.ok) {
+        console.warn(
+          `[trae] check-in failed: code=${result.code} ${result.message}`,
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          ok: result.ok,
+          code: result.code,
+          message: result.message,
+          credits: result.credits ?? null,
+          throttled: result.throttled,
+          alreadyClaimed: result.alreadyClaimed,
+          balance: balance ?? { total: 0, packs: [] },
+          balanceKnown: balance !== undefined,
+        }),
+        {
+          // 200 on a business failure: the transport succeeded and the panel
+          // renders `ok: false` with the reason. A 5xx would be retried by
+          // callers, and replaying a claim is exactly what must not happen.
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
             "Access-Control-Allow-Origin": "*",
           },
         },

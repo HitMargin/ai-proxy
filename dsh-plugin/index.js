@@ -2365,6 +2365,55 @@ function apiHandler(adapter, runtime, projectAdapter) {
         sendJson(res, 202, { ...before, started: true, reconfigured: before.configured });
         return;
       }
+      // TRAE account: the panel asks about credits and runs the daily check-in.
+      //
+      // The proxy owns the credential, the refresh and the 9074 backoff; the plugin
+      // only forwards. That split is deliberate - a retry policy that lived here
+      // would have to be re-implemented in the browser panel too, and the two
+      // copies would drift exactly where it matters (a claim must not be replayed).
+      //
+      // `/trae/v1/*` is a root path, not a provider basePath, so `request()` would
+      // ask for `/commandcode/v1/trae/v1/...` and 404 into the provider catalog.
+      if (method === 'GET' && route === '/trae/status') {
+        if (runtime.state !== 'running' && runtime.state !== 'external') await runtime.start();
+        // 409 means "no credential yet", which is a normal state the panel renders,
+        // not a failure of the proxy. requestAt would throw on it.
+        const response = await fetch(`${runtime.serviceUrl('/trae/v1')}/account`, {
+          headers: { ...runtime.headers() },
+          signal: AbortSignal.timeout(15000),
+        }).catch((reason) => ({ json: async () => ({ error: String(reason) }) }));
+        // Await first, then shape-check. Testing `response.json` before awaiting it
+        // inspects the *function*, which is always a record - so the check passed
+        // whatever came back and a transport failure was rendered as an empty
+        // account rather than as the reason it failed.
+        let payload = {};
+        try {
+          payload = await response.json();
+        } catch {
+          payload = { error: 'the proxy answered with no JSON' };
+        }
+        if (!isRecord(payload)) payload = { error: 'unexpected account payload' };
+        return sendJson(res, 200, payload);
+      }
+      if (method === 'POST' && route === '/trae/checkin') {
+        if (runtime.state !== 'running' && runtime.state !== 'external') await runtime.start();
+        try {
+          const response = await fetch(`${runtime.serviceUrl('/trae/v1')}/checkin`, {
+            method: 'POST',
+            headers: { ...runtime.headers(), 'content-type': 'application/json' },
+            body: '{}',
+            // The proxy backs off on 9074 for up to ~30s before answering, so the
+            // client timeout has to be well clear of that. A timeout here would
+            // leave the user clicking again while the first claim is still running.
+            signal: AbortSignal.timeout(90000),
+          });
+          const payload = await response.json();
+          return sendJson(res, 200, isRecord(payload) ? payload : {});
+        } catch (error) {
+          runtime.record(`trae: check-in request failed: ${error.message}`);
+          return sendJson(res, 502, { ok: false, code: 0, message: error.message });
+        }
+      }
       if (method === 'POST' && route === '/start') {
         await runtime.start();
         return sendJson(res, 200, runtime.snapshot());
