@@ -443,6 +443,63 @@ function saveSettings(settings) {
 }
 
 /**
+ * The three files a capture writes, and where their originals are kept.
+ *
+ * `.bak` is already in .gitignore. The point is not tidiness: a capture that dies
+ * after writing the cookie but before the token leaves a set that passes every
+ * presence check while being useless, and nothing in the panel can tell the
+ * difference - so the originals go back.
+ */
+const DEEPSEEK_STATE_FILES = ['deepseek-cookies.txt', 'deepseek-auth.txt', 'deepseek-headers.json'];
+
+/**
+ * Copy the current state aside. Returns how many files were there to copy.
+ *
+ * These return what they did rather than logging it. A `record` callback passed in
+ * unbound arrives with no `this`, and the first call throws on `this.logs` - which
+ * takes the whole route down with it.
+ */
+function backUpDeepseekState(root) {
+  let copied = 0;
+  for (const name of DEEPSEEK_STATE_FILES) {
+    try {
+      fs.copyFileSync(path.join(root, name), path.join(root, `${name}.bak`));
+      copied += 1;
+    } catch {
+      // Absent or unreadable: nothing to preserve for this one.
+    }
+  }
+  return copied;
+}
+
+/** Put the originals back after a capture that did not complete. */
+function restoreDeepseekState(root) {
+  let restored = 0;
+  for (const name of DEEPSEEK_STATE_FILES) {
+    const backup = path.join(root, `${name}.bak`);
+    try {
+      fs.copyFileSync(backup, path.join(root, name));
+      fs.rmSync(backup, { force: true });
+      restored += 1;
+    } catch {
+      // No backup, so there was nothing to keep.
+    }
+  }
+  return restored;
+}
+
+/** Drop the copies once a capture has completed and the new files are the good ones. */
+function dropDeepseekBackups(root) {
+  for (const name of DEEPSEEK_STATE_FILES) {
+    try {
+      fs.rmSync(path.join(root, `${name}.bak`), { force: true });
+    } catch {
+      // Nothing to remove.
+    }
+  }
+}
+
+/**
  * Whether deepseek-web has the three files it reads, and which are missing.
  *
  * It is a logged-in web channel, not an API-key channel: the proxy reads a cookie,
@@ -1957,9 +2014,15 @@ function apiHandler(adapter, runtime, projectAdapter) {
           return;
         }
         const before = deepseekWebStatus(runtime.settings);
+        // A capture overwrites all three files. A scan that dies half way through
+        // leaves a set that looks complete to `deepseekWebStatus` and is not - the
+        // panel would go on saying "ready" for a channel whose token is stale. The
+        // originals are kept and put back unless the capture actually finished.
         if (before.configured) {
-          sendJson(res, 200, { ...before, started: false, alreadyConfigured: true });
-          return;
+          const kept = backUpDeepseekState(root);
+          if (kept > 0) {
+            runtime.record(`deepseek-web: kept a copy of the current state (${kept} file(s))`);
+          }
         }
         // The capture opens a browser and waits for a QR scan, so it cannot be
         // awaited here. It runs detached and reports through the log tab, which is
@@ -1992,24 +2055,38 @@ function apiHandler(adapter, runtime, projectAdapter) {
         child.on('exit', (code) => {
           runtime.deepseekSetup = null;
           const after = deepseekWebStatus(runtime.settings);
+          // Both have to hold. `after.configured` alone is not enough: the capture
+          // writes the token and the headers before the cookie, so a scan that dies
+          // part way leaves all three present and the panel calls that broken set
+          // ready. The script exits non-zero on every failure path, so the code is
+          // what says whether the run actually finished.
+          const finished = code === 0 && after.configured;
           runtime.record(
-            after.configured
+            finished
               ? 'deepseek-web: capture finished; the channel is ready'
               : `deepseek-web: capture exited ${code} without completing (missing ${after.missing.join(', ')})`,
           );
-          if (after.configured) {
+          if (finished) {
+            dropDeepseekBackups(root);
             // Show it: the channel works, and leaving it hidden after the user just
             // set it up would be a second thing to figure out.
             applyHiddenChannels([...BLOCKED_CHANNELS].filter((name) => name !== 'deepseek-web'));
+          } else {
+            const restored = restoreDeepseekState(root);
+            if (restored > 0) {
+              runtime.record(`deepseek-web: capture incomplete; restored ${restored} file(s)`);
+            }
           }
         });
         child.on('error', (error) => {
           runtime.deepseekSetup = null;
           runtime.record(`deepseek-web: capture failed to start: ${error.message}`);
+          restoreDeepseekState(root);
         });
-        sendJson(res, 202, { ...before, started: true, alreadyConfigured: false });
+        sendJson(res, 202, { ...before, started: true, reconfigured: before.configured });
         return;
-      }      if (method === 'POST' && route === '/start') {
+      }
+      if (method === 'POST' && route === '/start') {
         await runtime.start();
         return sendJson(res, 200, runtime.snapshot());
       }

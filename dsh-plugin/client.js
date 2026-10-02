@@ -35,6 +35,8 @@ window.__ModuleLoader__.load({
         keySet: '已设置（{what}）。留空保存不会清除它。',
         keyMissing: '未设置。没有 key 时该渠道不列模型。',
         deepseekSetup: '一键配置',
+    deepseekRecapture: '重新配置',
+    deepseekRecaptureConfirm: '重新配置会覆盖现有的 cookie / token / 浏览器头。确定继续？',
         deepseekRunning: '正在配置…',
         deepseekReady: '登录态已就绪。',
     commandcodeLogin: '一键登录',
@@ -69,6 +71,9 @@ window.__ModuleLoader__.load({
         keySet: 'Set ({what}). Saving with the field empty leaves it alone.',
         keyMissing: 'Not set. Without a key the channel lists no models.',
         deepseekSetup: 'Set up',
+    deepseekRecapture: 'Re-capture',
+    deepseekRecaptureConfirm:
+      'Re-capturing replaces the current cookie / token / browser headers. Continue?',
         deepseekRunning: 'Setting up…',
         deepseekReady: 'Login state is ready.',
     commandcodeLogin: 'Sign in',
@@ -495,7 +500,13 @@ window.__ModuleLoader__.load({
         hiddenChannels: hiddenNow,
         channelKeys,
       })
-      const setUpDeepseek = () => act('/deepseek-web/setup')
+      const setUpDeepseek = () => {
+        // Re-capturing replaces working credentials. The originals are copied aside
+        // first and put back if the capture does not finish, so the worst case is a
+        // wasted scan - but the person still deserves to be told before it starts.
+        if (deepseek.configured && !globalThis.confirm?.(t('deepseekRecaptureConfirm'))) return
+        act('/deepseek-web/setup')
+      }
       // CommandCode signs in through the browser, so the button cannot be a spawn:
       // the proxy hands back a URL and waits up to ten minutes for the callback.
       // The state is kept here to cover the gap between the click and the next
@@ -691,7 +702,13 @@ window.__ModuleLoader__.load({
               type: 'button',
               onClick: setUpDeepseek,
               disabled: busy || deepseek.running,
-            }, deepseek.running ? t('deepseekRunning') : t('deepseekSetup')),
+            }, deepseek.running
+              ? t('deepseekRunning')
+              // The state is capturable more than once - cookies and the bearer token
+              // both expire, and re-running the capture is how that gets fixed. A
+              // button that silently does nothing once the files exist is worse than
+              // no button, so it says what it will do instead.
+              : (deepseek.configured ? t('deepseekRecapture') : t('deepseekSetup'))),
             h('span', { className: 'apx_muted' }, t('deepseekHint')),
           ),
         ),
