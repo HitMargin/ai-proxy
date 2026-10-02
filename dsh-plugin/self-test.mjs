@@ -495,6 +495,16 @@ try {
   );
   assert.deepEqual(projectResolved.inputModalities, ['text', 'image']);
   assert.equal(projectResolved.context.contextWindow, 1000000);
+
+  // The token meter reaches `adapter.imageRequestPricing(...)` during compaction.
+  // That optional chain guards a route that is not registered, not a method that
+  // does not exist - and this class is written from scratch rather than extending
+  // the base adapter that supplies a default, so the call threw
+  // 'imageRequestPricing is not a function' and a session that needed compacting
+  // could not. Declaring no pricing is the honest answer; inventing a figure for an
+  // upstream whose vision accounting is unknown is not.
+  assert.equal(typeof adapter.imageRequestPricing, 'function');
+  assert.equal(adapter.imageRequestPricing('ai-proxy', resolved.id), undefined);
   assert.equal(projectResolved.defaultMaxTokens, 64000);
   const events = [];
   for await (const event of adapter.stream({

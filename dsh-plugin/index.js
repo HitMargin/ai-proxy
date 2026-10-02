@@ -1219,6 +1219,26 @@ export class AiProxyAdapter {
     return { id: provider, name: this.displayName };
   }
 
+  /**
+   * Declare no provider-side image pricing.
+   *
+   * The base adapter this contract expects has it as an optional method whose
+   * default returns nothing, and consumers fall back to their own neutral
+   * estimate. This class is written from scratch rather than extending that
+   * base, so the method was simply absent - and the token meter reaches it as
+   * `adapter.imageRequestPricing(...)`, where the optional chain guards a route
+   * that is not registered, not a method that does not exist. The result was
+   * `... .imageRequestPricing is not a function` thrown from the meter, which
+   * runs during compaction - so a session that needed compacting could not.
+   *
+   * Returning undefined is the honest answer: this proxy does not know how the
+   * upstream meters vision, so it must not invent a figure. It has to answer
+   * synchronously and without I/O, as the contract requires.
+   */
+  imageRequestPricing(_provider, _model) {
+    return undefined;
+  }
+
   providerRetryPolicy() {
     return Object.freeze({
       mode: 'normal',
