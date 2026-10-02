@@ -498,9 +498,10 @@ window.__ModuleLoader__.load({
       const setUpDeepseek = () => act('/deepseek-web/setup')
       // CommandCode signs in through the browser, so the button cannot be a spawn:
       // the proxy hands back a URL and waits up to ten minutes for the callback.
-      // The state is kept here because the ten-second snapshot can land between
-      // states - showing "sign in" while the callback is already on its way is how
-      // a working flow reads as broken.
+      // The state is kept here to cover the gap between the click and the next
+      // ten-second snapshot, and it carries the baseline the server reported at that
+      // moment - which is how the card tells "the flow started" from "the flow
+      // finished" instead of painting over the server forever.
       const [commandLogin, setCommandLogin] = useState(null)
       const startCommandLogin = async () => {
     setBusy(true)
@@ -508,7 +509,7 @@ window.__ModuleLoader__.load({
     try {
       const response = await fetch('/api/ai-proxy/commandcode/login', { method: 'POST' })
       const status = await response.json()
-      setCommandLogin(status)
+      setCommandLogin({ ...status, baseline: data?.login?.status ?? null })
       // Opened here rather than on click, so a popup blocker is the only thing that
       // can stop it - and the link is on screen either way, so nothing is lost.
       if (typeof status?.authUrl === 'string' && status.authUrl) {
@@ -521,13 +522,25 @@ window.__ModuleLoader__.load({
       setBusy(false)
     }
   }
-  const cancelCommandLogin = () => act('/commandcode/login/cancel')
-  // The snapshot carries the proxy's own view of the flow. A local state wins while
-  // it is set, so the card does not flicker back to "sign in" on the ten-second
-  // tick between the click and the callback landing.
+  // Cancel has to drop the local copy as well as stop the flow. Calling the route
+  // without it leaves a card that still reads "waiting" over an idle server -
+  // which is exactly what a broken cancel button looks like.
+  const cancelCommandLogin = () => {
+    setCommandLogin(null)
+    act('/commandcode/login/cancel')
+  }
   // The commandcode snapshot is the base of this payload, so its fields are at the
   // top level rather than under a channel name.
-  const loginView = commandLogin ?? data?.login ?? null
+  //
+  // The proxy is the only thing that knows whether the callback landed, so its answer
+  // wins the moment it differs from what it said when we clicked. Holding the local
+  // copy unconditionally is what left this card reading "waiting" after a sign-in
+  // that had already succeeded, and what made cancel look broken: the route ran, the
+  // server went idle, and a stale local state kept painting over it.
+  const serverLogin = data?.login ?? null
+  const loginView = commandLogin && (!commandLogin.baseline || serverLogin?.status === commandLogin.baseline)
+    ? commandLogin
+    : serverLogin ?? commandLogin
   const loginWaiting = loginView?.status === 'waiting'
   const loginSignedIn = loginView?.status === 'done' || loginView?.status === 'success'
   const commandAccounts = Array.isArray(data?.accounts)
