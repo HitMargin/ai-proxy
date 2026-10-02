@@ -1603,6 +1603,12 @@ export class AiProxyAdapter {
       for (const block of toolBlocks.values()) {
         yield { type: 'block-end', index: block.index, block: { type: 'tool-call', id: block.id, name: block.name, arguments: block.args } };
       }
+      // The usage record says a turn failed; the log is where a person looks. Without
+      // this a cut stream leaves the panel log silent and the only symptom is the
+      // harness reporting an empty response, with nothing here to explain it.
+      this.runtime?.record?.(
+        `${modelId}: stream ended before [DONE] (exit path), delivered=${delivered ? 'partial' : 'nothing'}`,
+      );
       yield {
         type: 'finish',
         reason: {
@@ -1615,6 +1621,41 @@ export class AiProxyAdapter {
             // work and pay for it twice, so only the empty case is retryable. The
             // empty one is exactly the case a retry can help.
             code: delivered ? 'stream_cut' : 'TRANSPORT',
+          },
+        },
+      };
+      return;
+    }
+    // A stream that carried its terminal marker and produced nothing at all.
+    //
+    // This used to fall through and finish cleanly. A turn with no blocks is what
+    // the harness reports as "Provider returned an empty response" - and it reads a
+    // clean stop as the model having finished, so the failure looked like the model
+    // choosing to say nothing. Nothing was delivered, so a retry is safe here, which
+    // is the same rule the cut path above follows.
+    if (textIndex === undefined && reasoningIndex === undefined && toolBlocks.size === 0) {
+      this.runtime?.record?.(`${modelId}: stream completed with no content blocks; reporting a retryable failure`);
+      recordUsage({
+        at: startedAt,
+        model: modelId,
+        effort: typeof options.reasoningEffort === 'string' ? options.reasoningEffort : '',
+        ok: false,
+        input: usage?.inputTokens ?? 0,
+        output: usage?.outputTokens ?? 0,
+        reasoning: usage?.reasoningTokens ?? 0,
+        decodeTokens: 0,
+        ttftMs: firstDeltaAt === undefined ? undefined : firstDeltaAt - startedAt,
+        decodeMs: firstDeltaAt === undefined ? undefined : Date.now() - firstDeltaAt,
+        origin: 'harness',
+        truncated: true,
+      });
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: 'ai-proxy stream completed without delivering any content',
+            code: 'TRANSPORT',
           },
         },
       };

@@ -282,6 +282,18 @@ globalThis.fetch = async (input, init = {}) => {
   if (streamMode === 'cut-empty') {
     return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }
+  // A well-formed stream: a reason is named and [DONE] arrives, but not a single
+  // content, reasoning or tool block was ever opened. This is what the harness
+  // reports as "Provider returned an empty response".
+  if (streamMode === 'done-empty') {
+    return new Response(
+      [
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":1}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
   return new Response([
     'data: {"choices":[{"delta":{"content":"pong"},"finish_reason":null}]}\n\n',
     'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n',
@@ -536,6 +548,22 @@ try {
   assert.equal(emptyFinish?.reason?.kind, 'error');
   assert.equal(emptyFinish?.reason?.failure?.code, 'TRANSPORT');
   assert.match(emptyFinish?.reason?.failure?.message ?? '', /no output delivered/);
+
+  // A stream that ends properly but delivers nothing. This finished cleanly before,
+  // and a clean finish with no blocks is exactly what the harness turns into
+  // "Provider returned an empty response" - so the agent loop read a broken turn as
+  // the model choosing to say nothing. Nothing was delivered, so a retry is safe.
+  streamMode = 'done-empty';
+  const doneEmptyEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'do the thing' }],
+    maxTokens: 32,
+  }, resolved)) doneEmptyEvents.push(event);
+  const doneEmptyFinish = doneEmptyEvents.find((e) => e.type === 'finish');
+  assert.equal(doneEmptyFinish?.reason?.kind, 'error', 'a stream that delivered nothing is not a clean stop');
+  assert.equal(doneEmptyFinish?.reason?.failure?.code, 'TRANSPORT');
+  assert.match(doneEmptyFinish?.reason?.failure?.message ?? '', /without delivering any content/);
 
   // A stream that carried its terminal marker is still reported as a stop.
   streamMode = 'normal';
