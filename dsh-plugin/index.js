@@ -84,6 +84,43 @@ const DEFAULT_HIDDEN_CHANNELS = [
 ];
 
 /**
+ * One entry per channel that gets its own group in the model picker.
+ *
+ * The key is the registered provider id, and therefore also the first segment
+ * of every model id that channel serves. The value is only the heading label.
+ *
+ * The Host groups its catalog strictly by provider id (`buildModelCatalog`)
+ * and reads the heading from `providerInfo().name`, so this map is the
+ * entire mechanism - the Host has no per-model grouping at all.
+ *
+ * @type {Record<string, string>}
+ */
+const CHANNEL_GROUPS = {
+  commandcode: 'CommandCode',
+  cnb: 'CNB',
+  'deepseek-web': 'DeepSeek 网页端',
+  kilo: 'Kilo',
+  tokenharbor: 'TokenHarbor',
+  trae: 'TRAE',
+  zen: 'Zen',
+};
+
+/**
+ * The channel a model id belongs to: the segment before the first slash.
+ *
+ * Not a shape guess. `deepseek/test` is a model family and
+ * `kilo/openrouter/free` is a Kilo model that merely names a vendor, so
+ * a leading segment names a channel only when it is one we wrote down.
+ *
+ * @param modelId a possibly prefixed model id
+ * @returns the leading segment
+ */
+function channelOf(modelId) {
+  const id = String(modelId ?? '');
+  return id.includes('/') ? id.slice(0, id.indexOf('/')) : id;
+}
+
+/**
  * The channels the user has switched off, which the panel owns.
  *
  * Kept as a module-level set because `isBlockedModelId` is a free function reached
@@ -1349,6 +1386,13 @@ export class AiProxyAdapter {
     // rows, and the Host asks for one per model - without this it refetched the
     // whole roster 93 times for a single catalog build.
     this.catalogGate = new CatalogGate();
+    // Read in the constructor, never assigned in apply(): a capability set
+    // afterwards leaves every call outside apply() answering with the whole
+    // aggregate, which looks exactly like the split not existing. One gate per
+    // provider, so no group answers with another group's rows.
+    this.channelGroups = options.channelGroups ?? null;
+    this.displayNames = options.displayNames ?? null;
+    this.groupGates = new Map();
     // One gate per per-channel route. A single shared cache would answer one
     // channel's request with another channel's rows.
     this.routeGates = new Map();
@@ -1403,7 +1447,72 @@ export class AiProxyAdapter {
   }
 
   providerInfo(provider) {
-    return { id: provider, name: this.displayName };
+    // The Host asks once per registered provider, including every channel
+    // group, so the name has to be that group's own label. Handing all of them
+    // this adapter's single displayName is what makes every group look
+    // identical in the picker.
+    const channel = this.channelFor(provider);
+    return {
+      id: provider,
+      name: channel === null ? this.displayName : this.displayNameFor(channel),
+    };
+  }
+
+  /**
+   * The provider that is answering, from whichever shape the caller used.
+   *
+   * The Host's own registry calls `adapter.listModels(provider)` - the
+   * contract's parameter is named `provider` and it is a **bare string**,
+   * not an options bag. This adapter's own callers pass a bag. Both are
+   * accepted because the two shapes are indistinguishable at the call site, and
+   * reading only one made every channel group answer with the whole aggregate
+   * stamped `ai-proxy`, which the Host rejected for all seven groups at
+   * once (INVALID_CATALOG).
+   *
+   * @param input either a provider string or an options bag carrying one
+   * @returns the answering provider; this adapter's own route by default
+   */
+  providerFor(input) {
+    const asked = typeof input === 'string'
+      ? input
+      : (isRecord(input) && typeof input.provider === 'string' ? input.provider : '');
+    return asked !== '' ? asked : this.provider;
+  }
+
+  /**
+   * The channel group this provider stands for, or null for the aggregate.
+   *
+   * Grouping is the Host's: `buildModelCatalog` buckets strictly by
+   * provider id, so splitting the picker means registering one provider per
+   * channel. The aggregate keeps its own provider so a session that already
+   * selected `ai-proxy/<channel>/<model>` still resolves unchanged.
+   */
+  channelFor(provider) {
+    if (this.channelGroups === null) return null;
+    const asked = this.providerFor(provider);
+    if (asked === this.provider) return null;
+    return asked;
+  }
+
+  displayNameFor(channel) {
+    return this.displayNames?.[channel] ?? channel;
+  }
+
+  /**
+   * One catalog gate per provider.
+   *
+   * The gate's key is `which batch did these rows come from`. Sharing one
+   * across providers answers every channel with the first one's rows - the same
+   * mistake the per-channel route gates prevent, one level up.
+   */
+  gateFor(provider) {
+    if (this.channelGroups === null) return this.catalogGate;
+    let gate = this.groupGates.get(provider);
+    if (gate === undefined) {
+      gate = new CatalogGate();
+      this.groupGates.set(provider, gate);
+    }
+    return gate;
   }
 
   /**
@@ -1437,18 +1546,40 @@ export class AiProxyAdapter {
     });
   }
 
-  async listModels(options = {}) {
+  /**
+   * List the models this provider serves.
+   *
+   * @param input the Host passes a **bare provider string**; this adapter's own
+   *   callers pass `{ provider, force }`. Both are accepted - see providerFor.
+   * @returns rows for that provider, each stamped with the provider it is listed
+   *   under: the Host validates `model.provider === provider` per listing.
+   */
+  async listModels(input = {}) {
+    // providerFor is the single place that accepts both shapes, on purpose:
+    // normalising here as well looked harmless but meant the string case was
+    // handled twice, and a test that broke only the second copy still passed.
+    const options = isRecord(input) ? input : { provider: input };
+    const provider = this.providerFor(options);
+    const channel = this.channelFor(provider);
     // Every reader goes through one gate: `resolveModel` asks per model, and the
     // panel asks on a ten-second poll. Uncached, a catalog build alone asked the
     // proxy 186 times for 93 models.
-    if (options.force) this.catalogGate.refresh();
-    return this.catalogGate.read(async () => {
+    if (options.force) this.gateFor(provider).refresh();
+    return this.gateFor(provider).read(async () => {
       const response = await this.request('/models');
       const payload = await response.json();
       const rows = Array.isArray(payload?.data) ? payload.data : [];
       const normalized = rows
         .filter((row) => isRecord(row) && typeof row.id === 'string')
-        .map((row) => normalizeModel(this.provider, row));
+        // A channel group sees only its own models. Ids are already
+        // `channel/model`, so the channel is the first segment - no renaming
+        // needed, and an old `ai-proxy/kilo/x` id still resolves unchanged.
+        .filter((row) => channel === null || channelOf(row.id) === channel)
+        // Stamped with the provider that asked, NOT with the channel the row
+        // belongs to. The Host checks `model.provider === provider` against
+        // the provider being listed, so claiming the channel instead fails
+        // validation and takes the whole catalog down with it.
+        .map((row) => normalizeModel(provider, row));
       // An empty listing is reported as "no answer" rather than as a roster, so
       // one bad read cannot retire every channel: the gate keeps the previous rows
       // and, with nothing cached, opens its cooldown so a dead proxy is not asked
@@ -1458,8 +1589,12 @@ export class AiProxyAdapter {
   }
 
   async listProjectModels(options = {}) {
-    if (options.force) this.catalogGate.refresh();
-    const discovered = await this.listModels();
+    // Carried through, not dropped: a per-channel group has to get its own rows
+    // here too, or the panel keeps showing one undivided list.
+    const provider = this.providerFor(options);
+    const group = this.channelFor(provider);
+    if (options.force) this.gateFor(provider).refresh();
+    const discovered = await this.listModels(options);
     // Remembered so a restart can say what changed. The roster itself is never
     // cached - every call reads it fresh, which is what makes the panel's list live.
     const models = [];
@@ -1470,6 +1605,11 @@ export class AiProxyAdapter {
         blocked += 1;
         continue;
       }
+      // No channel filter here: the extras loop below already skips every route
+      // that is not this group (see its guard), and the aggregate rows reaching
+      // this point were filtered by listModels. Kept as a note because deleting
+      // the guard below does not turn any test red - it is defence in depth,
+      // not load-bearing.
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       models.push(model);
@@ -1485,6 +1625,10 @@ export class AiProxyAdapter {
       // channel's rows would be discarded, so polling it every snapshot was pure
       // log noise; an unconfigured one would list models that 400 on use.
       if (isBlockedModelId(`${route.prefix}/x`)) return [];
+      // A channel group must not see another channel's extras. This route is a
+      // second, independent source of rows, so filtering only the aggregate
+      // listing above leaves every group listing the whole proxy.
+      if (group !== null && route.prefix !== group) return [];
       if (route.requiresDeepseekLogin && !deepseekWebStatus(this.runtime?.settings ?? {}).configured) {
         return [];
       }
@@ -1514,7 +1658,11 @@ export class AiProxyAdapter {
           return rows.length === 0 ? undefined : rows;
         });
         return rows.filter(isRecord).map((row) => {
-          const normalized = normalizeModel(this.provider, row);
+          // Stamped with the provider that asked, like every other row in this
+          // listing. The Host checks model.provider === provider per listing, so a
+          // row found through a per-channel route still has to claim the group it
+          // is being listed under. Which route found it does not change that.
+          const normalized = normalizeModel(provider, row);
           return {
             ...normalized,
             id: `${route.prefix}/${row.id}`,
@@ -2582,9 +2730,28 @@ export function apply(ctx, config = {}) {
   const runtime = new ProxyRuntime(config);
   const resolveImage = installImageResolver(ctx, ctx?.logger);
   const adapter = new AiProxyAdapter({ runtime, resolveImage });
-  const projectAdapter = new ProjectAdapter({ runtime, resolveImage });
+  // The roster goes through the constructor: a capability assigned afterwards
+  // leaves every call outside apply() answering with the whole aggregate, which
+  // looks exactly like the split not existing.
+  const projectAdapter = new ProjectAdapter({
+    runtime,
+    resolveImage,
+    channelGroups: CHANNEL_GROUPS,
+    displayNames: CHANNEL_GROUPS,
+  });
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
-  const registration = ctx.llm.registerAdapter([PROJECT_ROUTE], projectAdapter);
+  const groupProviders = Object.keys(CHANNEL_GROUPS);
+  // One adapter instance serves every provider: the Host's registerAdapter takes
+  // a list and asks providerInfo(provider) once per entry, so each group narrows
+  // its own listing through the same object.
+  const registration = ctx.llm.registerAdapter(
+    [PROJECT_ROUTE, ...groupProviders],
+    projectAdapter,
+  );
+  // ai-proxy stays the only configurable provider. Registering the channels
+  // here would put seven API-key prompts in the settings page for one proxy that
+  // has a single address - dead controls, and the user asked for this split to be
+  // invisible outside the picker.
   ctx.llm.registerConfigurableProviders?.([
     { provider: PROJECT_ROUTE, displayName: 'ai-proxy', settingsNs: entryId, settingsPath: [] },
   ]);

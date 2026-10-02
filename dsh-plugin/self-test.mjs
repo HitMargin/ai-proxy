@@ -423,7 +423,15 @@ try {
     apiKeyEnv: 'TEST_BRIDGE_KEY',
   });
   assert.equal(typeof dispose, 'function');
-  assert.deepEqual(registeredRoutes, ['ai-proxy']);
+  // The aggregate stays and every channel joins it as its own provider: the Host
+  // groups its catalog strictly by provider id, so this list IS the grouping.
+  // Dropping the aggregate would break a session that already selected
+  // ai-proxy/commandcode/x; dropping a channel would merge its models back into
+  // the one undivided list this split exists to divide.
+  assert.deepEqual(registeredRoutes, [
+    'ai-proxy', 'commandcode', 'cnb', 'deepseek-web',
+    'kilo', 'tokenharbor', 'trae', 'zen',
+  ]);
   assert.equal(modelCalls, 0);
   const models = await discovery();
   assert.equal(models[0].id, 'deepseek/test');
@@ -1377,6 +1385,105 @@ try {
     assert.equal(shared.routeGate('tokenharbor'), shared.routeGate('tokenharbor'), 'and it is stable per channel');
   }
 
+  // The groups have to be real, not just registered. Each provider is asked for
+  // its own listing and must get only its own rows - one shared gate would answer
+  // every group with the first one's, which presents as the same models repeated
+  // under seven headings.
+  //
+  // Asked with a **bare string**, the way the Host's own registry calls it. Every
+  // other call in this suite passes an options bag, a shape the Host never uses -
+  // and a suite that only ever passes the bag cannot see a provider whose answer
+  // is stamped for the wrong group. That is exactly how all seven groups failed at
+  // once, with INVALID_CATALOG, while this suite stayed green.
+  for (const group of registeredRoutes) {
+    const listed = await adapter.listModels(group);
+    const rows = listed ?? [];
+    // The Host validates model.provider === provider and unique ids per listing.
+    // Replayed here so this suite fails on the same rule the Host enforces.
+    assert.deepEqual(
+      rows.filter((model) => model.provider !== group).map((model) => model.id).slice(0, 3),
+      [],
+      `the Host rejects "${group}": rows must claim the provider they are listed under`,
+    );
+    assert.equal(
+      new Set(rows.map((model) => model.id)).size,
+      rows.length,
+      `the Host rejects "${group}": duplicate ids in one listing`,
+    );
+    // A channel with nothing today still keeps its group: the switch has to
+    // survive a channel that lists nothing, which is what the KNOWN_CHANNELS
+    // baseline exists for.
+    if (rows.length === 0) continue;
+    const first = (id) => (id.includes('/') ? id.slice(0, id.indexOf('/')) : id);
+    if (group !== 'ai-proxy') {
+      assert.deepEqual(
+        rows.filter((model) => first(model.id) !== group).map((model) => model.id).slice(0, 3),
+        [],
+        `the "${group}" group must list only ${group} models`,
+      );
+    }
+  }
+  // The extras discovery path is a second source of rows, so it has to be
+  // checked separately - filtering only the aggregate listing is what let every
+  // channel group answer with the whole proxy.
+  for (const group of registeredRoutes) {
+    const rows = await adapter.listProjectModels({ provider: group });
+    if (rows.length === 0) continue;
+    const first = (id) => (id.includes('/') ? id.slice(0, id.indexOf('/')) : id);
+    assert.deepEqual(
+      group === 'ai-proxy'
+        ? []
+        : rows.filter((model) => first(model.id) !== group).map((model) => model.id).slice(0, 3),
+      [],
+      `listProjectModels("${group}") must not leak another channel's rows`,
+    );
+    assert.deepEqual(
+      rows.filter((model) => model.provider !== group).map((model) => model.id).slice(0, 3),
+      [],
+      `listProjectModels("${group}") rows must claim that provider`,
+    );
+  }
+  // Each group is a heading in the picker, so it needs its own label. Uniform
+  // labels render as seven identically-titled sections - the exact complaint the
+  // split was meant to fix, and it breaks nothing else, so nothing else catches it.
+  {
+    const labels = new Map();
+    for (const group of registeredRoutes) {
+      const info = adapter.providerInfo(group);
+      assert.equal(info.id, group, `providerInfo("${group}") must report that provider`);
+      labels.set(group, info.name);
+    }
+    assert.equal(
+      labels.get('ai-proxy'),
+      'ai-proxy',
+      'the aggregate keeps its own heading',
+    );
+    const channelLabels = [...labels].filter(([g]) => g !== 'ai-proxy').map(([, n]) => n);
+    assert.equal(
+      new Set(channelLabels).size,
+      channelLabels.length,
+      `every channel group needs its own heading, got ${JSON.stringify(channelLabels)}`,
+    );
+    for (const [group, name] of labels) {
+      if (group === 'ai-proxy') continue;
+      assert.ok(
+        name && name !== group,
+        `the "${group}" heading must be a readable label, not the raw provider id`,
+      );
+    }
+  }
+
+  // And the aggregate still answers with everything, so a session that already
+  // selected `ai-proxy/<channel>/<model>` keeps resolving to the same request.
+  {
+    const all = await adapter.listProjectModels({ provider: 'ai-proxy' });
+    const channels = registeredRoutes.filter((route) => route !== 'ai-proxy');
+    const present = new Set(all.map((model) => model.id.split('/')[0]));
+    assert.ok(
+      channels.some((channel) => present.has(channel)),
+      'the aggregate must still serve the channels',
+    );
+  }
   // NOTE: no assertion here covers `KNOWN_CHANNELS` for a channel that lists
   // nothing. The only existing loop is over channels the fixture *does* list, so
   // those also arrive through the roster - deleting one of them from
