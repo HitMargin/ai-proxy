@@ -1322,6 +1322,10 @@ export async function handleCommandCode(
       accounts,
       activeAccounts,
       catalogError: status.catalogError ?? null,
+      // The sign-in flow's state. This response is rebuilt field by field rather than
+      // passed through, so a field it does not name is a field the panel cannot see -
+      // which is how a sign-in button ends up with nothing to show while waiting.
+      login: status.login ?? { status: "unknown" },
       cache: status.cache,
     });
   }

@@ -37,6 +37,13 @@ window.__ModuleLoader__.load({
         deepseekSetup: '一键配置',
         deepseekRunning: '正在配置…',
         deepseekReady: '登录态已就绪。',
+    commandcodeLogin: '一键登录',
+    commandcodeWaiting: '等待浏览器回调…（最多 10 分钟）',
+    commandcodeSignedIn: '已登录。账号已写入 commandcode-accounts.json。',
+    commandcodeOpenLink: '打开登录页',
+    commandcodeCancel: '取消',
+    commandcodeAccounts: '{count} 个账号可用',
+    loginPopupBlocked: '浏览器拦截了新窗口，请点下面的链接手动打开。',
         deepseekMissing: '缺少：{what}',
         deepseekHint: '会打开浏览器，扫码登录后自动保存 cookie / token / 浏览器头。过程见「日志」。',
         speedNote: '输出速度只统计解码窗口 ≥250ms 且速率 ≤250 tok/s 的调用；窗口太短的一次性回答不算速度。',
@@ -64,6 +71,13 @@ window.__ModuleLoader__.load({
         deepseekSetup: 'Set up',
         deepseekRunning: 'Setting up…',
         deepseekReady: 'Login state is ready.',
+    commandcodeLogin: 'Sign in',
+    commandcodeWaiting: 'Waiting for the browser callback… (up to 10 minutes)',
+    commandcodeSignedIn: 'Signed in. The account was written to commandcode-accounts.json.',
+    commandcodeOpenLink: 'Open the sign-in page',
+    commandcodeCancel: 'Cancel',
+    commandcodeAccounts: '{count} account(s) ready',
+    loginPopupBlocked: 'The browser blocked the new window; use the link below.',
         deepseekMissing: 'Missing: {what}',
         deepseekHint: 'Opens a browser, waits for a QR scan, then saves the cookie, token and header set. Progress is in the log.',
         available: 'available', throttled: 'throttled', unavailable: 'unavailable', unprobed: 'unprobed',
@@ -482,6 +496,43 @@ window.__ModuleLoader__.load({
         channelKeys,
       })
       const setUpDeepseek = () => act('/deepseek-web/setup')
+      // CommandCode signs in through the browser, so the button cannot be a spawn:
+      // the proxy hands back a URL and waits up to ten minutes for the callback.
+      // The state is kept here because the ten-second snapshot can land between
+      // states - showing "sign in" while the callback is already on its way is how
+      // a working flow reads as broken.
+      const [commandLogin, setCommandLogin] = useState(null)
+      const startCommandLogin = async () => {
+    setBusy(true)
+    setError('')
+    try {
+      const response = await fetch('/api/ai-proxy/commandcode/login', { method: 'POST' })
+      const status = await response.json()
+      setCommandLogin(status)
+      // Opened here rather than on click, so a popup blocker is the only thing that
+      // can stop it - and the link is on screen either way, so nothing is lost.
+      if (typeof status?.authUrl === 'string' && status.authUrl) {
+        const opened = window.open(status.authUrl, '_blank', 'noopener')
+        if (!opened) setError(t('loginPopupBlocked'))
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+  const cancelCommandLogin = () => act('/commandcode/login/cancel')
+  // The snapshot carries the proxy's own view of the flow. A local state wins while
+  // it is set, so the card does not flicker back to "sign in" on the ten-second
+  // tick between the click and the callback landing.
+  // The commandcode snapshot is the base of this payload, so its fields are at the
+  // top level rather than under a channel name.
+  const loginView = commandLogin ?? data?.login ?? null
+  const loginWaiting = loginView?.status === 'waiting'
+  const loginSignedIn = loginView?.status === 'done' || loginView?.status === 'success'
+  const commandAccounts = Array.isArray(data?.accounts)
+    ? data.accounts.filter((account) => account.enabled).length
+    : Number(data?.activeAccounts ?? 0)
 
       const rows = useMemo(() => (Array.isArray(data?.models) ? data.models : []), [data])
       const projectRows = useMemo(
@@ -629,6 +680,32 @@ window.__ModuleLoader__.load({
               disabled: busy || deepseek.running,
             }, deepseek.running ? t('deepseekRunning') : t('deepseekSetup')),
             h('span', { className: 'apx_muted' }, t('deepseekHint')),
+          ),
+        ),
+        h('div', { className: 'apx_field' },
+          h('span', null, 'commandcode'),
+          h('p', { className: 'apx_tag' },
+            loginWaiting
+              ? t('commandcodeWaiting')
+              : loginSignedIn
+              ? t('commandcodeSignedIn')
+              : t('commandcodeAccounts', { count: String(commandAccounts) }),
+          ),
+          h('div', { className: 'apx_row' },
+            loginWaiting
+              // The sign-in page has to be reachable even if the popup was blocked,
+              // and the proxy is the one that will receive the callback, so the link
+              // stays on screen for the whole ten minutes.
+              ? h('a', { className: 'apx_btn', href: commandLogin?.authUrl, target: '_blank', rel: 'noreferrer' }, t('commandcodeOpenLink'))
+              : h('button', {
+                  className: 'apx_btn',
+                  type: 'button',
+                  onClick: startCommandLogin,
+                  disabled: busy,
+                }, t('commandcodeLogin')),
+            loginWaiting
+              ? h('button', { className: 'apx_btn danger', type: 'button', onClick: cancelCommandLogin, disabled: busy }, t('commandcodeCancel'))
+              : null,
           ),
         ),
         h('div', { className: 'apx_row' },

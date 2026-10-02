@@ -1727,6 +1727,11 @@ async function panelSnapshot(adapter) {
         lastUsedAt: Number(account.lastUsedAt ?? 0),
         source: typeof account.source === 'string' ? account.source : '',
       })),
+      // The login state, so the panel can show the sign-in URL in this path too.
+      // The primary branch returns /panel verbatim, which already carries it; only
+      // this fallback rebuilds the shape, and a field it forgets is a button that
+      // silently does nothing.
+      login: isRecord(status?.login) ? status.login : { status: 'unknown' },
       cache: isRecord(status?.cache) ? status.cache : {},
       generatedAt: new Date().toISOString(),
       panelSource: 'status-fallback',
@@ -1919,6 +1924,31 @@ function apiHandler(adapter, runtime, projectAdapter) {
         const next = await runtime.update(body);
         if (Array.isArray(body.hiddenChannels)) applyHiddenChannels(body.hiddenChannels);
         return sendJson(res, 200, next);
+      }
+      // CommandCode signs in through the browser: the proxy opens a local listener,
+      // hands back a URL, and waits up to ten minutes for the callback. Unlike the
+      // deepseek capture there is no script to spawn - the flow is already in the
+      // proxy - so this is a pass-through, and the panel's job is to show the URL
+      // and keep asking whether it landed.
+      if (method === 'POST' && /^\/commandcode\/login(?:\/cancel)?$/.test(route)) {
+        const proxyPath = route === '/commandcode/login'
+          ? '/commandcode/v1/login'
+          : '/commandcode/v1/login/cancel';
+        if (runtime.state !== 'running' && runtime.state !== 'external') await runtime.start();
+        const raw = await fetch(`${runtime.serviceUrl('/commandcode/v1')}${proxyPath.slice('/commandcode/v1'.length)}`, {
+          method: 'POST',
+          headers: { ...runtime.headers(), 'content-type': 'application/json' },
+          body: '{}',
+        })
+          .then((response) => response.json())
+          .catch((reason) => ({ status: { status: 'failed', error: String(reason) } }));
+        // POST /login answers `{authUrl, callbackUrl, status: {...}}` while the panel
+        // carries `login: {status: 'idle'}`. Handing the panel both shapes would make
+        // `status === 'waiting'` mean two different things depending on which one
+        // arrived, so only the inner object travels.
+        const status = isRecord(raw?.status) ? raw.status : raw;
+        sendJson(res, status.status === 'failed' ? 502 : 200, status);
+        return;
       }
       if (method === 'POST' && route === '/deepseek-web/setup') {
         const root = resolveProjectRoot(runtime.settings);

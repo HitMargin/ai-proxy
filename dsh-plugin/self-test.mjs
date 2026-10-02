@@ -20,6 +20,7 @@ const { apply, AiProxyAdapter, healthIndex } = await import('./index.js');
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
 let modelCalls = 0;
+let loginCalls = 0;
 let chatCalls = 0;
 let lastRequestHeaders = new Headers();
 let lastChatBody = null;
@@ -84,12 +85,22 @@ globalThis.fetch = async (input, init = {}) => {
       headers: { 'content-type': 'application/json' },
     });
   }
+  if (url.endsWith('/login')) {
+    loginCalls++;
+    return new Response(JSON.stringify({
+      ok: true,
+      authUrl: 'https://commandcode.test/studio/auth/cli?state=test',
+      callbackUrl: 'http://localhost:5959/callback',
+      status: { status: 'waiting', authUrl: 'https://commandcode.test/studio/auth/cli?state=test', callbackUrl: 'http://localhost:5959/callback' },
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
   if (url.endsWith('/status')) {
     return new Response(JSON.stringify({
       provider: 'commandcode',
       modelCount: 1,
       activeAccounts: 1,
       accounts: [{ id: 'test', enabled: true, cooling: false, keyName: 'must-not-leak' }],
+      login: { status: 'idle' },
       cache: { total: 1, sessions: 0 },
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
@@ -773,6 +784,27 @@ try {
     return JSON.parse(payload);
   })();
   assert.equal('channelKeySet' in settingsBody, false, 'the runtime snapshot is not where the panel reads it from');
+
+  // CommandCode signs in through the browser, so the button needs two things: the
+  // flow's state on the panel, and a route that starts it. The proxy answers
+  // POST /login with {authUrl, callbackUrl, status: {...}} while the panel carries
+  // login: {status: 'idle'} - handing the panel both would make `status === 'waiting'`
+  // mean two different things depending on which arrived.
+  assert.deepEqual(panel.login, { status: 'idle' }, 'the fallback panel must carry the login state');
+  const beforeLogin = loginCalls;
+  const loginBody = await (async () => {
+    let status = 0;
+    let payload = '';
+    await panelRoute.handler({ method: 'POST', url: '/api/ai-proxy-commandcode/commandcode/login', headers: { host: 'dsh.local' } }, {
+      writeHead(value) { status = value; },
+      end(value) { payload = value; },
+    });
+    assert.equal(status, 200);
+    return JSON.parse(payload);
+  })();
+  assert.equal(loginCalls, beforeLogin + 1, 'the button must actually start the flow');
+  assert.equal(loginBody.status, 'waiting');
+  assert.equal(typeof loginBody.authUrl, 'string');
   // The panel only shows 可用/限流/不可用 if the per-model verdicts are joined
   // onto the rows: /health keys samples by provider + unprefixed id, while the
   // roster uses `kilo/…`.
