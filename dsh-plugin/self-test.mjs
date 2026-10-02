@@ -1403,6 +1403,26 @@ try {
   // every ten seconds. Reading here cannot hide that.
   const firstSegment = (id) => (id.includes('/') ? id.slice(0, id.indexOf('/')) : id);
   for (const group of registeredRoutes) {
+    // Called the way the Host calls it - a bare string - not the options bag this
+    // suite used everywhere else. The bag happened to work and the string did not,
+    // so every group answered with the whole aggregate stamped `ai-proxy` and the
+    // Host rejected all seven at once; a suite that only ever passes a bag cannot
+    // see that. `listProjectModels` is checked separately below, because the panel
+    // is what calls that one.
+    const listed = await adapter.listModels(group);
+    // The Host's own check, replayed from its source: a row must claim the provider
+    // it is listed under, and ids must be unique within one listing. Getting the
+    // first one wrong is INVALID_CATALOG and takes the whole group down.
+    assert.deepEqual(
+      (listed ?? []).filter((model) => model.provider !== group).map((model) => model.id).slice(0, 3),
+      [],
+      `the Host rejects "${group}": rows must claim the provider they are listed under`,
+    );
+    assert.equal(
+      new Set((listed ?? []).map((model) => model.id)).size,
+      (listed ?? []).length,
+      `the Host rejects "${group}": duplicate ids in one listing`,
+    );
     const rows = await adapter.listProjectModels({ provider: group });
     // A channel with nothing today still has a group: the switch has to survive a
     // channel that lists nothing, which is the guarantee the KNOWN_CHANNELS baseline

@@ -1467,9 +1467,21 @@ export class AiProxyAdapter {
     return { id: route, name: channel === null ? this.displayName : this.displayNameFor(channel) };
   }
 
-  /** The provider that is answering: the one asked about, else our own route. */
-  providerFor(provider) {
-    return typeof provider === 'string' && provider !== '' ? provider : this.provider;
+  /**
+   * The provider that is answering: the one asked about, else our own route.
+   *
+   * Accepts both shapes on purpose. The Host calls `listModels(provider)` with a
+   * bare string, while this class's own callers pass an options bag - and reading
+   * only the bag made every channel group answer with the whole aggregate stamped
+   * `ai-proxy`, which the Host rejected with INVALID_CATALOG for all seven groups
+   * at once. **The caller's shape is part of the contract, not something to infer
+   * from what happens to work in a test.**
+   */
+  providerFor(input) {
+    const asked = typeof input === 'string'
+      ? input
+      : (isRecord(input) && typeof input.provider === 'string' ? input.provider : '');
+    return asked !== '' ? asked : this.provider;
   }
 
   /**
@@ -1536,7 +1548,16 @@ export class AiProxyAdapter {
     });
   }
 
-  async listModels(options = {}) {
+  async listModels(input = {}) {
+    // Two shapes reach here. The Host's own registry calls
+    // `adapter.listModels(provider)` with a bare string - the parameter is named
+    // `provider` in its contract - while this class's own callers pass an options
+    // bag. Normalising at the boundary is the only place both are visible; reading
+    // only the bag made every channel group answer with the whole aggregate
+    // stamped `ai-proxy`, and the Host rejected all seven groups at once with
+    // INVALID_CATALOG. **A parameter that arrives in two shapes has to accept two
+    // shapes - it is not safe to assume the one your own tests use.**
+    const options = typeof input === 'string' ? { provider: input } : (isRecord(input) ? input : {});
     // Every reader goes through one gate: `resolveModel` asks per model, and the
     // panel asks on a ten-second poll. Uncached, a catalog build alone asked the
     // proxy 186 times for 93 models.
