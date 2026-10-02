@@ -114,6 +114,36 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
 - git 已于今日 init（身份 HitMargin），`.gitignore` 已排除 cookies.txt / cnb-login.txt / deepseek-auth.txt / deepseek-cookies.txt / commandcode-accounts.json / *.bak 等。
 - **未决事项**：session journal/启动补删仍未完成。CommandCode `pause_turn` 目前仅支持尚未产生客户端输出时的有限同会话续写，输出开始后仍明确拒绝重放。TLS 指纹伪装（utls）仍未移植，受 Deno 限制；若要追 Zen 的 500 根因需先确认是否真与 TLS 有关。
 
+- **WorkBuddy 中国版（2026-10-03 新增渠道，`/workbuddy/v1`）**：移植自 `dsh-codearts-auth`（MIT）的 `buddy.ts`/`buddy-oauth.ts`/`buddy-adapter.ts`/`product.ts`，但**主机是中国版 `www.workbuddy.cn`**，不是参考实现里的国际版 `www.workbuddy.ai`。三条不能照抄的地方：① 国际版按模型族分档的 UA 表只服务国际版，中国版客户端产物里那张表是空的，所以只有单一 UA `WorkBuddy/5.6.2 WorkBuddy/5.6.2 CLI/5.6.2`（版本号取中国版文档站 Changelog 最新发布版，**不是**参考实现的 5.5.2，那是国际版桌面端）；② 静态兜底模型表**刻意留空**（拿国际版别名或按展示名猜 id = 把用户送进「选得到、调不通」的模型）；③ `X-Product` 聊天请求发归属名 `WorkBuddy`、目录请求发部署类型 `SaaS`，参考实现两处含义不同，两个常量必须分开命名。
+- **WorkBuddy 的请求体与 SSE 都是标准 OpenAI 形态**：本模块一个字节的帧转换都不做，`upstreamResponse.body` 直接透传。只做三件上游必须看到的事：凭据（401 后静默续期重试）、目录解析、流内 11140 窄判定。
+- **同名产品可以各有一个区域主机**：`www.workbuddy.cn` / `www.workbuddy.ai` / `copilot.tencent.com` 路径与响应结构完全相同、platform 同为 `workbuddy-ai`，实测三者的路由集一模一样。所以「参考实现里 WorkBuddy = 国际版」**推不出**「中国版 = copilot.tencent.com」——参考实现里那是它自己的映射。主机只能靠登录后打 `/v3/config` 判定（看哪个返回非空 `data.models`）。
+- **平台常量不能靠探测得**：`platform` 是纯回显字段，`POST /v2/plugin/auth/state?platform=totally-bogus-xyz` 返回 200 并把编造串原样回显在 `authUrl` 里。所以它只能来自客户端产物（登录 bundle 里的枚举 `Z.WORKBUDDYAI='workbuddy-ai'`）。
+- **`prompt_cache_key` 是费用量级差**：不带它 `prompt_tokens=8027, prompt_cache_hit_tokens=0, credit=0.34`，带上之后命中 7808、`credit=0.02`（约 17 倍）。代理从请求头 `x-session-id` / `x-conversation-id` 取，都没有才随机生成。
+- **登录轮询的两个超时**：`STATE_REQUEST_TIMEOUT_MS=10_000`（不能用通用 5s，实测 www.workbuddy.* 建连稳定 5860–7525ms）；聊天流 `AbortSignal.timeout(600_000)`（60s 会在长思考时把流掐断）。
+- **`/v2/plugin/auth/token` 只返回 `expiresIn`/`refreshExpiresIn` 相对秒数**，没有 `expiresAt`（e2e 实证 2026-09-11）。不换算的话 `expires_at` 恒为空串、面板显示「有效期未知」；相对秒数的基准取 JWT `iat`，否则用当前时间。
+- **JWT 解码必须用 `atob` 不能用 `Buffer`**：Buffer 是 Node 全局，Deno 不提供。JWT 兜底只在真登录/过期判定触发，正是最不该到运行期才炸、且测试容易漏的路径。
+- **解析不出过期时间 ⇒ 不判过期**：否则 `expires_at` 归一化失败的账号会被永久锁死在「请重新登录」。
+- **X-Domain 用 `||` 不用 `??`**：`readStringField` 对缺失字段返回**空串**不是 undefined，`??` 会把空值发出去。两处方向不同且都是故意的——聊天请求用**产品常量覆盖**凭据快照（凭据 domain 是登录时的历史快照，迁区后会过期，而 baseURL 来自 product endpoint，X-Domain 必须与目的地一致）；登录取 account 时用 `token.domain || product.apiDomain`（登录期服务端下发的值是权威的）。
+- **五个归属头一个都不能少**：`X-Product`/`X-Product-Code`/`X-IDE-Name`/`X-IDE-Type`/`X-IDE-Version`，后台「使用端」一栏靠它们归因，缺任一头显示 `-`。
+- **scope 字段实测是多行文本**，换行会破坏 YAML/JSON 往返，面板上表现为「有效期/昵称字段丢失」——所以写盘前必须 `stripControlChars`。
+- **目录必须取两个端点的并集**：`/console/enterprises/personal/models` 与 `/v3/config` 的 id 集合不同，促销 `modelIds` 只挂一侧。先到先得会让整批限时免费模型（如 `hy4-preview-f`）从选择器里消失，而服务端照常按它计费。同名 id 以企业端点为准（scoped 赢），另一侧独有的追加在后。
+- **倍率归一化的两个正则形状相反**：模型 credits 是 `'x0.29'`（前缀 x），促销 `discountedCredits` 是 `'0.50x'`（后缀 x）。共用正则会让**每一个**促销价静默失败 → 界面显示原价、后台按促销计费。
+- **促销 `factor: 0` 是「免费」不是「已结束」**：hy4-preview 夜间的 `{discountedCredits:'0x',factor:0}` 真的免费。但**无时间窗口**的 factor 0 促销仍按历史占位跳过。
+- **`schedule` 挂在 promotion 层，`discountedCredits`/`factor` 挂在 discount 层**——写成 `discount.schedule` 会让所有定时促销恒等于「无窗口」。且必须判定**本地时段窗口**：实测存在夜间 23:00–7:50 的 0.50x 促销，只看 `enabled` 会把夜间折扣显示一整天，用户按没折扣的预期被计费。
+- **promotion modelIds 引用但不在兜底表里的 id 要留下**（`agentReferenced`）：白名单式重建目录会把它整批丢掉。
+- **isAutoSelectAlias 只认字面量 `auto`/`default`**，不做前缀匹配——`default-model`/`fast-model` 被 craft 引用且是官方入口，前缀匹配会误杀。
+- **11140 是账号级拦截，且与真认证失败共用 HTTP 403**：不能靠状态码区分（403 同时覆盖真认证失败/额度/权限/安全策略），也不能走 `parseRateLimitError`（默认 1 小时，会和限流混淆，而 11140 冷却是 30 分钟且服务端不给解禁时间）。实测同一请求体发 7 个账号：2 个 200、4 个 403+11140、1 个 429 ⇒ **换号**而不是让用户改内容。
+- **流内 11140 的判据必须窄**：只有「**没有 `choices` 字段**」且正文命中 `/"code"s*:s*11140/` 的帧才算——模型正文里真的会讨论「安全审核」/出现 11140 字样，而合法内容帧一定带 `choices`。过去该帧被**静默丢弃**（帧分类器只认 `error`/`choices`/`usage`），表现为「干净地停了，没有任何失败」。判断复用同一份 `isContentRejection`，不做第二份拷贝——两份漂移正是 trae 那个 bug 的成因。
+- **deepseek 系必须同时带 `thinking:{type:'enabled'}` 和 `reasoning_effort`**，缺任一上游都按不思考应答（三点对比实测：裸请求 `reasoning_content` 恒 0；单给 `reasoning_effort:'high'` 才有思考；单给 `thinking:{type:'enabled'}` 仍为 0）。且该行为与 endpoint/UA 无关。
+- **只在目录确认该模型发布了这个档位时才发 `reasoning_effort`**：非 deepseek 模型选了未声明档位不兜底（发上去是 400）。
+- **Deno 的 `Deno.Command` 选项键叫 `windowsRawArguments`**，Node 的 `spawn` 才叫 `windowsVerbatimArguments`——同一语义的键名两边不同，照抄参考实现直接编译不过。
+- **登录 URL 只追加不重建**：`decorateLoginUrl` 在 `appendSessionParams` 为真时追加 `version=pluginVersion` 与 `loginSessionId=crypto.randomUUID()`；URL 非法原样返回。中国版是否也需要这两个参数尚未验证（plan 附录 B）。
+- **WorkBuddy 路由存在 ≠ 账号有资格签到**：`/v2/billing/meter/daily-checkin` 与 `/checkin-activity-status` 在 workbuddy.cn / workbuddy.ai / copilot.tencent.com 上都返回 401（**不是 404**），但中国版文档从未提及该活动，参考项目只是观察到国际版客户端 bundle 里没有这些字面量。所以 v1 不做签到按钮，状态记「待实测」。
+- **路由存在性探测需要一条对照路径**：`GET /totally/unknown/route/xyz` → 404 `{"error_msg":"404 Route Not Found"}`，而真实但未鉴权的路由 → 401（openresty HTML）。只看 404 会把「需要凭据」误判成「路由不存在」。
+- **业务 OK ≠ 有数据**：`/v3/config` 对编造的 bearer 照样回 200 且 `models:null`，判据是「非空数组」。
+- **凭据类渠道在 `isRosterDegraded` 里必须单独判**：`auth:{type:'none'}` 的渠道凭据在文件里，共享的 `hasChannelCredential` 会一直说「有凭据」，于是从首次启动起名单就被判 degraded —— 20 倍重取 + 每次启动告警，而该渠道在用户跑登录脚本前根本不会应答。
+- **插件面板的渠道开关与渠道列表是两种东西**：workbuddy 在 `KNOWN_CHANNELS` 里（开关可见、可管用），但 `EXTRA_MODEL_ROUTES` 的 `requiresCredential` 在 `workbuddy-auth.json` 存在之前不让它进模型列表（没有它的目录，代理答 502，面板只会渲染一个空渠道而不是那句「去跑登录脚本」）。只读文件是否存在、**不读不解析**：令牌归代理管，半写状态不该有第二个读者给出第二个判断。同 `requiresDeepseekLogin`。
+
 ## 行为规则
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。
 2. 会话被压缩或换模型后：先重读本文件定位任务，再继续；不要重新验证已确认的事实。

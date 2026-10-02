@@ -51,6 +51,14 @@ window.__ModuleLoader__.load({
     traeLoading: '读取账号状态…',
     traeRefresh: '刷新',
     traeHint: '积分是免费的：每月 500 + 每天签到 150。按钮不消耗推理额度；上游高峰限流（9074）会自动退避重试。',
+    workbuddyLogin: '一键登录',
+    workbuddyRunning: '正在登录…',
+    workbuddyNotSignedIn: '未登录。点击后浏览器会打开 WorkBuddy 中国版登录页（轮询式，最长 5 分钟）。',
+    workbuddyReady: '已登录。{nickname} · {count} 个模型可用。',
+    workbuddyExpired: '凭据已过期，请重新登录。',
+    workbuddyLoading: '读取账号状态…',
+    workbuddyRefresh: '刷新',
+    workbuddyHint: '凭据写入仓库根目录的 workbuddy-auth.json（已 gitignore）。代理会静默续期；模型目录取自账号自身。',
     commandcodeLogin: '一键登录',
     commandcodeWaiting: '等待浏览器回调…（最多 10 分钟）',
     commandcodeSignedIn: '已登录。账号已写入 commandcode-accounts.json。',
@@ -100,6 +108,14 @@ window.__ModuleLoader__.load({
     traeLoading: 'Reading account state…',
     traeRefresh: 'Refresh',
     traeHint: 'Credits are free: 500 a month plus 150 a day for checking in. The button spends no inference quota; a peak-hour limit (9074) is retried with backoff.',
+    workbuddyLogin: 'Sign in',
+    workbuddyRunning: 'Signing in…',
+    workbuddyNotSignedIn: 'Not signed in. The browser opens the WorkBuddy China sign-in page (polling, up to 5 minutes).',
+    workbuddyReady: 'Signed in. {nickname} · {count} model(s) available.',
+    workbuddyExpired: 'Credential expired; sign in again.',
+    workbuddyLoading: 'Reading account state…',
+    workbuddyRefresh: 'Refresh',
+    workbuddyHint: 'The credential is written to workbuddy-auth.json in the project root (gitignored). The proxy renews it silently; the model list comes from the account itself.',
     commandcodeLogin: 'Sign in',
     commandcodeWaiting: 'Waiting for the browser callback… (up to 10 minutes)',
     commandcodeSignedIn: 'Signed in. The account was written to commandcode-accounts.json.',
@@ -578,6 +594,53 @@ window.__ModuleLoader__.load({
           setBusy(false)
         }
       }
+      // ---- WorkBuddy: browser sign-in ----
+      //
+      // Read when the settings card mounts, like TRAE, rather than from the
+      // ten-second snapshot: the snapshot's "configured" only says the file
+      // exists, while this route reports what the proxy actually thinks of it
+      // (expired, usable, how many models the account can reach).
+      const [workbuddy, setWorkbuddy] = useState({ loading: true, data: null, started: false })
+      const loadWorkbuddy = useCallback(async () => {
+        try {
+          const response = await fetch('/api/ai-proxy/workbuddy/status')
+          const payload = await response.json()
+          setWorkbuddy((prev) => ({ ...prev, loading: false, data: payload }))
+        } catch (reason) {
+          setWorkbuddy((prev) => ({
+            ...prev,
+            loading: false,
+            data: { configured: false, error: reason instanceof Error ? reason.message : String(reason) },
+          }))
+        }
+      }, [])
+      useEffect(() => {
+        if (tab === 'settings') loadWorkbuddy()
+      }, [tab, loadWorkbuddy])
+      // The script owns the browser window and the polling, so there is no URL for
+      // the panel to offer - it just starts it and reports what the proxy says.
+      // A timer rather than the snapshot loop, because the credential file appears
+      // when the script finishes and a finished sign-in should show up without
+      // waiting for whatever else refreshes the page.
+      useEffect(() => {
+        if (tab !== 'settings' || !workbuddy.started) return undefined
+        const timer = setInterval(loadWorkbuddy, 4000)
+        return () => clearInterval(timer)
+      }, [tab, workbuddy.started, loadWorkbuddy])
+      const runWorkbuddyLogin = async () => {
+        setBusy(true)
+        setError('')
+        try {
+          const response = await fetch('/api/ai-proxy/workbuddy/login', { method: 'POST' })
+          const payload = await response.json()
+          setWorkbuddy((prev) => ({ ...prev, started: true }));
+          if (!response.ok) setError(payload?.error ?? `the sign-in request failed (${response.status})`)
+        } catch (reason) {
+          setError(reason instanceof Error ? reason.message : String(reason))
+        } finally {
+          setBusy(false)
+        }
+      }
       const setUpDeepseek = () => {
         // Re-capturing replaces working credentials. The originals are copied aside
         // first and put back if the capture does not finish, so the worst case is a
@@ -827,6 +890,41 @@ window.__ModuleLoader__.load({
               }))
             : null,
           h('span', { className: 'apx_muted' }, t('traeHint')),
+        ),
+        h('div', { className: 'apx_field' },
+          h('span', null, 'WorkBuddy'),
+          h('p', { className: 'apx_tag' },
+            workbuddy.loading
+              ? t('workbuddyLoading')
+              : workbuddy.data?.error
+              ? workbuddy.data.error
+              : !workbuddy.data?.configured
+              ? t('workbuddyNotSignedIn')
+              : workbuddy.data.expired
+              ? t('workbuddyExpired')
+              : t('workbuddyReady', {
+                  nickname: String(workbuddy.data.nickname ?? '?'),
+                  count: String(workbuddy.data.models ?? 0),
+                })),
+          h('div', { className: 'apx_row' },
+            h('button', {
+              className: 'apx_btn primary',
+              type: 'button',
+              onClick: runWorkbuddyLogin,
+              // Stays visible once configured, for the same reason the deepseek
+              // re-capture button does: the access token expires on its own.
+              disabled: busy || workbuddy.loading || Boolean(workbuddy.data?.running),
+            }, workbuddy.data?.running
+              ? t('workbuddyRunning')
+              : t('workbuddyLogin')),
+            h('button', {
+              className: 'apx_btn',
+              type: 'button',
+              onClick: loadWorkbuddy,
+              disabled: busy || workbuddy.loading,
+            }, t('workbuddyRefresh')),
+          ),
+          h('span', { className: 'apx_muted' }, t('workbuddyHint')),
         ),
         h('div', { className: 'apx_field' },
           h('span', null, 'deepseek-web'),

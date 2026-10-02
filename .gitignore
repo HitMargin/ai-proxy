@@ -6,6 +6,7 @@ deepseek-headers.json
 deepseek-web-cooldown.json
 commandcode-accounts.json
 trae-auth.json
+workbuddy-auth.json
 session.json
 commandcode-models.generated.yml
 .env

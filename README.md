@@ -249,6 +249,26 @@ commandcode:
 
 若使用远端 Worker/tunnel，只需把 `baseURL` 改为对应 Worker 地址。示例中的 `AI_PROXY_API_KEY` 是 **DSH 客户端访问本代理**所用的 key，其值应已列入代理的 `API_KEYS` 白名单；它与代理进程读取的 CommandCode 上游 `COMMANDCODE_API_KEY` 是两个不同用途。若 `API_KEYS` 留空，DSH 仍可配置一个占位 key，但请求不会鉴权。
 
+### WorkBuddy 中国版（`/workbuddy/v1`）
+
+WorkBuddy（中国版，主机 `www.workbuddy.cn`）的请求体和 SSE **本身就是标准 OpenAI 形态**，所以这一路不做任何协议翻译：`stream: true` 的 Chat Completions 请求原样转发，响应字节原样回传。代理只补三件上游必须看到的东西——凭据、归属头、以及藏在 200 里的内容拦截。
+
+**配置凭据**：
+
+```powershell
+deno run -A .tmp-workbuddy-login.ts
+```
+
+脚本会打开浏览器完成登录（轮询式，客户端不起本地回调服务器），把令牌写入仓库根目录的 `workbuddy-auth.json`（已加入 `.gitignore`），并顺带打印 `credential.domain` 与三个主机各自的模型目录——中国版与国际版路径完全相同，只有主机不同，实测 `www.workbuddy.cn` / `www.workbuddy.ai` / `copilot.tencent.com` 路由集一模一样，所以靠「参考实现里 WorkBuddy 是国际版」推不出中国版主机。凭据文件被删或损坏时 `GET /workbuddy/v1/models` 直接报错，不回退到静态模型表：静态表刻意留空，因为猜一个 id 只会把用户送进「选得到、调不通」的模型。
+
+三个必须照做的实现约束：
+
+- **`prompt_cache_key` 必须回传**。用请求头 `x-session-id` / `x-conversation-id`（都没有才随机生成），否则上游缓存命中率归零——实测同一会话 `prompt_tokens=8027, prompt_cache_hit_tokens=0, credit=0.34`，带上之后命中 7808、`credit=0.02`，约 17 倍。
+- **5 个归属头一个都不能少**（`X-Product` / `X-Product-Code` / `X-IDE-Name` / `X-IDE-Type` / `X-IDE-Version`），后台「使用端」一栏靠它们归因，缺任一头就显示 `-`。
+- **流内 11140 要单独判**。内容审核拒绝会返回 HTTP 403，也可以包在 HTTP 200 的 SSE 里；且它和真认证失败共用 403，所以只认「无 `choices` 字段 + 正文命中 `"code": 11140`」这一条窄判据。它是**账号级**拦截（同一请求发 7 个账号：2 个 200、4 个 403、1 个 429），换号而不是让用户改内容。
+
+401/403 会先静默用 `refresh_token` 续期并重试一次；目录取 `/console/enterprises/personal/models` 与 `/v3/config` 的**并集**（两个端点的 id 集合不同，促销只挂一侧，先到先得会让整批限时免费模型消失而服务端照常计费），缓存 5 分钟，`?refresh=true` 强制刷新。倍率显示用 `原价→促销价` 箭头形态。**不含签到**：路由 `/v2/billing/meter/daily-checkin` 确实存在（401 而非 404），但中国版文档从未提及该活动，路由存在不等于账号有资格。
+
 ### 可选 DSH Provider 桥接插件
 
 `/zen/v1` 现在由 `src/zen.ts` 处理：它补齐 OpenCode 客户端 User-Agent、DSH session 派生的 `x-opencode-session`/`x-opencode-request`、canonical session、工具 quartet、Muse Spark 的 Responses 转换和 FreeTier/Region 错误分类。实测非流式请求会触发 `FreeTierError`，DSH 路径必须保持 `stream: true`。可用 `ZEN_BASE_URL` 和 `ZEN_BEARER_TOKEN` 覆盖默认上游；原始项目代码仍是唯一实现。
@@ -383,6 +403,8 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 | `/kilo/v1` | api.kilo.ai | 透传，仅保留 `isFree: true` 的模型（kilo 的直连前缀，聚合成员之一） |
 | `/zen/v1` | opencode.ai/zen | 透传，默认 token `public`，仅保留 `-free` 模型 |
 | `/deepseek-web/v1` | chat.deepseek.com 网页聊天端 | 需要登录 Cookie，支持 Chat Completions 与 Responses |
+| `/trae/v1` | api.trae.cn | 入站/出站协议翻译、工具调用、思考档位、账号状态与每日签到 |
+| `/workbuddy/v1` | www.workbuddy.cn | **自定义处理器**：文件凭据 + 401 自动续期重试 + 流内 11140 内容拦截；目录取自账号自身 |
 | `/commandcode/v1` | CommandCode Go CLI 网关 | 模型发现、私有协议转换、多账号池、额度、Chat Completions 与 Responses |
 | `/anthropic/v1` | api.anthropic.com | `toAnthropic` 双向翻译 |
 | `/gemini/v1` | generativelanguage.googleapis.com | `toGemini` 双向翻译 |
@@ -507,6 +529,8 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 | `src/core.ts` | 环境变量、Provider 配置、协议适配器、通用 HTTP/流式工具 |
 | `src/cnb.ts` | cnb.cool CSRF、登录态、工具调用、Responses API |
 | `src/deepseek-web.ts` | DeepSeek 登录态、PoW、完整上下文、SSE、思考和工具调用 |
+| `src/workbuddy.ts` | WorkBuddy 常量、凭据解析、目录/倍率/促销解析、请求头、请求体、SSE 拦截 |
+| `src/workbuddy-account.ts` | WorkBuddy 凭据落盘、过期与续期、目录并集 |
 | `src/commandcode/` | CommandCode Go 模型发现、私有协议、多账号池、OAuth、额度与 OpenAI 转换 |
 | `src/zen-catalog.ts` | Zen 模型能力元数据（来自 models.dev），Zen 网关自己不返回 |
 | `third_party/dsh-deepseek-web-login/` | Apache-2.0 工具协议派生代码及许可证 |
@@ -517,7 +541,7 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 | `restart.ps1` | 一键：本地服务 + 隧道 + 更新 Worker 的 `BACKEND_URL` 密钥；`-Local` 只启动本地服务，不碰隧道/Worker/代理 |
 | `deno.lock` | 依赖锁定 |
 
-本地开发还会出现（已在 `.gitignore` 中排除）：`cookies.txt`（抓包得到的 cookie）、`commandcode-accounts.json`（CommandCode OAuth 多账号 key）、`.wrangler/`（Cloudflare 账号缓存）、
+本地开发还会出现（已在 `.gitignore` 中排除）：`cookies.txt`（抓包得到的 cookie）、`commandcode-accounts.json`（CommandCode OAuth 多账号 key）、`trae-auth.json` 与 `workbuddy-auth.json`（登录脚本抓取的令牌）、`.wrangler/`（Cloudflare 账号缓存）、
 `cloudflared.exe`、`page.html`（页面快照）、`main.ts.bak-*`（历史备份）。
 
 ---

@@ -24,7 +24,9 @@ DSH 中的 `ai-proxy` Provider 会从本地代理读取完整模型目录：
 - `kilo/*`：Kilo 免费模型；
 - `zen/*`：Zen 免费模型（代理会补 OpenCode 指纹和 session；上游拒绝时返回明确错误）；
 - `commandcode/*`：CommandCode Go 通道；
-- `tokenharbor/*`：TokenHarbor 通道（可用时）。
+- `tokenharbor/*`：TokenHarbor 通道（可用时）；
+- `trae/*`：TRAE 通道（账号目录，附账号状态与每日签到）；
+- `workbuddy/*`：WorkBuddy 中国版通道（账号目录）。**需要先运行 `deno run -A .tmp-workbuddy-login.ts` 抓取凭据**——凭据是仓库根目录的 `workbuddy-auth.json`，没有它代理答 502，插件因此在文件存在之前不把这个渠道放进面板和选择器。这不是「渠道不可用」，而是「还没配置」：面板的渠道开关里它照常可见，开关也照常管用。
 
 以下渠道不进入模型列表，即使旧会话仍缓存着这些 ID，调用也会立刻以 `CONFIG_DISABLED` 拒绝，不会消耗一轮请求：
 
@@ -51,6 +53,8 @@ kilo/...          → /v1
 commandcode/...   → /v1
 zen/...           → /v1
 tokenharbor/...   → /tokenharbor/v1
+trae/...          → /trae/v1
+workbuddy/...     → /workbuddy/v1
 ```
 
 被屏蔽的渠道仍保留路由（`cnb/... → /v1`、`deepseek-web/... → /deepseek-web/v1`），但请求在发出前就会被 `CONFIG_DISABLED` 拦下，所以这两条不会真正被用到；留着是为了将来在设置里恢复某个渠道时不必改路由表。

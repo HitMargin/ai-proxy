@@ -27,6 +27,7 @@ let loginCalls = 0;
 let traeAccountCalls = 0;
 let traeCheckinCalls = 0;
 let traeCheckinOk = true;
+let workBuddyAccountCalls = 0;
 let chatCalls = 0;
 let lastRequestHeaders = new Headers();
 let lastChatBody = null;
@@ -96,6 +97,23 @@ globalThis.fetch = async (input, init = {}) => {
       balanceKnown: true,
       checkin: { checkedIn: false, credits: 100, enabled: true },
       checkinKnown: true,
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url.endsWith('/workbuddy/v1/account')) {
+    workBuddyAccountCalls++;
+    // Deliberately carries no token of any shape. The proxy's own account route is
+    // the boundary that decides what the panel may see, and a fixture that smuggled
+    // one in would let a leak pass this suite unnoticed.
+    return new Response(JSON.stringify({
+      configured: true,
+      nickname: 'WorkBuddy Tester',
+      userId: 'wb-user-1',
+      accountType: 'personal',
+      expired: false,
+      refreshable: true,
+      usable: true,
+      models: 14,
+      catalogKnown: true,
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   }
   if (url.endsWith('/trae/v1/checkin')) {
@@ -1099,6 +1117,32 @@ try {
     return JSON.parse(payload);
   })();
   assert.equal(traeCheckinCalls, beforeCheckin + 1, 'the button must actually claim');
+  // WorkBuddy's account read, and the one thing the panel route must never do:
+  // hand a credential back to a page that renders in a browser.
+  const beforeWorkBuddy = workBuddyAccountCalls;
+  const workBuddyStatusPayload = await (async () => {
+    let sent;
+    await panelRoute.handler({ method: 'GET', url: '/api/ai-proxy/workbuddy/status', headers: { host: 'dsh.local' } }, {
+      writeHead(statusCode, headers) { sent = { statusCode, headers }; },
+      end(body) { sent.body = body; },
+    });
+    return JSON.parse(sent.body);
+  })();
+  assert.equal(
+    workBuddyAccountCalls,
+    beforeWorkBuddy + 1,
+    'the status read must reach the proxy account route',
+  );
+  assert.equal(workBuddyStatusPayload.configured, true);
+  assert.equal(workBuddyStatusPayload.usable, true);
+  assert.equal(workBuddyStatusPayload.models, 14);
+  for (const secret of ['access_token', 'refresh_token', 'accessToken', 'refreshToken', 'token', 'credential']) {
+    assert.equal(
+      secret in workBuddyStatusPayload,
+      false,
+      `the account route must not answer with "${secret}"`,
+    );
+  }
   assert.equal(traeClaim.ok, true);
   assert.equal(traeClaim.credits, 100);
   // The balance rides along so the panel does not have to ask again and render a
@@ -1240,6 +1284,11 @@ try {
   for (const name of ['deepseek-cookies.txt', 'deepseek-auth.txt', 'deepseek-headers.json']) {
     fs.writeFileSync(path.join(fixtureRoot, name), 'fixture');
   }
+  // WorkBuddy's hold is the same shape for the same reason: the proxy reads a
+  // credential file, so with no file the channel's listing answers 502 and the
+  // panel renders a channel at zero instead of the command that would fix it.
+  // Only the existence is read, so 'fixture' is the whole requirement.
+  fs.writeFileSync(path.join(fixtureRoot, 'workbuddy-auth.json'), 'fixture');
   const disposeEnabled = apply(enabledCtx, {
     mode: 'external',
     externalUrl: 'http://127.0.0.1:8000/commandcode/v1',
@@ -1254,6 +1303,15 @@ try {
   // variable across keyed channels means a key for one is silently used for the
   // other, which fails as a 401 at the far end with nothing in the logs.
   assert.equal(modelCallsByPath['/tokenharbor/v1/models'], 1, 'a keyed channel must be listed once keyed');
+  assert.equal(
+    modelCallsByPath['/workbuddy/v1/models'],
+    1,
+    'a channel whose credential file exists must be listed',
+  );
+  assert.ok(
+    afterSwitch.some((model) => model.id.startsWith('workbuddy/')),
+    'a captured credential must put WorkBuddy rows in the roster',
+  );
   assert.ok(
     afterSwitch.some((model) => model.id.startsWith('deepseek-web/')),
     'enabling the channel must put its models in the roster',

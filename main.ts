@@ -35,11 +35,35 @@ import {
   toModelCard,
   type TraeModel,
 } from "./src/trae.ts";
+import {
+  buildChatBody,
+  CHAT_COMPLETIONS_PATH,
+  guardWorkBuddyStream,
+  isWorkBuddyExpired,
+  isWorkBuddyRefreshable,
+  toWorkBuddyModelCard,
+  WORKBUDDY_ENDPOINT,
+  workBuddyChatHeaders,
+  type WorkBuddyChatPlan,
+  type WorkBuddyCredential,
+  type WorkBuddyModel,
+} from "./src/workbuddy.ts";
+import {
+  fetchWorkBuddyModels,
+  isWorkBuddyUsable,
+  readWorkBuddyCredential,
+  refreshWorkBuddyCredential,
+  refreshWorkBuddyIfNeeded,
+  writeWorkBuddyCredential,
+} from "./src/workbuddy-account.ts";
 // The credential sits next to the project sources, like the deepseek login state.
 // Resolved per request rather than once at import so a restart is not needed after
 // the capture script writes it.
 const TRAE_ROOT = new URL(".", import.meta.url).pathname.replace(/\/+$/, "")
   .replace(/^\/(?:[A-Za-z]:)/, (m) => m.slice(1));
+// Same resolution as TRAE_ROOT, same reason: the login script writes the
+// credential next to the sources, so picking it up must not require a restart.
+const WORKBUDDY_ROOT = TRAE_ROOT;
 // ---------- 鉴权 ----------
 function checkAuth(request: Request) {
   const authHeader = request.headers.get("authorization");
@@ -184,6 +208,10 @@ const V1_AGGREGATE_MEMBERS = [
   // this aggregate, not from the plugin's separate project listing. Left out here,
   // the panel showed all ten of its models while the picker had none of them.
   "deepseek-web",
+  // WorkBuddy joins for the same reason: its catalog is read from the account
+  // file, so leaving it out would report a channel whose models the harness
+  // cannot see at all.
+  "workbuddy",
   // TRAE joins for the same reason, plus one more: its catalog is read from the
   // account's remote listing, so leaving it out would report a channel whose
   // models the harness cannot see at all.
@@ -423,6 +451,282 @@ async function handleTrae(path: string, request: Request): Promise<Response> {
 
   return jsonResponse({ error: "Unknown TRAE route" }, 404);
 }
+// ---------- WorkBuddy（中国版） ----------
+
+/**
+ * WorkBuddy 目录缓存。
+ *
+ * 与 TRAE 目录同样**是路由表的一部分**：模型只在列出它的渠道里可调用，拉不到目录
+ * 就没有正确路由。TTL 与共享在飞请求的写法照 TRAE（面板每 10 秒轮询一次，不共享
+ * 就是每次都打上游）。
+ */
+const workBuddyCatalog = {
+  models: [] as WorkBuddyModel[],
+  at: 0,
+  loading: null as Promise<WorkBuddyModel[]> | null,
+  // Whether the credential file is present, cached because the roster check that
+  // needs it is synchronous. A channel with no credential is dormant by the
+  // user's choice, not degraded - see the isRosterDegraded call site.
+  configured: false,
+};
+
+async function loadWorkBuddyCatalog(force = false): Promise<WorkBuddyModel[]> {
+  const now = Date.now();
+  if (
+    !force && workBuddyCatalog.models.length > 0 &&
+    now - workBuddyCatalog.at < 300_000
+  ) {
+    return workBuddyCatalog.models;
+  }
+  if (workBuddyCatalog.loading !== null) return await workBuddyCatalog.loading;
+  const pending = (async () => {
+    const credential = await readWorkBuddyCredential(WORKBUDDY_ROOT);
+    workBuddyCatalog.configured = credential !== undefined;
+    if (credential === undefined) {
+      throw new Error(
+        "no WorkBuddy credential. run: deno run -A .tmp-workbuddy-login.ts (opens a browser)",
+      );
+    }
+    try {
+      await refreshWorkBuddyIfNeeded(WORKBUDDY_ROOT, credential);
+    } catch (error) {
+      console.warn(
+        "[workbuddy] token refresh failed:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+    const models = await fetchWorkBuddyModels(credential);
+    if (models.length === 0) {
+      throw new Error(
+        workBuddyCatalog.models.length > 0
+          ? "the remote listing came back empty (kept the previous one)"
+          : "no WorkBuddy models are available for this account",
+      );
+    }
+    workBuddyCatalog.models = models;
+    workBuddyCatalog.at = Date.now();
+    console.log("[workbuddy] catalog: " + models.length + " model(s) loaded");
+    return models;
+  })();
+  workBuddyCatalog.loading = pending;
+  try {
+    return await pending;
+  } finally {
+    // 无论成败都要清空，否则一次失败会把闸门永久卡住。
+    workBuddyCatalog.loading = null;
+  }
+}
+
+/** 请求上游 `/v2/chat/completions`，返回原始 Response（流不落盘）。 */
+async function postWorkBuddyChat(
+  credential: WorkBuddyCredential,
+  payload: Record<string, unknown>,
+): Promise<Response> {
+  return await fetch(WORKBUDDY_ENDPOINT + CHAT_COMPLETIONS_PATH, {
+    method: "POST",
+    headers: workBuddyChatHeaders(credential),
+    body: JSON.stringify(payload),
+    // 长会话的生成可能跑满几分钟；60s 会在正常思考时把流掐断。
+    signal: AbortSignal.timeout(600_000),
+  });
+}
+
+async function handleWorkBuddy(
+  path: string,
+  request: Request,
+): Promise<Response> {
+  if (path === "/workbuddy/v1/models") {
+    try {
+      const models = await loadWorkBuddyCatalog(
+        request.url.includes("refresh=true"),
+      );
+      return jsonResponse({
+        object: "list",
+        data: models.map(toWorkBuddyModelCard),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[workbuddy] catalog failed: " + message);
+      return jsonResponse({ error: message }, 502);
+    }
+  }
+
+  if (path === "/workbuddy/v1/account" && request.method === "GET") {
+    const credential = await readWorkBuddyCredential(WORKBUDDY_ROOT);
+    if (credential === undefined) {
+      return jsonResponse({
+        configured: false,
+        error:
+          "no WorkBuddy credential. run: deno run -A .tmp-workbuddy-login.ts (opens a browser)",
+      }, 409);
+    }
+    return jsonResponse({
+      configured: true,
+      nickname: credential.nickname ?? "",
+      userId: credential.user_id ?? "",
+      accountType: credential.account_type ?? "personal",
+      // 三个字段分开报：过期但能续期是**可恢复**状态，与「需要重新登录」不同，
+      // 面板要能据此给出不同的提示。
+      expired: isWorkBuddyExpired(credential),
+      refreshable: isWorkBuddyRefreshable(credential),
+      usable: isWorkBuddyUsable(credential),
+      models: workBuddyCatalog.models.length,
+      catalogKnown: workBuddyCatalog.models.length > 0,
+      // 令牌本身绝不出现在这里：这个响应会被渲染进面板，而截图只差一次按键。
+    });
+  }
+
+  if (path === "/workbuddy/v1/chat/completions" && request.method === "POST") {
+    const parsed = await readJsonBodyLimited(request);
+    if (!parsed.ok) {
+      return jsonResponse({ error: parsed.message }, parsed.status);
+    }
+    const body = parsed.value as Record<string, unknown>;
+    const requested = typeof body?.model === "string" ? String(body.model) : "";
+    if (requested.length === 0) {
+      return jsonResponse({ error: "model is required" }, 400);
+    }
+
+    let models: WorkBuddyModel[];
+    try {
+      models = await loadWorkBuddyCatalog();
+    } catch (error) {
+      return jsonResponse(
+        { error: error instanceof Error ? error.message : String(error) },
+        502,
+      );
+    }
+    const model = models.find((entry) => entry.id === requested);
+    if (model === undefined) {
+      return jsonResponse({
+        error: "Unknown WorkBuddy model: " + requested,
+        available: models.map((entry) => entry.id).slice(0, 40),
+      }, 400);
+    }
+
+    const credential = await readWorkBuddyCredential(WORKBUDDY_ROOT);
+    if (credential === undefined) {
+      return jsonResponse({ error: "no WorkBuddy credential" }, 409);
+    }
+    let current = credential;
+    try {
+      const refreshed = await refreshWorkBuddyIfNeeded(
+        WORKBUDDY_ROOT,
+        current,
+      );
+      if (refreshed !== undefined) current = refreshed;
+    } catch (error) {
+      // 非致命：让上游决定。过期令牌和没有令牌失败方式一样，把一个换成另一个
+      // 只会掩盖真正的原因。
+      console.warn(
+        "[workbuddy] pre-chat refresh failed:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+
+    // 稳定的会话 id：WorkBuddy 用 prompt_cache_key 做前缀缓存，不带它同一段 8k
+    // 前缀的命中是 0（实测费用差约 17 倍）。用请求头带的会话 id，缺失才现生成。
+    const sessionId = request.headers.get("x-session-id")?.trim() ||
+      request.headers.get("x-conversation-id")?.trim() ||
+      ("workbuddy-" + crypto.randomUUID());
+    const plan: WorkBuddyChatPlan = {
+      maxOutputTokens: model.maxOutputTokens,
+      efforts: model.reasoningEfforts ?? [],
+      defaultEffort: model.defaultReasoningEffort,
+    };
+    const payload = buildChatBody(
+      model.id,
+      body.messages ?? [],
+      sessionId,
+      plan,
+      {
+        maxTokens: typeof body.max_tokens === "number"
+          ? body.max_tokens
+          : undefined,
+        reasoningEffort: typeof body.reasoning_effort === "string"
+          ? body.reasoning_effort
+          : undefined,
+        temperature: typeof body.temperature === "number"
+          ? body.temperature
+          : undefined,
+        stop: Array.isArray(body.stop) ? body.stop.map(String) : undefined,
+      },
+    );
+
+    let upstream: Response;
+    try {
+      upstream = await postWorkBuddyChat(current, payload);
+      if (upstream.status === 401 || upstream.status === 403) {
+        // 401 之后**静默续期并重试一次**。pre-flight 的续期只覆盖 expires_at 说
+        // 该续的情况；服务端也能提前吊销（改密码、后台踢下线），那时文件里的
+        // 有效期还没到。少了这一步，用户看到的是「模型突然全挂」，而真相是令牌
+        // 过期且可自愈。
+        try {
+          const revived = await refreshWorkBuddyCredential(current);
+          current = revived;
+          await writeWorkBuddyCredential(WORKBUDDY_ROOT, revived);
+          upstream = await postWorkBuddyChat(current, payload);
+          console.log(
+            "[workbuddy] token was stale; refreshed and retried (" +
+              requested + ")",
+          );
+        } catch (error) {
+          console.warn(
+            "[workbuddy] retry after 401 failed:",
+            error instanceof Error ? error.message : error,
+          );
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[workbuddy] chat transport failed: " + message);
+      return jsonResponse({ error: message }, 502);
+    }
+
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => "");
+      console.warn(
+        "[workbuddy] chat HTTP " + upstream.status + " for " + requested +
+          ": " +
+          text.slice(0, 240),
+      );
+      return jsonResponse({
+        error: "WorkBuddy chat HTTP " + upstream.status,
+        detail: text.slice(0, 500),
+      }, upstream.status);
+    }
+    if (upstream.body === null) {
+      return jsonResponse(
+        { error: "WorkBuddy chat returned an empty body" },
+        502,
+      );
+    }
+
+    // 原样透传：请求体与 SSE 都是标准 OpenAI，**一个字节都不翻译**。唯一的一层
+    // 是只读扫描，拦到 11140 才改写帧（见 guardWorkBuddyStream）。
+    const headers = new Headers();
+    for (const name of ["content-type", "cache-control", "x-request-id"]) {
+      const value = upstream.headers.get(name);
+      if (value) headers.set(name, value);
+    }
+    if (!headers.has("content-type")) {
+      headers.set("content-type", "text/event-stream; charset=utf-8");
+    }
+    headers.set("cache-control", "no-cache");
+    const guard: ReadableStream<Uint8Array> = guardWorkBuddyStream(
+      upstream.body,
+      (rejection) => {
+        console.warn(
+          "[workbuddy] in-stream content rejection (11140) for " + requested +
+            ": " + rejection.payload.slice(0, 200),
+        );
+      },
+    );
+    return new Response(guard, { status: 200, headers });
+  }
+
+  return jsonResponse({ error: "Unknown WorkBuddy route" }, 404);
+}
 async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
   const out: Record<string, any[]> = {};
   const now = Date.now();
@@ -481,6 +785,25 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
         // Empty here means "not readable right now", not "there is nothing".
         // Reporting it that way is the difference between a fixable message and
         // a channel that quietly went missing.
+        const reason = error instanceof Error ? error.message : String(error);
+        catalog.failed(key, reason, now);
+        console.warn(`[v1] ${key}: ${reason}`);
+      }
+      return;
+    }
+    if (key === "workbuddy") {
+      // Asked of the account's remote listing, not a local table: the models,
+      // their credits rate and their reasoning ladder all come from upstream,
+      // and there is no static list to answer with (the CN fallback table is
+      // deliberately empty - see STATIC_FALLBACK_MODELS).
+      try {
+        const models = await loadWorkBuddyCatalog();
+        out[key] = models.map(toWorkBuddyModelCard);
+        catalog.ok(key, models.length, models.length, now);
+      } catch (error) {
+        // Empty here means "not readable right now" - most often no credential
+        // yet - not "this account has nothing". Reporting it that way is the
+        // difference between a fixable message and a channel that went missing.
         const reason = error instanceof Error ? error.message : String(error);
         catalog.failed(key, reason, now);
         console.warn(`[v1] ${key}: ${reason}`);
@@ -625,7 +948,14 @@ async function handleAggregateV1(
       const degraded = isRosterDegraded(
         V1_AGGREGATE_MEMBERS,
         members,
-        (key) => !hasChannelCredential(key, (providers as any)[key]),
+        (key) =>
+          !hasChannelCredential(key, (providers as any)[key]) ||
+          // WorkBuddy declares auth:{type:'none'} (the credential is a file, not
+          // an env var), so the shared check says "has one" even when nothing has
+          // ever logged in. Without this the roster is degraded from the first
+          // boot until the user runs the login script - a 20x refetch rate and a
+          // startup warning for a channel that was never going to answer.
+          (key === "workbuddy" && !workBuddyCatalog.configured),
       );
       if (degraded && previous?.degraded !== true) {
         console.warn(
@@ -966,6 +1296,7 @@ export async function handler(request: Request): Promise<Response> {
         commandcode: "commandcode",
         "deepseek-web": "deepseek-web",
         tokenharbor: "tokenharbor",
+        workbuddy: "workbuddy",
       };
       const prefix = channelPrefixes[provider];
       if (!prefix) {
@@ -1085,6 +1416,9 @@ export async function handler(request: Request): Promise<Response> {
     }
     if (provider.customHandler === "trae") {
       return await handleTrae(path, request);
+    }
+    if (provider.customHandler === "workbuddy") {
+      return await handleWorkBuddy(path, request);
     }
     if (provider.customHandler === "commandcode") {
       return await handleCommandCode(path, request, url);

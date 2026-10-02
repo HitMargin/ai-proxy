@@ -74,6 +74,7 @@ const KNOWN_CHANNELS = [
   'openrouter',
   'tokenharbor',
   'trae',
+  'workbuddy',
   'zen',
 ];
 
@@ -102,6 +103,7 @@ export const CHANNEL_GROUPS = {
   'ai-proxy-kilo': { channel: 'kilo', label: 'Kilo' },
   'ai-proxy-tokenharbor': { channel: 'tokenharbor', label: 'TokenHarbor' },
   'ai-proxy-trae': { channel: 'trae', label: 'TRAE' },
+  'ai-proxy-workbuddy': { channel: 'workbuddy', label: 'WorkBuddy' },
   'ai-proxy-zen': { channel: 'zen', label: 'Zen' },
 };
 
@@ -151,6 +153,8 @@ const BLOCK_REASON = {
   'deepseek-web': 'this channel is switched off in the ai-proxy panel',
   cnb: 'cnb needs a login cookie; paste one into cnb-login.txt to re-enable it',
   trae: 'TRAE needs a captured credential; run deno run -A .tmp-trae-login.ts to capture one',
+  workbuddy:
+    'WorkBuddy needs a captured credential; run deno run -A .tmp-workbuddy-login.ts to capture one',
 };
 
 /** Fallback text for a channel the user switched off that has no specific reason. */
@@ -181,6 +185,12 @@ const EXTRA_MODEL_ROUTES = [
   // panel listing like deepseek-web does - otherwise the panel shows a channel the
   // picker has never heard of, which is the mismatch this list exists to prevent.
   { prefix: 'trae', basePath: '/trae/v1' },
+  // WorkBuddy is listed from the account's remote catalog, exactly like TRAE, and
+  // for the same reason: the panel must not show a channel the picker has never
+  // heard of. `requiresCredential` keeps it out of the panel until the login script
+  // has run - a listing with no credential behind it answers 502, which renders as
+  // an empty channel rather than as the instruction to run the script.
+  { prefix: 'workbuddy', basePath: '/workbuddy/v1', requiresCredential: true },
 ];
 
 /**
@@ -625,6 +635,28 @@ function deepseekWebStatus(settings) {
     (present ? found : missing).push(entry.what);
   }
   return { configured: missing.length === 0, found, missing };
+}
+
+/**
+ * Whether the WorkBuddy credential file exists and is non-empty.
+ *
+ * Not read-and-parsed on purpose: the proxy is the one that owns the token, and a
+ * truncated or half-written file is exactly the state where a second reader would
+ * produce a second verdict. The panel's job is only to decide whether to offer the
+ * channel at all.
+ */
+function workBuddyStatus(settings) {
+  return { configured: hasWorkBuddyCredentialFile(settings) };
+}
+
+function hasWorkBuddyCredentialFile(settings) {
+  return projectCandidates(settings).some((root) => {
+    try {
+      return fs.statSync(path.join(root, 'workbuddy-auth.json')).size > 0;
+    } catch {
+      return false;
+    }
+  });
 }
 function projectCandidates(settings) {
   const candidates = [
@@ -1651,6 +1683,13 @@ export class AiProxyAdapter {
         const keys = this.runtime?.settings?.channelKeys;
         if (!keys?.[route.prefix]?.trim()) return [];
       }
+      // A file-backed credential, not an env var: the same reasoning as
+      // requiresDeepseekLogin above, and the same check - asking the proxy for a
+      // listing with nothing behind it returns 502, which renders as a channel at
+      // zero rather than as the one command that would fix it.
+      if (route.requiresCredential && !workBuddyStatus(this.runtime?.settings ?? {}).configured) {
+        return [];
+      }
 
       try {
         // A gate per route, not one shared with the aggregate: the rows are keyed
@@ -2369,6 +2408,14 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
       ...deepseekWebStatus(runtime.settings),
       running: Boolean(runtime.deepseekSetup),
     },
+    // Same shape for WorkBuddy. `configured` alone is deliberately weak here the
+    // same way deepseek-web's is: the login script writes the credential as one
+    // file, so a half-written one would look complete. The proxy's own
+    // `/workbuddy/v1/account` is what decides usability, and the panel asks it.
+    workbuddy: {
+      ...workBuddyStatus(runtime.settings),
+      running: Boolean(runtime.workBuddyLogin),
+    },
     channels,
     health,
     modelHealth: counts,
@@ -2587,6 +2634,69 @@ function apiHandler(adapter, runtime, projectAdapter) {
           runtime.record(`trae: check-in request failed: ${error.message}`);
           return sendJson(res, 502, { ok: false, code: 0, message: error.message });
         }
+      }
+      // WorkBuddy's account read. `/workbuddy/v1/*` is a root path, not a provider
+      // basePath, so request() would ask for `/commandcode/v1/workbuddy/v1/...`.
+      if (method === 'GET' && route === '/workbuddy/status') {
+        if (runtime.state !== 'running' && runtime.state !== 'external') await runtime.start();
+        const response = await fetch(`${runtime.serviceUrl('/workbuddy/v1')}/account`, {
+          headers: { ...runtime.headers() },
+          signal: AbortSignal.timeout(15000),
+        }).catch((reason) => ({ json: async () => ({ error: String(reason) }) }));
+        let payload = {};
+        try {
+          payload = await response.json();
+        } catch {
+          payload = { error: 'the proxy answered with no JSON' };
+        }
+        if (!isRecord(payload)) payload = { error: 'unexpected account payload' };
+        return sendJson(res, 200, payload);
+      }
+      // The capture opens a browser and polls for five minutes, so it cannot be
+      // awaited here; it runs detached and reports through the log tab. No backup:
+      // the script overwrites one file, and unlike the deepseek capture there is no
+      // half-set to distinguish - if it dies the file is either the old credential
+      // or nothing, both of which the status read already reports honestly.
+      if (method === 'POST' && route === '/workbuddy/login') {
+        const root = resolveProjectRoot(runtime.settings);
+        if (!root) {
+          sendJson(res, 400, { error: 'project directory not found; set it in the settings above' });
+          return;
+        }
+        if (runtime.workBuddyLogin) {
+          sendJson(res, 409, { ...workBuddyStatus(runtime.settings), started: false, alreadyRunning: true });
+          return;
+        }
+        const script = path.join(root, '.tmp-workbuddy-login.ts');
+        if (!fs.existsSync(script)) {
+          sendJson(res, 400, {
+            error: 'login script not found at .tmp-workbuddy-login.ts',
+            root,
+          });
+          return;
+        }
+        const deno = runtime.settings.denoPath || 'deno';
+        const child = spawn(deno, ['run', '-A', '.tmp-workbuddy-login.ts'], {
+          cwd: root,
+          // Visible: the browser it opens has to come up in front of the user.
+          windowsHide: false,
+          env: { ...process.env, DENO_NO_UPDATE_CHECK: '1' },
+          stdio: 'inherit',
+        });
+        runtime.workBuddyLogin = child;
+        runtime.record(
+          `workbuddy: signing in through the browser in ${root} — finish in the page that opens`,
+        );
+        child.on('exit', (code) => {
+          runtime.workBuddyLogin = null;
+          const after = workBuddyStatus(runtime.settings);
+          runtime.record(
+            code === 0 && after.configured
+              ? 'workbuddy: sign-in finished; the channel is ready'
+              : `workbuddy: sign-in exited ${code} without capturing a credential`,
+          );
+        });
+        return sendJson(res, 200, { started: true });
       }
       if (method === 'POST' && route === '/start') {
         await runtime.start();

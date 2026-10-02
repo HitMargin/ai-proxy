@@ -260,6 +260,25 @@ export const providers: Record<string, any> = {
     filterModels: null,
     customHandler: "trae",
   },
+  // WorkBuddy speaks plain OpenAI on its own host, but the credential lives in
+  // a file, a 401 has to trigger a refresh-and-retry, and 11140 arrives inside a
+  // 200 stream — so every path is served by handleWorkBuddy rather than the
+  // generic upstream call. Like trae, the baseUrl and endpoints are placeholders
+  // that are never fetched; declaring them keeps the prefix recognisable, which
+  // is what the aggregator dispatches on.
+  workbuddy: {
+    prefix: "/workbuddy/v1",
+    baseUrl: "https://www.workbuddy.cn/v1",
+    auth: { type: "none" },
+    pathRewrite: (path: string) => path.replace(/^\/workbuddy\/v1/, ""),
+    endpoints: {
+      models: "/v3/config",
+      chat: "/v2/chat/completions",
+    },
+    adapter: adapters.passthrough,
+    filterModels: null,
+    customHandler: "workbuddy",
+  },
   tokenharbor: {
     prefix: "/tokenharbor/v1",
     baseUrl: "https://tokenharbor.ai/v1",
