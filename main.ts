@@ -160,6 +160,11 @@ const V1_AGGREGATE_MEMBERS = [
   "cnb",
   "commandcode",
   "openrouter",
+  // deepseek-web is served on its own prefix, but it has to be a member as well:
+  // the harness's model catalog is built from `adapter.listModels()`, which reads
+  // this aggregate, not from the plugin's separate project listing. Left out here,
+  // the panel showed all ten of its models while the picker had none of them.
+  "deepseek-web",
 ];
 
 /**
@@ -274,6 +279,25 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
     if (key === "cnb") {
       out[key] = CNB_MODELS;
       catalog.ok(key, CNB_MODELS.length, CNB_MODELS.length, now);
+      return;
+    }
+    if (key === "deepseek-web") {
+      // Asked of this proxy rather than of chat.deepseek.com: the ten entries are
+      // a fixed set of variants the handler answers from its own state, so an
+      // outbound call would add a dependency and a failure mode for no new data.
+      const models = await v1FetchOwnListing("deepseek-web");
+      out[key] = models;
+      if (models.length > 0) {
+        catalog.ok(key, models.length, models.length, now);
+      } else {
+        // Empty here means the login state is absent, not that the channel is
+        // broken. Saying so is the difference between a fixable report and a
+        // roster that is quietly short.
+        const reason =
+          "deepseek-web has no login state yet (cookie, token, headers)";
+        catalog.failed(key, reason, now);
+        console.warn(`[v1] ${key}: ${reason}`);
+      }
       return;
     }
     if (key === "commandcode") {
