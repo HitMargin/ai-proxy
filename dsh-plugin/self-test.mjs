@@ -15,7 +15,7 @@ process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -428,10 +428,19 @@ try {
   // Dropping the aggregate would break a session that already selected
   // ai-proxy/commandcode/x; dropping a channel would merge its models back into
   // the one undivided list this split exists to divide.
+  // Group provider ids are namespaced. Other plugins register providers under
+  // the bare channel names - the local llm-pi-ai config does exactly that for
+  // commandcode and deepseek-web - and two plugins claiming one id makes the
+  // second throw DUPLICATE_ADAPTER, which takes the whole entry down.
   assert.deepEqual(registeredRoutes, [
-    'ai-proxy', 'commandcode', 'cnb', 'deepseek-web',
-    'kilo', 'tokenharbor', 'trae', 'zen',
+    'ai-proxy',
+    ...Object.keys(CHANNEL_GROUPS),
   ]);
+  assert.equal(
+    registeredRoutes.includes('commandcode'),
+    false,
+    'a group must not claim a bare channel name another plugin may register',
+  );
   assert.equal(modelCalls, 0);
   const models = await discovery();
   assert.equal(models[0].id, 'deepseek/test');
@@ -1415,13 +1424,45 @@ try {
     // baseline exists for.
     if (rows.length === 0) continue;
     const first = (id) => (id.includes('/') ? id.slice(0, id.indexOf('/')) : id);
-    if (group !== 'ai-proxy') {
+    const channel = CHANNEL_GROUPS[group]?.channel;
+    if (channel !== undefined) {
       assert.deepEqual(
-        rows.filter((model) => first(model.id) !== group).map((model) => model.id).slice(0, 3),
+        rows.filter((model) => first(model.id) !== channel).map((model) => model.id).slice(0, 3),
         [],
-        `the "${group}" group must list only ${group} models`,
+        `the "${group}" group must list only ${channel} models`,
       );
     }
+  }
+  // A group that answers with nothing renders as a heading with an empty list,
+  // and every filter bug so far has presented exactly that way. So: whichever
+  // channels the aggregate is actually serving, their groups must not be empty.
+  // Read from the aggregate rather than assumed, so a channel that is genuinely
+  // dormant today does not fail this.
+  {
+    // force on both reads: this compares two listings of one upstream, and a
+    // cached side would silently compare different payloads (the fixture swaps
+    // its /models body partway through, which is exactly how it surfaced).
+    const served = new Set(
+      (await adapter.listProjectModels({ provider: 'ai-proxy', force: true }))
+        .map((model) => model.id.split('/')[0]),
+    );
+    for (const [gid, gg] of Object.entries(CHANNEL_GROUPS)) {
+      const rr = await adapter.listModels(gid);
+    }
+    let checked = 0;
+    for (const [id, group] of Object.entries(CHANNEL_GROUPS)) {
+      if (!served.has(group.channel)) continue;
+      checked += 1;
+      // listProjectModels, not listModels: the extras-backed channels
+      // (deepseek-web, trae, tokenharbor) are discovered on that path, so
+      // listModels answers empty for them even when the group does show rows.
+      const rows = (await adapter.listProjectModels({ provider: id, force: true })) ?? [];
+      assert.ok(
+        rows.length > 0,
+        `the aggregate serves "${group.channel}", so group "${id}" must not be empty`,
+      );
+    }
+    assert.ok(checked > 0, 'the fixture must serve at least one channel for this to mean anything');
   }
   // The extras discovery path is a second source of rows, so it has to be
   // checked separately - filtering only the aggregate listing is what let every
@@ -1430,10 +1471,11 @@ try {
     const rows = await adapter.listProjectModels({ provider: group });
     if (rows.length === 0) continue;
     const first = (id) => (id.includes('/') ? id.slice(0, id.indexOf('/')) : id);
+    const want = CHANNEL_GROUPS[group]?.channel;
     assert.deepEqual(
-      group === 'ai-proxy'
+      want === undefined
         ? []
-        : rows.filter((model) => first(model.id) !== group).map((model) => model.id).slice(0, 3),
+        : rows.filter((model) => first(model.id) !== want).map((model) => model.id).slice(0, 3),
       [],
       `listProjectModels("${group}") must not leak another channel's rows`,
     );
@@ -1477,7 +1519,9 @@ try {
   // selected `ai-proxy/<channel>/<model>` keeps resolving to the same request.
   {
     const all = await adapter.listProjectModels({ provider: 'ai-proxy' });
-    const channels = registeredRoutes.filter((route) => route !== 'ai-proxy');
+    // The channels, not the provider ids: group ids are namespaced while model
+    // ids still start with the bare channel name.
+    const channels = Object.values(CHANNEL_GROUPS).map((group) => group.channel);
     const present = new Set(all.map((model) => model.id.split('/')[0]));
     assert.ok(
       channels.some((channel) => present.has(channel)),

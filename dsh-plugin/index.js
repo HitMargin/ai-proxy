@@ -95,14 +95,14 @@ const DEFAULT_HIDDEN_CHANNELS = [
  *
  * @type {Record<string, string>}
  */
-const CHANNEL_GROUPS = {
-  commandcode: 'CommandCode',
-  cnb: 'CNB',
-  'deepseek-web': 'DeepSeek 网页端',
-  kilo: 'Kilo',
-  tokenharbor: 'TokenHarbor',
-  trae: 'TRAE',
-  zen: 'Zen',
+export const CHANNEL_GROUPS = {
+  'ai-proxy-commandcode': { channel: 'commandcode', label: 'CommandCode' },
+  'ai-proxy-cnb': { channel: 'cnb', label: 'CNB' },
+  'ai-proxy-deepseek-web': { channel: 'deepseek-web', label: 'DeepSeek 网页端' },
+  'ai-proxy-kilo': { channel: 'kilo', label: 'Kilo' },
+  'ai-proxy-tokenharbor': { channel: 'tokenharbor', label: 'TokenHarbor' },
+  'ai-proxy-trae': { channel: 'trae', label: 'TRAE' },
+  'ai-proxy-zen': { channel: 'zen', label: 'Zen' },
 };
 
 /**
@@ -1391,7 +1391,8 @@ export class AiProxyAdapter {
     // aggregate, which looks exactly like the split not existing. One gate per
     // provider, so no group answers with another group's rows.
     this.channelGroups = options.channelGroups ?? null;
-    this.displayNames = options.displayNames ?? null;
+    // No separate displayNames map: headings live on the roster entries, so a
+    // group has exactly one source for its id and its label.
     this.groupGates = new Map();
     // One gate per per-channel route. A single shared cache would answer one
     // channel's request with another channel's rows.
@@ -1454,7 +1455,7 @@ export class AiProxyAdapter {
     const channel = this.channelFor(provider);
     return {
       id: provider,
-      name: channel === null ? this.displayName : this.displayNameFor(channel),
+      name: channel === null ? this.displayName : this.displayNameFor(provider),
     };
   }
 
@@ -1488,14 +1489,23 @@ export class AiProxyAdapter {
    * selected `ai-proxy/<channel>/<model>` still resolves unchanged.
    */
   channelFor(provider) {
-    if (this.channelGroups === null) return null;
-    const asked = this.providerFor(provider);
-    if (asked === this.provider) return null;
-    return asked;
+    // Answers the CHANNEL, not the provider id. The id is namespaced
+    // (ai-proxy-kilo) while rows are filtered on the leading segment of the
+    // model id (kilo); conflating the two was how a group first listed
+    // everything, and how two plugins came to claim one provider id.
+    return this.channelGroups?.[this.providerFor(provider)]?.channel ?? null;
   }
 
-  displayNameFor(channel) {
-    return this.displayNames?.[channel] ?? channel;
+  /**
+   * The heading to show for one group provider. Read off the roster entry,
+   * which is why an entry is an object: the id is namespaced for collision
+   * safety while the heading stays the readable channel name.
+   *
+   * @param provider a registered group provider id
+   * @returns the label, or the id itself when it is not a group
+   */
+  displayNameFor(provider) {
+    return this.channelGroups?.[provider]?.label ?? provider;
   }
 
   /**
@@ -2736,8 +2746,8 @@ export function apply(ctx, config = {}) {
   const projectAdapter = new ProjectAdapter({
     runtime,
     resolveImage,
+    // The roster carries each group id together with its heading.
     channelGroups: CHANNEL_GROUPS,
-    displayNames: CHANNEL_GROUPS,
   });
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
   const groupProviders = Object.keys(CHANNEL_GROUPS);
