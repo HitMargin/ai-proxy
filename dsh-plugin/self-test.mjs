@@ -423,7 +423,21 @@ try {
     apiKeyEnv: 'TEST_BRIDGE_KEY',
   });
   assert.equal(typeof dispose, 'function');
-  assert.deepEqual(registeredRoutes, ['ai-proxy']);
+  // The aggregate stays, and every channel joins it as its own provider: the Host
+  // groups its catalog by provider id and nothing else, so this list IS the
+  // grouping. Dropping the aggregate would break a session that already selected
+  // `ai-proxy/commandcode/x`; dropping a channel would merge its models back into
+  // the one list this split exists to divide.
+  assert.deepEqual(registeredRoutes, [
+    'ai-proxy',
+    'commandcode',
+    'cnb',
+    'deepseek-web',
+    'kilo',
+    'tokenharbor',
+    'trae',
+    'zen',
+  ]);
   assert.equal(modelCalls, 0);
   const models = await discovery();
   assert.equal(models[0].id, 'deepseek/test');
@@ -1377,6 +1391,66 @@ try {
     assert.equal(shared.routeGate('tokenharbor'), shared.routeGate('tokenharbor'), 'and it is stable per channel');
   }
 
+  // The groups have to be real, not just registered. Each provider is asked for its
+  // own listing and must get only its own rows - one shared gate would answer every
+  // group with the first one's, which presents as the same models repeated under
+  // seven headings. Read per provider and check the ids, not the counts: a count can
+  // match while the contents do not.
+  //
+  // Placed at the end on purpose. Reading a listing per group warms every gate, so
+  // doing this earlier would change how many requests the discovery below makes - and
+  // that counter is written down precisely because it caught a channel being polled
+  // every ten seconds. Reading here cannot hide that.
+  const firstSegment = (id) => (id.includes('/') ? id.slice(0, id.indexOf('/')) : id);
+  for (const group of registeredRoutes) {
+    const rows = await adapter.listProjectModels({ provider: group });
+    // A channel with nothing today still has a group: the switch has to survive a
+    // channel that lists nothing, which is the guarantee the KNOWN_CHANNELS baseline
+    // exists for.
+    if (rows.length === 0) continue;
+    assert.deepEqual(
+      rows.filter((model) => group !== 'ai-proxy' && firstSegment(model.id) !== group)
+        .map((model) => model.id),
+      [],
+      `the "${group}" group must list only ${group} models`,
+    );
+    // Stamped with the group it is listed under. That is the Host's own rule -
+    // `model.provider === provider`, checked per listing - and getting it wrong fails
+    // validation and takes the whole catalog with it.
+    assert.equal(
+      rows.every((model) => model.provider === group),
+      true,
+      `every row listed under "${group}" must be stamped with it`,
+    );
+  }
+  // And the aggregate still answers with everything, so a session that already
+  // selected `ai-proxy/<channel>/<model>` keeps resolving to the same request.
+  {
+    const all = await adapter.listProjectModels({ provider: 'ai-proxy' });
+    const channels = new Set(all.map((model) => firstSegment(model.id)));
+    assert.ok(channels.size > 1, 'the aggregate must still span every channel');
+    // Every row whose first segment names a known channel must belong to that
+    // channel's group. A slash alone does not mean a channel: `deepseek/test` is a
+    // model family, and `kilo/openrouter/free` is a Kilo model that merely says
+    // OpenRouter. So membership is tested against the known list, not guessed from
+    // the shape - which is also why a genuinely unknown channel is worth flagging
+    // only when it matches the channel naming we wrote down.
+    // Read off the registered providers rather than importing a private constant:
+    // the aggregate itself is not a channel, so the group names are the rest.
+    const known = new Set(registeredRoutes.filter((route) => route !== 'ai-proxy'));
+    for (const model of all) {
+      const channel = firstSegment(model.id);
+      if (!known.has(channel)) continue;
+      assert.ok(
+        registeredRoutes.includes(channel),
+        `the aggregate serves "${model.id}", whose channel has no group of its own`,
+      );
+    }
+    assert.ok(
+      Array.from(channels).some((channel) => known.has(channel)),
+      'the aggregate must serve at least one known channel',
+    );
+  }
   // NOTE: no assertion here covers `KNOWN_CHANNELS` for a channel that lists
   // nothing. The only existing loop is over channels the fixture *does* list, so
   // those also arrive through the roster - deleting one of them from
