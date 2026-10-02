@@ -3,6 +3,7 @@ import {
   CatalogRegistry,
   classifyProbeStatus,
   HealthRegistry,
+  isRosterDegraded,
 } from "./health.ts";
 
 function equal<T>(actual: T, expected: T, message = ""): void {
@@ -123,4 +124,48 @@ Deno.test("the registry hands out copies so a caller cannot edit the record", ()
   const status = catalog.get("kilo");
   status.keptModels = 999;
   equal(catalog.get("kilo").keptModels, 17);
+});
+
+// ── degraded roster ──
+//
+// 「短」指的是「本该应答的没应答」。没配 key 的成员是用户自己选的休眠，不是短。
+// 混为一谈会让名册永久停在 DEGRADED_TTL：20 倍的重拉频率，和每次启动一条警告。
+
+Deno.test("a member with no credential cannot mark the roster degraded", () => {
+  // openrouter 有 key 才可能应答，没 key 时聚合**根本不写这一项**。
+  equal(
+    isRosterDegraded(
+      ["kilo", "openrouter"],
+      { kilo: [{ id: "a" }] },
+      (key) => key === "openrouter",
+    ),
+    false,
+    "a dormant channel is not a short roster",
+  );
+});
+
+Deno.test("a configured member that answered nothing still degrades the roster", () => {
+  equal(
+    isRosterDegraded(
+      ["kilo", "zen"],
+      { kilo: [{ id: "a" }], zen: [] },
+      () => false,
+    ),
+    true,
+  );
+  equal(
+    isRosterDegraded(["kilo", "zen"], { kilo: [{ id: "a" }] }, () => false),
+    true,
+    "an unset entry is a failed member, and must be counted",
+  );
+});
+
+Deno.test("a roster nobody is missing is not degraded", () => {
+  equal(
+    isRosterDegraded(["kilo"], { kilo: [{ id: "a" }] }, () => false),
+    false,
+  );
+  // 全休眠 = 全都不会应答 = 无从变短。这条是上面那条的反面，防止把
+  // isDormant 写成「只要有一个休眠就返回 false」以外的东西。
+  equal(isRosterDegraded(["a", "b"], {}, () => true), false);
 });

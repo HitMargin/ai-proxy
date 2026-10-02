@@ -1,6 +1,28 @@
 export type CatalogState = "ok" | "failed";
 
 /**
+ * Whether a freshly fetched aggregate roster counts as degraded.
+ *
+ * "Degraded" means "shorter than it should be", so the real question is not
+ * whether a member is missing but whether it was ever expected to answer. A
+ * member with no credential is dormant by the user's own choice; counting it as
+ * degraded pinned the roster to DEGRADED_TTL permanently - a 20x refetch rate
+ * and a warning on every start, for a channel that would not answer until a key
+ * was pasted.
+ */
+export function isRosterDegraded(
+  keys: readonly string[],
+  members: Record<string, unknown[] | undefined>,
+  isDormant: (key: string) => boolean,
+): boolean {
+  return keys.some((key) => {
+    if (isDormant(key)) return false;
+    const rows = members[key];
+    return !Array.isArray(rows) || rows.length === 0;
+  });
+}
+
+/**
 
  * What happened when the aggregate went to a member for its model list.
 

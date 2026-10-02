@@ -733,6 +733,38 @@ export async function fetchTraeCatalog(
  * 非流式请求也走这里：**上游没有非流式路径**（transformToSOLOBody 强制
  * stream:true，由服务端聚合），所以调用方想要非流式必须自己聚合。
  */
+/**
+ * A frame writer that survives a client that has already gone away.
+ *
+ * `controller.enqueue` throws `TypeError: The stream controller cannot close or
+ * enqueue` once the consumer has cancelled. Every path in this handler ends by
+ * writing frames - including the catch - so an unguarded write rethrows FROM the
+ * catch block, escapes as an unhandled rejection and takes the process down.
+ * Record the closure instead, and make every later write a no-op.
+ */
+export function createFrameWriter(
+  sink: { enqueue(chunk: Uint8Array): void },
+  encoder: TextEncoder = new TextEncoder(),
+): { send(payload: string): void; readonly closed: boolean; close(): void } {
+  let closed = false;
+  return {
+    get closed(): boolean {
+      return closed;
+    },
+    send(payload: string): void {
+      if (closed) return;
+      try {
+        sink.enqueue(encoder.encode(payload));
+      } catch {
+        closed = true;
+      }
+    },
+    close(): void {
+      closed = true;
+    },
+  };
+}
+
 export async function handleTraeChat(
   credential: {
     access_token: string;
@@ -790,9 +822,8 @@ export async function handleTraeChat(
           emitted: boolean;
         }>();
 
-        const send = (payload: string): void => {
-          controller.enqueue(encoder.encode(payload));
-        };
+        const writer = createFrameWriter(controller, encoder);
+        const send = (payload: string): void => writer.send(payload);
 
         try {
           for (;;) {
@@ -851,6 +882,9 @@ export async function handleTraeChat(
           } catch {
             /* 上游已断开 */
           }
+          // Mark the writer closed BEFORE closing the controller, so the
+          // close itself can never be turned into another write.
+          writer.close();
           try {
             controller.close();
           } catch {

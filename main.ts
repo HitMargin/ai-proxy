@@ -11,7 +11,7 @@ import {
   tryParseResponse,
 } from "./src/core.ts";
 export { ENV } from "./src/core.ts";
-import { CatalogRegistry } from "./src/runtime/health.ts";
+import { CatalogRegistry, isRosterDegraded } from "./src/runtime/health.ts";
 import { CNB_MODELS, handleCnb } from "./src/cnb.ts";
 import { readJsonBodyLimited } from "./src/deepseek-responses.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
@@ -613,12 +613,19 @@ async function handleAggregateV1(
           data.push({ ...m, id: `${key}/${m.id}`, owned_by: key });
         }
       }
-      // Degraded means any member is absent or came back empty. One channel
-      // failing while the rest answer is precisely the case that used to hide:
-      // the roster looked healthy, only shorter, and stayed that way for the
-      // whole window.
-      const degraded = V1_AGGREGATE_MEMBERS.some((key) =>
-        !Array.isArray(members[key]) || members[key].length === 0
+      // Degraded means any member that SHOULD answer is absent or came back
+      // empty. One channel failing while the rest answer is precisely the case
+      // that used to hide: the roster looked healthy, only shorter, and stayed
+      // that way for the whole window.
+      //
+      // A member with no credential is not that case: it is dormant by the
+      // user's choice, and counting it pinned the roster to DEGRADED_TTL forever
+      // - a 20x refetch rate and a warning at every start, for a channel that
+      // was never going to answer until a key was pasted.
+      const degraded = isRosterDegraded(
+        V1_AGGREGATE_MEMBERS,
+        members,
+        (key) => !hasChannelCredential(key, (providers as any)[key]),
       );
       if (degraded && previous?.degraded !== true) {
         console.warn(

@@ -6,6 +6,7 @@
 
 import {
   buildOpenAIChunk,
+  createFrameWriter,
   handleTraeChat,
   mapTraeUsage,
   parseTraeBatchModelList,
@@ -649,4 +650,127 @@ Deno.test("no usage frame means no usage field, not zeros", async () => {
     ),
   );
   equal("usage" in chunks[chunks.length - 1], false);
+});
+
+// ── 帧写入器：客户端已经走了 ──
+//
+// 报错路径的最后一步也是写帧，所以一个不设防的 send 会在 catch 里**再抛一次**：
+// 第一次抛出被 catch 接住，catch 里的这次抛出就没人接了，变成 unhandled rejection
+// 把进程带走。日志里的 `TypeError: The stream controller cannot close or enqueue`
+// 就是它。
+
+Deno.test("a write to a client that already went away is swallowed, not thrown", () => {
+  let attempts = 0;
+  const writer = createFrameWriter({
+    enqueue(): void {
+      attempts += 1;
+      throw new TypeError("The stream controller cannot close or enqueue");
+    },
+  });
+  // 调用者正在 catch 块里收尾：这里再抛就是进程级事故。
+  writer.send("data: [DONE]\n\n");
+  equal(writer.closed, true, "a refused write must mark the writer closed");
+  // 而且后续每一次写都必须是空操作，不能是第二次抛出。
+  writer.send("data: [DONE]\n\n");
+  equal(attempts, 1, "a closed writer must stop touching the sink");
+});
+
+Deno.test("a writer emits until the sink refuses, then emits nothing more", () => {
+  const frames: string[] = [];
+  let refuse = false;
+  const decoder = new TextDecoder();
+  const writer = createFrameWriter({
+    enqueue(chunk: Uint8Array): void {
+      if (refuse) throw new TypeError("closed");
+      frames.push(decoder.decode(chunk));
+    },
+  });
+  writer.send("a");
+  writer.send("b");
+  refuse = true;
+  writer.send("c");
+  equal(frames, ["a", "b"], "only the frames the sink accepted");
+  equal(writer.closed, true);
+});
+
+Deno.test("an explicitly closed writer writes nothing at all", () => {
+  const frames: string[] = [];
+  const decoder = new TextDecoder();
+  const writer = createFrameWriter({
+    enqueue(chunk: Uint8Array): void {
+      frames.push(decoder.decode(chunk));
+    },
+  });
+  writer.close();
+  writer.send("x");
+  equal(frames, [], "close() must pre-empt every later write");
+  equal(writer.closed, true);
+});
+
+Deno.test("a client that cancels mid-stream does not raise an unhandled rejection", async () => {
+  const encoder = new TextEncoder();
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let pulled = 0;
+  const fetcher = (async () => {
+    const stream = new ReadableStream({
+      async pull(controller) {
+        pulled += 1;
+        if (pulled === 1) {
+          controller.enqueue(
+            encoder.encode(
+              "event:output\ndata:" + JSON.stringify({ response: "hi" }) +
+                "\n\n",
+            ),
+          );
+          return;
+        }
+        if (pulled === 2) {
+          // 上游说到一半就停住，等我们把客户端放掉。
+          await gate;
+          controller.enqueue(
+            encoder.encode(
+              "event:done\ndata:" +
+                JSON.stringify({ finish_reason: "stop" }) + "\n\n",
+            ),
+          );
+          return;
+        }
+        controller.close();
+      },
+    });
+    return new Response(stream, { status: 200 });
+  }) as unknown as typeof fetch;
+
+  const rejections: unknown[] = [];
+  const onRejection = (event: PromiseRejectionEvent) => {
+    rejections.push(event.reason);
+    event.preventDefault();
+  };
+  globalThis.addEventListener("unhandledrejection", onRejection);
+  try {
+    const response = await handleTraeChat(
+      CREDENTIAL,
+      DEMO,
+      { model: "demo", messages: [] },
+      fetcher,
+    );
+    const reader = response.body!.getReader();
+    await reader.read();
+    // 关标签页：正文被取消，之后每一次 enqueue 都会抛。
+    await reader.cancel();
+    release();
+    for (let i = 0; i < 30; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  } finally {
+    globalThis.removeEventListener("unhandledrejection", onRejection);
+  }
+  equal(
+    rejections.map((reason) => String(reason)),
+    [],
+    "a cancelled client must not surface as an unhandled rejection",
+  );
 });
