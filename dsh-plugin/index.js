@@ -565,7 +565,11 @@ export class ProxyRuntime {
 
   originUrl() {
     if (this.settings.mode === 'external') {
-      return new URL(safeBaseUrl(this.settings.externalUrl || `http://127.0.0.1:${this.settings.port}/commandcode/v1`)).origin;
+      // The fallback carries no channel path. With one appended, a mode switched to
+      // "external" and a left-blank field produced an origin of
+      // `.../commandcode/v1`, and every request built on top of it started with
+      // `/commandcode/v1/v1/...` - a path that answers nothing.
+      return new URL(safeBaseUrl(this.settings.externalUrl || `http://127.0.0.1:${this.settings.port}`)).origin;
     }
     return `http://127.0.0.1:${this.settings.port}`;
   }
@@ -575,8 +579,16 @@ export class ProxyRuntime {
     return `${this.originUrl()}${suffix}`;
   }
 
+  /**
+   * The address a client should be pointed at: the aggregate, not one channel.
+   *
+   * This used to return the commandcode prefix, so the panel's settings header
+   * advertised `http://127.0.0.1:8000/commandcode/v1` as "the proxy". Copying that
+   * into a client sends every turn to a single channel - and the aggregate at `/v1`
+   * is the route the `ai-proxy` provider actually registers under.
+   */
   baseUrl() {
-    return this.serviceUrl('/commandcode/v1');
+    return this.serviceUrl('/v1');
   }
 
   snapshot() {
