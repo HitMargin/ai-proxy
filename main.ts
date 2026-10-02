@@ -221,6 +221,34 @@ function v1ResolveModel(model: string): { key: string; raw: string } | null {
  */
 const catalog = new CatalogRegistry();
 
+/**
+ * A channel's own model listing, for a channel that is not an aggregate member.
+ *
+ * Asked of the local server rather than the upstream: the channel's handler is
+ * where its listing is normalised, and deepseek-web's in particular is a fixed set
+ * of variants the proxy answers from its own state.
+ */
+async function v1FetchOwnListing(prefix: string): Promise<any[]> {
+  const port = ENV.PORT || 8000;
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${port}/${prefix}/v1/models`,
+      {
+        headers: {
+          authorization: `Bearer ${ENV.DEFAULT_BEARER_TOKEN || "public"}`,
+        },
+        signal: AbortSignal.timeout(15_000),
+      },
+    );
+    if (!response.ok) return [];
+    const parsed = await response.json();
+    return Array.isArray(parsed?.data) ? parsed.data : [];
+  } catch {
+    // A channel that will not list is a channel with nothing to probe.
+    return [];
+  }
+}
+
 async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
   const out: Record<string, any[]> = {};
   const now = Date.now();
@@ -616,7 +644,13 @@ export async function handler(request: Request): Promise<Response> {
       // 实时拉取而不是读 v1MemberModelIds：后者依赖此前是否有人访问过
       // /v1/models 暖过缓存，冷启动时会是空列表，用户点「检查状态」就得到 0 个。
       const members = await v1FetchMemberModels();
-      const rows = members[provider] ?? [];
+      // A channel does not have to be an aggregate member to be probeable.
+      // deepseek-web is not one - it is served on its own prefix - so reading the
+      // aggregate alone found no rows for it and the probe answered
+      // `probed: 0` for a channel that works, which is the same "silent zero" the
+      // model list had. Fall back to the channel's own listing.
+      let rows = members[provider] ?? [];
+      if (rows.length === 0) rows = await v1FetchOwnListing(prefix);
       const listing = rows
         .map((row: any) => (typeof row?.id === "string" ? row.id : ""))
         .filter((value: string) => value !== "");
@@ -637,12 +671,18 @@ export async function handler(request: Request): Promise<Response> {
       const limit = Number.isInteger(limitParam) && limitParam > 0
         ? Math.min(limitParam, listing.length)
         : listing.length;
+      // The aggregate only routes its members. A channel that has its own prefix
+      // has to be probed there, with the bare model id, or every model reads
+      // unavailable regardless of whether it answers.
+      const isAggregateMember = (V1_AGGREGATE_MEMBERS as readonly string[])
+        .includes(provider);
       const results = await probeChannel(
         provider,
         listing.slice(0, limit).map((id: string) => `${provider}/${id}`),
         {
           origin: new URL("/", url).href.replace(/\/$/, ""),
           apiKey,
+          basePath: isAggregateMember ? "/v1" : `/${prefix}/v1`,
         },
       );
       return new Response(

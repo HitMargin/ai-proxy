@@ -312,18 +312,25 @@ export function recordModelHealth(
 }
 
 /**
- * Probe one model through this proxy's own aggregate route.
+ * Probe one model through this proxy's own route.
  *
  * Asking the channel's upstream directly would bypass the request rewriting
  * that channel needs (the Zen fingerprint, the CLI gateway protocol, the web
  * session headers), and a model that works in the panel would then be reported
- * as broken. Going back through `/v1` tests the same path a real turn takes.
+ * as broken. Going back through the proxy tests the same path a real turn takes.
+ *
+ * `basePath` is the channel's own prefix, not `/v1`. The aggregate only routes its
+ * members, so a channel that is not one - deepseek-web - came back "unavailable"
+ * through `/v1` while answering perfectly on its own prefix. The same applies to
+ * the model name: the aggregate needs `channel/model`, a channel's own route needs
+ * the bare id.
  */
 async function testModelThroughProxy(
   origin: string,
   modelId: string,
   apiKey: string,
   timeoutMs: number,
+  basePath = "/v1",
 ): Promise<ProbeSample> {
   const startedAt = Date.now();
   const controller = new AbortController();
@@ -334,11 +341,16 @@ async function testModelThroughProxy(
       accept: "text/event-stream",
     });
     if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
-    const response = await fetch(`${origin}/v1/chat/completions`, {
+    // The aggregate addresses models as `channel/model`; a channel's own route
+    // takes the bare id, so the prefix is dropped when not going through `/v1`.
+    const wireModel = basePath === "/v1"
+      ? modelId
+      : modelId.replace(new RegExp(`^${modelId.split("/")[0]}/`), "");
+    const response = await fetch(`${origin}${basePath}/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify({
-        model: modelId,
+        model: wireModel,
         messages: [{ role: "user", content: "Hi" }],
         stream: true,
         max_tokens: 1,
@@ -416,6 +428,8 @@ export async function probeChannel(
     concurrency?: number;
     timeoutMs?: number;
     signal?: AbortSignal;
+    /** The channel's own prefix, when it is not served through `/v1`. */
+    basePath?: string;
   },
 ): Promise<Record<string, ProbeSample & { latencyMs?: number }>> {
   const concurrency = Math.max(
@@ -437,6 +451,7 @@ export async function probeChannel(
           modelId,
           options.apiKey,
           timeoutMs,
+          options.basePath,
         ),
       );
     }

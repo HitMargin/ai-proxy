@@ -2244,7 +2244,28 @@ export function apply(ctx, config = {}) {
   ctx.llm.registerConfigurableProviders?.([
     { provider: PROJECT_ROUTE, displayName: 'ai-proxy', settingsNs: entryId, settingsPath: [] },
   ]);
-  ctx.llm.registerModelDiscovery?.(entryId, () => projectAdapter.listProjectModels());
+  // The Host builds its model catalog once per generation, and it does that as
+  // soon as the plugin loads - which is before the proxy it has to ask is
+  // listening. A cold start measured three seconds apart, and a catalog built
+  // against a proxy that is not up yet is kept, so the channels that were missing
+  // simply never appear in the picker.
+  //
+  // Retrying here is the only place that can help: the Host has no retry of its
+  // own, and a later successful call would not be read.
+  ctx.llm.registerModelDiscovery?.(entryId, async () => {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      if (attempt > 0) {
+        await new Promise((done) => setTimeout(done, 2000 * attempt));
+      }
+      try {
+        const rows = await projectAdapter.listProjectModels();
+        if (rows.length > 0) return rows;
+      } catch {
+        // The proxy is not up yet. Try again while attempts remain.
+      }
+    }
+    return [];
+  });
   ctx.inject?.(['webServer'], (scoped) => {
     const handler = apiHandler(adapter, runtime, projectAdapter);
     for (const path of ['/api/ai-proxy', '/api/ai-proxy-commandcode']) {
