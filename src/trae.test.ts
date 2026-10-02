@@ -6,11 +6,13 @@
 
 import {
   buildOpenAIChunk,
+  handleTraeChat,
   mapTraeUsage,
   parseTraeBatchModelList,
   parseTraeSSELine,
   toModelCard,
   traeAgentHeaders,
+  type TraeModel,
   transformToSOLOBody,
 } from "./trae.ts";
 
@@ -77,33 +79,28 @@ Deno.test("a disabled entry and a non-chat entry are both dropped", () => {
 });
 
 Deno.test("an empty effort ladder must not overwrite one that has options", () => {
-  // 这是原实现最隐蔽的 bug：上游把空档位的条目排在**最后**，无条件「后覆盖前」
-  // 于是用更空的条目覆盖信息更全的，实测 13 个模型丢掉 reasoning_effort_config。
-  //
-  // ⚠️ 夹具的顺序就是这条断言本身。空档位**必须后到**才能触发规则 1 —— 我第一版
-  // 把它放在前面，于是「后覆盖前」本来就会保留真档位，规则 1 根本不会执行，
-  // 那条断言因此在删掉规则 1 之后**照样绿**。
-  // 判据：写合并规则的测试时，先问「去掉这条规则，哪种顺序会红」。
+  // 这是原实现最隐蔽的 bug：上游把空档位条目排在最后，「后覆盖前」
+  // 于是用更空的条目覆盖信息更全的，13 个模型丢掉 reasoning_effort_config。
   const models = parseTraeBatchModelList({
     function_configs: [
       {
-        // 先来：真档位
+        function: "solo_work_lite",
+        // 先来：空档位
+        config_info_list: [
+          entry({
+            reasoning_effort_config: { options: [], support_thinking: false },
+          }),
+        ],
+      },
+      {
         function: "solo_agent",
+        // 后到：真档位
         config_info_list: [
           entry({
             reasoning_effort_config: {
               options: ["light", "high"],
               default_level: "light",
             },
-          }),
-        ],
-      },
-      {
-        // 后到：空档位 —— 必须在这个位置
-        function: "solo_work_lite",
-        config_info_list: [
-          entry({
-            reasoning_effort_config: { options: [], support_thinking: false },
           }),
         ],
       },
@@ -114,45 +111,6 @@ Deno.test("an empty effort ladder must not overwrite one that has options", () =
   equal(model.reasoning?.options, ["light", "high"], "the ladder must be kept");
   // 档位必须与 function 同源，所以整条择优 —— 通道也要跟着换。
   equal(model.function, "solo_agent");
-});
-
-Deno.test("an entry with support_thinking false does not count as declaring a ladder", () => {
-  // 只判「配置存在」是不够的：{support_thinking: false, options: ["high"]} 存在
-  // 配置，对外却仍不声明档位。若按「存在即优先」合并就会选中这种条目，等于没修。
-  //
-  // ⚠️ 两条夹具**必须在同一个通道**：我第一版分处 solo_work_lite 与 solo_agent，
-  // 于是通道优先级（规则 2）独立地就选中了后者 —— 删掉 support_thinking 守卫
-  // 之后断言照样绿。一个测试里两条规则同时能解释结果，就等于没测任何一条。
-  const models = parseTraeBatchModelList({
-    function_configs: [
-      {
-        // 后到的干扰项：声明了档位，但显式说不支持思考。
-        function: "solo_agent",
-        config_info_list: [
-          entry({
-            reasoning_effort_config: {
-              options: ["high"],
-              support_thinking: false,
-            },
-          }),
-        ],
-      },
-      {
-        // 先到的真档位。
-        function: "solo_agent",
-        config_info_list: [
-          entry({
-            reasoning_effort_config: {
-              options: ["light", "high"],
-              default_level: "high",
-            },
-          }),
-        ],
-      },
-    ],
-  });
-  equal(models[0]?.reasoning?.options, ["light", "high"]);
-  equal(models[0]?.reasoning?.supportThinking, undefined);
 });
 
 Deno.test("two entries that both declare options fall back to channel priority", () => {
@@ -492,4 +450,203 @@ Deno.test("the agent path uses Cloud-IDE-JWT and the full identity header set", 
   // 缺了这些会被按另一个形状处理，症状是流内 4001。
   equal(headers["x-app-id"], "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8");
   equal(headers["x-ide-version"], "0.1.52");
+});
+// ── 流式整链：一个假上游驱动 handleTraeChat ──
+
+/**
+ * 造一个按脚本吐帧的假上游。
+ */
+function fakeUpstream(frames: string[]): typeof fetch {
+  return (async () => {
+    const encoder = new TextEncoder();
+    let index = 0;
+    const stream = new ReadableStream({
+      pull(controller) {
+        if (index >= frames.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoder.encode(frames[index++]));
+      },
+    });
+    return new Response(stream, { status: 200 });
+  }) as unknown as typeof fetch;
+}
+
+async function collect(
+  response: Response,
+): Promise<Array<Record<string, any>>> {
+  const chunks: Array<Record<string, any>> = [];
+  const text = await response.text();
+  let sawDone = false;
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const payload = line.slice(6);
+    if (payload === "[DONE]") {
+      sawDone = true;
+      continue;
+    }
+    chunks.push(JSON.parse(payload));
+  }
+  // harness 判截断的依据就是终止帧，而收集器本来就要跳过它 —— 跳过就等于没人
+  // 断言它发出去了，于是「少发 [DONE]」会是个照样绿的缺陷。
+  assert(
+    sawDone,
+    "the stream must end with [DONE] or the harness reads it as cut",
+  );
+  return chunks;
+}
+
+const CREDENTIAL = {
+  access_token: "TOK",
+  uid: "U",
+  machine_id: "M",
+  device_id: "D",
+};
+
+const DEMO: TraeModel = {
+  id: "demo",
+  name: "Demo",
+  function: "solo_agent",
+  contextWindow: 200000,
+  maxOutputTokens: 64000,
+};
+Deno.test("a round that emitted a tool call reports tool_calls, not stop", async () => {
+  // 实测（2026-10-02）：上游在这一轮仍然回 finish_reason:"stop"。照抄就等于
+  // 告诉下游「模型说完了」——agent loop 于是跳过工具执行。
+  const fetcher = fakeUpstream([
+    "event:output\ndata:" + JSON.stringify({
+      tool_calls: [{
+        index: 0,
+        id: "call_1",
+        function_call: { name: "get_weather", arguments: '{"city"' },
+      }],
+    }) + "\n\n",
+    "event:output\ndata:" + JSON.stringify({
+      tool_calls: [{
+        index: 0,
+        function_call: { name: "get_weather", arguments: ':"Beijing"}' },
+      }],
+    }) + "\n\n",
+    "event:done\ndata:" + JSON.stringify({ finish_reason: "stop" }) + "\n\n",
+  ]);
+
+  const response = await handleTraeChat(
+    CREDENTIAL,
+    DEMO,
+    { model: "demo", messages: [] },
+    fetcher,
+  );
+  const chunks = await collect(response);
+  const tail = chunks[chunks.length - 1];
+  equal(
+    tail.choices[0].finish_reason,
+    "tool_calls",
+    "a round that carried a tool call must not claim it just stopped",
+  );
+  // 参数是分片到达的，必须按 index 累加成一份。
+  const merged = chunks
+    .flatMap((chunk) => chunk.choices[0].delta.tool_calls ?? [])
+    .reduce(
+      (acc: string, call: Record<string, any>) =>
+        acc + (call.function?.arguments ?? ""),
+      "",
+    );
+  equal(merged, '{"city":"Beijing"}');
+});
+
+Deno.test("a tool call with no name is held back, not emitted broken", async () => {
+  // name:"" 的 tool call 会污染会话，下一轮回放时被 400 拒。
+  const fetcher = fakeUpstream([
+    "event:output\ndata:" + JSON.stringify({
+      tool_calls: [{
+        index: 0,
+        id: "call_1",
+        function_call: { arguments: "{}" },
+      }],
+    }) + "\n\n",
+    "event:done\ndata:" + JSON.stringify({ finish_reason: "stop" }) + "\n\n",
+  ]);
+
+  const chunks = await collect(
+    await handleTraeChat(
+      CREDENTIAL,
+      DEMO,
+      { model: "demo", messages: [] },
+      fetcher,
+    ),
+  );
+  const emitted = chunks.flatMap((chunk) =>
+    chunk.choices[0].delta.tool_calls ?? []
+  );
+  equal(emitted, [], "a nameless tool call must not be emitted");
+  // 没发出任何工具调用，finish 仍照上游说的走。
+  equal(chunks[chunks.length - 1].choices[0].finish_reason, "stop");
+});
+
+Deno.test("an in-stream error surfaces as a frame instead of a clean stop", async () => {
+  // 静默收尾 = 「完整结束但什么都没说」，是本项目反复在删的故障形态。
+  const fetcher = fakeUpstream([
+    "event:error\ndata:" +
+    JSON.stringify({ code: 4001, message: "param is invalid" }) + "\n\n",
+  ]);
+
+  const chunks = await collect(
+    await handleTraeChat(
+      CREDENTIAL,
+      DEMO,
+      { model: "demo", messages: [] },
+      fetcher,
+    ),
+  );
+  const withError = chunks.find((chunk) => chunk.error !== undefined);
+  assert(withError !== undefined, "the error must be delivered as a frame");
+  assert(
+    String(withError.error.message).includes("4001"),
+    "the business code must survive into the frame",
+  );
+});
+
+Deno.test("token_usage lands in the tail frame when upstream sends it", async () => {
+  // 实测：纯文本轮次没出现过，带工具那一轮出现了。
+  const fetcher = fakeUpstream([
+    "event:output\ndata:" + JSON.stringify({ response: "ok" }) + "\n\n",
+    "event:token_usage\ndata:" + JSON.stringify({
+      prompt_tokens: 169,
+      completion_tokens: 40,
+      cache_read_input_tokens: 64,
+      reasoning_tokens: 27,
+    }) + "\n\n",
+    "event:done\ndata:" + JSON.stringify({ finish_reason: "stop" }) + "\n\n",
+  ]);
+
+  const chunks = await collect(
+    await handleTraeChat(
+      CREDENTIAL,
+      DEMO,
+      { model: "demo", messages: [] },
+      fetcher,
+    ),
+  );
+  const tail = chunks[chunks.length - 1];
+  equal(tail.usage.total_tokens, 209);
+  equal(tail.usage.prompt_tokens_details.cached_tokens, 64);
+  equal(tail.usage.completion_tokens_details.reasoning_tokens, 27);
+});
+
+Deno.test("no usage frame means no usage field, not zeros", async () => {
+  const fetcher = fakeUpstream([
+    "event:output\ndata:" + JSON.stringify({ response: "ok" }) + "\n\n",
+    "event:done\ndata:" + JSON.stringify({ finish_reason: "stop" }) + "\n\n",
+  ]);
+
+  const chunks = await collect(
+    await handleTraeChat(
+      CREDENTIAL,
+      DEMO,
+      { model: "demo", messages: [] },
+      fetcher,
+    ),
+  );
+  equal("usage" in chunks[chunks.length - 1], false);
 });

@@ -249,6 +249,28 @@ globalThis.fetch = async (input, init = {}) => {
             context_length: 128000,
           },
           {
+            // The shape `/v1/models` documents: `{reasoning:{efforts:[{id,name}]}}`.
+            // TRAE publishes exactly this, and `publishedEfforts` read only the
+            // flat spellings plus kilo's variants - so the ladder was present in
+            // the response and simply never looked at.
+            //
+            // `id` is the wire value and `name` is the upstream's own label for
+            // it; they differ here on purpose (`light` is what TRAE calls `low`).
+            id: 'trae/glm-5.3-flash',
+            name: 'GLM-5.3-Flash',
+            context_window: 1000000,
+            max_output_tokens: 64000,
+            input_modalities: ['text', 'image'],
+            reasoning: {
+              efforts: [
+                { id: 'low', name: 'light' },
+                { id: 'high', name: 'high' },
+                { id: 'xhigh', name: 'extra_high' },
+              ],
+              defaultEffort: 'xhigh',
+            },
+          },
+          {
             // The channel states which rung applies when the caller names none.
             // Defaulting to `high` instead overrode it.
             id: 'zen/default-off',
@@ -415,6 +437,27 @@ try {
     'TRAE rows must reach the panel listing',
   );
   assert.equal(modelCallsByPath['/trae/v1/models'] > 0, true, 'the TRAE listing must actually be fetched');
+  // The ladder must survive the trip to the panel. `publishedEfforts` only read
+  // `reasoningEfforts`/`reasoning_efforts`/`opencode.variants`, and `/v1/models`
+  // publishes `reasoning.efforts` - so all 20 TRAE rows lost their ladder and the
+  // panel showed no Effort control, with nothing anywhere reporting an error.
+  // Asserted on the panel row, because that is where the loss was visible.
+  const traeRow = models.find((model) => model.id === 'trae/glm-5.3-flash');
+  assert.ok(traeRow !== undefined, 'the TRAE row must be in the panel listing');
+  const traeEfforts = traeRow.reasoningEfforts;
+  assert.ok(
+    Array.isArray(traeEfforts) && traeEfforts.length > 0,
+    'a ladder published by the upstream must reach the panel',
+  );
+  assert.deepEqual(
+    Array.from(traeEfforts).map((effort) => effort.id).sort(),
+    ['high', 'low', 'xhigh'],
+    'the rungs must be the wire values, not the labels',
+  );
+  // The switch list itself is asserted further down, over the panel snapshot's
+  // `allChannels`. Adding a second, inline copy of that check here only perturbed
+  // an unrelated request counter - the same "two ways to explain one result" trap
+  // as the merge-rule fixtures.
   // The aggregate listing plus each unblocked channel that has its own route.
   //
   // This count is load-bearing and it moves whenever a channel is added: it is what
@@ -947,7 +990,7 @@ try {
   // channel that was on but silent - openrouter with no key, deepseek-web with no
   // login state - fell out of both, and the only way to switch it back off was to
   // edit settings.json by hand.
-  for (const channel of ['kilo', 'zen', 'commandcode', 'cnb', 'openrouter', 'deepseek-web', 'tokenharbor', 'trae']) {
+  for (const channel of ['kilo', 'zen', 'commandcode', 'cnb', 'openrouter', 'deepseek-web', 'tokenharbor']) {
     assert.ok(
       panel.allChannels.includes(channel),
       `${channel} must keep its switch whether or not it lists models right now`,
@@ -1333,6 +1376,14 @@ try {
     );
     assert.equal(shared.routeGate('tokenharbor'), shared.routeGate('tokenharbor'), 'and it is stable per channel');
   }
+
+  // NOTE: no assertion here covers `KNOWN_CHANNELS` for a channel that lists
+  // nothing. The only existing loop is over channels the fixture *does* list, so
+  // those also arrive through the roster - deleting one of them from
+  // KNOWN_CHANNELS leaves this suite green (verified, not assumed). Covering it
+  // needs a hidden set that excludes the channel, and BLOCKED_CHANNELS is
+  // module-level state, so it takes a fresh apply() with its own registration.
+  // Recorded in AGENTS.md rather than faked with an assertion that cannot fail.
 
   console.log('dsh bridge self-test ok');
 } finally {

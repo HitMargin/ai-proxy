@@ -376,6 +376,15 @@ function publishedEfforts(row) {
   const sources = [];
   if (Array.isArray(row.reasoningEfforts)) sources.push(row.reasoningEfforts);
   if (Array.isArray(row.reasoning_efforts)) sources.push(row.reasoning_efforts);
+  // A third shape: `{reasoning: {efforts: [{id, name}], defaultEffort}}`, which is
+  // the one `/v1/models` documents. Reading only the flat spellings made every
+  // model served under that shape lose its whole ladder - TRAE all 20 rows had
+  // `reasoning` in the response and the panel showed no Effort control at all.
+  // Same failure as the kilo one, one level deeper: a field that is present and
+  // simply never looked at.
+  if (isRecord(row.reasoning) && Array.isArray(row.reasoning.efforts)) {
+    sources.push(row.reasoning.efforts);
+  }
   const variants = isRecord(row.opencode) ? row.opencode.variants : undefined;
   if (isRecord(variants)) {
     // `{id, name}`: id is the effort kilo validates, name is the variant it shows.

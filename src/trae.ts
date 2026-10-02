@@ -815,6 +815,21 @@ export async function handleTraeChat(
           // 收尾：先 finish_reason 再 [DONE]。
           //
           // ⚠️ 顺序反了会让 harness 的流截断检测误判（缺终止帧 = stream_cut）。
+          //
+          // ⚠️ 实测（2026-10-02 抓包）：上游在**发起了工具调用**的那一轮仍然回
+          // finish_reason:"stop"。照抄就等于告诉下游「模型说完了」——agent loop
+          // 于是跳过工具执行、拿空工具结果继续，症状是「模型好像没在用工具」。
+          // 所以 finish_reason 以**我们自己看见了什么**为准：转出过任何工具调用
+          // 就是 tool_calls，否则那是在断言一个这一轮没有发生的事。
+          // ⚠️ 判据是「**真的发出去了**」，不是「看见了」。一个 nameless 的工具
+          // 调用会被扣住不发射（name:"" 会污染会话），若按「看见了」算，
+          // 这一轮就会报 tool_calls 而客户端一个工具调用都收不到 —— 反过来撒谎。
+          for (const entry of toolIndex.values()) {
+            if (entry.emitted) {
+              finish = "tool_calls";
+              break;
+            }
+          }
           send(buildOpenAIChunk(chatId, created, modelName, {}, finish, usage));
           send("data: [DONE]\n\n");
         } catch (error) {
