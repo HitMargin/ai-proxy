@@ -1179,6 +1179,115 @@ function clampOutputBudget(body, contextWindow) {
   body.max_tokens = Math.max(MIN_OUTPUT_TOKENS, room);
   body.max_tokensClamped = true;
 }
+/**
+ * Deduplicates the model-listing fetch and cools down after a failure.
+ *
+ * The Host builds a catalog by calling `listModels()` once and then
+ * `resolveModel()` once per model, concurrently. Both paths need the listing, so
+ * a fetch per call turns one catalog build into one request per model - 93 here,
+ * and every one of them a full aggregate listing rather than one cheap answer.
+ *
+ * Three rules, each answering a specific way that naive caching fails:
+ *
+ * 1. **One in-flight fetch.** Concurrent callers share a promise instead of
+ *    racing. The loader's `catch` turns any throw into a *resolved* `undefined`
+ *    and the async IIFE settles before the assignment below can be observed by
+ *    anyone else, so the slot is cleared for every outcome - measured with a
+ *    synchronous throw and with two overlapping reads, both of which recover.
+ *    The clearing is inside a `finally` for that reason: without it a settled
+ *    `task` would stay in the slot and every later reader would attach to it.
+ * 2. **A settled listing is reused for the rest of the generation.** The panel
+ *    needs a live list, so the cache is short-lived rather than permanent, and
+ *    `refreshCatalog()` drops it whenever the user asks for fresh data. Without
+ *    this the 93 `resolveModel` calls above would still each run `run`, just
+ *    under a lock, and a listing that failed once would retry 93 times.
+ * 3. **Failure cools down.** A proxy that is down must not be asked 93 times per
+ *    keystroke; the last failure is remembered for a short window and the
+ *    previous rows are reused so the panel shows the last known catalog instead of
+ *    going blank.
+ *
+ * The window is bounded by how long the host keeps a catalog, so a stale row can
+ * outlive a restart that would otherwise fix it - `refreshCatalog()` exists so
+ * the restart path and the panel's own refresh can bypass it.
+ */
+export class CatalogGate {
+  constructor(options = {}) {
+    this.cooldownMs = options.cooldownMs ?? 5000;
+    this.now = options.now ?? (() => Date.now());
+    this.rows = undefined;
+    this.loadedAt = 0;
+    this.inFlight = undefined;
+    this.retryAt = undefined;
+  }
+
+  /** Rows from the last successful read, or undefined if there has never been one. */
+  peek() {
+    return this.rows;
+  }
+
+  /**
+   * Let the next read bypass the cache, keeping the current rows in place.
+   *
+   * Deliberately not "drop the cache": a panel poll that forces a refresh must
+   * still fall back to the last known roster when the proxy is unreachable, or
+   * the catalogue blanks out exactly when the user is looking at it to work out
+   * why. Only `forget()` actually discards the rows.
+   */
+  refresh() {
+    this.loadedAt = 0;
+    this.retryAt = undefined;
+  }
+
+  /** Drop the cached rows entirely, so the next read has no fallback. */
+  forget() {
+    this.rows = undefined;
+    this.loadedAt = 0;
+    this.retryAt = undefined;
+  }
+
+  /**
+   * Call `load` at most once for concurrent callers, honouring both the cache
+   * window and the failure cooldown. Never throws: a caller that wanted a
+   * listing gets the previous rows (possibly none) instead of an exception.
+   */
+  async read(load) {
+    if (this.rows !== undefined && this.now() - this.loadedAt < this.cooldownMs) return this.rows;
+    if (this.inFlight !== undefined) {
+      await this.inFlight;
+      return this.rows ?? [];
+    }
+    if (this.retryAt !== undefined && this.now() < this.retryAt) return this.rows ?? [];
+    const task = (async () => {
+      try {
+        return await load();
+      } catch {
+        return undefined;
+      }
+    })();
+    this.inFlight = task;
+    try {
+      const loaded = await task;
+      if (loaded !== undefined) {
+        // A successful read always supersedes both the rows and any pending retry,
+        // and starts a fresh window.
+        this.rows = loaded;
+        this.loadedAt = this.now();
+        this.retryAt = undefined;
+      } else {
+        // A failure opens the cooldown whether or not there are rows to fall back
+        // on. With rows, callers keep the previous roster - the panel showing the
+        // last known catalogue beats a blank one while the proxy is down. Without
+        // rows there is nothing to show, but the cooldown still stops one dead
+        // proxy from being asked once per model.
+        this.retryAt = this.now() + this.cooldownMs;
+      }
+    } finally {
+      // Identity check: only the fetch that installed this promise clears it.
+      if (this.inFlight === task) this.inFlight = undefined;
+    }
+    return this.rows ?? [];
+  }
+}
 async function* readSse(response) {
   if (!response.body) throw new Error('ai-proxy returned an empty stream');
   const reader = response.body.getReader();
@@ -1220,6 +1329,23 @@ export class AiProxyAdapter {
     // Ids seen by the last roster read, so a restart can report what moved.
     this.lastRoster = [];
     this.blockedModelCount = 0;
+    // Guards the listing fetch behind `listModels`. `resolveModel` needs the same
+    // rows, and the Host asks for one per model - without this it refetched the
+    // whole roster 93 times for a single catalog build.
+    this.catalogGate = new CatalogGate();
+    // One gate per per-channel route. A single shared cache would answer one
+    // channel's request with another channel's rows.
+    this.routeGates = new Map();
+  }
+
+  /** The gate for one channel's own listing, created on first use. */
+  routeGate(prefix) {
+    let gate = this.routeGates.get(prefix);
+    if (gate === undefined) {
+      gate = new CatalogGate();
+      this.routeGates.set(prefix, gate);
+    }
+    return gate;
   }
 
   get baseUrl() {
@@ -1295,14 +1421,28 @@ export class AiProxyAdapter {
     });
   }
 
-  async listModels() {
-    const response = await this.request('/models');
-    const payload = await response.json();
-    const rows = Array.isArray(payload?.data) ? payload.data : [];
-    return rows.filter((row) => isRecord(row) && typeof row.id === 'string').map((row) => normalizeModel(this.provider, row));
+  async listModels(options = {}) {
+    // Every reader goes through one gate: `resolveModel` asks per model, and the
+    // panel asks on a ten-second poll. Uncached, a catalog build alone asked the
+    // proxy 186 times for 93 models.
+    if (options.force) this.catalogGate.refresh();
+    return this.catalogGate.read(async () => {
+      const response = await this.request('/models');
+      const payload = await response.json();
+      const rows = Array.isArray(payload?.data) ? payload.data : [];
+      const normalized = rows
+        .filter((row) => isRecord(row) && typeof row.id === 'string')
+        .map((row) => normalizeModel(this.provider, row));
+      // An empty listing is reported as "no answer" rather than as a roster, so
+      // one bad read cannot retire every channel: the gate keeps the previous rows
+      // and, with nothing cached, opens its cooldown so a dead proxy is not asked
+      // once per model. The next read after that window tries again.
+      return normalized.length === 0 ? undefined : normalized;
+    });
   }
 
-  async listProjectModels() {
+  async listProjectModels(options = {}) {
+    if (options.force) this.catalogGate.refresh();
     const discovered = await this.listModels();
     // Remembered so a restart can say what changed. The roster itself is never
     // cached - every call reads it fresh, which is what makes the panel's list live.
@@ -1343,9 +1483,20 @@ export class AiProxyAdapter {
       }
 
       try {
-        const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
-        const payload = await response.json();
-        const rows = Array.isArray(payload?.data) ? payload.data : [];
+        // A gate per route, not one shared with the aggregate: the rows are keyed
+        // by what they came from, and one cache holding tokenharbor's listing
+        // would answer deepseek-web's request with it - which showed up as 105
+        // rows prefixed twice over (`deepseek-web/deepseek-web/…`). Each route is
+        // still one request per call, and `resolveModel` walks this method once per
+        // model, so each needs its own.
+        const rows = await this.routeGate(route.prefix).read(async () => {
+          const response = await this.requestAt(route.basePath, '/models', { signal: AbortSignal.timeout(3000) });
+          const payload = await response.json();
+          const rows = Array.isArray(payload?.data) ? payload.data : [];
+          // Same rule as the aggregate: no rows means "no answer", not "nothing
+          // is served". Caching that would silently retire a channel.
+          return rows.length === 0 ? undefined : rows;
+        });
         return rows.filter(isRecord).map((row) => {
           const normalized = normalizeModel(this.provider, row);
           return {

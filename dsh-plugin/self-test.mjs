@@ -15,7 +15,7 @@ process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, healthIndex } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -1092,6 +1092,141 @@ try {
     'enabling the channel must put its models in the roster',
   );
   disposeEnabled();
+
+  // ── The listing gate ──────────────────────────────────────────────────────
+  //
+  // The Host builds a catalogue by calling `listModels()` once and then
+  // `resolveModel()` once per model, concurrently. Both paths need the listing,
+  // so without a gate one build costs one full aggregate read per model: 93
+  // models here turned into 186 listing requests, every one of them a complete
+  // `/v1/models` rather than one cheap answer.
+  {
+    let clock = 1000;
+    const gate = new CatalogGate({ cooldownMs: 5000, now: () => clock });
+    let loads = 0;
+    const load = async () => { loads += 1; return [{ id: 'a' }]; };
+
+    const concurrent = await Promise.all([gate.read(load), gate.read(load), gate.read(load)]);
+    assert.equal(loads, 1, 'concurrent readers share one fetch');
+    assert.equal(concurrent[2].length, 1, 'every caller gets the rows');
+
+    await gate.read(load);
+    assert.equal(loads, 1, 'a settled listing is reused inside the window');
+
+    clock += 6000;
+    await gate.read(load);
+    assert.equal(loads, 2, 'the window expires and the proxy is asked again');
+
+    // A failing read must not blank the catalogue, and must not be retried on
+    // every model of the same build either.
+    clock += 6000;
+    await gate.read(async () => { throw new Error('proxy down'); });
+    assert.deepEqual(gate.peek(), [{ id: 'a' }], 'the last known rows survive a failure');
+    loads = 0;
+    await gate.read(load);
+    await gate.read(load);
+    assert.equal(loads, 0, 'a failure opens a cooldown instead of retrying per model');
+
+    // A forced refresh goes to the proxy even inside the window - this is the
+    // panel's own poll, and it must be able to see what just changed.
+    clock += 6000;
+    gate.refresh();
+    await gate.read(load);
+    assert.equal(loads, 1, 'a forced refresh bypasses the window');
+
+    // A loader that throws must not leave the gate wedged - a settled promise
+    // stuck in the in-flight slot would answer every later read with nothing,
+    // forever, with nothing logged. `cooldownMs: 0` with a frozen clock is what
+    // makes this measurable: the cooldown cannot be what lets the next read
+    // through, so reaching the loader again is the only explanation.
+    //
+    // The assertion counts loader reaches rather than comparing rows, because a
+    // wedged gate and a working one can both answer with the same array once a
+    // cooldown is in play. `overlapping` covers the case where the failed read is
+    // still in flight when a second reader arrives.
+    const racing = new CatalogGate({ cooldownMs: 0, now: () => 0 });
+    let racingLoads = 0;
+    const racingLoad = async () => { racingLoads += 1; return [{ id: 'fresh' }]; };
+    await racing.read(() => { throw new Error('boom'); });
+    assert.deepEqual(await racing.read(racingLoad), [{ id: 'fresh' }], 'a throwing load must still answer');
+    await racing.read(racingLoad);
+    assert.equal(racingLoads, 2, 'and the loader must be reachable again, not a stuck promise');
+
+    // A reader that arrives while a *failing* read is in flight joins that read
+    // rather than starting its own, so it gets no rows - correct dedupe, wrong
+    // answer for that one caller. What matters is that it is bounded: with the
+    // cooldown at zero the very next read has to reach the loader again. A gate
+    // holding a settled promise answers every later read with nothing forever.
+    const overlapping = new CatalogGate({ cooldownMs: 0, now: () => 0 });
+    await Promise.allSettled([
+      overlapping.read(() => { throw new Error('boom'); }),
+      overlapping.read(async () => [{ id: 'a' }]),
+    ]);
+    assert.deepEqual(await overlapping.read(async () => [{ id: 'a' }]), [{ id: 'a' }], 'a failed read must not poison later reads');
+
+    // `forget()` is the only way to drop the rows: `refresh()` deliberately keeps
+    // them, so a failed panel poll falls back instead of blanking the catalogue.
+    gate.forget();
+    assert.equal(gate.peek(), undefined, 'forget drops the cached rows');
+  }
+
+  // The empty-listing rule belongs to `listModels`, not to the gate: the gate
+  // caches whatever a loader returns, and the loader translates "no rows" into
+  // "no answer" so a single bad read cannot retire every channel.
+  {
+    const empty = new AiProxyAdapter({
+      runtime: new ProxyRuntime({ mode: 'external', externalUrl: 'http://127.0.0.1:8000/v1' }),
+      provider: 'ai-proxy',
+      basePath: '/v1',
+    });
+    const served = ['kilo/a', 'kilo/b'];
+    let calls = 0;
+    globalThis.fetch = async (input) => {
+      if (!String(input).includes('/models')) return new Response('{}', { status: 200 });
+      calls++;
+      return new Response(JSON.stringify({ data: calls === 1 ? [] : served.map((id) => ({ id })) }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const nothing = await empty.listModels();
+    assert.deepEqual(nothing, [], 'an empty listing still answers with no rows');
+    assert.equal(empty.catalogGate.peek(), undefined, 'but it is not cached as the roster');
+    // And it opens the cooldown, so one empty answer is not retried per model -
+    // the same rule that stops a dead proxy from being asked 93 times.
+    const duringCooldown = await empty.listModels();
+    assert.deepEqual(duringCooldown, [], 'an empty answer is not retried inside the cooldown');
+    assert.equal(calls, 1, 'the cooldown suppressed the second request');
+    // Once it expires the proxy is asked again and the roster comes back.
+    empty.catalogGate.retryAt = 0;
+    const recovered = await empty.listModels();
+    assert.deepEqual(recovered.map((m) => m.id), served, 'after the window the listing is read again');
+    assert.equal(calls, 2, 'and that read reached the proxy');
+  }
+
+  // Two channels must not share one cache. One gate holding tokenharbor's rows
+  // answers deepseek-web's request with them, which produced 105 rows prefixed
+  // twice over (`deepseek-web/deepseek-web/…`) the moment the gate was introduced.
+  {
+    const shared = new AiProxyAdapter({
+      runtime: new ProxyRuntime({
+        mode: 'external',
+        externalUrl: 'http://127.0.0.1:8000/v1',
+        hiddenChannels: ['cnb', 'openrouter'],
+        channelKeys: { tokenharbor: 'test-tokenharbor-key' },
+      }),
+      provider: 'ai-proxy',
+      basePath: '/v1',
+      project: true,
+    });
+    assert.notEqual(
+      shared.routeGate('tokenharbor'),
+      shared.routeGate('deepseek-web'),
+      'each channel needs its own gate',
+    );
+    assert.equal(shared.routeGate('tokenharbor'), shared.routeGate('tokenharbor'), 'and it is stable per channel');
+  }
+
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;
