@@ -1070,6 +1070,10 @@ export function parsePromotions(
     for (const id of modelIds) {
       if (typeof id !== "string" || id.length === 0) continue;
       const previous = chosen.get(id);
+      // ⚠️ 这条守卫在当前实现里**不可达**：ordered 已按 priority 升序，同一 id 的
+      //  previous 恒 ≤ priority。保留它是给「将来有人改成乱序写入」兜底 —— 但别
+      //  为它写测试：不可达的分支写不出有意义的断言（同 AGENTS.md「变异体存活
+      //  不一定是漏测」：先问平台是不是已经吞了它）。
       if (previous !== undefined && previous > priority) continue;
       chosen.set(id, priority);
       result.set(id, rate);
@@ -1834,6 +1838,10 @@ export async function aggregateWorkBuddySse(
     }
     if (rejectionPayload === "") consume(carry.trim());
   } finally {
+    // 同样地：拦到 11140 后只是 break 出循环，上游那一发还在跑。必须 cancel。
+    if (rejectionPayload !== "") {
+      await reader.cancel("content rejection").catch(() => undefined);
+    }
     reader.releaseLock();
   }
   const calls = [...toolCalls.values()].sort((a, b) => a.index - b.index);
@@ -1920,6 +1928,13 @@ export function guardWorkBuddyStream(
         if (!clientGone) controller.error(error);
         return;
       } finally {
+        // 拦到 11140 就必须**取消上游**，不能只是不再读它：releaseLock 只解开锁，
+        // 底层 socket 照样在跑，这一发会继续生成到结束而内容已经没人要 —— credit
+        // 照算。与 cancel() 不转发那个漏洞同型，且实测可复现（探针里 cancel 钩子
+        // 一次都没被触发）。
+        if (rejected) {
+          await reader.cancel("content rejection").catch(() => undefined);
+        }
         reader.releaseLock();
       }
       // 客户端中途取消时不能再补 error 帧/[DONE]：controller 已是 canceled 状态，

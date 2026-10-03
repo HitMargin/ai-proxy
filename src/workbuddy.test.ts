@@ -10,11 +10,18 @@
 import {
   aggregateWorkBuddySse,
   buildChatBody,
+  buildCredential,
+  credentialExpiresAtMs,
   displayNameForModel,
   formatCreditsRate,
   guardWorkBuddyStream,
+  hasTimeWindow,
   HTTP_HEADER_DOMAIN,
   HTTP_HEADER_ENTERPRISE_ID,
+  HTTP_HEADER_NO_AUTHORIZATION,
+  HTTP_HEADER_NO_DEPARTMENT_INFO,
+  HTTP_HEADER_NO_ENTERPRISE_ID,
+  HTTP_HEADER_NO_USER_ID,
   HTTP_HEADER_PRODUCT,
   HTTP_HEADER_TENANT_ID,
   isChatModel,
@@ -23,17 +30,28 @@ import {
   isDeepSeekModel,
   isWorkBuddyExpired,
   isWorkBuddyThrottled,
+  jwtClaimMs,
+  jwtNickname,
+  jwtSubject,
   normalizeCreditsRate,
   normalizeDiscountedRate,
+  parseAccountData,
+  parseHHMM,
   parseModelsFromConfig,
   parsePromotions,
   parseTokenData,
   postWorkBuddyChatWithThrottleRetry,
+  promotionActiveNow,
+  readNumberField,
+  readStringField,
   resetWorkBuddyCircuit,
   sendWorkBuddyChat,
   stripControlChars,
+  toWorkBuddyModelCard,
+  trialModelIds,
   tripWorkBuddyCircuit,
   WORKBUDDY_CHAT_TIMEOUT_MS,
+  workBuddyAnonymousHeaders,
   workBuddyBaseHeaders,
   workBuddyChatHeaders,
   workBuddyChatSignal,
@@ -41,6 +59,7 @@ import {
   type WorkBuddyCredential,
   workBuddyRetryAfterMs,
   workBuddyTruncationError,
+  zonedMinutes,
 } from "./workbuddy.ts";
 
 function assert(
@@ -198,6 +217,282 @@ Deno.test("解析：token 只给相对秒数时要换算成时间戳", () => {
       token.expiresAt,
   );
   assert(issuedAt > 0, "sanity");
+});
+
+Deno.test("促销：每日时段必须本地推算（跨零点也算），不看时段就全天显示夜间价", () => {
+  const night = {
+    schedule: {
+      timezone: "Asia/Shanghai",
+      daily: [{ start: "23:00", end: "07:50" }],
+    },
+  };
+  const day = {
+    schedule: {
+      timezone: "Asia/Shanghai",
+      daily: [{ start: "07:50", end: "23:00" }],
+    },
+  };
+  const hours = [0, 3, 8, 12, 23];
+  for (const h of hours) {
+    const at = new Date(Date.UTC(2026, 0, 1, h - 8, 30));
+    const nightActive = promotionActiveNow(night, at);
+    const dayActive = promotionActiveNow(day, at);
+    equal(
+      nightActive !== dayActive,
+      true,
+      "两条活动互补，h=" + h + " 不能同时生效",
+    );
+    equal(nightActive, h === 0 || h === 3 || h === 23, "夜间时段 h=" + h);
+  }
+  // 无时段 ⇒ 按生效处理（宁可多显示一条过期促销）。
+  equal(promotionActiveNow({}, new Date()), true);
+  equal(promotionActiveNow({ schedule: { daily: [] } }, new Date()), true);
+  equal(hasTimeWindow({ daily: [{ start: "1", end: "2" }] }), true);
+  equal(hasTimeWindow({ daily: [] }), false);
+  equal(hasTimeWindow({ validFrom: "2026-01-01T00:00:00Z" }), true);
+  equal(hasTimeWindow("nope"), false);
+});
+
+Deno.test("促销：有效期窗口要真的参与判定（validFrom/validUntil 都会否掉）", () => {
+  const now = new Date("2026-06-01T12:00:00Z");
+  equal(
+    promotionActiveNow(
+      { schedule: { validFrom: "2026-07-01T00:00:00Z" } },
+      now,
+    ),
+    false,
+    "还没开始的活动不能计价",
+  );
+  equal(
+    promotionActiveNow(
+      { schedule: { validUntil: "2026-05-01T00:00:00Z" } },
+      now,
+    ),
+    false,
+    "已经结束的活动不能计价",
+  );
+  equal(
+    promotionActiveNow(
+      { schedule: { validFrom: "2026-05-01T00:00:00Z" } },
+      now,
+    ),
+    true,
+  );
+});
+
+Deno.test("促销：时段解析失败一律按生效处理（不能误杀正在打折的模型）", () => {
+  const now = new Date();
+  const broken = {
+    schedule: {
+      timezone: "Asia/Shanghai",
+      daily: [{ start: "24:00", end: "7:50" }],
+    },
+  };
+  equal(promotionActiveNow(broken, now), false, "非法时段不匹配任何 slot");
+  equal(parseHHMM("24:00"), undefined);
+  equal(parseHHMM("12:60"), undefined);
+  equal(parseHHMM("1230"), undefined);
+  equal(parseHHMM(1230), undefined);
+  equal(parseHHMM("7:50"), 7 * 60 + 50, "不补零也要认");
+  equal(zonedMinutes(now, "Not/AZone"), undefined, "坏时区要退回不判断");
+  equal(
+    zonedMinutes(now, ""),
+    zonedMinutes(now, "Asia/Shanghai"),
+    "空时区用默认",
+  );
+});
+
+Deno.test("促销：算不出墙上时间时不能编一个（宁可按不判断处理）", () => {
+  // Intl 对非法 Date 直接抛，走 catch 分支。
+  equal(
+    zonedMinutes({} as unknown as Date, "Asia/Shanghai"),
+    undefined,
+    "非法 Date 让 Intl 直接抛，走 catch",
+  );
+  // hour/minute 取不到数字（时区库形态异常）时也必须当判不出。
+  // ⚠️ 必须给**普通函数**：zonedMinutes 里是 `new Intl.DateTimeFormat(...)`，
+  // 箭头函数不可构造，那样只会走到 catch 分支而测不到非有限这条。
+  const real = Intl.DateTimeFormat;
+  (Intl as unknown as Record<string, unknown>).DateTimeFormat = function () {
+    return {
+      formatToParts: () => [
+        { type: "hour", value: "??" },
+        { type: "minute", value: "??" },
+      ],
+    };
+  };
+  try {
+    equal(
+      zonedMinutes(new Date(), "Asia/Shanghai"),
+      undefined,
+      "NaN 小时/分钟不能当成 0 点",
+    );
+    equal(
+      promotionActiveNow(
+        {
+          schedule: {
+            timezone: "Asia/Shanghai",
+            daily: [{ start: "00:00", end: "23:59" }],
+          },
+        },
+        new Date(),
+      ),
+      true,
+      "判不出墙上时间就不该匹配任何 slot，按生效处理",
+    );
+  } finally {
+    (Intl as unknown as Record<string, unknown>).DateTimeFormat = real;
+  }
+});
+
+Deno.test("促销：坏 slot 必须整条跳过而不是把整张表否掉", () => {
+  const at = new Date(Date.UTC(2026, 0, 1, 4, 30)); // 上海 12:30
+  equal(
+    promotionActiveNow({ schedule: { daily: [null, 7, {}] } }, at),
+    false,
+    "全是坏 slot ⇒ 没有任何时段匹配",
+  );
+  equal(
+    promotionActiveNow(
+      { schedule: { daily: [null, { start: "03:00", end: "04:00" }] } },
+      at,
+    ),
+    false,
+    "好 slot 与坏 slot 混排时只按好的那些判",
+  );
+  equal(
+    promotionActiveNow(
+      { schedule: { daily: [null, { start: "12:00", end: "13:00" }] } },
+      at,
+    ),
+    true,
+    "同一个好 slot 命中时不能被前面的坏条目否掉",
+  );
+});
+
+Deno.test("促销表：坏条目逐条跳过而不是整表丢弃", () => {
+  const rates = parsePromotions({
+    modelPromotions: [
+      null,
+      {
+        enabled: false,
+        modelIds: ["m-off"],
+        discount: { discountedCredits: "x0.5" },
+      },
+      { enabled: true, modelIds: ["m-nodiscount"] },
+      { enabled: true, modelIds: ["m-zero"], discount: { factor: 0 } },
+      {
+        enabled: true,
+        modelIds: ["m-zero0"],
+        discount: { discountedCredits: "0x" },
+      },
+      {
+        enabled: true,
+        modelIds: ["m-noids"],
+        discount: { discountedCredits: "x0.4" },
+      },
+      { enabled: true, discount: { discountedCredits: "x0.4" } },
+      {
+        enabled: true,
+        modelIds: ["m-ok", 7, ""],
+        discount: { discountedCredits: "x0.4" },
+      },
+      {
+        enabled: true,
+        modelIds: ["m-dup"],
+        discount: { discountedCredits: "x0.9" },
+        priority: 1,
+      },
+      {
+        enabled: true,
+        modelIds: ["m-dup"],
+        discount: { discountedCredits: "x0.3" },
+        priority: 5,
+      },
+    ],
+  }, new Date());
+  equal(rates.get("m-off"), undefined, "enabled:false 不计价");
+  equal(rates.get("m-nodiscount"), undefined, "没有 discount 字段就跳过");
+  equal(rates.get("m-zero"), undefined, "factor:0 但没有时段 ⇒ 不能标免费");
+  equal(rates.get("m-zero0"), undefined, "归一化后是 x0 的占位要跳过");
+  equal(rates.get("m-noids"), "x0.4", "没有时间窗的普通折扣照常计价");
+  equal(rates.size, 3, "缺 modelIds 的条目不能顺带污染整张表");
+  equal(rates.get("m-ok"), "x0.4");
+  equal(rates.get("m-dup"), "x0.3", "高 priority 覆盖低 priority");
+  equal(parsePromotions({}, new Date()).size, 0, "没有促销表就是空映射");
+});
+
+Deno.test("促销表：归一化不出倍率时跳过；低优先级不得覆盖高优先级", () => {
+  const rates = parsePromotions({
+    modelPromotions: [
+      // 非字符串 discountedCredits ⇒ 归一化返回 undefined，必须跳过。
+      {
+        enabled: true,
+        modelIds: ["m-bad-rate"],
+        discount: { discountedCredits: 7 },
+      },
+      {
+        enabled: true,
+        modelIds: ["m-bad-rate"],
+        discount: { discountedCredits: "0.9x" },
+        priority: 9,
+      },
+      {
+        enabled: true,
+        modelIds: ["m-bad-rate"],
+        discount: { discountedCredits: "0.1x" },
+        priority: 1,
+      },
+    ],
+  }, new Date());
+  equal(rates.get("m-bad-rate"), "x0.9", "低优先级的 0.1x 不得覆盖 0.9x");
+});
+
+Deno.test("促销表：factor 为 0 且带时段时可以标免费", () => {
+  const rates = parsePromotions({
+    modelPromotions: [{
+      enabled: true,
+      modelIds: ["m-free"],
+      discount: { factor: 0 },
+      schedule: {
+        timezone: "Asia/Shanghai",
+        daily: [{ start: "00:00", end: "23:59" }],
+      },
+    }],
+  }, new Date("2026-06-01T04:00:00Z"));
+  equal(rates.get("m-free"), "免费");
+});
+
+Deno.test("试用横幅：只认 targetModelId，坏条目逐个跳过", () => {
+  equal(trialModelIds({}).length, 0);
+  equal(trialModelIds({ productFeaturesConfig: "nope" }).length, 0);
+  equal(
+    trialModelIds({ productFeaturesConfig: { ModelTrialBanner: 5 } }).length,
+    0,
+  );
+  equal(
+    trialModelIds({
+      productFeaturesConfig: { ModelTrialBanner: { banners: "x" } },
+    })
+      .length,
+    0,
+  );
+  equal(
+    trialModelIds({
+      productFeaturesConfig: {
+        ModelTrialBanner: {
+          banners: [
+            null,
+            { targetModelId: "t-1" },
+            { targetModelId: "" },
+            { targetModelId: 5 },
+            { targetModelId: "t-2" },
+          ],
+        },
+      },
+    }),
+    ["t-1", "t-2"],
+  );
 });
 
 Deno.test("过滤：自动选择别名只认 auto/default 两个字面量", () => {
@@ -389,6 +684,107 @@ Deno.test("目录：坏响应返回空数组而不是抛错", () => {
   equal(parseModelsFromConfig("nope"), []);
   equal(parseModelsFromConfig({ data: null }), []);
   equal(parseModelsFromConfig({ data: { models: "no" } }), []);
+});
+
+Deno.test("目录：models/agents 里的坏条目逐个跳过，不许炸掉整张表", () => {
+  const models = parseModelsFromConfig(
+    config({
+      agents: [
+        null,
+        7,
+        {},
+        { name: "cli", models: ["glm-5.3", 5, null] },
+        { name: "cli", models: "no" },
+        { name: "cli" },
+      ],
+      models: [null, "x", {}, { id: 7 }, { id: "kimi-k2.6", name: "K" }],
+    }),
+  );
+  equal(models.map((m) => m.id), ["glm-5.3", "kimi-k2.6"]);
+  equal(models[0].agentReferenced, true, "只有带 models 的 agent 才算数");
+});
+
+Deno.test("目录：排位只认第一个同名 agent（后来的同名条目不再顶到前面）", () => {
+  const models = parseModelsFromConfig(
+    config({
+      agents: [
+        { name: "cli" },
+        { name: "cli", models: ["glm-5.3"] },
+      ],
+      models: [
+        { id: "kimi-k2.6", name: "Kimi" },
+        { id: "glm-5.3", name: "GLM" },
+      ],
+    }),
+  );
+  equal(
+    models.map((m) => m.id),
+    ["kimi-k2.6", "glm-5.3"],
+    "第一个同名 agent 没有 models 就没有可顶前的模型，glm 只能按 data.models 原序出现",
+  );
+  equal(
+    models[1].agentReferenced,
+    true,
+    "agentReferenced 来自全部 agent 的引用集合，与排位用的第一个条目无关",
+  );
+});
+
+Deno.test("目录：不可对话的模型不得混进选择器（每条判据各挡一类）", () => {
+  const models = parseModelsFromConfig(
+    config({
+      agents: [{
+        name: "cli",
+        models: [
+          "nes-a1",
+          "completion-gf",
+          "codewise-jump",
+          "hunyuan-image-alpha",
+          "auto",
+          "default",
+          "hy3",
+        ],
+      }],
+      models: [
+        { id: "codewise-jump", name: "CW", supportsExtra: true },
+        { id: "hunyuan-image-alpha", name: "IMG", tags: ["text-to-image"] },
+      ],
+    }),
+  );
+  equal(models.map((m) => m.id), ["hy3"], "只剩真正能对话的那个");
+});
+
+Deno.test("目录：maxOutputTokens 落在补全区间的一律丢掉", () => {
+  const models = parseModelsFromConfig(
+    config({
+      models: [
+        { id: "small-1", name: "S1", maxOutputTokens: 1 },
+        { id: "small-256", name: "S2", maxOutputTokens: 256 },
+        { id: "big-257", name: "B", maxOutputTokens: 257 },
+        { id: "huge", name: "H", maxOutputTokens: 131072 },
+      ],
+    }),
+  );
+  equal(models.map((m) => m.id), ["big-257", "huge"]);
+});
+
+Deno.test("目录：试用横幅里的别名与重复项只留一个", () => {
+  const models = parseModelsFromConfig(
+    config({
+      agents: [{ name: "cli", models: ["hy3"] }],
+      models: [{ id: "hy3", name: "HY3" }],
+      productFeaturesConfig: {
+        ModelTrialBanner: {
+          banners: [
+            { targetModelId: "hy3" },
+            { targetModelId: "auto" },
+            { targetModelId: "hy4-preview-f" },
+            { targetModelId: "hy4-preview-f" },
+          ],
+        },
+      },
+    }),
+  );
+  equal(models.map((m) => m.id), ["hy3", "hy4-preview-f"]);
 });
 
 Deno.test("目录：缺 maxOutputTokens 时不猜", () => {
@@ -1108,6 +1504,51 @@ Deno.test("聚合：帧被切成半个 JSON 时必须等到完整才能判（不
   equal(out.content, "split");
 });
 
+Deno.test("聚合：畸形帧必须被跳过而不是把整条流打断", async () => {
+  const junk = [
+    "data:",
+    "data:   ",
+    "data: not json at all",
+    'data: "just a string"',
+    "data: [1,2,3]",
+    'data: {"id":"x","choices":[]}',
+    'data: {"choices":[null]}',
+    'data: {"choices":[7]}',
+    'data: {"choices":[{"delta":null}]}',
+    'data: {"choices":[{"delta":7}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[null,7,"x"]}}]}',
+  ];
+  const out = await aggregateWorkBuddySse(sseStream([
+    ...junk.map((line) => line + "\n\n"),
+    AGG_FRAME({ content: "survived" }, "stop"),
+    "data: [DONE]\n\n",
+  ]));
+  equal(out.content, "survived", "畸形帧全部被跳过");
+  equal(out.finishReason, "stop");
+  equal(out.toolCalls.length, 0, "坏 tool_call 不得造出半截调用");
+  equal(out.truncated, false);
+  equal(out.rejectionPayload, "");
+});
+
+Deno.test("聚合：id/model/created 只有真值才覆盖（不能用 0 顶掉首帧）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: "a" }, ""),
+    "data: " + JSON.stringify({
+      id: 7,
+      model: 9,
+      created: "nope",
+      usage: "nope",
+      choices: [{ delta: { content: "b" } }],
+    }) + "\n\n",
+    "data: [DONE]\n\n",
+  ]));
+  equal(out.id, "chatcmpl-x", "非字符串 id 不覆盖");
+  equal(out.model, "hy3", "非字符串 model 不覆盖");
+  equal(out.created, 7, "非数字 created 不覆盖");
+  equal(out.content, "ab", "内容照常累加");
+  equal(out.usage, undefined, "usage 不是 record 就当没有");
+});
+
 Deno.test("聚合：usage 缺失时不得编一个出来", async () => {
   const out = await aggregateWorkBuddySse(sseStream([
     AGG_FRAME({ content: "x" }, "stop"),
@@ -1405,17 +1846,79 @@ Deno.test("流：内容拦截后补 error 帧与 [DONE] 再收尾", async () => 
   );
 });
 
-Deno.test("流：正常流到结束时不取消上游（判据不能只看 clientGone）", async () => {
+Deno.test("流：拦截时 onRejection 必须带着原帧载荷被调用", async () => {
+  const seen: string[] = [];
   let cancelled = false;
+  const encoder = new TextEncoder();
+  const rejectionFrame = "data: " + JSON.stringify({
+    code: 11140,
+    msg: "request illegal",
+    displayMsg: "内容涉及敏感信息",
+  }) + "\n\n";
+  const held = new Promise<void>(() => {});
   const guarded = guardWorkBuddyStream(
-    generatingStream(GUARD_FRAME, {
-      cancelled: () => {
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(rejectionFrame));
+      },
+      pull() {
+        return held;
+      },
+      cancel() {
         cancelled = true;
       },
     }),
-    () => {},
+    (rejection) => {
+      seen.push(rejection.payload);
+    },
   );
-  // 换一条会正常结束的流再验一遍收尾：读完必须真的 close。
+  for await (const _ of guarded) {
+    // 读完即可（拦到拦截帧后 wrapper 会自行收尾）。
+  }
+  equal(seen.length, 1, "回调只触发一次");
+  assert(seen[0].includes("11140"), "原帧载荷必须交给调用方");
+  equal(cancelled, true, "拦截后上游被取消");
+});
+
+Deno.test("流：扫描只判 data 行（注释帧与半行不得被误当成拦截）", async () => {
+  let cancelled = false;
+  const encoder = new TextEncoder();
+  const seen: string[] = [];
+  // 前导注释行里写着 11140 —— 若不先挡 startsWith("data:")，它会被当拦截。
+  const stream = guardWorkBuddyStream(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(": note 11140 request illegal\n\n" + GUARD_FRAME),
+        );
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }),
+    (rejection) => {
+      seen.push(rejection.payload);
+    },
+  );
+  for await (const chunk of stream) {
+    // 收集即可。
+  }
+  equal(seen.length, 0, "注释行不是拦截帧");
+  equal(cancelled, false, "正常结束的流不该被取消");
+});
+
+Deno.test("流：正常流到结束时不取消上游（判据不能只看 clientGone）", async () => {
+  let cancelled = false;
+  // ⚠️ 判据必须在**会正常结束的那条流**上取。上一版拿一个没有 cancel 钩子的
+  // 流去跑收尾、把 cancelled 断在另一条流上，于是无论实现怎么改都绿 ——
+  // 断言看起来在测「不该取消」，实际什么都没测到。
+  //
+  // 这条断言仍然杀不掉「无条件 cancel」变异体，但**不是因为漏测**：探针证实
+  // 流一旦 done，reader.cancel() 就不再落到源的 cancel 钩子上（关闭态与出错态
+  // 都一样），所以那个变异体在本平台不可观测 —— 见 AGENTS.md「变异体存活先
+  // 问平台是不是已经吞了它」。
   const encoder = new TextEncoder();
   const closing = guardWorkBuddyStream(
     new ReadableStream<Uint8Array>({
@@ -1423,6 +1926,9 @@ Deno.test("流：正常流到结束时不取消上游（判据不能只看 clien
         controller.enqueue(encoder.encode(GUARD_FRAME));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
+      },
+      cancel() {
+        cancelled = true;
       },
     }),
     () => {},
@@ -1436,7 +1942,6 @@ Deno.test("流：正常流到结束时不取消上游（判据不能只看 clien
   }
   equal(seen.join("").includes("[DONE]"), true, "原样转发 [DONE]");
   equal(cancelled, false, "自然结束的流没有被取消");
-  await guarded.cancel();
 });
 
 Deno.test("信号：客户端一中止，合成的信号立刻 aborted（上游随之收手）", () => {
@@ -1495,4 +2000,280 @@ Deno.test("流：上游中途断掉必须让客户端读到 error（不能安静
   }
   equal(failed, true, "上游断了就得报错，不能假装正常结束");
   equal(message.includes("upstream socket died"), true, "把原因带出去");
+});
+
+/**
+ * 造一个「正常帧 → 11140 拦截帧 → 永远挂着」的流。
+ *
+ * 拦到 11140 之后代理已经知道这一发没人要了，上游必须被 cancel；否则它会照
+ * 常生成到结束而 credit 照算（探针里 cancel 钩子一次都没被触发就是证据）。
+ */
+function rejectionStream(hooks: { cancelled: () => void }) {
+  const encoder = new TextEncoder();
+  let pulls = 0;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        "data: " + JSON.stringify({
+          choices: [{ delta: { content: "第一段" } }],
+        }) + "\n\n",
+      ));
+    },
+    pull(controller) {
+      pulls += 1;
+      if (pulls === 1) {
+        controller.enqueue(encoder.encode(
+          "data: " + JSON.stringify({ code: 11140, msg: "request illegal" }) +
+            "\n\n",
+        ));
+        return;
+      }
+      return new Promise<void>(() => {});
+    },
+    cancel() {
+      hooks.cancelled();
+    },
+  });
+}
+
+Deno.test("请求体：stop 与 temperature 原样下发（判据不能只看有没有该字段）", () => {
+  const body = buildChatBody("hy3-c", [], "s1", undefined, {
+    stop: ["STOP", "END"],
+    temperature: 0.7,
+  });
+  equal(body.stop, ["STOP", "END"], "stop 列表必须原样透传");
+  equal(body.temperature, 0.7, "temperature 0 也要能下发（不是假值判断）");
+  const bare = buildChatBody("hy3-c", [], "s1", undefined, {});
+  assert(!("stop" in bare), "没给 stop 就不该出现该字段");
+  assert(!("temperature" in bare), "没给 temperature 就不该出现该字段");
+  const emptyStop = buildChatBody("hy3-c", [], "s1", undefined, { stop: [] });
+  assert(!("stop" in emptyStop), "空 stop 列表等于没给");
+  const zero = buildChatBody("hy3-c", [], "s1", undefined, { temperature: 0 });
+  equal(zero.temperature, 0, "0 是合法值，不能被 if (x) 吃掉");
+});
+
+Deno.test("目录卡：能力字段缺失就不下发，efforts 为空时整个 reasoning 省略", () => {
+  const thin = toWorkBuddyModelCard({
+    id: "m-1",
+    name: "M1",
+    reasoningEfforts: [],
+  });
+  assert(!("context_window" in thin), "远端没给窗口就别编一个");
+  assert(!("max_output_tokens" in thin), "远端没给上限就别编一个");
+  assert(!("reasoning" in thin), "空阶梯要整体省略，空数组会被 harness 拒掉");
+  equal(thin.input_modalities, ["text"]);
+  assert(!("creditsRate" in thin), "没有倍率信息就不下发");
+  const full = toWorkBuddyModelCard({
+    id: "m-2",
+    name: "M2",
+    contextWindow: 128_000,
+    maxOutputTokens: 8192,
+    supportsImages: true,
+    reasoningEfforts: ["low", "high"],
+    defaultReasoningEffort: "high",
+    creditsRate: "x1",
+    discountedCreditsRate: "x0.5",
+  });
+  equal(full.context_window, 128_000);
+  equal(full.max_output_tokens, 8192);
+  equal(full.input_modalities, ["text", "image"]);
+  equal(full.reasoning?.defaultEffort, "high");
+  equal(full.creditsRate, "x1→x0.5");
+});
+
+Deno.test("目录卡：声明的默认档不在阶梯里时必须回落（不能下发一个无效档位）", () => {
+  const card = toWorkBuddyModelCard({
+    id: "m-3",
+    name: "M3",
+    reasoningEfforts: ["low", "medium"],
+    defaultReasoningEffort: "ultra",
+  });
+  equal(card.reasoning?.defaultEffort, "low", "阶梯里没有 high 就取第一个");
+});
+
+Deno.test("匿名头：四个 X-No-* 一个都不能少（缺一个就去找不存在的登录态）", () => {
+  const headers = workBuddyAnonymousHeaders();
+  equal(headers[HTTP_HEADER_NO_AUTHORIZATION], "true");
+  equal(headers[HTTP_HEADER_NO_USER_ID], "true");
+  equal(headers[HTTP_HEADER_NO_ENTERPRISE_ID], "true");
+  equal(headers[HTTP_HEADER_NO_DEPARTMENT_INFO], "true");
+  equal(headers[HTTP_HEADER_DOMAIN], "www.workbuddy.cn");
+  assert(
+    headers["User-Agent"]?.startsWith("WorkBuddy/"),
+    "匿名登录也要带真实 UA",
+  );
+  assert(!("Authorization" in headers), "匿名请求不得带任何 Authorization");
+});
+
+/** 造一个只有 payload 段的 JWT（atob 路径，不需要签名）。 */
+function jwt(payload: Record<string, unknown>): string {
+  const raw = new TextEncoder().encode(JSON.stringify(payload));
+  let binary = "";
+  for (const byte of raw) binary += String.fromCharCode(byte);
+  return "header." + btoa(binary) + ".signature";
+}
+
+Deno.test("JWT：坏令牌不许抛（这是登录兜底路径，最不该在运行期炸）", () => {
+  equal(jwtClaimMs("garbage", "exp"), undefined, "单段不是 JWT");
+  equal(jwtClaimMs("", "exp"), undefined, "空串不是 JWT");
+  equal(jwtClaimMs(12345, "exp"), undefined, "非字符串令牌");
+  equal(jwtClaimMs("a.!!!not-base64!!!.c", "exp"), undefined, "base64 坏了");
+  equal(
+    jwtClaimMs("a." + btoa("not-json") + ".c", "exp"),
+    undefined,
+    "payload 不是 JSON",
+  );
+  equal(jwtNickname("garbage"), "");
+  equal(jwtSubject("garbage"), "");
+  equal(jwtNickname(jwt({ nickname: "" })), "", "空昵称要继续往下找");
+  equal(jwtNickname(jwt({ preferred_username: "pu" })), "pu");
+  equal(jwtNickname(jwt({ name: "nm" })), "nm");
+  equal(jwtNickname(jwt({ nickname: 7 })), "", "非字符串不算");
+  equal(jwtSubject(jwt({ sub: 7 })), "", "非字符串 sub 不算");
+  equal(jwtSubject(jwt({ sub: "u-9" })), "u-9");
+});
+
+Deno.test("JWT：exp/iat 是秒，要换算成毫秒（漏乘 1000 会把寿命差 1000 倍）", () => {
+  const token = jwt({ exp: 1795696324, iat: 1790944324, sub: "u-1" });
+  equal(jwtClaimMs(token, "exp"), 1795696324000);
+  equal(jwtClaimMs(token, "iat"), 1790944324000);
+  equal(
+    jwtClaimMs(jwt({ exp: "1795696324" }), "exp"),
+    undefined,
+    "字符串 exp 不认",
+  );
+});
+
+Deno.test("兜底：expires_at 不可解析时退回 JWT exp（那是权威值）", () => {
+  const cred = credential({
+    expires_at: "not-a-date",
+    access_token: jwt({ exp: 1795696324 }),
+  });
+  equal(credentialExpiresAtMs(cred), 1795696324000);
+  const none = credential({ expires_at: "", access_token: "garbage" });
+  equal(credentialExpiresAtMs(none), undefined, "两条路都断了就只能不知道");
+});
+
+Deno.test("读数：数值型字符串要认，指数写法要当缺失（否则会算错输出上限）", () => {
+  equal(readNumberField({ v: "24000" }, "v"), 24000);
+  equal(readNumberField({ v: " 7 " }, "v"), 7);
+  equal(
+    readNumberField({ v: "1e3" }, "v"),
+    undefined,
+    "指数写法不认，否则会算错上限",
+  );
+  equal(readNumberField({ v: "-3" }, "v"), -3);
+  equal(readNumberField({ v: "abc" }, "v"), undefined);
+  equal(readNumberField({}, "v"), undefined);
+  equal(readStringField({ v: 0 }, "v"), "0", "数字 0 不是缺失");
+  equal(readStringField({ v: null }, "v"), "");
+  equal(
+    stripControlChars("a\u0000b  c"),
+    "a b c",
+    "控制字符与连续空白都要清掉",
+  );
+});
+
+Deno.test("登录：token 响应的相对秒数要按 iat 换算成绝对时刻", () => {
+  const token = parseTokenData({
+    accessToken: jwt({ iat: 1790944324 }),
+    expiresIn: 7200,
+    refreshExpiresIn: 1209600,
+  });
+  equal(token.expiresAt, String(1790944324000 + 7200 * 1000));
+  equal(token.refreshExpiresAt, String(1790944324000 + 1209600 * 1000));
+  equal(token.tokenType, "Bearer", "缺 tokenType 要有默认值");
+  // expiresAt 给了绝对值时优先用它，不再换算。
+  const absolute = parseTokenData({
+    accessToken: "at",
+    expiresAt: "1795649744000",
+    expiresIn: 7200,
+  });
+  equal(absolute.expiresAt, "1795649744000");
+  // 秒级绝对值要乘 1000。
+  equal(
+    parseTokenData({ accessToken: "at", expiresAt: "1795649744" }).expiresAt,
+    "1795649744000",
+  );
+  // 不可解析就原样保留，别把线索抹成空串。
+  equal(
+    parseTokenData({ accessToken: "at", expiresAt: "soon" }).expiresAt,
+    "soon",
+  );
+  // 两边都没有 ⇒ 空串（面板显示「有效期未知」）。
+  equal(parseTokenData({ accessToken: "at" }).expiresAt, "");
+  equal(parseTokenData(null).accessToken, "");
+});
+
+Deno.test("登录：账号字段缺失时逐项回落（不能把整份账号当成空）", () => {
+  const full = parseAccountData({
+    uid: "u-1",
+    nickname: "n-1",
+    enterpriseId: "e-1",
+    type: "enterprise",
+  });
+  equal(full.uid, "u-1");
+  equal(full.accountType, "enterprise");
+  const thin = parseAccountData({ uid: 7 });
+  equal(thin.uid, "7", "数字 uid 要转成字符串");
+  equal(thin.nickname, "");
+  equal(thin.accountType, "personal", "缺 type 默认个人账号");
+  const built = buildCredential(
+    parseTokenData({
+      accessToken: jwt({ sub: "jwt-uid", nickname: "jwt-nick" }),
+    }),
+    parseAccountData({}),
+  );
+  equal(built.user_id, "jwt-uid", "账号为空时用 JWT 的 sub 兜底");
+  equal(built.nickname, "jwt-nick");
+});
+
+Deno.test("流：内容拦截必须取消上游（否则这一发继续生成到结束、credit 照算）", async () => {
+  let cancelled = false;
+  const guarded = guardWorkBuddyStream(
+    rejectionStream({
+      cancelled: () => {
+        cancelled = true;
+      },
+    }),
+    () => {},
+  );
+  const text = await new Response(guarded).text();
+  equal(text.includes("content_rejection"), true, "拦截仍然要补 error 帧");
+  equal(cancelled, true, "停止读取不等于取消上游");
+});
+
+Deno.test("聚合：内容拦截必须取消上游（同一个漏，聚合侧也得补）", async () => {
+  let cancelled = false;
+  const out = await aggregateWorkBuddySse(rejectionStream({
+    cancelled: () => {
+      cancelled = true;
+    },
+  }));
+  equal(out.rejectionPayload !== "", true, "拦截报文如实带回");
+  equal(out.truncated, false, "拦截有独立通道，不是传输截断");
+  equal(cancelled, true, "没人要的输出还在上游继续生成");
+});
+
+Deno.test("正常结束的流不得被取消（cancel 只属于拦截与客户端取消两条路径）", async () => {
+  let cancelled = false;
+  const encoder = new TextEncoder();
+  const out = await aggregateWorkBuddySse(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(AGG_FRAME({ content: "答完了" }, "stop")),
+        );
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }),
+  );
+  equal(out.truncated, false);
+  // 同样是平台吞掉：流已 done，cancel 到不了源的钩子，所以这条只保证「没有在
+  // 自然结束时提前 break 出循环」（那种情况源还开着、钩子会翻，会被抓到）。
+  equal(cancelled, false, "自然读到 done 的流被多取消了一次");
 });

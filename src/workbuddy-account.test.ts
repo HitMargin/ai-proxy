@@ -16,6 +16,7 @@ import {
   refreshWorkBuddyCredential,
   refreshWorkBuddyIfNeeded,
   resetWorkBuddyProbeFlakiness,
+  WORKBUDDY_PROBE_CONCURRENCY,
   WORKBUDDY_REFRESH_SKEW_MS,
   type WorkBuddyFetcher,
   WorkBuddyRefreshTokenExpiredError,
@@ -28,6 +29,7 @@ import {
   classifyModelProbe,
   dropUnavailableModels,
   SCOPED_MODELS_PATH,
+  STATIC_FALLBACK_MODELS,
   type WorkBuddyCredential,
 } from "./workbuddy.ts";
 
@@ -278,6 +280,84 @@ Deno.test("续期：响应没带 refresh_token 时必须保留旧的", async () 
   );
 });
 
+Deno.test("续期：账号字段缺失时逐项回落（不能把整份账号当成空）", async () => {
+  const { fetcher } = fakeFetcher(() => ({ body: tokenBody() }));
+  const bare = credential({
+    user_id: undefined,
+    nickname: undefined,
+    enterprise_id: undefined,
+    account_type: undefined,
+    domain: undefined,
+  });
+  const refreshed = await refreshWorkBuddyCredential(bare, fetcher);
+  equal(refreshed.user_id, "", "缺失的 uid 回落成空串");
+  equal(refreshed.nickname, "");
+  equal(refreshed.enterprise_id, "");
+  equal(refreshed.account_type, "personal", "缺的账号类型按 personal 记");
+});
+
+Deno.test("续期：响应整体不是对象时必须报错（不能读出 undefined 就当成功）", async () => {
+  const bodies = [
+    "null",
+    "7",
+    JSON.stringify("text"),
+    "[1,2]",
+    JSON.stringify({ code: 0, data: null }),
+  ];
+  for (const bad of bodies) {
+    const { fetcher } = fakeFetcher(() => ({ body: bad }));
+    let thrown: unknown;
+    try {
+      await refreshWorkBuddyCredential(credential(), fetcher);
+    } catch (error) {
+      thrown = error;
+    }
+    assert(thrown instanceof Error, "body=" + bad + " must throw");
+    assert(
+      thrown.message.includes("缺少 data"),
+      "body=" + bad + ": " + thrown.message,
+    );
+  }
+});
+
+Deno.test("续期：data 存在但读不出 accessToken 时必须报错", async () => {
+  for (const bad of ["[]", "7", JSON.stringify("text"), "{}"]) {
+    const { fetcher } = fakeFetcher(() => ({
+      body: JSON.stringify({ code: 0, data: bad }),
+    }));
+    let thrown: unknown;
+    try {
+      await refreshWorkBuddyCredential(credential(), fetcher);
+    } catch (error) {
+      thrown = error;
+    }
+    assert(thrown instanceof Error, "data=" + bad + " must throw");
+    assert(
+      thrown.message.includes("缺少 accessToken"),
+      "data=" + bad + ": " + thrown.message,
+    );
+  }
+});
+
+Deno.test("续期：响应没带域名时保留原凭据的 domain（不能落成空串）", async () => {
+  const { fetcher } = fakeFetcher(() => ({
+    body: tokenBody({ domain: "" }),
+  }));
+  const kept = await refreshWorkBuddyCredential(
+    credential({ domain: "www.workbuddy.cn" }),
+    fetcher,
+  );
+  equal(kept.domain, "www.workbuddy.cn", "空域名不能把租户信息抹掉");
+  const { fetcher: bare } = fakeFetcher(() => ({
+    body: tokenBody({ domain: "" }),
+  }));
+  const none = await refreshWorkBuddyCredential(
+    credential({ domain: undefined }),
+    bare,
+  );
+  equal(none.domain, "", "凭据本来就没有域名时落成空串，不留 undefined");
+});
+
 Deno.test("续期：域名以产品常量为准，不吃凭据里的旧快照", async () => {
   const { fetcher, calls } = fakeFetcher(() => ({ body: tokenBody() }));
   await refreshWorkBuddyCredential(
@@ -375,6 +455,67 @@ Deno.test("续期：响应缺 data 或缺 accessToken 都要报错而不是返�
   }
 });
 
+Deno.test("探测：并发上限不得超过目录长度（免得空转 worker）", async () => {
+  let maxInFlight = 0;
+  let inFlight = 0;
+  const models = Array.from(
+    { length: WORKBUDDY_PROBE_CONCURRENCY - 1 },
+    (_, i) => ({
+      id: "m-" + i,
+      name: "M" + i,
+    }),
+  );
+  // 目录长度由外部决定（解析自上游），稀疏数组会在 models[cursor++] 处读到
+  //  undefined —— worker 顶上那一行 continue 就是为它准备的。
+  const counting: WorkBuddyFetcher = () => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        inFlight -= 1;
+        resolve(
+          new Response(JSON.stringify({ code: 11133, msg: "OK" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }, 5);
+    });
+  };
+  const verdicts = await probeWorkBuddyModels(credential(), models, counting);
+  equal(verdicts.size, models.length, "每个模型都要有结论");
+  equal(
+    maxInFlight,
+    models.length,
+    "目录比并发上限还小时，全部并行而不是补空转 worker",
+  );
+
+  // 稀疏目录：models[cursor++] 会读到 undefined，worker 顶上那一行 continue
+  // 就是为它准备的（目录来自上游解析，长度不受我们控制）。
+  let holes = 0;
+  const sparse = [
+    { id: "a", name: "A" },
+    undefined as unknown as { id: string; name: string },
+    { id: "b", name: "B" },
+  ];
+  const holeFetcher: WorkBuddyFetcher = () => {
+    holes += 1;
+    return Promise.resolve(
+      new Response(JSON.stringify({ code: 11133, msg: "OK" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  };
+  const sparseVerdicts = await probeWorkBuddyModels(
+    credential(),
+    sparse,
+    holeFetcher,
+  );
+  equal(holes, 2, "空洞不该白发探测请求");
+  equal([...sparseVerdicts.keys()].sort(), ["a", "b"]);
+});
+
 Deno.test("可用性：过期但能续期 ⇒ 仍可用；过期且不能续期 ⇒ 不可用", () => {
   const now = Date.now();
   const dead = credential({ expires_at: String(now - 1000) });
@@ -393,6 +534,14 @@ Deno.test("可用性：过期但能续期 ⇒ 仍可用；过期且不能续期 
   assert(
     !isWorkBuddyUsable(credential({ access_token: "" }), now),
     "no token at all is never usable",
+  );
+});
+
+Deno.test("可用性：没过期但没有 refresh_token 也算可用（别提前判死）", () => {
+  const now = Date.now();
+  assert(
+    isWorkBuddyUsable(credential({ refresh_token: "" }), now),
+    "an unexpired token is usable even with no refresh_token",
   );
 });
 
@@ -710,6 +859,93 @@ Deno.test("the sweep never runs more probes than there are models", async () => 
     fetcher,
   );
   equal(calls.length, 1);
+});
+
+Deno.test("续期：判不出过期时刻就不续（宁可漏续也不要每请求一次续期）", () => {
+  const now = Date.now();
+  // 没有 refresh_token ⇒ 不可续期。
+  equal(needsWorkBuddyRefresh(credential({ refresh_token: "" }), now), false);
+  // 可续期，但 expires_at 是垃圾 ⇒ 解析不出绝对时刻，同样不续。
+  equal(
+    needsWorkBuddyRefresh(credential({ expires_at: "not-a-date" }), now),
+    false,
+  );
+  equal(needsWorkBuddyRefresh(credential({ expires_at: "" }), now), false);
+});
+
+Deno.test("续期：没有 refresh_token 时 refreshWorkBuddyCredential 直接报终态", async () => {
+  let called = 0;
+  const { fetcher } = fakeFetcher(() => {
+    called++;
+    return { status: 200, body: tokenBody() };
+  });
+  let name = "";
+  try {
+    await refreshWorkBuddyCredential(
+      credential({ refresh_token: "" }),
+      fetcher,
+    );
+  } catch (error) {
+    name = error instanceof Error ? error.name : String(error);
+  }
+  equal(name, "WorkBuddyRefreshTokenExpiredError");
+  equal(called, 0, "明知不能续期就不该发那一发请求");
+});
+
+Deno.test("续期：响应里 data 为 null 时必须报错（不能把半份凭据当成续期成功）", async () => {
+  const { fetcher } = fakeFetcher(() => ({
+    status: 200,
+    body: JSON.stringify({ code: 0, data: null }),
+  }));
+  let message = "";
+  try {
+    await refreshWorkBuddyCredential(credential(), fetcher);
+  } catch (error) {
+    message = error instanceof Error ? error.message : String(error);
+  }
+  equal(message.includes("缺少 data"), true, "data:null 要被当成缺失");
+});
+
+Deno.test("目录：两个端点都非 200 时回落到静态表（不能返回空列表）", async () => {
+  const failing = (() =>
+    Promise.resolve(
+      new Response("upstream said 503", {
+        status: 503,
+        headers: { "content-type": "text/plain" },
+      }),
+    )) as WorkBuddyFetcher;
+  const models = await fetchWorkBuddyModels(credential(), failing);
+  equal(models.length, STATIC_FALLBACK_MODELS.length, "整体失败要给兜底表");
+});
+
+Deno.test("目录：端点抛异常也要回落到静态表（网络失败不是模型为空）", async () => {
+  const throwing =
+    (() => Promise.reject(new Error("ECONNRESET"))) as WorkBuddyFetcher;
+  const models = await fetchWorkBuddyModels(credential(), throwing);
+  equal(models.length, STATIC_FALLBACK_MODELS.length);
+});
+
+Deno.test("目录：端点返回 200 但没有 models 时同样回落到静态表", async () => {
+  const empty = (() =>
+    Promise.resolve(
+      new Response(JSON.stringify({ code: 0, data: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    )) as WorkBuddyFetcher;
+  const models = await fetchWorkBuddyModels(credential(), empty);
+  equal(models.length, STATIC_FALLBACK_MODELS.length);
+});
+
+Deno.test("探测：模型列表为空时一发都不发（空目录不该变成探测风暴）", async () => {
+  let called = 0;
+  const counting = ((url: string | URL | Request) => {
+    called++;
+    return Promise.resolve(new Response("{}", { status: 200 }));
+  }) as WorkBuddyFetcher;
+  const verdicts = await probeWorkBuddyModels(credential(), [], counting);
+  equal(verdicts.size, 0);
+  equal(called, 0);
 });
 
 Deno.test("the catalog can skip the probe entirely (offline callers stay cheap)", async () => {
