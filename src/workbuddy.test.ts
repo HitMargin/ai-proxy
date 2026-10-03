@@ -60,6 +60,8 @@ import {
   workBuddyCooldownRemaining,
   type WorkBuddyCredential,
   workBuddyErrorCode,
+  workBuddyLocalError,
+  workBuddyLocalErrorBody,
   workBuddyRetryAfterMs,
   workBuddyTruncationError,
   zonedMinutes,
@@ -346,6 +348,119 @@ Deno.test("分类：拦截判据把「正文里提到 11140」和「真错误体
   equal(empty.refreshFirst, false);
 });
 
+Deno.test("本地失败：形状必须与上游失败同族（同一个路由不许有两种 error 形状）", () => {
+  // 判据来自一次自检：第 10 轮只把**上游**失败改成 OpenAI 形状，路由自己产生的
+  // 400/404/409/502 仍然是 {error:"…字符串"}。客户端按标准形状读 message 时，
+  // 上游错误读得到、本地错误读不到 —— 同一个接口两种形状，比两种都不对还难查。
+  for (
+    const status of [400, 404, 409, 502]
+  ) {
+    const local = workBuddyLocalError(status, "boom");
+    equal(local.status, status);
+    equal(local.error.message, "boom");
+    equal(
+      local.error.code,
+      status,
+      "没有上游业务码可抄，code 就是 HTTP 状态码",
+    );
+    equal(local.error.type, "upstream_error");
+    // 与 classifyWorkBuddyChatFailure 的返回逐键同形。
+    const remote = classifyWorkBuddyChatFailure(status, "");
+    equal(
+      Object.keys(local.error).sort(),
+      Object.keys(remote.error).sort(),
+      "error 对象的键集合必须一致",
+    );
+    equal(typeof local.error.message, "string");
+    equal(typeof local.error.type, "string");
+  }
+});
+
+Deno.test("本地失败：type 可显式指定，且不能被默认值吃掉", () => {
+  equal(
+    workBuddyLocalError(400, "bad", "invalid_request_error").error.type,
+    "invalid_request_error",
+  );
+  equal(
+    workBuddyLocalError(409, "no cred", "authentication_error").error.type,
+    "authentication_error",
+  );
+  // 显式传 upstream_error（= 默认值）也必须是字符串，不是空串/undefined。
+  const explicit = workBuddyLocalError(500, "boom", "upstream_error");
+  equal(explicit.error.type, "upstream_error");
+  equal(explicit.error.code, 500);
+});
+
+Deno.test("响应体：必须真的有 error 键（展开 error 会把整个 error 键弄丢）", () => {
+  // 这是第 11 轮第一版的真 bug，且**任何单测都抓不到**：main.ts 里写的是
+  // `jsonResponse({ ...local.error, available })`，展开后响应变成
+  // `{message,type,code,available}` —— error 键整个不见了，只读 error.message
+  // 的解析器照样读不到。上一批测试只断言 helper 的返回值，helper 本身是对的，
+  // 错的是**组装**。判据：组装响应体的代码也必须住 src/，并断言「线上形状」而不是
+  // 「函数返回值」。
+  const local = workBuddyLocalError(
+    400,
+    "Unknown WorkBuddy model: x",
+    "invalid_request_error",
+  );
+  const body = workBuddyLocalErrorBody(local, { available: ["a", "b"] });
+  // 关键断言：error 键存在本身。
+  equal(Object.keys(body).indexOf("error") >= 0, true, "响应体必须有 error 键");
+  equal(typeof body.error, "object");
+  equal(body.error.message, "Unknown WorkBuddy model: x");
+  equal(body.error.type, "invalid_request_error");
+  equal(body.error.code, 400);
+  // available 作为兄弟键存在，但不污染 error 本身。
+  equal(body.available, ["a", "b"]);
+  equal(
+    Object.keys(body.error).sort(),
+    ["code", "message", "type"],
+    "extra 键不许进 error 对象，否则多绕一层",
+  );
+});
+
+Deno.test("响应体：没有 extra 时形状就是 error 本身（不许凭空多个键）", () => {
+  const body = workBuddyLocalErrorBody(workBuddyLocalError(404, "nope"));
+  equal(Object.keys(body).sort(), ["error"]);
+  equal(body.error.message, "nope");
+  equal(body.error.code, 404);
+});
+
+Deno.test("响应体：extra 里就算带了 error 键也不许覆盖真的 error", () => {
+  // 展开顺序敏感的那一条。前两条用例的 extra 里没有 error 键，所以**两种顺序都过**，
+  // 断言等于没写（`{error, ...extra}` 与 `{...extra, error}` 键集合完全相同）。
+  // 只有 extra 自己携带同名键时，顺序才有可观测的后果 —— 这正是变异体存活的原因。
+  const local = workBuddyLocalError(500, "boom");
+  const shadowed = workBuddyLocalErrorBody(local, { error: "a string, oops" });
+  equal(
+    typeof shadowed.error,
+    "object",
+    "extra 里的 error 字符串不许顶掉真 error",
+  );
+  equal(shadowed.error.message, "boom");
+  equal(shadowed.error.code, 500);
+});
+
+Deno.test("响应体：上游失败与本地失败必须走同一个组装口", () => {
+  // 参数类型是放宽的（code: number | string）而不是只收 WorkBuddyLocalError：
+  // 上游失败的 code 是业务码、可能是字符串（stream_cut 就是字符串）。它要是进不来，
+  // 调用方就会另写一条拼装代码，「同一个路由不许有两种错误形状」立刻重新长回来。
+  const upstream = classifyWorkBuddyChatFailure(502, "");
+  const body = workBuddyLocalErrorBody(upstream, { detail: "raw body here" });
+  equal(Object.keys(body).indexOf("error") >= 0, true);
+  equal(body.error.message, upstream.error.message);
+  equal(body.error.type, upstream.error.type);
+  equal(body.error.code, upstream.error.code);
+  equal(body.detail, "raw body here");
+});
+
+Deno.test("响应体：extra 的普通兄弟键照常透传", () => {
+  const body = workBuddyLocalErrorBody(workBuddyLocalError(500, "boom"), {
+    detail: "upstream said no",
+  });
+  equal(body.error.message, "boom");
+  equal(body.detail, "upstream said no");
+});
 // ===== 业务码读取 =====
 Deno.test("业务码：只从真报文里读，读不出就返回 undefined（绝不编）", () => {
   equal(workBuddyErrorCode('{"code":14003,"msg":"x"}'), 14003);

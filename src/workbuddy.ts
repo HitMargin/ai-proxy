@@ -1577,6 +1577,63 @@ export function workBuddyErrorCode(body: string): number | undefined {
   return typeof code === "number" && Number.isFinite(code) ? code : undefined;
 }
 
+/**
+ * 本地产生的失败（路由参数错、没凭据、传输挂了、聚合炸了）的 OpenAI 形状错误体。
+ *
+ * 为什么要单独一个函数：第 10 轮只把**上游**失败改成 `{error:{message,type,code}}`，
+ * 但同一路由自己产生的 400/404/409/502 仍然是 `{error:"…字符串"}` —— 客户端按
+ * OpenAI 形状读 message 会整个丢掉，只能看到 `error` 键存在却取不到值。判据：
+ ***同一个路由不许有两种错误形状**，而且形状住在 src/ 才测得到（main.ts 不在
+ * deno task test 的范围里）。
+ *
+ * `type` 取值与 classifyWorkBuddyChatFailure 同族：invalid_request_error（4xx 请求
+ * 自身不对）/ authentication_error（没凭据、登录过期）/ upstream_error（上游或传输
+ * 层面挂了）。`code` 用 HTTP 状态码本身 —— 本地失败没有上游业务码可抄。
+ */
+export interface WorkBuddyLocalError {
+  status: number;
+  error: { message: string; type: string; code: number };
+}
+
+export function workBuddyLocalError(
+  status: number,
+  message: string,
+  type: "invalid_request_error" | "authentication_error" | "upstream_error" =
+    "upstream_error",
+): WorkBuddyLocalError {
+  return {
+    status,
+    error: { message: message, type: type, code: status },
+  };
+}
+
+/**
+ * 本地失败在**整体响应体**里的形状。
+ *
+ * 为什么要单独一层：调用方很容易顺手写 `jsonResponse({ ...local.error, extra })`，
+ * 那样 `extra` 会被提升到顶层，响应变成 `{message,type,code,extra}` —— **error 键
+ * 整个没了**，只读 `error.message` 的解析器照样读不到。第 11 轮第一版就是这个形状，
+ * 而 `deno task test` 只跑 src/，main.ts 里写错没有任何测试会红。判据：
+ * **组装响应体的代码也必须放 src/**，形状和取形是同一件事的两半。
+ */
+export function workBuddyLocalErrorBody(
+  local: {
+    status: number;
+    error: { message: string; type: string; code: number | string };
+  },
+  extra: Record<string, unknown> = {},
+):
+  & { error: { message: string; type: string; code: number | string } }
+  & Record<string, unknown> {
+  // 参数类型放宽到上游失败也能传：上游失败（code 是业务码，`number | string`）和
+  // 本地失败（code 是 HTTP 状态码）**必须走同一个组装口**，否则「同一个路由不许有
+  // 两种错误形状」会以「两条各自拼装的代码」形式重新长回来。deno check 报 TS2345
+  // 时提醒的正是这件事：能编译过不等于形状统一。
+  // extra 的键作为 error 的兄弟，不进 error 本身：它是代理的诊断信息，
+  // 不属于 OpenAI 协议，塞进去会让只读 error.{message,type,code} 的解析器多绕一层。
+  return { ...extra, error: local.error };
+}
+
 export function isDeepSeekModel(model: string): boolean {
   return /^deepseek/i.test(model.trim());
 }

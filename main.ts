@@ -50,6 +50,8 @@ import {
   type WorkBuddyChatPlan,
   workBuddyChatSignal,
   type WorkBuddyCredential,
+  workBuddyLocalError,
+  workBuddyLocalErrorBody,
   type WorkBuddyModel,
   workBuddyTruncationError,
 } from "./src/workbuddy.ts";
@@ -625,12 +627,25 @@ async function handleWorkBuddy(
   if (path === "/workbuddy/v1/chat/completions" && request.method === "POST") {
     const parsed = await readJsonBodyLimited(request);
     if (!parsed.ok) {
-      return jsonResponse({ error: parsed.message }, parsed.status);
+      const malformed = workBuddyLocalError(
+        parsed.status,
+        parsed.message,
+        "invalid_request_error",
+      );
+      return jsonResponse(
+        workBuddyLocalErrorBody(malformed),
+        malformed.status,
+      );
     }
     const body = parsed.value as Record<string, unknown>;
     const requested = typeof body?.model === "string" ? String(body.model) : "";
     if (requested.length === 0) {
-      return jsonResponse({ error: "model is required" }, 400);
+      const noModel = workBuddyLocalError(
+        400,
+        "model is required",
+        "invalid_request_error",
+      );
+      return jsonResponse(workBuddyLocalErrorBody(noModel), noModel.status);
     }
 
     let models: WorkBuddyModel[];
@@ -644,15 +659,31 @@ async function handleWorkBuddy(
     }
     const model = models.find((entry) => entry.id === requested);
     if (model === undefined) {
-      return jsonResponse({
-        error: "Unknown WorkBuddy model: " + requested,
-        available: models.map((entry) => entry.id).slice(0, 40),
-      }, 400);
+      const unknown = workBuddyLocalError(
+        400,
+        "Unknown WorkBuddy model: " + requested,
+        "invalid_request_error",
+      );
+      return jsonResponse(
+        workBuddyLocalErrorBody(
+          unknown,
+          { available: models.map((entry) => entry.id).slice(0, 40) },
+        ),
+        unknown.status,
+      );
     }
 
     const credential = await readWorkBuddyCredential(WORKBUDDY_ROOT);
     if (credential === undefined) {
-      return jsonResponse({ error: "no WorkBuddy credential" }, 409);
+      const missing = workBuddyLocalError(
+        409,
+        "no WorkBuddy credential",
+        "authentication_error",
+      );
+      return jsonResponse(
+        workBuddyLocalErrorBody(missing),
+        missing.status,
+      );
     }
     let current = credential;
     try {
@@ -794,7 +825,11 @@ async function handleWorkBuddy(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn("[workbuddy] chat transport failed: " + message);
-      return jsonResponse({ error: message }, 502);
+      const transport = workBuddyLocalError(502, message);
+      return jsonResponse(
+        workBuddyLocalErrorBody(transport),
+        transport.status,
+      );
     }
 
     if (!upstream.ok) {
@@ -810,16 +845,17 @@ async function handleWorkBuddy(
       // `{error:"…字符串",detail:…}` —— 客户端按 OpenAI 形状解析时 message 整个丢掉，
       // 只能显示一句自造的 "HTTP 403"。而 11140 必须能一眼看出是「换号」而不是
       // 「改内容」，所以 type/code 都取自分类结果而不是原样转发。
-      return jsonResponse({
-        error: failure.error,
-        detail: text.slice(0, 500),
-      }, failure.status);
+      return jsonResponse(
+        workBuddyLocalErrorBody(failure, { detail: text.slice(0, 500) }),
+        failure.status,
+      );
     }
     if (upstream.body === null) {
-      return jsonResponse(
-        { error: "WorkBuddy chat returned an empty body" },
+      const empty = workBuddyLocalError(
         502,
+        "WorkBuddy chat returned an empty body",
       );
+      return jsonResponse(workBuddyLocalErrorBody(empty), empty.status);
     }
 
     // 非流式调用：上游**只支持流式**（stream:false 直接 11101），所以这里必须把
@@ -833,7 +869,11 @@ async function handleWorkBuddy(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.warn("[workbuddy] chat aggregation failed: " + message);
-        return jsonResponse({ error: message }, 502);
+        const aggregationFailed = workBuddyLocalError(502, message);
+        return jsonResponse(
+          workBuddyLocalErrorBody(aggregationFailed),
+          aggregationFailed.status,
+        );
       }
       if (aggregated.rejectionPayload !== "") {
         console.warn(
@@ -918,7 +958,15 @@ async function handleWorkBuddy(
     return new Response(guard, { status: 200, headers });
   }
 
-  return jsonResponse({ error: "Unknown WorkBuddy route" }, 404);
+  const unknownRoute = workBuddyLocalError(
+    404,
+    "Unknown WorkBuddy route",
+    "invalid_request_error",
+  );
+  return jsonResponse(
+    workBuddyLocalErrorBody(unknownRoute),
+    unknownRoute.status,
+  );
 }
 async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
   const out: Record<string, any[]> = {};
