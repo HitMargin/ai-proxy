@@ -754,6 +754,76 @@ export function resetWorkBuddyCircuit(): void {
   workBuddyBlockedUntil = 0;
 }
 
+export interface WorkBuddyChatDispatch<T> {
+  /** 上游响应；被本地闸门挡在门外时是 undefined。 */
+  response?: T;
+  /** 被闸门挡住时剩余的冷却毫秒（响应要带 Retry-After 给客户端）。 */
+  cooldownMs?: number;
+  /** 实际发了几发上游。没撞限流就是 1，被闸门挡住是 0。 */
+  attempts: number;
+  /** 第一次撞到的 429 报文；没撞到是空串。 */
+  throttledBody: string;
+  /** 实际退避时长（毫秒）；没退避是 0。 */
+  backoffMs: number;
+}
+
+export interface WorkBuddyChatDispatchOptions {
+  nowMs?: number;
+  retryOnce?: boolean;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * 发一次聊天请求：先看本地闸门，撞到 429 退避再来一次，再撞就记窗口。
+ *
+ * ⚠️ 这段编排整体放在这里而不是 main.ts，是因为它带着一个只有测试能证伪的硬约束：
+ * **没撞限流时必须只发一发上游**。它在线上曾真的被写错过一次 —— main.ts 先裸发一次
+ * postWorkBuddyChat() 再把同一个 payload 交给重试包装，于是每个请求都打两发，
+ * 第一发的 body 既没读也没取消（既双倍计费，又在真正该重试时提前用掉一次配额），
+ * 而当时 12 并发的 e2e 全部 200、一个 429 都没撞到，**端到端永远测不出双发**。
+ */
+export async function sendWorkBuddyChat<
+  T extends {
+    status: number;
+    headers: { get(name: string): string | null };
+    text(): Promise<string>;
+  },
+>(
+  send: () => Promise<T>,
+  options: WorkBuddyChatDispatchOptions = {},
+): Promise<WorkBuddyChatDispatch<T>> {
+  // 上一轮刚撞过 429 的话先在本地拒一次：过了窗口才发请求，否则每次都拿一个
+  // 必然 429 的请求去确认上游还在限流。
+  const cooldownMs = workBuddyCooldownRemaining(options.nowMs ?? Date.now());
+  if (cooldownMs > 0) {
+    return { cooldownMs, attempts: 0, throttledBody: "", backoffMs: 0 };
+  }
+  const sent = await postWorkBuddyChatWithThrottleRetry(send, {
+    ...options.retryOnce === undefined ? {} : { retryOnce: options.retryOnce },
+    ...options.sleep === undefined ? {} : { sleep: options.sleep },
+  });
+  if (sent.attempts === 2 && sent.response.status === 429) {
+    // 第二次还撞 ⇒ 持续限流，记窗口并把 Retry-After 应答给客户端。
+    const again = await sent.response.text().catch(() => "");
+    const window = tripWorkBuddyCircuit(
+      again.slice(0, 200),
+      workBuddyRetryAfterMs(sent.response.headers.get("retry-after")),
+    );
+    return {
+      response: sent.response,
+      cooldownMs: window,
+      attempts: sent.attempts,
+      throttledBody: sent.throttledBody,
+      backoffMs: sent.backoffMs,
+    };
+  }
+  return {
+    response: sent.response,
+    attempts: sent.attempts,
+    throttledBody: sent.throttledBody,
+    backoffMs: sent.backoffMs,
+  };
+}
 // ---------- 倍率归一化 ----------
 
 /**

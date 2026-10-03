@@ -28,6 +28,7 @@ import {
   parseTokenData,
   postWorkBuddyChatWithThrottleRetry,
   resetWorkBuddyCircuit,
+  sendWorkBuddyChat,
   stripControlChars,
   tripWorkBuddyCircuit,
   workBuddyBaseHeaders,
@@ -725,6 +726,141 @@ Deno.test("重试：上游给的短 Retry-After 被采纳", async () => {
     },
   );
   equal(slept, 1_000);
+});
+
+function fakeUpstream2(
+  status: number,
+  body = "",
+  headers: Record<string, string> = {},
+) {
+  return {
+    status,
+    headers: {
+      get: (name: string) =>
+        headers[name.toLowerCase()] ?? headers[name] ?? null,
+    },
+    text: () => Promise.resolve(body),
+  };
+}
+
+Deno.test("派发：没撞限流时只发一发上游（双发回归）", async () => {
+  resetWorkBuddyCircuit();
+  let calls = 0;
+  const slept: number[] = [];
+  const out = await sendWorkBuddyChat(
+    () => {
+      calls++;
+      return Promise.resolve(fakeUpstream2(200, "ok"));
+    },
+    {
+      sleep: (ms) => {
+        slept.push(ms);
+        return Promise.resolve();
+      },
+    },
+  );
+  equal(calls, 1, "a healthy chat must cost exactly one upstream send");
+  equal(out.attempts, 1);
+  equal(out.response?.status, 200);
+  equal(out.cooldownMs, undefined);
+  equal(slept, []);
+});
+
+Deno.test("派发：被闸门挡住时一发都不发", async () => {
+  resetWorkBuddyCircuit();
+  tripWorkBuddyCircuit("test");
+  let calls = 0;
+  const out = await sendWorkBuddyChat(() => {
+    calls++;
+    return Promise.resolve(fakeUpstream2(200));
+  });
+  equal(calls, 0, "a tripped gate must not spend an upstream request");
+  equal(out.attempts, 0);
+  equal(out.response, undefined);
+  assert((out.cooldownMs ?? 0) > 0, "the caller needs a Retry-After value");
+  resetWorkBuddyCircuit();
+});
+
+Deno.test("派发：429 退避成功时不记窗口", async () => {
+  resetWorkBuddyCircuit();
+  let calls = 0;
+  const out = await sendWorkBuddyChat(
+    () => {
+      calls++;
+      return Promise.resolve(
+        calls === 1
+          ? fakeUpstream2(429, '{"code":14003}')
+          : fakeUpstream2(200, "recovered"),
+      );
+    },
+    { sleep: () => Promise.resolve() },
+  );
+  equal(calls, 2);
+  equal(out.response?.status, 200);
+  equal(
+    out.cooldownMs,
+    undefined,
+    "a jitter the retry rode out must not close the gate",
+  );
+  equal(workBuddyCooldownRemaining(), 0);
+});
+
+Deno.test("派发：连续两次 429 记窗口并交出 Retry-After", async () => {
+  resetWorkBuddyCircuit();
+  let calls = 0;
+  const out = await sendWorkBuddyChat(
+    () => {
+      calls++;
+      return Promise.resolve(fakeUpstream2(429, "still throttled"));
+    },
+    { sleep: () => Promise.resolve() },
+  );
+  equal(calls, 2, "one retry, never a storm");
+  assert(
+    (out.cooldownMs ?? 0) > 0,
+    "a sustained throttle must open the gate",
+  );
+  assert(
+    (out.cooldownMs ?? 0) <= 20_000,
+    "the window must stay clamped: " + out.cooldownMs,
+  );
+  resetWorkBuddyCircuit();
+});
+
+Deno.test("派发：401 不开闸门也不重发", async () => {
+  resetWorkBuddyCircuit();
+  let calls = 0;
+  const out = await sendWorkBuddyChat(
+    () => {
+      calls++;
+      return Promise.resolve(fakeUpstream2(401, "stale token"));
+    },
+    { sleep: () => Promise.resolve() },
+  );
+  equal(calls, 1, "a 401 is the refresh path, not the throttle path");
+  equal(out.response?.status, 401);
+  equal(out.cooldownMs, undefined);
+  equal(workBuddyCooldownRemaining(), 0);
+});
+Deno.test("派发：retryOnce:false 时撞到 429 也不记窗口", async () => {
+  resetWorkBuddyCircuit();
+  let calls = 0;
+  const out = await sendWorkBuddyChat(
+    () => {
+      calls++;
+      return Promise.resolve(fakeUpstream2(429, '{"code":14003}'));
+    },
+    { retryOnce: false, sleep: () => Promise.resolve() },
+  );
+  equal(calls, 1);
+  equal(out.attempts, 1);
+  equal(out.response?.status, 429);
+  equal(
+    out.cooldownMs,
+    undefined,
+    "opting out of the retry must opt out of the gate too",
+  );
+  equal(workBuddyCooldownRemaining(), 0);
 });
 
 Deno.test("重试：retryOnce:false 时一次都不重试", async () => {

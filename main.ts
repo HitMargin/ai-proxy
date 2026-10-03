@@ -41,16 +41,13 @@ import {
   guardWorkBuddyStream,
   isWorkBuddyExpired,
   isWorkBuddyRefreshable,
-  postWorkBuddyChatWithThrottleRetry,
+  sendWorkBuddyChat,
   toWorkBuddyModelCard,
-  tripWorkBuddyCircuit,
   WORKBUDDY_ENDPOINT,
   workBuddyChatHeaders,
   type WorkBuddyChatPlan,
-  workBuddyCooldownRemaining,
   type WorkBuddyCredential,
   type WorkBuddyModel,
-  workBuddyRetryAfterMs,
 } from "./src/workbuddy.ts";
 import {
   fetchWorkBuddyModels,
@@ -692,38 +689,30 @@ async function handleWorkBuddy(
 
     // 限流闸门：上一轮刚撞过 429 的话，先在本地拒一次，把上游抖动挡在外面。
     // 过了窗口才发请求 —— 否则每次都拿一个必然 429 的请求去确认上游还在限流。
-    const cooldown = workBuddyCooldownRemaining();
-    if (cooldown > 0) {
-      return workBuddyThrottleResponse(cooldown, requested);
-    }
-
     let upstream: Response;
     try {
-      upstream = await postWorkBuddyChat(current, payload);
-      // 撞到 429 就退避再来一次（编排与判据见 postWorkBuddyChatWithThrottleRetry）。
-      //
-      // 实测这个渠道的 429 是随机抖动而不是并发阈值（并发 3/5 挂 1~2 个、并发 6/8
-      // 全过），所以一次短退避重试通常就落在窗口外，而直接把 429 抛给用户等于
-      // 让一次 1~2 秒的抖动毁掉整轮对话。只重试一次：上游持续限流时，第二次的
-      // 等待由冷却窗口替我们承担。
-      const sent = await postWorkBuddyChatWithThrottleRetry(
+      // 发请求 + 退避重试 + 记窗口都在 sendWorkBuddyChat() 里（判据与编排见
+      // workbuddy.ts 的注释）。它自己保证「没撞限流时只发一发上游」，所以这里
+      // **不要再裸发一次** postWorkBuddyChat() —— 那会让每个请求都打两发，
+      // 第一发的 body 既没读也没取消（双倍计费 + 提前用掉配额），而且 e2e 全绿
+      // 测不出来。
+      const sent = await sendWorkBuddyChat(
         () => postWorkBuddyChat(current, payload),
       );
-      upstream = sent.response;
+      if (sent.cooldownMs !== undefined && sent.response === undefined) {
+        // 上一轮刚撞过 429，本地闸门在发请求前就挡住了。
+        return workBuddyThrottleResponse(sent.cooldownMs, requested);
+      }
+      upstream = sent.response as Response;
       if (sent.attempts === 2) {
         console.warn(
           "[workbuddy] chat throttled for " + requested + "; backed off " +
             sent.backoffMs + "ms before one retry: " +
             sent.throttledBody.slice(0, 200),
         );
-        // 第二次还撞 ⇒ 持续限流，记窗口并把 Retry-After 应答给客户端。
-        if (upstream.status === 429) {
-          const again = await upstream.text().catch(() => "");
-          const window = tripWorkBuddyCircuit(
-            again.slice(0, 200),
-            workBuddyRetryAfterMs(upstream.headers.get("retry-after")),
-          );
-          return workBuddyThrottleResponse(window, requested);
+        // 第二次还撞 ⇒ 持续限流，闸门已记窗口，把 Retry-After 应答给客户端。
+        if (sent.cooldownMs !== undefined) {
+          return workBuddyThrottleResponse(sent.cooldownMs, requested);
         }
       }
       if (upstream.status === 401 || upstream.status === 403) {
