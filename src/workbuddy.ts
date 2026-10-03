@@ -1668,6 +1668,18 @@ export interface WorkBuddyAggregatedCompletion {
   usage?: Record<string, unknown>;
   /** 11140 拦截帧的原报文。非空表示这一轮是被内容拦截结束的。 */
   rejectionPayload: string;
+  /**
+   * 上游没送 `data: [DONE]` 就断了 —— 这一轮的完整性无法证明。
+   *
+   * 为什么必须单独判定：非流式调用方拿到的是一个 JSON 对象，**`[DONE]` 这个
+   * 唯一的终止证据在聚合时就被丢掉了**。不判定的话「正常结束」和「被掐断」
+   * 产出逐字节相同的响应（实测 A/B 两者 JSON 完全一致），截断会以 HTTP 200 +
+   * 半截回答的形式交出去，调用方无从分辨。
+   *
+   * 内容拦截（11140）是**正常业务收尾**，不是截断 —— 它有 `rejectionPayload`
+   * 这条独立的失败通道，不能被这里吞掉。
+   */
+  truncated: boolean;
 }
 
 export interface WorkBuddyAggregatedToolCall {
@@ -1675,6 +1687,42 @@ export interface WorkBuddyAggregatedToolCall {
   type: string;
   function: { name: string; arguments: string };
   index: number;
+}
+
+export interface WorkBuddyTruncationError {
+  status: number;
+  body: { error: { message: string; type: string; code: string } };
+}
+
+/**
+ * 非流式路径上，截断该怎么回给调用方。返回 `undefined` 表示这一轮是完整的。
+ *
+ * 为什么要单独抽出来：`main.ts` 不在 `deno task test` 的范围里（那条任务只跑
+ * `src/`），逻辑放在那里就等于**永远不会被测试覆盖**。同理第 7 轮的
+ * `workBuddyChatSignal` 也因为这个原因放进了 `src/`。
+ *
+ * 两种形状要分开：有内容的是「半截回答」（客户端已经准备渲染），没内容的是
+ * 「什么都没交付」—— 后者是 AGENTS.md 里那条「完整结束但什么都没吐不是正常
+ * 结束」：调用方若拿到一份 `finish_reason: stop` 的空回答，会以为模型答完了。
+ */
+export function workBuddyTruncationError(
+  aggregated: WorkBuddyAggregatedCompletion,
+): WorkBuddyTruncationError | undefined {
+  if (!aggregated.truncated) return undefined;
+  const delivered = aggregated.content !== "" ||
+    aggregated.toolCalls.length > 0;
+  return {
+    status: 502,
+    body: {
+      error: {
+        message: delivered
+          ? "WorkBuddy stream was cut before [DONE]; the answer above is incomplete - retry the request"
+          : "WorkBuddy stream ended without [DONE] and delivered nothing (empty response)",
+        type: delivered ? "stream_cut" : "empty_response",
+        code: "stream_cut",
+      },
+    },
+  };
 }
 
 /**
@@ -1687,6 +1735,9 @@ export interface WorkBuddyAggregatedToolCall {
  *
  * 判据与 guardWorkBuddyStream 同源：11140 帧不能当内容累加，否则会得到一段
  * 「模型很平静地什么都没说」的回复 —— 那正是当初要修的静默失败。
+ *
+ * 完整性判定也在这里做：非流式调用方拿不到 SSE，**`[DONE]` 必须在聚合期就被
+ * 记住**，否则「答完了」和「被掐断了」对它是同一份响应（见 `truncated`）。
  */
 export async function aggregateWorkBuddySse(
   upstream: ReadableStream<Uint8Array>,
@@ -1702,11 +1753,17 @@ export async function aggregateWorkBuddySse(
   let finishReason = "stop";
   let usage: Record<string, unknown> | undefined;
   let rejectionPayload = "";
+  // 只有字面量的 `data: [DONE]` 算终止证据；正文里出现的 "[DONE]" 字样不算。
+  let sawDone = false;
   let carry = "";
   const consume = (line: string): void => {
     if (!line.startsWith("data:")) return;
     const payload = line.slice(5).trim();
-    if (payload.length === 0 || payload === "[DONE]") return;
+    if (payload.length === 0) return;
+    if (payload === "[DONE]") {
+      sawDone = true;
+      return;
+    }
     if (isContentRejectionFrame(payload)) {
       rejectionPayload = payload;
       return;
@@ -1793,6 +1850,7 @@ export async function aggregateWorkBuddySse(
       : finishReason,
     usage,
     rejectionPayload,
+    truncated: !sawDone && rejectionPayload === "",
   };
 }
 

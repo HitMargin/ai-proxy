@@ -46,10 +46,11 @@ import {
   toWorkBuddyModelCard,
   WORKBUDDY_ENDPOINT,
   workBuddyChatHeaders,
-  workBuddyChatSignal,
   type WorkBuddyChatPlan,
+  workBuddyChatSignal,
   type WorkBuddyCredential,
   type WorkBuddyModel,
+  workBuddyTruncationError,
 } from "./src/workbuddy.ts";
 import {
   fetchWorkBuddyModels,
@@ -808,6 +809,20 @@ async function handleWorkBuddy(
             code: 11140,
           },
         }, 403);
+      }
+      // 终止帧缺席 = 完整性无法证明。非流式响应里没有「半条流」可供下游自己判断，
+      // 照发 200 会把半截回答当成完整回答交出去（实测截断与正常结束的 JSON 逐字节相同）。
+      // 与 11140 分开：拦截是业务失败、已经走上面那条通道，不该被算成传输截断。
+      // 判定与取形放在 src/（workBuddyTruncationError）—— main.ts 不在
+      // deno task test 的范围里，逻辑留在这里就永远测不到。
+      const truncation = workBuddyTruncationError(aggregated);
+      if (truncation !== undefined) {
+        console.warn(
+          "[workbuddy] upstream stream ended without [DONE] for " + requested +
+            ": " + truncation.body.error.type + ", chars=" +
+            aggregated.content.length,
+        );
+        return jsonResponse(truncation.body, truncation.status);
       }
       const message: Record<string, unknown> = {
         role: "assistant",

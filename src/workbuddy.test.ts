@@ -40,6 +40,7 @@ import {
   workBuddyCooldownRemaining,
   type WorkBuddyCredential,
   workBuddyRetryAfterMs,
+  workBuddyTruncationError,
 } from "./workbuddy.ts";
 
 function assert(
@@ -1161,6 +1162,93 @@ Deno.test("聚合：工具名在多个分片帧重发时只能留一个", async 
     '{"city": "Paris"}',
     "arguments still concatenate while the name does not",
   );
+});
+
+Deno.test("聚合：完整的流不算截断（有 [DONE] 终止帧）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: "答完了" }, "stop"),
+    "data: [DONE]\n\n",
+  ]));
+  equal(out.truncated, false, "带 [DONE] 不算截断");
+  equal(out.content, "答完了");
+});
+
+Deno.test("聚合：上游半路断掉必须报截断（不能与正常结束同形）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: "半句话" }, ""),
+    AGG_FRAME({ content: "没了" }, "stop"),
+  ]));
+  // 这正是原来的缺陷：截断与正常结束产出逐字节相同的响应，调用方无从分辨。
+  equal(out.truncated, true, "缺 [DONE] 就是截断");
+  equal(out.content, "半句话没了", "已收到的内容仍然如实保留");
+  equal(out.finishReason, "stop", "上游自己说了 stop 也不算终止证据");
+});
+
+Deno.test("聚合：什么都吐出来就干净结束也不算截断（有终止帧）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream(["data: [DONE]\n\n"]));
+  equal(out.truncated, false, "[DONE] 到过就不算截断");
+  equal(out.content, "");
+});
+
+Deno.test("聚合：正文里提到 [DONE] 不算终止帧（判据是整帧而不是 includes）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: '数组里有 "[DONE]" 这个字样' }, "stop"),
+  ]));
+  equal(out.truncated, true, "正文提到 [DONE] 不能顶替终止帧");
+});
+
+Deno.test("聚合：内容拦截是业务收尾，不是传输截断", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: "半句" }, ""),
+    'data: {"code":11140,"msg":"blocked"}\n\n',
+  ]));
+  equal(out.truncated, false, "拦截帧有独立的失败通道，不能被算成截断");
+  equal(out.rejectionPayload !== "", true, "拦截报文仍然如实带回");
+});
+
+Deno.test("聚合：零内容零工具的截断也要被认出来（不能安静地交一份空回答）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ role: "assistant", content: "" }, ""),
+  ]));
+  equal(out.truncated, true, "空的截断同样是截断");
+  equal(out.content, "");
+});
+
+Deno.test("截断映射：完整的流不产生错误（不能把正常回答变成 502）", async () => {
+  const ok = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: "答完了" }, "stop"),
+    "data: [DONE]\n\n",
+  ]));
+  equal(workBuddyTruncationError(ok), undefined, "完整流不该被拦下");
+});
+
+Deno.test("截断映射：半截回答要报 stream_cut（502，不能当完整回答交出去）", async () => {
+  const cut = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: "说到一半" }, ""),
+  ]));
+  const err = workBuddyTruncationError(cut);
+  equal(err?.status, 502);
+  equal(err?.body.error.type, "stream_cut");
+  equal(err?.body.error.code, "stream_cut");
+});
+
+Deno.test("截断映射：零内容零工具要报 empty_response（空回答不是正常结束）", async () => {
+  const cut = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ role: "assistant", content: "" }, ""),
+  ]));
+  const err = workBuddyTruncationError(cut);
+  equal(err?.body.error.type, "empty_response", "没交付任何东西要说出来");
+  equal(err?.status, 502);
+});
+
+Deno.test("截断映射：只有工具调用也算交付过东西（不能报 empty_response）", async () => {
+  const cut = await aggregateWorkBuddySse(sseStream([
+    toolNameFrame("get_weather", ' {"city":"Paris"}'),
+  ]));
+  equal(cut.content, "", "确实一个字都没说");
+  equal(cut.toolCalls.length, 1, "但工具调用发出来了");
+  const err = workBuddyTruncationError(cut);
+  equal(err?.body.error.type, "stream_cut", "有工具调用就不是空交付");
 });
 Deno.test("重试：retryOnce:false 时一次都不重试", async () => {
   let calls = 0;
