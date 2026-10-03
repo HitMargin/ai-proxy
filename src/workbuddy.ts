@@ -611,6 +611,32 @@ export function buildModelProbeBody(model: string): Record<string, unknown> {
 }
 
 /**
+ * 长会话的生成可能跑满几分钟；60s 会在正常思考时把流掐断。
+ */
+export const WORKBUDDY_CHAT_TIMEOUT_MS = 600_000;
+
+/**
+ * 合成聊天请求的 abort 信号：超时 **与** 客户端取消，两个都认。
+ *
+ * 只挂超时是不够的，且这不是推测：实测客户端在发请求后 20ms 中止时，上游 fetch
+ * 仍一路跑到 400ms 自己的超时才结束 —— 客户端已经走了，上游继续生成到完成，
+ * 内容没人要、credit 照算，而代理这边**没有任何日志**（请求确实成功了）。
+ * 长会话里关一次标签页就能白烧掉几十分钟额度。
+ *
+ * 为什么抽成纯函数：这一段住在 main.ts，而 `deno task test` 只跑 `src/`，
+ * 留在那里就等于**永远测不到**。
+ */
+export function workBuddyChatSignal(
+  clientSignal?: AbortSignal,
+  timeoutMs = WORKBUDDY_CHAT_TIMEOUT_MS,
+): AbortSignal {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return clientSignal === undefined
+    ? timeout
+    : AbortSignal.any([timeout, clientSignal]);
+}
+
+/**
  * 上游限流窗口（毫秒）。
  *
  * 实测 WorkBuddy 的 429 不是并发阈值：空 messages 探测在并发 3/5 时随机挂 1~2 个，
@@ -1790,8 +1816,10 @@ export function guardWorkBuddyStream(
 ): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
+  const reader = upstream.getReader();
   let carry = "";
   let rejected = false;
+  let clientGone = false;
   const scan = (text: string): boolean => {
     carry += text;
     // 只判定**完整行**：半行可能是下一个 chunk 的一半，提前判定会切坏 JSON。
@@ -1813,7 +1841,6 @@ export function guardWorkBuddyStream(
   };
   return new ReadableStream({
     async start(controller) {
-      const reader = upstream.getReader();
       try {
         for (;;) {
           const { done, value } = await reader.read();
@@ -1829,11 +1856,17 @@ export function guardWorkBuddyStream(
           if (rejected) break;
         }
       } catch (error) {
-        controller.error(error);
+        // 客户端已经走了（cancel() 会把读打断）：上游那个 TypeError 只是收尾噪音，
+        // 报给一个已经不在的订阅者毫无意义，还会变成未处理拒绝把进程带走
+        // —— 与 AGENTS.md「catch 里的 send 会二次抛出」那条同型。
+        if (!clientGone) controller.error(error);
         return;
       } finally {
         reader.releaseLock();
       }
+      // 客户端中途取消时不能再补 error 帧/[DONE]：controller 已是 canceled 状态，
+      // 任何 enqueue 都抛，且那正是 trae 那条二次抛出的来源。
+      if (clientGone) return;
       if (rejected) {
         const message =
           "WorkBuddy content rejection (code 11140): the account, not" +
@@ -1848,6 +1881,13 @@ export function guardWorkBuddyStream(
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       }
       controller.close();
+    },
+    cancel(reason) {
+      clientGone = true;
+      // 客户端走了就**取消上游**，否则这一发请求会在上游继续生成到结束：
+      // 内容没人要了，credit 却照算（长会话里一次取消能白烧掉几十分钟的额度）。
+      // 这不是猜测 —— cancel() 不转发时，实测上游完全收不到通知。
+      return reader.cancel(reason).catch(() => undefined);
     },
   });
 }

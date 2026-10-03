@@ -12,6 +12,7 @@ import {
   buildChatBody,
   displayNameForModel,
   formatCreditsRate,
+  guardWorkBuddyStream,
   HTTP_HEADER_DOMAIN,
   HTTP_HEADER_ENTERPRISE_ID,
   HTTP_HEADER_PRODUCT,
@@ -32,8 +33,10 @@ import {
   sendWorkBuddyChat,
   stripControlChars,
   tripWorkBuddyCircuit,
+  WORKBUDDY_CHAT_TIMEOUT_MS,
   workBuddyBaseHeaders,
   workBuddyChatHeaders,
+  workBuddyChatSignal,
   workBuddyCooldownRemaining,
   type WorkBuddyCredential,
   workBuddyRetryAfterMs,
@@ -1178,4 +1181,230 @@ Deno.test("重试：retryOnce:false 时一次都不重试", async () => {
   equal(calls, 1);
   equal(out.attempts, 1);
   equal(slept, 0);
+});
+
+/**
+ * 造一个「上游还在生成」的流：先给一帧，然后**永不结束**。
+ *
+ * 上游 request 被取消时 cancel() 会翻转 cancelled 标志 —— 这就是判据：取消有没有
+ * 一路传回上游 socket。没有它，一次关标签页就会让这一发在上游跑满 600 秒。
+ */
+function generatingStream(
+  firstFrame: string,
+  hooks: { cancelled?: () => void; pulls?: () => number },
+) {
+  const encoder = new TextEncoder();
+  let pulls = 0;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(firstFrame));
+    },
+    pull() {
+      pulls += 1;
+      hooks.pulls?.();
+      if (pulls === 1) return;
+      return new Promise<void>(() => {});
+    },
+    cancel() {
+      hooks.cancelled?.();
+    },
+  });
+}
+
+const GUARD_FRAME = "data: " + JSON.stringify({
+  id: "chatcmpl-g",
+  model: "hy3",
+  created: 3,
+  choices: [{ index: 0, delta: { content: "partial" }, finish_reason: "" }],
+}) + "\n\n";
+
+Deno.test("流：客户端取消必须传回上游（否则这一发继续生成到结束）", async () => {
+  let cancelled = false;
+  const guarded = guardWorkBuddyStream(
+    generatingStream(GUARD_FRAME, {
+      cancelled: () => {
+        cancelled = true;
+      },
+    }),
+    () => {},
+  );
+  const reader = guarded.getReader();
+  equal((await reader.read()).value !== undefined, true, "先拿到一帧");
+  await reader.cancel("client went away");
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  equal(cancelled, true, "上游必须收到取消");
+});
+
+Deno.test("流：客户端取消后不得再补帧（controller 已 canceled，enqueue 会抛）", async () => {
+  const rejections: unknown[] = [];
+  const onRejection = (event: PromiseRejectionEvent) => {
+    rejections.push(event.reason);
+    event.preventDefault();
+  };
+  globalThis.addEventListener("unhandledrejection", onRejection);
+  try {
+    const guarded = guardWorkBuddyStream(
+      generatingStream(GUARD_FRAME, {}),
+      () => {},
+    );
+    const reader = guarded.getReader();
+    await reader.read();
+    await reader.cancel();
+    for (let i = 0; i < 20; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  } finally {
+    globalThis.removeEventListener("unhandledrejection", onRejection);
+  }
+  equal(
+    rejections.map((reason) => String(reason)),
+    [],
+    "a cancelled client must not surface as an unhandled rejection",
+  );
+});
+
+Deno.test("流：内容拦截后补 error 帧与 [DONE] 再收尾", async () => {
+  const rejections: unknown[] = [];
+  const onRejection = (event: PromiseRejectionEvent) => {
+    rejections.push(event.reason);
+    event.preventDefault();
+  };
+  globalThis.addEventListener("unhandledrejection", onRejection);
+  try {
+    const encoder = new TextEncoder();
+    const rejectionFrame = "data: " + JSON.stringify({
+      code: 11140,
+      msg: "request illegal",
+    }) + "\n\n";
+    let release: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const guarded = guardWorkBuddyStream(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(rejectionFrame));
+        },
+        pull() {
+          return held;
+        },
+      }),
+      () => {},
+    );
+    const reader = guarded.getReader();
+    const first = await reader.read();
+    // 拦截帧让 wrapper 收尾并补 error 帧 + [DONE]，两个 chunk 是一次 read 之前的 enqueue
+    equal(first.done, false, "补帧成功");
+    const chunks: string[] = [
+      new TextDecoder().decode(first.value ?? new Uint8Array()),
+    ];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      chunks.push(new TextDecoder().decode(next.value ?? new Uint8Array()));
+    }
+    release?.();
+    const text = chunks.join("");
+    equal(text.includes("content_rejection"), true, "补了 error 帧");
+    equal(text.includes("[DONE]"), true, "补了 [DONE]");
+  } finally {
+    globalThis.removeEventListener("unhandledrejection", onRejection);
+  }
+  equal(
+    rejections.map((reason) => String(reason)),
+    [],
+    "拦截收尾不得变成未处理拒绝",
+  );
+});
+
+Deno.test("流：正常流到结束时不取消上游（判据不能只看 clientGone）", async () => {
+  let cancelled = false;
+  const guarded = guardWorkBuddyStream(
+    generatingStream(GUARD_FRAME, {
+      cancelled: () => {
+        cancelled = true;
+      },
+    }),
+    () => {},
+  );
+  // 换一条会正常结束的流再验一遍收尾：读完必须真的 close。
+  const encoder = new TextEncoder();
+  const closing = guardWorkBuddyStream(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(GUARD_FRAME));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      },
+    }),
+    () => {},
+  );
+  const reader = closing.getReader();
+  const seen: string[] = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    seen.push(new TextDecoder().decode(value ?? new Uint8Array()));
+  }
+  equal(seen.join("").includes("[DONE]"), true, "原样转发 [DONE]");
+  equal(cancelled, false, "自然结束的流没有被取消");
+  await guarded.cancel();
+});
+
+Deno.test("信号：客户端一中止，合成的信号立刻 aborted（上游随之收手）", () => {
+  const client = new AbortController();
+  const signal = workBuddyChatSignal(client.signal);
+  if (signal.aborted) throw new Error("还没中止就已经 aborted");
+  client.abort();
+  if (!signal.aborted) {
+    throw new Error("客户端已 abort，合成信号却没跟上");
+  }
+});
+
+Deno.test("信号：没有客户端信号时，只由超时控制（不能一开始就 aborted）", () => {
+  const signal = workBuddyChatSignal();
+  if (signal.aborted) {
+    throw new Error("刚建好就 aborted：超时被当成了立即中止");
+  }
+});
+
+Deno.test("信号：超时到期也会中止合成信号（不能只认客户端那一侧）", async () => {
+  const client = new AbortController();
+  const signal = workBuddyChatSignal(client.signal, 20);
+  let abortedByTimeout = false;
+  signal.addEventListener("abort", () => {
+    abortedByTimeout = client.signal.aborted;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  if (!signal.aborted) throw new Error("超时没有中止合成信号");
+  if (abortedByTimeout) {
+    throw new Error("超时中止被误记成客户端中止");
+  }
+});
+
+Deno.test("流：上游中途断掉必须让客户端读到 error（不能安静截断）", async () => {
+  const encoder = new TextEncoder();
+  const guarded = guardWorkBuddyStream(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(GUARD_FRAME));
+      },
+      pull() {
+        return Promise.reject(new Error("upstream socket died"));
+      },
+    }),
+    () => {},
+  );
+  const reader = guarded.getReader();
+  equal((await reader.read()).value !== undefined, true, "先拿到一帧");
+  let failed = false;
+  let message = "";
+  try {
+    await reader.read();
+  } catch (error) {
+    failed = true;
+    message = String(error);
+  }
+  equal(failed, true, "上游断了就得报错，不能假装正常结束");
+  equal(message.includes("upstream socket died"), true, "把原因带出去");
 });

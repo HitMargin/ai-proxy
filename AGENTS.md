@@ -172,6 +172,22 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
 15. **没有便宜的按 id 查活跃度的端点**（都试过了，别再试）：`GET /v3/config/models/{id}` 与 `GET /v3/models` → TypeError（网关不存在的路径行为）；`GET {SCOPED_MODELS_PATH}/{id}` → `http=403 access_denied not_authorized`；`GET /v2/models` 与 `GET /v2/plugin/models` → `http=404 Route Not Found`。探测仍是唯一信号源。
 
 
+- **客户端取消必须一路传回上游**：流包装层光 `getReader()` 不够，还得显式声明
+  `cancel(reason) { return reader.cancel(reason) }`，否则客户端一关标签页，这一发仍在
+  上游生成到结束、credit 照算，而代理这边零日志（请求确实成功了，什么都不报）。
+  判据：造一个「先给一帧、`pull()` 永不 resolve」的流，取消后断言上游的 `cancel()`
+  被调到 —— 否则 `read()` 循环会挂在那儿直到上游自己结束。
+- **请求级 abort 必须把客户端信号与超时**合成**，只挂超时不够**：实测客户端发请求后
+  20ms 中止，上游 fetch 仍跑到 400ms 自己的超时才结束。合成逻辑放 `src/` 不放
+  `main.ts` —— `deno task test` 只跑 `src/`，留在 `main.ts` 就等于**永远测不到**。
+- **变异体存活不一定是漏测**：先问「平台是不是已经吞了」，再补用例。
+  `clientGone` 标志、取消后的提前 `return`、catch 里无条件 `controller.error` 三个
+  变异体全部存活，但探针证明：取消后 controller 的 `error`/`close`/`enqueue` 抛出的
+  TypeError 落在 `start()` 的 promise 上，而按 Streams 规范，start() 的 rejection 只在
+  state 仍是 `"readable"` 时才被记进 `[[storedError]]` —— 已被取消的流 state 是
+  `"closed"`，一律丢弃。三者是**等价变异体**（防御性冗余），不是未断言的契约。
+  拿不到红测时，先写探针证明该分支不可观测，再记成等价变异体，别硬凑用例。
+
 ## 行为规则
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。
 2. 会话被压缩或换模型后：先重读本文件定位任务，再继续；不要重新验证已确认的事实。

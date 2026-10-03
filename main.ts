@@ -46,6 +46,7 @@ import {
   toWorkBuddyModelCard,
   WORKBUDDY_ENDPOINT,
   workBuddyChatHeaders,
+  workBuddyChatSignal,
   type WorkBuddyChatPlan,
   type WorkBuddyCredential,
   type WorkBuddyModel,
@@ -552,17 +553,25 @@ function workBuddyThrottleResponse(
   );
 }
 
-/** 请求上游 `/v2/chat/completions`，返回原始 Response（流不落盘）。 */
+/**
+ * 请求上游 `/v2/chat/completions`，返回原始 Response（流不落盘）。
+ *
+ * @param signal 客户端信号。**必须**与超时合成，否则用户关掉标签页之后这一发
+ *   仍会在上游跑满 600 秒：内容没人要，credit 却照算。少了它，长会话里取消
+ *   一次能白烧掉几十分钟额度，而代理这边什么日志都没有 —— 请求确实成功了。
+ */
 async function postWorkBuddyChat(
   credential: WorkBuddyCredential,
   payload: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   return await fetch(WORKBUDDY_ENDPOINT + CHAT_COMPLETIONS_PATH, {
     method: "POST",
     headers: workBuddyChatHeaders(credential),
     body: JSON.stringify(payload),
-    // 长会话的生成可能跑满几分钟；60s 会在正常思考时把流掐断。
-    signal: AbortSignal.timeout(600_000),
+    // 合成逻辑住在 src/workbuddy.ts：`deno task test` 只跑 src/，
+    // 留在 main.ts 就等于永远测不到（判据见那个函数的注释）。
+    signal: workBuddyChatSignal(signal),
   });
 }
 
@@ -703,7 +712,7 @@ async function handleWorkBuddy(
       // 第一发的 body 既没读也没取消（双倍计费 + 提前用掉配额），而且 e2e 全绿
       // 测不出来。
       const sent = await sendWorkBuddyChat(
-        () => postWorkBuddyChat(current, payload),
+        () => postWorkBuddyChat(current, payload, request.signal),
       );
       if (sent.cooldownMs !== undefined && sent.response === undefined) {
         // 上一轮刚撞过 429，本地闸门在发请求前就挡住了。
@@ -730,7 +739,11 @@ async function handleWorkBuddy(
           const revived = await refreshWorkBuddyCredential(current);
           current = revived;
           await writeWorkBuddyCredential(WORKBUDDY_ROOT, revived);
-          upstream = await postWorkBuddyChat(current, payload);
+          upstream = await postWorkBuddyChat(
+            current,
+            payload,
+            request.signal,
+          );
           console.log(
             "[workbuddy] token was stale; refreshed and retried (" +
               requested + ")",
