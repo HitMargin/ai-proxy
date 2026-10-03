@@ -26,6 +26,7 @@ import {
   buildModelProbeBody,
   classifyModelProbe,
   dropUnavailableModels,
+  SCOPED_MODELS_PATH,
   type WorkBuddyCredential,
 } from "./workbuddy.ts";
 
@@ -595,4 +596,227 @@ Deno.test("a sweep that judges every model dead still keeps the catalog", async 
     ),
   );
   equal(models.map((m) => m.id), ["a", "b"]);
+});
+
+/**
+ * 两个目录端点对同一 id 给出**不同形状**的 reasoning（真实上游实测）：
+ *   /console/enterprises/personal/models → { effort, summary }
+ *   /v3/config                        → { canDisableThinking, defaultEffort,
+ *                                            supportedEfforts, summary }
+ * 这个夹具让两端点返回**不同**内容，才能看出合并到底是逐字段还是整块取一个。
+ */
+function splitFetcher(
+  scoped: Array<Record<string, unknown>>,
+  config: Array<Record<string, unknown>>,
+): WorkBuddyFetcher {
+  return ((url: string | URL | Request, init?: RequestInit) => {
+    const href = String(url);
+    if (href.endsWith("/chat/completions")) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ code: 11133 }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    const models = href.endsWith(SCOPED_MODELS_PATH) ? scoped : config;
+    return Promise.resolve(
+      new Response(JSON.stringify({ data: { models: models } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  }) as WorkBuddyFetcher;
+}
+
+Deno.test("merged catalogs keep the ladder the primary endpoint never sent", async () => {
+  // 真实缺陷：deepseek-v4-pro 在企业端点只有 reasoning.effort:"high"，
+  // 阶梯 ["high","xhigh"] 只在 /v3/config 里。整块取 primary 时选择器里
+  // 这个阶梯**整块消失** —— 用户连档位都看不到。
+  const models = await fetchWorkBuddyModels(
+    credential(),
+    splitFetcher(
+      [
+        {
+          id: "deepseek-v4-pro",
+          name: "d",
+          reasoning: { effort: "high", summary: "auto" },
+        },
+      ],
+      [
+        {
+          id: "deepseek-v4-pro",
+          name: "d",
+          reasoning: {
+            canDisableThinking: true,
+            defaultEffort: "high",
+            supportedEfforts: ["high", "xhigh"],
+            summary: "auto",
+          },
+        },
+      ],
+    ),
+    undefined,
+    { probe: false },
+  );
+  const model = models.find((m) => m.id === "deepseek-v4-pro");
+  assert(model !== undefined, "the model survives the merge");
+  equal(model.reasoningEfforts, ["high", "xhigh"]);
+  equal(model.defaultReasoningEffort, "high");
+});
+
+Deno.test("the merged ladder keeps the primary default when both sides declare one", async () => {
+  // 两边默认值实测 20 处不一致（glm-5.2 是 medium vs high）。默认档是「选择器
+  // 预选哪一档」，属于身份语义仍以 primary 为准，但阶梯是能力要并集。
+  const models = await fetchWorkBuddyModels(
+    credential(),
+    splitFetcher(
+      [
+        {
+          id: "glm-5.2",
+          name: "g",
+          reasoning: { effort: "medium" },
+        },
+      ],
+      [
+        {
+          id: "glm-5.2",
+          name: "g",
+          reasoning: {
+            defaultEffort: "high",
+            supportedEfforts: ["high", "xhigh"],
+          },
+        },
+      ],
+    ),
+    undefined,
+    { probe: false },
+  );
+  const model = models.find((m) => m.id === "glm-5.2");
+  assert(model !== undefined, "the model survives the merge");
+  equal(model.defaultReasoningEffort, "medium", "primary keeps the default");
+  equal(
+    model.reasoningEfforts,
+    ["high", "xhigh"],
+    "the ladder itself is a capability, so it merges in",
+  );
+});
+
+Deno.test("a default effort declared only by the config endpoint still survives", async () => {
+  // N5 存活暴露的缺口：两端点默认值 20 处实测不一致，于是「primary 根本没声明」
+  // 是常态而不是边角情况。少了这个回落，这些模型在选择器里就没有默认档。
+  const models = await fetchWorkBuddyModels(
+    credential(),
+    splitFetcher(
+      [{ id: "kimi-k3-1", name: "k", reasoning: { summary: "auto" } }],
+      [
+        {
+          id: "kimi-k3-1",
+          name: "k",
+          reasoning: {
+            defaultEffort: "high",
+            supportedEfforts: ["low", "high", "xhigh"],
+          },
+        },
+      ],
+    ),
+    undefined,
+    { probe: false },
+  );
+  const model = models.find((m) => m.id === "kimi-k3-1");
+  assert(model !== undefined, "the model survives the merge");
+  equal(
+    model.defaultReasoningEffort,
+    "high",
+    "the primary declared nothing, so the extra endpoint supplies the default",
+  );
+});
+
+Deno.test("capability fields merge while billing stays with the primary endpoint", async () => {
+  // 计费三件套描述「这个账号怎么计费」，两边混搭会算出既不属 primary 也不属
+  // extra 的第三种价格 —— 所以阶梯并集、计费不并集，两条规则必须分开测。
+  const models = await fetchWorkBuddyModels(
+    credential(),
+    splitFetcher(
+      [
+        {
+          id: "hy3-c",
+          name: "h",
+          reasoning: { effort: "high" },
+        },
+        {
+          id: "glm-5.1",
+          name: "g",
+          maxInputTokens: 100000,
+          reasoning: { effort: "medium" },
+        },
+      ],
+      [
+        {
+          id: "hy3-c",
+          name: "h",
+          maxInputTokens: 200000,
+          maxOutputTokens: 8192,
+          supportsImages: true,
+          reasoning: {
+            defaultEffort: "high",
+            supportedEfforts: ["low", "high"],
+          },
+        },
+        {
+          id: "glm-5.1",
+          name: "g",
+          maxInputTokens: 200000,
+          reasoning: { effort: "medium" },
+        },
+      ],
+    ),
+    undefined,
+    { probe: false },
+  );
+  const model = models.find((m) => m.id === "hy3-c");
+  assert(model !== undefined, "the model survives the merge");
+  equal(model.reasoningEfforts, ["low", "high"]);
+  equal(
+    model.maxOutputTokens,
+    8192,
+    "a missing primary field comes from extra",
+  );
+  equal(model.supportsImages, true);
+  // 这一侧**只有** extra 有窗口大小，所以它必须整块来自 extra ——
+  // 另一个模型两边都有，才测「两边都有时以 primary 为准」。两条规则分开测，
+  // 否则「只取 primary」和「正确并集」会一起通过。
+  equal(
+    model.contextWindow,
+    200000,
+    "only extra declares a window, so extra supplies it",
+  );
+  const both = models.find((m) => m.id === "glm-5.1");
+  assert(both !== undefined, "the second model survives the merge");
+  equal(
+    both.contextWindow,
+    100000,
+    "the primary value wins when both sides have one",
+  );
+});
+
+Deno.test("a thin reasoning shape still publishes its declared default", async () => {
+  // 薄形状端点只有 reasoning.effort。少了这个回落，minimax-m3 / glm-5.1 这些
+  // 模型声明的默认档就永远进不了目录。
+  const models = await fetchWorkBuddyModels(
+    credential(),
+    splitFetcher(
+      [{ id: "minimax-m3", name: "m", reasoning: { effort: "medium" } }],
+      [],
+    ),
+    undefined,
+    { probe: false },
+  );
+  const model = models.find((m) => m.id === "minimax-m3");
+  assert(model !== undefined, "the model survives the merge");
+  equal(model.defaultReasoningEffort, "medium");
+  assert(
+    model.reasoningEfforts === undefined,
+    "a single default effort must not be turned into a one-stop ladder",
+  );
 });

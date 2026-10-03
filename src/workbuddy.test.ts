@@ -425,24 +425,61 @@ Deno.test("请求体：max_tokens 优先用调用方给的，其次远端的", (
   );
 });
 
-Deno.test("请求体：只有模型支持该等级时才发 reasoning_effort", () => {
+Deno.test("请求体：调用方给的 effort 必须原样下发", () => {
   const plan = { efforts: ["low", "high"] };
   equal(
     buildChatBody("m", [], "s", plan, { reasoningEffort: "high" })
       .reasoning_effort,
     "high",
   );
-  // 发一个未声明的档位会被服务端 400。
+  // "none" 是**唯一的关闭档**，它必然不在 supportedEfforts 里（那里只列开着
+  // 的档）。曾用 efforts.includes() 过滤，于是「关思考」被静默丢掉：请求照发、
+  // 思考照开 —— 而实测正是收到 "none" 才把推理从 ~1200 压到 ~0。
+  equal(
+    buildChatBody("m", [], "s", plan, { reasoningEffort: "none" })
+      .reasoning_effort,
+    "none",
+    "the off switch is not in the ladder and must still be sent",
+  );
+  // 未声明的档位也照发：实测上游接受**任意字符串**（totally-bogus → 200），
+  // 只有类型错（数字）才 400。所以那个校验防的不是 400，是静默丢弃。
+  equal(
+    buildChatBody("m", [], "s", plan, { reasoningEffort: "ultra" })
+      .reasoning_effort,
+    "ultra",
+  );
+});
+
+Deno.test("请求体：调用方没选档时不替裸请求补默认档", () => {
+  // 裸请求（不带 effort）是否思考**因模型而异**，所以不能无脑补一个默认档：
+  // 实测 minimax-m2.7 裸请求思考 840 token，补上目录的 effort:"medium" 后变 0；
+  // 反过来 hy3-c 裸请求本来就在思考（359 token），硬塞一个 high 只会改掉
+  // 用户没要求过的行为。回退因此只对 deepseek 系成立 —— 它们的裸请求实测
+  // 恒为 0，不补就等于思考功能整个失效。
   assert(
-    !("reasoning_effort" in
-      buildChatBody("m", [], "s", plan, { reasoningEffort: "ultra" })),
-    "undeclared effort must not be sent",
+    !("reasoning_effort" in buildChatBody("hy3-c", [], "s", {
+      efforts: ["low", "high"],
+      defaultEffort: "high",
+    }, {})),
+    "a ladder must not become an implicit choice when the caller picked none",
   );
   assert(
-    !("reasoning_effort" in buildChatBody("m", [], "s", undefined, {
-      reasoningEffort: "high",
-    })),
-    "a model with no declared ladder gets no effort field",
+    !("reasoning_effort" in
+      buildChatBody("minimax-m3", [], "s", { efforts: [] }, {})),
+    "a model with no ladder keeps the bare request bare",
+  );
+  assert(
+    !("reasoning_effort" in buildChatBody("glm-5.1", [], "s", undefined, {})),
+    "no plan at all means no effort field",
+  );
+  // 声明了默认档但没有阶梯的模型**同样不补**：声明本身不构成「该模型需要
+  // effort 才思考」的证据，只有 deepseek 系的裸请求实测恒为 0。
+  assert(
+    !("reasoning_effort" in buildChatBody("minimax-m3", [], "s", {
+      efforts: [],
+      defaultEffort: "medium",
+    }, {})),
+    "a declared default effort is not on its own a reason to send one",
   );
 });
 
@@ -457,6 +494,32 @@ Deno.test("请求体：deepseek 系必须同时带 thinking 与 reasoning_effort
   );
   equal(body.thinking, { type: "enabled" });
   equal(body.reasoning_effort, "high", "falls back to high");
+  // 声明的默认档**优先于** "high"：它才是这个模型自己声明的起点。实测两端点
+  // 的默认值 20 处不一致（glm-5.2 是 medium vs high），所以这条优先级要盯住。
+  equal(
+    buildChatBody("deepseek-v4-pro", [], "s", {
+      efforts: ["low", "high"],
+      defaultEffort: "low",
+    }, {}).reasoning_effort,
+    "low",
+    "the declared default beats the high preference",
+  );
+  // 但声明的档**不在阶梯里**时不能照发 —— 那等于给上游一个它没公布过的档。
+  equal(
+    buildChatBody("deepseek-v4-pro", [], "s", {
+      efforts: ["low", "high"],
+      defaultEffort: "medium",
+    }, {}).reasoning_effort,
+    "high",
+    "a default outside the ladder is not sent",
+  );
+  // 阶梯里没有 high 时退到第一个，而不是发一个编出来的 "high"。
+  equal(
+    buildChatBody("deepseek-v4-pro", [], "s", { efforts: ["xhigh", "max"] }, {})
+      .reasoning_effort,
+    "xhigh",
+    "no high in the ladder means the first rung",
+  );
   const other = buildChatBody(
     "glm-5.3",
     [],

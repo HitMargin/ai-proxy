@@ -1129,6 +1129,14 @@ export function parseModelMeta(
   }
   const reasoning = record.reasoning;
   if (isRecord(reasoning)) {
+    // ⚠️ 两个目录端点对**同一模型**下发的 reasoning 形状**不同**（实测），
+    // 所以这里每个字段各自独立解析，绝不能「哪边有 reasoning 就整块用哪边」：
+    //   /console/enterprises/personal/models → { effort, summary }            （18 个）
+    //   /v3/config                        → { canDisableThinking, defaultEffort,
+    //                                            supportedEfforts, summary }  （14 个）
+    // 同名 id 上两边的默认值实测 20 处不一致（glm-5.3 只有 defaultEffort、
+    // glm-5.2 是 medium vs high）。按整块覆盖会让 5 个模型真实存在的阶梯消失。
+    //
     // supportedEfforts 是**可枚举**的等级列表，只在模型真支持多等级时下发；
     // 只有单一默认 effort 的模型此处缺省，就不暴露等级选择器。
     const supported = reasoning.supportedEfforts;
@@ -1138,10 +1146,24 @@ export function parseModelMeta(
       );
       if (efforts.length > 0) meta.reasoningEfforts = efforts;
     }
-    const defaultEffort = reasoning.defaultEffort;
-    if (typeof defaultEffort === "string" && defaultEffort.length > 0) {
+    // defaultEffort 优先；缺省时回落到 effort —— 后者是薄形状端点唯一的
+    // 档位字段。回落**不猜值**：拿不到就保持 undefined，让请求体不发这个字段
+    // （编一个会被上游当未知档接受，实际不生效，比不发更坏）。
+    const declared = reasoning.defaultEffort;
+    const fallback = reasoning.effort;
+    const defaultEffort = typeof declared === "string" && declared.length > 0
+      ? declared
+      : typeof fallback === "string" && fallback.length > 0
+      ? fallback
+      : undefined;
+    if (defaultEffort !== undefined) {
       meta.defaultReasoningEffort = defaultEffort;
     }
+    // ⚠️ canDisableThinking **刻意不消费**：它只说「能不能关」，不说关用哪个值。
+    // 实测关思考的合法值是 "none" / "minimal" / "off"，而这三个值上游对**所有**
+    // 模型都接受，所以拿它没法反推出「哪一个是官方关闭档」—— 编一个进阶梯就是
+    // 死控件（用户点了没反应）。真要支持关思考，正确做法是把 none 作为关闭档
+    // 显式下发，而不是猜。
   }
   return meta;
 }
@@ -1501,25 +1523,27 @@ export function buildChatBody(
   const maxTokens = options.maxTokens ?? plan?.maxOutputTokens;
   if (maxTokens !== undefined && maxTokens > 0) body.max_tokens = maxTokens;
 
-  // 思考开关。**实测关键结论（直连三站点对照）**：
-  //   - 裸请求 → reasoning_content 恒为 0；
-  //   - 仅 reasoning_effort:high → 返回思考；
-  //   - 仅 thinking:{type:"enabled"} → 仍为 0；
-  //   - 两者都带 → 返回思考。
-  // 即 reasoning_effort 才是真正的开关。三个站点行为一致 ⇒ 与 endpoint/UA 无关。
-  // thinking 仍保留，用来对齐官方客户端出站形态并覆盖后端将来按它判定的情形。
+  // 思考开关。⚠️ 本段结论全部由实测推翻过一轮旧结论，改动前先读下面四条：
+  //   1. reasoning_effort 是**真开关**，但**不分档**（5~8 轮交替取中位数：
+  //      space-bunny bare 64 / high 53.5 / off 64.5；hy3-c low 332 vs high 313）。
+  //      所以阶梯表达的是「开着 / 关掉」，不是思考强度。
+  //   2. 裸请求（不带该字段）是否思考**因模型而异**：space-bunny 62、hy3-c 359、
+  //      glm-5.3 1761 会思考；deepseek-v4-pro、minimax-m3、glm-5v-turbo、
+  //      glm-5.1、deepseek-v4.1-flash、deepseek-v3-2-volc 恒为 0。
+  //   3. **任意字符串都被上游接受**（"totally-bogus" → 200），只有类型错才 400。
+  //      所以下面那个 efforts.includes 校验防的**不是 400，而是静默丢弃**。
+  //   4. 所以**不要无脑给裸请求补一个默认档** —— 那会改变默认行为：实测
+  //      minimax-m2.7 裸请求思考 840 token，补上目录的 effort:"medium" 后变 0。
   const efforts = plan?.efforts ?? [];
-  const deepseek = isDeepSeekModel(model);
-  if (deepseek) body.thinking = { type: "enabled" };
-  if (
-    options.reasoningEffort !== undefined && efforts.length > 0 &&
-    efforts.includes(options.reasoningEffort)
-  ) {
-    // 只在该模型确实支持该等级时才发，否则服务端因非法参数 400。
+  if (isDeepSeekModel(model)) body.thinking = { type: "enabled" };
+  // 调用方显式给了就**原样发**。曾用 efforts.includes() 过滤，于是 DSH 选了
+  // "none"（唯一的关闭档，它必然不在 supportedEfforts 里）时被静默丢掉，
+  // 请求照发、思考照开 —— 而实测正是 glm-5.3 收到 "none" 才把推理压到 ~0。
+  if (options.reasoningEffort !== undefined) {
     body.reasoning_effort = options.reasoningEffort;
-  } else if (efforts.length > 0 && deepseek) {
-    // deepseek 系：没选档（或所选档不支持）时**必须**补一个 —— 此时请求体里
-    // 只剩 thinking，上游仍按不思考应答（实测）。回退顺序：声明的默认档 →
+  } else if (efforts.length > 0 && isDeepSeekModel(model)) {
+    // deepseek 系：没选档时**必须**补一个，否则只剩 thinking，裸请求不思考。
+    // 回退顺序：声明的默认档 → 阶梯里有 high 就 high → 第一个。
     const declared = plan?.defaultEffort;
     body.reasoning_effort = declared !== undefined && efforts.includes(declared)
       ? declared

@@ -460,26 +460,54 @@ export async function probeWorkBuddyModels(
   return verdicts;
 }
 
-/** 同名 id 以 primary（企业端点）为准，extra 独有的追加在后。 */
+/**
+ * 同名 id 以 primary（企业端点）为准，extra 独有的追加在后。
+ *
+ * ⚠️ 但「为准」只对**身份与计费**成立，能力字段要**逐字段取并集**。两个端点对
+ * 同一 id 下发的 `reasoning` 形状**不同**（实测）：
+ *   /console/enterprises/personal/models → { effort, summary }
+ *   /v3/config                        → { canDisableThinking, defaultEffort,
+ *                                           supportedEfforts, summary }
+ * 同名 id 上两边的默认值实测 20 处不一致（glm-5.3 只有 defaultEffort、glm-5.2 是
+ * medium vs high）。若整块取 primary，deepseek-v4-pro 会只剩 effort:"high" 而丢掉
+ * /v3/config 真实下发的 supportedEfforts:["high","xhigh"] —— 阶梯在选择器里整块消失。
+ * 实测 5 个模型中招：hy3 / glm-5.2 / kimi-k3-1 / deepseek-v4-flash /
+ * deepseek-v4-pro。
+ *
+ * 逐字段规则（每边缺失即 undefined，**不拿对方整个对象覆盖**）：能力字段取并集；
+ * 计费三件套（creditsRate / discountedCreditsRate / agentReferenced）仍严格以
+ * primary 为准 —— 它们描述「这个账号怎么计费」，两边不一致时混搭会算出既不属
+ * primary 也不属 extra 的第三种价格。
+ */
 function mergeRemoteModels(
   primary: WorkBuddyModel[],
   extra: WorkBuddyModel[],
 ): WorkBuddyModel[] {
+  const extraById = new Map(extra.map((model) => [model.id, model]));
+  const merged = primary.map((model) => {
+    const other = extraById.get(model.id);
+    if (other === undefined) return model;
+    // 阶梯宁多不少：primary 没给就拿 extra 的，给了就以 primary 为准。
+    const efforts = model.reasoningEfforts ?? other.reasoningEfforts;
+    const contextWindow = model.contextWindow ?? other.contextWindow;
+    const maxOutputTokens = model.maxOutputTokens ?? other.maxOutputTokens;
+    const supportsImages = model.supportsImages ?? other.supportsImages;
+    const defaultEffort = model.defaultReasoningEffort ??
+      other.defaultReasoningEffort;
+    return {
+      ...model,
+      ...contextWindow === undefined ? {} : { contextWindow },
+      ...maxOutputTokens === undefined ? {} : { maxOutputTokens },
+      ...supportsImages === undefined ? {} : { supportsImages },
+      ...efforts === undefined ? {} : { reasoningEfforts: efforts },
+      ...defaultEffort === undefined
+        ? {}
+        : { defaultReasoningEffort: defaultEffort },
+    };
+  });
   const known = new Set(primary.map((model) => model.id));
-  return [...primary, ...extra.filter((model) => !known.has(model.id))];
+  return [...merged, ...extra.filter((model) => !known.has(model.id))];
 }
-
-/**
- * 一次对话的目录：`/console/enterprises/personal/models` 与 `/v3/config` 的**并集**。
- *
- * ⚠️ 必须并集而不是「谁先成功用谁」：两个端点的 id 集合并不相同，促销的 modelIds
- * 也只挂在其中一侧。先到先得的写法会让 hy4-preview-f（新用户限时免费变体，
- * 只由 /v3/config 下发且被 agent 引用）在另一个端点可用时整批消失 —— 用户看不到
- * 那个免费变体，而服务端照常按它计费。
- *
- * 两个端点都空才回退静态表（中国版那张表是空的，见 STATIC_FALLBACK_MODELS 注释：
- * 与其给一份「选得到、调不通」的国际版别名，不如让渠道如实为空）。
- */
 /** 可调性探测开关。默认开；测试关掉以免依赖网络。 */
 export interface WorkBuddyCatalogOptions {
   /** 默认 true。false 时原样返回目录，不发任何探测请求。 */
