@@ -5,9 +5,9 @@
 支持以下上游：
 
 1. **标准 OpenAI 兼容上游**（透传）：kilo.ai、opencode.ai/zen、openrouter.ai、tokenharbor.ai
-2. **协议转换上游**：Anthropic、Gemini（OpenAI 格式 ⇄ 各自原生格式双向翻译）
-3. **cnb.cool 网页聊天**：通过会话自举 + 提示词协议模拟，包装成标准 Chat Completions / Responses。
-4. **CommandCode Go 私有网关**：移植 `dsh-cmdgo-provider` 的模型筛选、CLI 网关协议、多账号池与额度读取，提供 `/commandcode/v1`。
+2. **网页端私有接口**：chat.deepseek.com（PoW + Cookie 会话）、api.trae.cn（协议翻译 + 签到）、cnb.cool（会话自举 + 提示词协议模拟），分别包装成标准 Chat Completions / Responses
+3. **私有 CLI 网关**：CommandCode Go（移植 `dsh-cmdgo-provider` 的模型筛选、网关协议、多账号池与额度读取）与 WorkBuddy 中国版（文件凭据 + 自动续期 + 流内内容拦截）
+4. **Anthropic Messages**：`/commandcode/v1/messages` 做 OpenAI ⇄ Messages 双向转换（原先的 `/anthropic/v1` 与 `/gemini/v1` 已下线，见下方说明）
 
 > 同一份 `main.ts` 可以跑在 **Deno Deploy**、**本地 Deno**、**Cloudflare Workers** 三种环境。
 
@@ -26,7 +26,7 @@
 
 ```
 客户端（任意 OpenAI SDK）
-      │  /cnb/v1/chat/completions  /v1/...  /anthropic/v1/...
+      │  /cnb/v1/chat/completions  /v1/...  /commandcode/v1/messages  ...
       ▼
 Cloudflare Worker  https://<worker>.workers.dev          ← worker.ts
       │  ENV.BACKEND_URL 有值 → 纯字节转发（流式；仅幂等请求最多重试一次，非幂等 POST 不自动重放）
@@ -55,9 +55,21 @@ main.ts                    入口、鉴权、Provider 路由、/v1 聚合、本�
 src/core.ts                环境变量、Provider 配置、协议适配器、通用 HTTP/流式工具
 src/cnb.ts                 cnb.cool CSRF、登录态、工具调用、Responses 转换
 src/deepseek-web.ts        DeepSeek 网页登录态、PoW WASM、SSE 解析、OpenAI 转换
+src/deepseek-gate.ts       DeepSeek 网页端串行闸与安全阀（冷却、频率、并发）
+src/deepseek-responses.ts  DeepSeek 网页端 Responses API 转换
+src/deepseek-risk.ts       DeepSeek 网页端本地启发式风险打分
+src/trae.ts                TRAE 协议翻译、工具调用、思考档位、签到
+src/trae-account.ts        TRAE 凭据落盘、过期与续期、远端模型目录
+src/workbuddy.ts           WorkBuddy 凭据解析、目录/倍率/促销、请求体、错误分类、流内拦截
+src/workbuddy-account.ts   WorkBuddy 凭据落盘、过期与续期、目录并集、可调性探测
+src/zen.ts                 Zen 请求头补齐、Responses/Messages 转换、错误分类
+src/zen-catalog.ts         Zen 模型能力元数据（来自 models.dev）
+src/zen-compaction.ts      Zen 会话压缩
+src/zen-egress.ts          Zen 出口代理轮换
 src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度、Messages 转换与路由
-src/runtime/               响应体形状嗅探、流回放与 abort/截断分类
-dsh-plugin/               可选 DSH Host Provider 桥接插件
+src/runtime/               响应体形状嗅探、流回放、abort/截断分类、目录健康登记
+dsh-plugin/               可选 DSH Host Provider 桥接插件（按渠道分组注册）
+third_party/              移植来源的代码与许可说明（CommandCode Go provider）
 deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 ```
 
@@ -147,9 +159,7 @@ deno task test
 | `MAX_REQUEST_BODY_BYTES` | 否 | 通用 `/v1` 与反向代理请求体上限，默认 `12582912`（12 MiB） |
 | `BACKEND_URL` | 否 | 有值即进入**反向代理模式**，全部请求原样转发到该地址（如隧道 URL） |
 | `DEFAULT_BEARER_TOKEN` | 否 | 透传类上游的兜底 Bearer token |
-| `ANTHROPIC_API_KEY` | 否 | `/anthropic/v1` 使用 |
-| `GEMINI_API_KEY` | 否 | `/gemini/v1` 使用 |
-| `OPENROUTER_API_KEY` | 否 | `/openrouter/v1` 使用 |
+| `OPENROUTER_API_KEY` | 否 | `/openrouter/v1` 使用；未配置时该渠道不进模型列表 |
 | `COMMANDCODE_ADMIN_KEY` | 否 | CommandCode 管理接口独立密钥；设置后需通过 `X-CommandCode-Admin-Key` 发送 |
 | `COMMANDCODE_API_KEY` | 否 | CommandCode Go 账号 key；账号池为空时作为单账号兜底 |
 | `COMMANDCODE_BASE_URL` | 否 | CommandCode 网关地址，默认 `https://api.commandcode.ai`；非 loopback 必须 HTTPS |
@@ -166,6 +176,8 @@ deno task test
 | `COMMANDCODE_TIMEOUT_MS` | 否 | 单次 CommandCode 请求总超时，默认 `600000` |
 | `COMMANDCODE_SESSION_SALT` | 否 | 显式会话头哈希的服务端盐；不设时每进程随机，重启后亲和性改变 |
 | `COMMANDCODE_ALLOW_REMOTE_IMAGES` | 否 | 设为 `1/true/yes` 才允许代理下载 HTTP(S) 图片；默认关闭以避免 SSRF |
+| `ZEN_BASE_URL` | 否 | Zen 上游地址覆盖，默认 `https://opencode.ai/zen/v1` |
+| `ZEN_BEARER_TOKEN` | 否 | Zen 上游 Bearer token 覆盖（默认走 `public`） |
 | `ZEN_CATALOG` | 否 | 从 models.dev 读取 Zen 模型能力元数据；设为 `off` 跳过（该目录约 5 MB，见下） |
 | `ZEN_MODEL_LIMITS` | 否 | 目录未收录模型的上下限，如 `{"jev-1.13-free":{"context":200000,"output":32000}}` |
 
@@ -267,9 +279,27 @@ deno run -A .tmp-workbuddy-login.ts
 - **5 个归属头一个都不能少**（`X-Product` / `X-Product-Code` / `X-IDE-Name` / `X-IDE-Type` / `X-IDE-Version`），后台「使用端」一栏靠它们归因，缺任一头就显示 `-`。
 - **流内 11140 要单独判**。内容审核拒绝会返回 HTTP 403，也可以包在 HTTP 200 的 SSE 里；且它和真认证失败共用 403，所以只认「无 `choices` 字段 + 正文命中 `"code": 11140`」这一条窄判据。它是**账号级**拦截（同一请求发 7 个账号：2 个 200、4 个 403、1 个 429），换号而不是让用户改内容。
 
-401/403 会先静默用 `refresh_token` 续期并重试一次；目录取 `/console/enterprises/personal/models` 与 `/v3/config` 的**并集**（两个端点的 id 集合不同，促销只挂一侧，先到先得会让整批限时免费模型消失而服务端照常计费），缓存 5 分钟，`?refresh=true` 强制刷新。倍率显示用 `原价→促销价` 箭头形态。**不含签到**：路由 `/v2/billing/meter/daily-checkin` 确实存在（401 而非 404），但中国版文档从未提及该活动，路由存在不等于账号有资格。
+**401** 会先静默用 `refresh_token` 续期并重试一次；**403 要先看 body 再决定**——403 同时承载账号级内容拦截（11140），若不分类就一律续期重发，每次确定性拦截都会白烧一次 refresh 额度**外加**一发全额计费的请求，结果还是同样的 403。目录取 `/console/enterprises/personal/models` 与 `/v3/config` 的**并集**（两个端点的 id 集合不同，促销只挂一侧，先到先得会让整批限时免费模型消失而服务端照常计费），缓存 5 分钟，`?refresh=true` 强制刷新。倍率显示用 `原价→促销价` 箭头形态。**不含签到**：路由 `/v2/billing/meter/daily-checkin` 确实存在（401 而非 404），但中国版文档从未提及该活动，路由存在不等于账号有资格。
 
-### 可选 DSH Provider 桥接插件
+### TRAE（`/trae/v1`）
+
+TRAE 只有网页端私有接口，没有公开的 OpenAI 端点，所以这一路必须自己做协议翻译：请求侧的 `reasoning` 块、工具声明、工具选择映射到 TRAE 的私有形状，响应侧的思考增量、文本增量、工具调用分片再拼回标准 SSE/JSON。
+
+**配置凭据**：
+
+```powershell
+deno run -A .tmp-trae-login.ts
+```
+
+凭据写入仓库根目录的 `trae-auth.json`（已加入 `.gitignore`），过期后自动续期。
+
+三处必须照做的实现约束：
+
+- **模型 id 必须携带所属通道**。TRAE 的目录来自远端（`TraeModel.function`），同一个模型只在列出它的那个通道里可调用——把 `glm-5.1` 发到 `solo_work_lite` 会得到流内 `4001 param is invalid`。所以目录里必须有通道信息，前缀式路由表达不了这件事，**推不到通道宁可 502，也不猜默认值**。
+- **多通道目录要带通道信息合并**。目录来自 `/api/ide/v1/batch_get_detail_param`，一次返回多个通道的条目（`TraeModel.function` 标明每个模型属于哪个通道），解析时合并成一份。同一 id 在不同通道给的能力字段可能不一致，能力字段逐字段并集、计费字段留 primary；整块取一个来源会让真实的档位阶梯整个消失。
+- **签到是独立的一条链路**：`/trae/api/v2/ug/checkin_credits/status` 与 `/claim` 走 `api.trae.cn`，推理走 `trae-api-cn.mchost.guru` 的 `/api/agent/v3/llm_utils_chat`，两条链路**主机不同**，请求头也不一样（签到不带 SOLO 专属头）。业务码 `9074`「当前参与用户太多」是**按 device_id 的全网高峰限流**，不是账号出问题，所以只能退避重试，不能混进「账号异常」分支；claim 之后要补查 status 才下结论。
+
+### Zen（`/zen/v1`）
 
 `/zen/v1` 现在由 `src/zen.ts` 处理：它补齐 OpenCode 客户端 User-Agent、DSH session 派生的 `x-opencode-session`/`x-opencode-request`、canonical session、工具 quartet、Muse Spark 的 Responses 转换和 FreeTier/Region 错误分类。实测非流式请求会触发 `FreeTierError`，DSH 路径必须保持 `stream: true`。可用 `ZEN_BASE_URL` 和 `ZEN_BEARER_TOKEN` 覆盖默认上游；原始项目代码仍是唯一实现。
 
@@ -295,7 +325,17 @@ Zen 的 `GET /models` 只返回 `{ id, object, created, owned_by }`，没有上�
 
 在此之前，代理对全部 11 个模型使用同一个 `{ context: 1,000,000, output: 64,000 }` 兜底值，而压缩正是在拿这个数字做分母。真实输出上限从 32,000 到 524,288 不等，旧值对目录覆盖的 10 个模型**全都错**：mimo 高估 2 倍，`space-bunny-free` 低估 8.2 倍。
 
-`dsh-plugin/` 现在是整个项目的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。它注册一个 `ai-proxy` Provider，动态发现 `/v1` 聚合模型以及 DeepSeek 网页端、TokenHarbor 等可用渠道，并按模型前缀把请求路由回原始代理；`openrouter/*`、`anthropic/*`、`gemini/*` 依赖 per-user key，本代理不持有，因此不进入模型列表。浏览器侧是一个现代设置面板：每秒走动的运行时长、10 秒刷新的全渠道快照、可搜索的模型表、渠道统计、账号池状态、启停和日志；账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
+### 可选 DSH Provider 桥接插件
+
+`dsh-plugin/` 现在是整个项目的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。它动态发现 `/v1` 聚合模型并按模型前缀把请求路由回原始代理；浏览器侧是一个现代设置面板：每秒走动的运行时长、10 秒刷新的全渠道快照、可搜索的模型表、渠道统计、账号池状态、启停和日志；账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
+
+**模型选择器按渠道分组。** 插件向 Host 注册**两个层面**：一个可配置的 `ai-proxy` Provider（地址在设置页里改），以及 8 个 `ai-proxy-<渠道>` 的只读 adapter（`ai-proxy-commandcode` / `-cnb` / `-deepseek-web` / `-kilo` / `-tokenharbor` / `-trae` / `-workbuddy` / `-zen`，见 `dsh-plugin/index.js` 的 `CHANNEL_GROUPS`），每个 adapter 只列自己渠道的模型并带上中文标题。全部 adapter 共用同一个 `ProjectAdapter` 实例——Host 的 `registerAdapter` 一次接收一个列表，所以同一个对象按 provider id 各自收窄列表即可。
+
+三处必须照做的约束：
+
+- **id 必须带 `ai-proxy-` 前缀**。用户的 `cordis.patch.yml` 里已经注册过 `commandcode` / `deepseek-web` 同名 provider，宿主的 `prepareRoutes` 遇重名抛 `DUPLICATE_ADAPTER`，**整个插件条目都不激活**（炸过两次桌面端）。选择器里显示的名字来自 `providerInfo().name`，与 id 无关。
+- **渠道分组的代码不在热重载范围**。热重载只换 `stream` / `resolveModel`，模块级 `listModels` / `normalizeModel` / `publishedEfforts` 以及 `apply()` 里的闭包换不掉，所以插件改动要**重启 DSH Host** 才生效。
+- **目录是冷启动抢跑**。Host 每次生成只建一次模型目录，且插件加载时代理往往还没监听上；冷启动实测两次相隔三秒。`registerModelDiscovery` 里重试 4 次（间隔 2s×attempt）是唯一能救回来的地方，Host 自己不重试。
 
 ```powershell
 node dsh-plugin/self-test.mjs
@@ -399,15 +439,13 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 
 | 路径前缀 | 上游 | 适配方式 |
 |---|---|---|
-| `/v1` | **聚合入口** | kilo / zen / cnb / commandcode：模型加 `kilo/`、`zen/`、`cnb/`、`commandcode/` 前缀统一列出与分发 |
+| `/v1` | **聚合入口** | kilo / zen / cnb / commandcode / openrouter / deepseek-web / workbuddy / trae：模型加渠道名前缀统一列出与分发 |
 | `/kilo/v1` | api.kilo.ai | 透传，仅保留 `isFree: true` 的模型（kilo 的直连前缀，聚合成员之一） |
 | `/zen/v1` | opencode.ai/zen | 透传，默认 token `public`，仅保留 `-free` 模型 |
 | `/deepseek-web/v1` | chat.deepseek.com 网页聊天端 | 需要登录 Cookie，支持 Chat Completions 与 Responses |
-| `/trae/v1` | api.trae.cn | 入站/出站协议翻译、工具调用、思考档位、账号状态与每日签到 |
+| `/trae/v1` | trae-api-cn.mchost.guru（推理）/ api.trae.cn（签到与积分） | 入站/出站协议翻译、工具调用、思考档位、账号状态与每日签到 |
 | `/workbuddy/v1` | www.workbuddy.cn | **自定义处理器**：文件凭据 + 401 自动续期重试 + 流内 11140 内容拦截；目录取自账号自身 |
 | `/commandcode/v1` | CommandCode Go CLI 网关 | 模型发现、私有协议转换、多账号池、额度、Chat Completions 与 Responses |
-| `/anthropic/v1` | api.anthropic.com | `toAnthropic` 双向翻译 |
-| `/gemini/v1` | generativelanguage.googleapis.com | `toGemini` 双向翻译 |
 | `/openrouter/v1` | openrouter.ai | 透传 |
 | `/openrouter/v1/responses` | openrouter.ai | 透传 Responses API |
 | `/tokenharbor/v1` | tokenharbor.ai | 透传，仅保留 `:free` 模型 |
@@ -416,9 +454,13 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 
 `GET /` 会返回所有可用 provider 列表。`GET /health` 返回各 provider 最近一次健康探测的状态（`available` / `degraded` / `unavailable` / `unknown`）；没有探测记录时显示 `unknown`，不会因为一次网络失败把模型清单清空。
 
-**聚合端点 `/v1`**：`GET /v1/models` 返回 kilo + zen + cnb + commandcode 全部模型的并集（id 分别加 `kilo/`、`zen/`、`cnb/`、`commandcode/` 前缀防冲突）；
+**聚合端点 `/v1`**：`GET /v1/models` 返回 **8 个成员**（`kilo` / `zen` / `cnb` / `commandcode` / `openrouter` / `deepseek-web` / `workbuddy` / `trae`，见 `main.ts` 的 `V1_AGGREGATE_MEMBERS`）全部模型的并集，id 分别加渠道名前缀防冲突；
 POST 时 model 写带前缀的 id（如 `cnb/deepseek-v4-pro`、`commandcode/deepseek/deepseek-v4-flash`）即自动分发到对应上游，完整复用该上游的
 处理链。不带前缀的裸 id 按 kilo→zen→cnb→commandcode 顺序解析（保持旧行为），冷启动后需先 GET 一次 `/v1/models` 暖缓存。分发时会剥掉客户端 token，让各成员用自家默认凭据；仅当本代理设置 `API_KEYS` 时才透传客户端鉴权头。
+
+⚠️ **`/workbuddy/v1/chat/completions` 的 `model` 必须写裸 id**（如 `deepseek-v4-flash`），不能带 `workbuddy/` 前缀——带前缀会被判成未知模型并回 400。`/v1` 聚合入口的分发只认带前缀的 id，这是两条不同的解析路径。
+
+后四个成员（deepseek-web / workbuddy / trae / openrouter）加入聚合**不是为了分发**，而是 **harness 的模型目录读的是这个聚合**（`adapter.listModels()`），不是插件那份独立清单——漏掉任何一个，就会出现「面板里有该渠道、选择器里一个模型都没有」。`openrouter` 在没配 key 时主动隐身（未鉴权的目录请求会回 401，列出来再 401 比不列更糟）。
 
 **模型列表**有 5 分钟内存缓存，并会在后台异步做健康探测（`testModel`，3 秒超时；200 可用，429/5xx 视为 degraded，401/403 才是 unavailable，网络失败保留为 unknown），在 Deno Deploy 上用 `EdgeRuntime.waitUntil` 挂起，不阻塞响应；加 `?health=true` 可强制同步探测。探测结果可通过 `GET /health` 查看。
 
@@ -529,10 +571,18 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 | `src/core.ts` | 环境变量、Provider 配置、协议适配器、通用 HTTP/流式工具 |
 | `src/cnb.ts` | cnb.cool CSRF、登录态、工具调用、Responses API |
 | `src/deepseek-web.ts` | DeepSeek 登录态、PoW、完整上下文、SSE、思考和工具调用 |
-| `src/workbuddy.ts` | WorkBuddy 常量、凭据解析、目录/倍率/促销解析、请求头、请求体、SSE 拦截 |
-| `src/workbuddy-account.ts` | WorkBuddy 凭据落盘、过期与续期、目录并集 |
+| `src/deepseek-gate.ts` | DeepSeek 网页端串行闸与安全阀（并发、频率、冷却） |
+| `src/deepseek-responses.ts` | DeepSeek 网页端 Responses API 转换 |
+| `src/deepseek-risk.ts` | DeepSeek 网页端本地启发式风险打分 |
+| `src/trae.ts` | TRAE 协议翻译、工具调用、思考档位、每日签到 |
+| `src/trae-account.ts` | TRAE 凭据落盘、过期与续期、远端模型目录 |
+| `src/workbuddy.ts` | WorkBuddy 常量、凭据解析、目录/倍率/促销解析、请求头、请求体、错误分类、SSE 拦截 |
+| `src/workbuddy-account.ts` | WorkBuddy 凭据落盘、过期与续期、目录并集、模型可调性探测 |
 | `src/commandcode/` | CommandCode Go 模型发现、私有协议、多账号池、OAuth、额度与 OpenAI 转换 |
+| `src/zen.ts` | Zen 请求头补齐、Responses/Messages 转换、FreeTier/Region 错误分类 |
 | `src/zen-catalog.ts` | Zen 模型能力元数据（来自 models.dev），Zen 网关自己不返回 |
+| `src/zen-compaction.ts` | Zen 会话压缩 |
+| `src/zen-egress.ts` | Zen 出口代理轮换（匿名额度按地址计费） |
 | `third_party/dsh-deepseek-web-login/` | Apache-2.0 工具协议派生代码及许可证 |
 | `third_party/dsh-cmdgo-provider/` | dsh-cmdgo-provider 的 MIT 许可证与移植说明 |
 | `worker.ts` | Cloudflare Workers 入口 shim（把 `vars`/secrets 注入 `main.ts` 的模块级 `ENV`） |
@@ -549,6 +599,9 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 ## 已知限制
 
 - cnb 通道完全依赖网页端私有接口，**上游改版即失效**；
+- DeepSeek 网页端、TRAE、WorkBuddy 三个渠道同样依赖网页端私有接口：TRAE 的推理走 `trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`、签到走 `api.trae.cn`（两套主机，且客户端版号不匹配时新模型直接报流内 4001），WorkBuddy 的目录靠逐模型实发探测剔除调不通的 id（上游改版后探测结论要重跑），两者都与上游页面强绑定；
+- 原先的 `/anthropic/v1`（api.anthropic.com）与 `/gemini/v1`（generativelanguage.googleapis.com）两条路由**已下线**，`ANTHROPIC_API_KEY` / `GEMINI_API_KEY` 也随之失效。Anthropic Messages 的转换能力保留在 `/commandcode/v1/messages`；
+- 模型选择器里的**按渠道分组依赖重启 DSH Host** 才生效：插件的渠道分组是模块级代码，热重载只换 `stream` / `resolveModel`。不重启的话模型仍然是全挤在 `ai-proxy` 一个 provider 下（功能可用，只是没分组）。
 - CommandCode Go 同样依赖 `/alpha/*` 私有 CLI 网关，模型档位、指纹要求或 OAuth 回调发生变化时需要更新；
 - 免费上游的模型清单随时变化，且常见限流（429）与容量窗口（5xx）；
 - `trycloudflare` 快速隧道的 URL 每次重启都会变（由 `restart.ps1` 自动回写 `BACKEND_URL`），且可能有连接抖动；`proxyToBackend` 仅对幂等请求最多重试一次，非幂等 POST 不自动重放以避免重复计费；
