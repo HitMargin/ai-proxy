@@ -11,6 +11,7 @@ import {
   aggregateWorkBuddySse,
   buildChatBody,
   buildCredential,
+  classifyWorkBuddyChatFailure,
   credentialExpiresAtMs,
   displayNameForModel,
   formatCreditsRate,
@@ -51,12 +52,14 @@ import {
   trialModelIds,
   tripWorkBuddyCircuit,
   WORKBUDDY_CHAT_TIMEOUT_MS,
+  WORKBUDDY_PASSTHROUGH_FIELDS,
   workBuddyAnonymousHeaders,
   workBuddyBaseHeaders,
   workBuddyChatHeaders,
   workBuddyChatSignal,
   workBuddyCooldownRemaining,
   type WorkBuddyCredential,
+  workBuddyErrorCode,
   workBuddyRetryAfterMs,
   workBuddyTruncationError,
   zonedMinutes,
@@ -95,6 +98,272 @@ function credential(
 function config(data: Record<string, unknown>): unknown {
   return { code: 0, data };
 }
+
+// ===== 第 10 轮：输出上限的第二个字段 =====
+Deno.test("输出上限：正文上限与总上限必须**分别**下发，缺一个上游就不采纳另一个", () => {
+  const both = buildChatBody("hy3-c", [], "s", undefined, {
+    maxTokens: 200,
+    maxCompletionTokens: 24,
+  });
+  equal(both.max_tokens, 200);
+  equal(both.max_completion_tokens, 24);
+  // 只给一个时那个字段仍然照发（上游的采纳规则是它的责任，不是我们的）。
+  const onlyTotal = buildChatBody("hy3-c", [], "s", undefined, {
+    maxTokens: 200,
+  });
+  equal(onlyTotal.max_tokens, 200);
+  equal("max_completion_tokens" in onlyTotal, false);
+  const onlyBody_ = buildChatBody("hy3-c", [], "s", undefined, {
+    maxCompletionTokens: 24,
+  });
+  equal(onlyBody_.max_completion_tokens, 24);
+  equal("max_tokens" in onlyBody_, false);
+});
+
+Deno.test("输出上限：两个字段各自拒掉非正数（0 与负数都不该下发）", () => {
+  for (const bad of [0, -1, -100]) {
+    const b = buildChatBody("hy3-c", [], "s", undefined, {
+      maxTokens: 200,
+      maxCompletionTokens: bad,
+    });
+    equal(b.max_tokens, 200);
+    equal(
+      "max_completion_tokens" in b,
+      false,
+      "max_completion_tokens=" + bad,
+    );
+    const t = buildChatBody("hy3-c", [], "s", undefined, {
+      maxTokens: bad,
+      maxCompletionTokens: 24,
+    });
+    equal("max_tokens" in t, false, "max_tokens=" + bad);
+    equal(t.max_completion_tokens, 24);
+  }
+});
+
+Deno.test("输出上限：plan 的默认值**不**填进正文上限（上限语义不同，不能替调用方决定）", () => {
+  const b = buildChatBody("hy3-c", [], "s", {
+    maxOutputTokens: 4096,
+    efforts: [],
+    defaultEffort: undefined,
+  }, {});
+  equal(b.max_tokens, 4096);
+  equal("max_completion_tokens" in b, false);
+});
+
+// ===== 第 10 轮：透传白名单 =====
+Deno.test("透传：采样与结构化字段原样下发", () => {
+  const b = buildChatBody("hy3-c", [], "s", undefined, {
+    passthrough: {
+      response_format: { type: "json_object" },
+      top_p: 0.9,
+      seed: 42,
+      presence_penalty: 0.5,
+      frequency_penalty: -0.5,
+      logprobs: true,
+      top_logprobs: 3,
+      n: 2,
+      user: "u-1",
+      parallel_tool_calls: false,
+      service_tier: "flex",
+      top_k: 40,
+      logit_bias: { "1": -100 },
+    },
+  });
+  for (const key of WORKBUDDY_PASSTHROUGH_FIELDS) {
+    equal(key in b, true, "missing passthrough field: " + key);
+  }
+  equal(b.response_format, { type: "json_object" });
+  equal(b.top_p, 0.9);
+  equal(b.seed, 42);
+  equal(b.user, "u-1");
+  equal(b.parallel_tool_calls, false);
+});
+
+Deno.test("透传：白名单**之外**的字段一律不下发", () => {
+  const b = buildChatBody(
+    "hy3-c",
+    [{ role: "user", content: "hi" }],
+    "s",
+    undefined,
+    {
+      passthrough: {
+        // 这几个是我们要改写或必须由代理生成的，调用方给了也不能覆盖。
+        model: "evil",
+        messages: [],
+        stream: false,
+        prompt_cache_key: "caller-supplied",
+        // 有各自判据与兜底的字段**不走白名单**：白名单包里塞它们等于没给。
+        // （这条断言在写测试时真的红了：max_tokens 来自 options.maxTokens，
+        //  不来自 passthrough，所以包里的 7 会被忽略且请求体里没有该字段。）
+        max_tokens: 7,
+        max_completion_tokens: 9,
+        reasoning_effort: "high",
+        stop: ["x"],
+        tools: [{ type: "function" }],
+        tool_choice: "auto",
+        // 完全无关的自造字段。
+        whatever: true,
+      },
+    },
+  );
+  equal(b.model, "hy3-c");
+  equal(b.messages, [{ role: "user", content: "hi" }]);
+  equal(b.stream, true);
+  equal(b.prompt_cache_key, "s");
+  equal(
+    "max_tokens" in b,
+    false,
+    "max_tokens comes from options, not passthrough",
+  );
+  equal("max_completion_tokens" in b, false);
+  equal("reasoning_effort" in b, false);
+  equal("stop" in b, false);
+  equal("tools" in b, false);
+  equal("tool_choice" in b, false);
+  equal("whatever" in b, false);
+  for (const key of WORKBUDDY_PASSTHROUGH_FIELDS) {
+    equal(key in b, false, "unexpected passthrough field: " + key);
+  }
+});
+
+Deno.test("透传：显式的 undefined / null 不下发（undefined 是没给，null 是显式清空）", () => {
+  const b = buildChatBody("hy3-c", [], "s", undefined, {
+    passthrough: {
+      top_p: undefined,
+      seed: null,
+      response_format: null,
+    },
+  });
+  equal("top_p" in b, false, "undefined must not be sent");
+  // null 是**显式值**：调用方写了 null 就是想让它出现在请求体里，不能当没给。
+  equal("seed" in b, true);
+  equal(b.seed, null);
+  equal("response_format" in b, true);
+});
+
+Deno.test("透传：没有 passthrough 包的调用方行为完全不变", () => {
+  const b = buildChatBody("hy3-c", [], "s", undefined, {});
+  for (const key of WORKBUDDY_PASSTHROUGH_FIELDS) {
+    equal(key in b, false);
+  }
+  const withEmpty = buildChatBody("hy3-c", [], "s", undefined, {
+    passthrough: {},
+  });
+  equal(Object.keys(withEmpty).length, Object.keys(b).length);
+});
+
+// ===== 第 10 轮：错误分类 =====
+Deno.test("分类：403 上的 11140 是**内容拦截**，绝不能去续期重试", () => {
+  const f = classifyWorkBuddyChatFailure(
+    403,
+    JSON.stringify({
+      code: 11140,
+      msg: "request illegal",
+      displayMsg: { en: "content did not pass the safety review" },
+    }),
+  );
+  equal(f.rejection, true);
+  equal(f.refreshFirst, false, "11140 must not trigger a token refresh");
+  equal(f.status, 403);
+  equal(f.error.code, 11140);
+  equal(f.error.type, "content_rejection");
+  equal(f.error.message.includes("another account"), true);
+});
+
+Deno.test("分类：拦截判据**不看状态码**（SSE 内嵌 11140 也走同一条通道）", () => {
+  for (const status of [200, 400, 401, 403, 429, 500]) {
+    const f = classifyWorkBuddyChatFailure(
+      status,
+      '{"code":11140,"msg":"request illegal"}',
+    );
+    equal(
+      f.rejection,
+      true,
+      "status " + status + " must classify as rejection",
+    );
+    equal(f.refreshFirst, false);
+  }
+});
+
+Deno.test("分类：401 与非拦截的 403 才续期重试一次", () => {
+  const a = classifyWorkBuddyChatFailure(
+    401,
+    '{"code":40100,"msg":"unauthorized"}',
+  );
+  equal(a.refreshFirst, true);
+  equal(a.rejection, false);
+  equal(a.status, 401);
+  equal(a.error.type, "authentication_error");
+  // 403 但不是拦截（权限/额度）⇒ 同样当令牌问题处理，可自愈。
+  const b = classifyWorkBuddyChatFailure(
+    403,
+    '{"code":40300,"msg":"forbidden"}',
+  );
+  equal(b.refreshFirst, true);
+  equal(b.rejection, false);
+  equal(b.status, 403);
+  // ⚠️ 失败信息不能承诺「正在重试」：重试成功时不回这条，只有续期失败才回它，
+  // 那样写等于在失败时骗用户。
+  equal(a.error.message.includes("retrying"), false);
+});
+
+Deno.test("分类：429 是限流而非认证问题，且带出上游真实业务码", () => {
+  const f = classifyWorkBuddyChatFailure(
+    429,
+    '{"code":14003,"msg":"too many requests"}',
+  );
+  equal(f.refreshFirst, false, "a 429 must not burn a refresh_token");
+  equal(f.rejection, false);
+  equal(f.status, 429);
+  equal(f.error.code, 14003);
+  equal(f.error.type, "rate_limit_exceeded");
+});
+
+Deno.test("分类：其余状态码原样透传，且**不**续期", () => {
+  for (const status of [400, 404, 500, 502, 503]) {
+    const f = classifyWorkBuddyChatFailure(
+      status,
+      '{"code":' + status + ',"msg":"boom"}',
+    );
+    equal(f.status, status);
+    equal(f.refreshFirst, false);
+    equal(f.rejection, false);
+    equal(f.error.code, status);
+    equal(f.error.type, "upstream_error");
+  }
+});
+
+Deno.test("分类：拦截判据把「正文里提到 11140」和「真错误体」区分开", () => {
+  // 上游拿 HTML 页面挡回来（三个 host 的真 401 都是 openresty HTML）时不能误判。
+  const html =
+    "<html>\r\n<head><title>401 Authorization Required</title></head>" +
+    "<body>\n<center><h1>401 Authorization Required</h1></center>\n<hr>APISIX</body>";
+  equal(classifyWorkBuddyChatFailure(401, html).refreshFirst, true);
+  // 空的响应体也不能编出一个码来。
+  const empty = classifyWorkBuddyChatFailure(500, "");
+  equal(empty.error.code, 500);
+  equal(empty.refreshFirst, false);
+});
+
+// ===== 业务码读取 =====
+Deno.test("业务码：只从真报文里读，读不出就返回 undefined（绝不编）", () => {
+  equal(workBuddyErrorCode('{"code":14003,"msg":"x"}'), 14003);
+  equal(
+    workBuddyErrorCode('{"code":"14003"}'),
+    undefined,
+    "字符串不是数字",
+  );
+  equal(workBuddyErrorCode('{"code":null}'), undefined);
+  equal(workBuddyErrorCode('{"code":1.5e400}'), undefined);
+  equal(workBuddyErrorCode(""), undefined);
+  equal(workBuddyErrorCode("plain text"), undefined);
+  equal(workBuddyErrorCode("[1,2,3]"), undefined);
+  equal(workBuddyErrorCode("null"), undefined);
+  // 非 JSON 的报文也要能挖 —— 三个 host 的真 401 是 openresty HTML。
+  equal(workBuddyErrorCode('garbage "code":11140 tail'), 11140);
+  equal(workBuddyErrorCode('garbage "code": abc'), undefined);
+});
 
 Deno.test("凭据：解析不出过期时刻时**不**判过期", () => {
   // 归一化失败的账号若被判过期，会被永久锁死在「请重新登录」。
@@ -1907,6 +2176,142 @@ Deno.test("流：扫描只判 data 行（注释帧与半行不得被误当成拦
   }
   equal(seen.length, 0, "注释行不是拦截帧");
   equal(cancelled, false, "正常结束的流不该被取消");
+  // ⚠️ 下面这行注释不是客套：上面那条 `: note 11140 request illegal` 的前缀是
+  // 「: note」**6 个字符**，即便把 startsWith("data:") 守卫删掉，第 6 个字符往后
+  // 也切不出合法 JSON，变异体照样绿。真正能杀掉那个变异体的形状是**前缀恰好
+  // 5 个字符**（切片点正好落在 JSON 的开括号上），所以单开一条用例。
+});
+
+Deno.test("流：注释行前缀恰好 5 个字符时也不许被当成拦截（守卫的真正形状）", async () => {
+  // 这条单独立，是因为它守的是 `startsWith("data:")` 这道守卫本身。
+  // 变异体 G2 把守卫换成 `if (line.length > 0)`：于是每条行都拿第 6 个字符往后
+  // 当 JSON 试。绝大多数行切不出合法 JSON（4 个、6 个字符的前缀都试过），
+  // 所以老用例里那种 `: note ...` 形状压根杀不掉它 —— 变异体会存活。
+  // 唯一能暴露的形状是**前缀恰好 5 个字符**：切片点正好落在 `{` 上。
+  // 实测：G2 存活时本用例看到 onRejection 调用 1 次 + 尾帧被改写成
+  // content_rejection 错误；真代码下是 0 次 + [DONE] 原样透传。
+  const encoder = new TextEncoder();
+  const evil = ": abc" + JSON.stringify({
+    code: 11140,
+    msg: "request illegal",
+  }) + "\n";
+  const body = ": heartbeat\n" + GUARD_FRAME + "\n" + evil + "data: [DONE]\n\n";
+  const seen: string[] = [];
+  const stream = guardWorkBuddyStream(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(body));
+        controller.close();
+      },
+    }),
+    (rejection) => {
+      seen.push(rejection.payload);
+    },
+  );
+  let out = "";
+  for await (const chunk of stream) {
+    out += new TextDecoder().decode(chunk);
+  }
+  equal(seen.length, 0, "五字符前缀的注释行也不是拦截帧");
+  equal(out.includes("request illegal"), true, "注释行内容原样透传");
+  equal(out.indexOf("content_rejection"), -1, "不许把注释行改写成错误帧");
+});
+Deno.test("流：同一个 chunk 里的多帧必须逐行判（真 socket 不一行一包）", async () => {
+  // ⚠️ 这条用例守的是**真实 chunk 形状**：上游把「心跳注释 + 若干帧 + [DONE]」放在
+  // 一个 TCP chunk 里送达是常态。老夹具一行一个 chunk，于是扫描循环写成
+  // lastIndexOf（只取最后一行、拿整个前缀去判 startsWith）也是绿的 ——
+  // 实测那种实现下 onRejection 调用 0 次、原始 11140 原样透传给客户端。
+  const encoder = new TextEncoder();
+  const rejection = "data: " + JSON.stringify({
+    id: "chatcmpl-x",
+    model: "hy3",
+    created: 1,
+    code: 11140,
+    msg: "request illegal",
+  }) + "\n\n";
+  const shapes: Record<string, string[]> = {
+    // 拦截帧与 [DONE] 同包。
+    "rejection-then-done": [
+      ": heartbeat\n" + rejection + "\ndata: [DONE]\n\n",
+    ],
+    // 拦截帧在包尾，后面什么都没有。
+    "content-then-rejection": [
+      ": heartbeat\n" + GUARD_FRAME + rejection,
+    ],
+    // 拦帧被 TCP 切成两半，第二片以残缺 JSON 开头。
+    "rejection-split-mid-json": [
+      ": heartbeat\n" + GUARD_FRAME + rejection.slice(0, 25),
+      rejection.slice(25) + "\ndata: [DONE]\n\n",
+    ],
+    // 多帧之后才出现拦截帧。
+    "many-frames-then-rejection": [
+      ": heartbeat\n" + GUARD_FRAME + GUARD_FRAME + GUARD_FRAME + rejection,
+    ],
+  };
+  for (const [name, chunks] of Object.entries(shapes)) {
+    const seen: string[] = [];
+    const stream = guardWorkBuddyStream(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+          controller.close();
+        },
+      }),
+      (r) => {
+        seen.push(r.payload);
+      },
+    );
+    const decoder = new TextDecoder();
+    let out = "";
+    for await (const chunk of stream) {
+      out += decoder.decode(chunk, { stream: true });
+    }
+    equal(seen.length, 1, name + ": 拦帧必须被认出来一次");
+    assert(
+      seen[0].indexOf("11140") >= 0,
+      name + ": 回调必须带着原始载荷",
+    );
+    // 判据不能是「输出里有没有 11140」—— 改写后的 error 帧里也有这个码。真正的
+    // 区别在于**顶层还是嵌在 error 里**：上游发的是顶层 {code,msg}，客户端插件
+    // index.js 只认 payload.error，于是顶层裸帧会被当成一条无内容的普通帧，
+    // 接着读到 [DONE] 就报「成功但什么都没收到」。
+    assert(
+      out.indexOf('"msg":"request illegal"') < 0,
+      name + ": 顶层 {" + '"msg":"request illegal"' + "} 裸帧不得透传给客户端",
+    );
+    assert(
+      out.indexOf('"type":"content_rejection"') >= 0,
+      name + ": 必须补一个 OpenAI 形状的 error 帧",
+    );
+    assert(out.indexOf("[DONE]") >= 0, name + ": 必须用 [DONE] 收尾");
+  }
+});
+
+Deno.test("流：一整包多帧但没有拦截时不能误报（正常路径不许被改写）", async () => {
+  // 反向用例：修「漏判」不能变成「乱判」。一整包里三帧正常内容 + [DONE]，
+  // 客户端必须收到**原始字节**（含心跳注释行），回调 0 次。
+  const encoder = new TextEncoder();
+  let seen = 0;
+  const payload = ": heartbeat\n" + GUARD_FRAME + GUARD_FRAME + GUARD_FRAME +
+    "data: [DONE]\n\n";
+  const stream = guardWorkBuddyStream(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(payload));
+        controller.close();
+      },
+    }),
+    () => {
+      seen += 1;
+    },
+  );
+  const decoder = new TextDecoder();
+  let out = "";
+  for await (const chunk of stream) {
+    out += decoder.decode(chunk, { stream: true });
+  }
+  equal(seen, 0, "正常的一整包不许被判成拦截");
+  equal(out, payload, "正常路径必须逐字节原样透传");
 });
 
 Deno.test("流：正常流到结束时不取消上游（判据不能只看 clientGone）", async () => {

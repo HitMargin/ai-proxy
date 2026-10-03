@@ -230,6 +230,35 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
   原理不可观测。这是「等价」的合法理由，但**必须留下探针和结论**，并在测试注释里
   写清是平台吞掉的，别让下一个人把它当成漏测去补测试。
 
+- **只认白名单的字段透传必须把白名单补齐**：第 4 轮 `tools` 漏传让 agent 循环停在第一轮，
+  第 10 轮同一族的毛病还在 —— `buildChatBody` 只认 6 个字段，`response_format`、
+  `top_p`、`top_k`、`seed`、`presence_penalty`、`frequency_penalty`、`logprobs`、
+  `top_logprobs`、`n`、`user`、`parallel_tool_calls`、`service_tier` 全部**静默丢弃**。
+  判据：**先查上游真会不会用**（实测上游忽略 `n` 与 `logprobs` ⇒ 那两个字段转发与否
+  在上游侧不可区分，不是缺陷；`max_completion_tokens` 只在与 `max_tokens` 同时出现时
+  被采纳 ⇒ 必须两个一起下发），再决定转发还是显式拒绝 —— 但**不能默默吞掉**：
+  同 `src/commandcode/handler.ts` 那种「不支持就明说」是本项目的既有惯例。
+- **状态码有第二重语义时，必须先按报文分类再决定是否续期**：`guardWorkBuddyStream` 之外的
+  HTTP 层原来写成 `status === 401 || status === 403` 就一律「静默续期 + 重发一整轮」，而
+  **403 同时承载 11140 内容拦截**（账号级，续期毫无用处）⇒ 每次确定性拦截都白烧一次
+  refresh_token 额度加一发全额计费的请求，结果还是同样的 403。根因是
+  `isContentRejection` 在生产代码里**零调用方** —— 分类器写了却没接上。
+  配对动作：错误体必须是 OpenAI 的 `{error:{message,type,code}}`（原来回的是
+  `{error:"字符串", detail}`,客户端按标准形状读 message 会整个丢掉），
+  且这段判定要放 `src/` 才测得到，同 `workBuddyTruncationError`。
+- **流扫描必须按真实 chunk 边界逐行判**：`guardWorkBuddyStream` 的扫描循环曾写成
+  `carry.lastIndexOf("\n")` + `carry.slice(0, at)`，`slice(0, at)` 取的是**整个前缀**
+  不是一行。上游把「心跳注释 + 若干帧 + [DONE]」放在同一个 TCP chunk 里是常态，
+  于是前缀以 `: heartbeat` 开头，`startsWith("data:")` 恒 false ⇒
+  **整块缓冲区的帧一个都没判**，原始 11140 原样透传给客户端，而老测试全绿 ——
+  因为夹具一行一个 chunk。判据：**先问真实 socket 怎么切 chunk，再造夹具**；
+  同形状喂 `aggregateWorkBuddySse`（它用 `indexOf` 逐行）才是对照组。
+- **变异体存活时，还要问「夹具是不是正好落在守卫的盲区外」**：本轮「去掉
+  `startsWith("data:")` 守卫」这个变异体存活了很久。原因是老夹具的前缀
+  「`: note`」有 6 个字符，切片点落在 JSON 中间，删掉守卫也切不出合法 JSON ——
+  差一个字符就活了。唯一能暴露它的形状是**前缀恰好 5 个字符**（切片点正好落在
+  `{` 上），补上那条用例后立刻被杀。与上一条「平台吞掉了它」并列为两种存活理由。
+
 ## 行为规则
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。
 2. 会话被压缩或换模型后：先重读本文件定位任务，再继续；不要重新验证已确认的事实。

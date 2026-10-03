@@ -1466,6 +1466,117 @@ export function isContentRejectionFrame(payload: string): boolean {
 // ---------- 请求体组装 ----------
 
 /** 是否为 DeepSeek 系模型（前缀匹配，不区分大小写）。 */
+/**
+ * 一发**拿到响应**的上游调用该怎么收尾：回给客户端什么，以及要不要先续期重试。
+ *
+ * 抽到 src/ 的理由同 workBuddyTruncationError：main.ts 不在 `deno task test` 的
+ * 范围里，这段判定逻辑写在路由里就永远测不到。
+ *
+ * ⚠️ 这里修的是一个真缺陷：主路由原来写成 `status === 401 || status === 403` 就
+ * 一律「静默续期 + 重发一整轮」。但 **403 同时承载两件完全不同的事**：
+ *   · 令牌 / 权限真失效 —— 续期能自愈，重发是对的；
+ *   · 11140 内容拦截 —— **账号级**、续期毫无用处（实测同一份请求发 7 个账号，
+ *     2 个 200 / 4 个 403+11140 / 1 个 429；用户侧连「你好」都被拦）。
+ * 原写法于是让每一次确定性拦截都白烧一次 refresh_token 额度 **加** 一发全额计费
+ * 的请求，而结果仍然是 403 —— 用户等的是双倍时间，拿到的是一模一样的错误。
+ */
+export interface WorkBuddyChatFailure {
+  /** 回给客户端的状态码（分类后可能与上游原状态码不同）。 */
+  status: number;
+  /** OpenAI 形状的 error 体，调用方与客户端读的是同一个 key。 */
+  error: { message: string; type: string; code: number | string };
+  /** 是否应该先静默续期再重试一次。 */
+  refreshFirst: boolean;
+  /** 是否是内容拦截（处理方式是换号，不是改内容，也不是续期）。 */
+  rejection: boolean;
+}
+
+export function classifyWorkBuddyChatFailure(
+  status: number,
+  body: string,
+): WorkBuddyChatFailure {
+  // 上游错误体是 `{"code":14003,"msg":"…","requestId":"…"}` 这样的形状，code 是
+  // 真正的业务码（与 HTTP 状态码不是一回事）。能读出来就照抄，别用猜的默认值。
+  const upstreamCode = workBuddyErrorCode(body);
+  // 内容拦截先判，且**不看状态码**：11140 既出现在 403 上，也会以 HTTP 200 +
+  // SSE 内嵌错误帧的形式出现（另一条通道由 aggregateWorkBuddySse / guard 处理）。
+  // 把它放在 401/403 的分支之前，才能挡住「403 就去续期」这个错误动作。
+  if (isContentRejection(body)) {
+    return {
+      status: 403,
+      error: {
+        message:
+          "WorkBuddy content rejection (code 11140): the account, not the prompt, was blocked; retrying on another account is the fix",
+        type: "content_rejection",
+        code: 11140,
+      },
+      refreshFirst: false,
+      rejection: true,
+    };
+  }
+  if (status === 429) {
+    return {
+      status: 429,
+      error: {
+        message: "WorkBuddy rate limited; retry after a short backoff",
+        type: "rate_limit_exceeded",
+        code: upstreamCode ?? 14003,
+      },
+      refreshFirst: false,
+      rejection: false,
+    };
+  }
+  // 401 与「非拦截的 403」都当成令牌/权限失效：服务端能提前吊销令牌（改密码、
+  // 后台踢下线），那时文件里的有效期还没到。少这一步用户看到的是「模型突然全挂」，
+  // 而真相是令牌过期且可自愈。
+  if (status === 401 || status === 403) {
+    return {
+      status,
+      error: {
+        // 中性措辞：重试成功时不回这条（成功路径继续走），只有续期失败才回它，
+        // 所以这里**不能**写「正在重试」—— 那样失败时会在骗用户。
+        message: "WorkBuddy rejected the credential (HTTP " + status + ")",
+        type: "authentication_error",
+        code: upstreamCode ?? status,
+      },
+      refreshFirst: true,
+      rejection: false,
+    };
+  }
+  return {
+    status,
+    error: {
+      message: "WorkBuddy chat HTTP " + status,
+      type: "upstream_error",
+      code: upstreamCode ?? status,
+    },
+    refreshFirst: false,
+    rejection: false,
+  };
+}
+
+/**
+ * 从上游错误体里读业务码 `{"code":14003,…}`。
+ *
+ * 为什么值得单独抽：HTTP 状态码在这个渠道上**不携带业务语义**（429 可能是抖动、
+ * 403 可能是拦截也可能是权限），真正的分类依据全在这个 code 上。读不出来就返回
+ * undefined，让调用方用自己的默认值，**不要编一个**。
+ */
+export function workBuddyErrorCode(body: string): number | undefined {
+  if (body.length === 0) return undefined;
+  const parsed = safeParseJson(body);
+  if (!isRecord(parsed)) {
+    // 三个 host 的 401 其实是 openresty 的 HTML 页面（<html>…401 Authorization
+    // Required…APISIX），不是 JSON —— 不能因此报错，正文照样透传给用户。
+    const at = body.indexOf('"code"');
+    if (at < 0) return undefined;
+    const digits = /\d+/.exec(body.slice(at, at + 32));
+    return digits ? Number(digits[0]) : undefined;
+  }
+  const code = parsed.code;
+  return typeof code === "number" && Number.isFinite(code) ? code : undefined;
+}
+
 export function isDeepSeekModel(model: string): boolean {
   return /^deepseek/i.test(model.trim());
 }
@@ -1479,6 +1590,34 @@ export interface WorkBuddyChatPlan {
   /** 声明的默认等级。 */
   defaultEffort?: string;
 }
+
+/**
+ * 照单透传的标准 OpenAI 字段。
+ *
+ * 白名单而不是「把 body 剩下的都塞进去」：`model` / `messages` / `stream` 是
+ * 我们**要改写**的（stream 恒 true —— 上游不支持非流式，11101），`max_tokens` /
+ * `reasoning_effort` / `stop` / `tools` / `tool_choice` 有各自的判据与兜底，
+ * `prompt_cache_key` 必须由代理生成（实测带上它前缀缓存命中率 0 → 7808，费用差
+ * 约 17 倍）。剩下的才是纯转发。
+ *
+ * 判据是**上游会不会因此改变行为**，而不是「我们自己用不上」：上游实测原样接受
+ * 这些字段（除 stream:false 直接 11101）。
+ */
+export const WORKBUDDY_PASSTHROUGH_FIELDS = [
+  "response_format",
+  "top_p",
+  "top_k",
+  "seed",
+  "presence_penalty",
+  "frequency_penalty",
+  "logit_bias",
+  "logprobs",
+  "top_logprobs",
+  "n",
+  "user",
+  "parallel_tool_calls",
+  "service_tier",
+] as const;
 
 export interface WorkBuddyBodyOptions {
   /** 调用方（DSH）显式给的上限，优先级最高。 */
@@ -1500,6 +1639,32 @@ export interface WorkBuddyBodyOptions {
   tools?: unknown;
   /** 工具选择策略，原样透传（auto / none / required / 具体函数）。 */
   toolChoice?: unknown;
+  /**
+   * 正文输出上限（OpenAI 的 `max_completion_tokens`），与 `maxTokens` 并存。
+   *
+   * ⚠️ 实测上游把这两个字段的语义**切开了**（hy3-c 逐条对照）：
+   *   · 只给 mct=24        → 完全忽略（170 字，与不限流一模一样）
+   *   · 只给 max_tokens=200 → 生效，但 0 字 + finish_reason:"length"（推理吃光预算）
+   *   · 200/200 同时给     → 出 132 字
+   *   · 32000/32000 同时给  → 170 字、finish:"stop"
+   * 也就是说 mct 只在**与 max_tokens 同时出现**时被采纳，且它单独限制正文、
+   * max_tokens 限制「推理 + 正文」之和。少传任何一个，输出长度都会静默变形，
+   * 而代理原先**两个都不传**（只读 max_tokens）—— 于是任何写 `max_completion_tokens`
+   * 的调用方（OpenAI 的推荐写法）拿到的上限其实是网关默认值。
+   */
+  maxCompletionTokens?: number;
+  /**
+   * 标准采样与结构化输出字段，**原样透传**。
+   *
+   * 与 tools 同族的教训：曾用一份手挑的白名单组请求体，于是 response_format
+   * 这类调用方真正在用的字段被静默丢掉。判据是「上游会不会因此改变行为」，
+   * 而不是「我们自己用不用得上」—— 上游实测除 stream:false 外**原样接受**这些字段。
+   *
+   * 特别注意 `n` 与 `logprobs`：上游**自己**就会忽略它们（n=2 也只回 index 0；
+   * logprobs:true 时 165 帧里 0 帧带 logprobs），所以透传与否在上游侧不可区分，
+   * 仍然照传（保持请求体忠实于调用方），但别把它们当成已生效的语义。
+   */
+  passthrough?: Record<string, unknown>;
 }
 
 /**
@@ -1552,6 +1717,22 @@ export function buildChatBody(
   // 偏小把输出无谓截断）。
   const maxTokens = options.maxTokens ?? plan?.maxOutputTokens;
   if (maxTokens !== undefined && maxTokens > 0) body.max_tokens = maxTokens;
+  // 正文上限与总上限**分开**下发，缺一不可（实测结论写在 BodyOptions 的字段注释里）。
+  if (
+    options.maxCompletionTokens !== undefined &&
+    options.maxCompletionTokens > 0
+  ) {
+    body.max_completion_tokens = options.maxCompletionTokens;
+  }
+
+  // 采样与结构化输出字段照单透传。手挑白名单组请求体的老教训：漏掉一个字段不会
+  // 报错，只会让调用方以为自己设了、实际没生效（tools、max_completion_tokens、
+  // response_format 都踩过）。逐个字段透传而不是整包塞进去，是因为 messages /
+  // model / stream 这几个是我们**要改写**的（stream 恒 true，见上）。
+  for (const name of WORKBUDDY_PASSTHROUGH_FIELDS) {
+    const value = options.passthrough?.[name];
+    if (value !== undefined) body[name] = value;
+  }
 
   // 思考开关。⚠️ 本段结论全部由实测推翻过一轮旧结论，改动前先读下面四条：
   //   1. reasoning_effort 是**真开关**，但**不分档**（5~8 轮交替取中位数：
@@ -1888,20 +2069,29 @@ export function guardWorkBuddyStream(
   let clientGone = false;
   const scan = (text: string): boolean => {
     carry += text;
+    // ⚠️ 必须用 indexOf 逐行往前扫，**不能**用 lastIndexOf。这里曾经写的是
+    // lastIndexOf：它每次都只取缓冲区里**最后一个**换行，然后拿 slice(0, at) 当成
+    // 「一行」去判 startsWith("data:")。可 slice(0, at) 是**整个前缀** —— 上游把
+    // 「心跳注释行 + 若干帧 + [DONE]」放在同一个 TCP chunk 里送达是常态，于是前缀以
+    // ": heartbeat" 开头，startsWith 恒 false，**整块缓冲区的帧一个都没判**。
+    // 实测：单 chunk 送「心跳 + 拦截帧 + [DONE]」时 onRejection 调用 0 次、原始 11140
+    // 原样透传给客户端；改成逐行扫描后同一输入才正确拦下。
+    // ⚠️ 连带后果：老测试之所以一直是绿的，是因为它们造的假流**一行一个 chunk**，
+    // 真实 socket 不这么切。判据必须按真实 chunk 边界写。
     // 只判定**完整行**：半行可能是下一个 chunk 的一半，提前判定会切坏 JSON。
-    for (
-      let at = carry.lastIndexOf("\n");
-      at >= 0;
-      at = carry.lastIndexOf("\n")
-    ) {
+    let at = carry.indexOf("\n");
+    while (at >= 0) {
       const line = carry.slice(0, at).trim();
       carry = carry.slice(at + 1);
-      if (!line.startsWith("data:")) continue;
-      const payload = line.slice(5).trim();
-      if (!isContentRejectionFrame(payload)) continue;
-      rejected = true;
-      onRejection({ payload });
-      return true;
+      if (line.startsWith("data:")) {
+        const payload = line.slice(5).trim();
+        if (isContentRejectionFrame(payload)) {
+          rejected = true;
+          onRejection({ payload });
+          return true;
+        }
+      }
+      at = carry.indexOf("\n");
     }
     return false;
   };

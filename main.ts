@@ -39,6 +39,7 @@ import {
   aggregateWorkBuddySse,
   buildChatBody,
   CHAT_COMPLETIONS_PATH,
+  classifyWorkBuddyChatFailure,
   guardWorkBuddyStream,
   isWorkBuddyExpired,
   isWorkBuddyRefreshable,
@@ -688,6 +689,14 @@ async function handleWorkBuddy(
         maxTokens: typeof body.max_tokens === "number"
           ? body.max_tokens
           : undefined,
+        // ⚠️ 正文上限与总上限是**两个**字段，上游只在两者同时出现时才采纳后者，
+        // 且后者单独限制正文、前者限制「推理+正文」之和（实测 hy3-c：只给 mct=24
+        // → 170 字不变；只给 max_tokens=200 → 0 字 length；200/200 → 132 字）。
+        // 原来只读 max_tokens，于是任何写 max_completion_tokens 的调用方（OpenAI 的
+        // 推荐写法）拿到的其实是网关默认上限 —— 不报错，只是静默不生效。
+        maxCompletionTokens: typeof body.max_completion_tokens === "number"
+          ? body.max_completion_tokens
+          : undefined,
         reasoningEffort: typeof body.reasoning_effort === "string"
           ? body.reasoning_effort
           : undefined,
@@ -700,6 +709,10 @@ async function handleWorkBuddy(
         // 原样接受标准 OpenAI tools 并出标准 delta.tool_calls，不需要任何翻译。
         tools: body.tools,
         toolChoice: body.tool_choice,
+        // 采样与结构化输出字段整包交给 buildChatBody 按白名单透传。白名单住在
+        // src/workbuddy.ts（WORKBUDDY_PASSTHROUGH_FIELDS）：白名单要能被测，而
+        // main.ts 不在 deno task test 的范围里。
+        passthrough: body,
       },
     );
 
@@ -731,28 +744,50 @@ async function handleWorkBuddy(
           return workBuddyThrottleResponse(sent.cooldownMs, requested);
         }
       }
-      if (upstream.status === 401 || upstream.status === 403) {
-        // 401 之后**静默续期并重试一次**。pre-flight 的续期只覆盖 expires_at 说
-        // 该续的情况；服务端也能提前吊销（改密码、后台踢下线），那时文件里的
-        // 有效期还没到。少了这一步，用户看到的是「模型突然全挂」，而真相是令牌
-        // 过期且可自愈。
-        try {
-          const revived = await refreshWorkBuddyCredential(current);
-          current = revived;
-          await writeWorkBuddyCredential(WORKBUDDY_ROOT, revived);
-          upstream = await postWorkBuddyChat(
-            current,
-            payload,
-            request.signal,
-          );
-          console.log(
-            "[workbuddy] token was stale; refreshed and retried (" +
-              requested + ")",
-          );
-        } catch (error) {
+      // 续期重试**只**用于令牌/权限失效。403 同时承载 11140 内容拦截，而拦截是
+      // 账号级、续期无用（实测同一份请求发 7 个账号：2 个 200 / 4 个 403+11140 /
+      // 1 个 429）。原来这里写成 `401 || 403` 一律续期，于是每一次确定性拦截都
+      // 白烧一次 refresh_token 额度 **加** 一发全额计费的请求，结果还是同样的 403
+      // —— 用户等双倍时间、拿一模一样的错误。判定与理由住在
+      // classifyWorkBuddyChatFailure（src/，可测）。
+      //
+      // ⚠️ clone() 只能在这一支里做：它会 tee 流，两个分支都得被读干净，否则另一边
+      // 不读时数据会**在内存里堆积**。放在成功路径上就等于给每一次正常的 SSE 响应
+      // 都挂一个永不消费的缓冲分支。失败响应是有限长度的小报文，代价可以忽略。
+      if (!upstream.ok) {
+        const probe = upstream.clone();
+        const failure = classifyWorkBuddyChatFailure(
+          upstream.status,
+          await probe.text().catch(() => ""),
+        );
+        if (failure.refreshFirst) {
+          // pre-flight 的续期只覆盖 expires_at 说该续的情况；服务端也能提前吊销
+          // （改密码、后台踢下线），那时文件里的有效期还没到。少了这一步，用户看到
+          // 的是「模型突然全挂」，而真相是令牌过期且可自愈。
+          try {
+            const revived = await refreshWorkBuddyCredential(current);
+            current = revived;
+            await writeWorkBuddyCredential(WORKBUDDY_ROOT, revived);
+            upstream = await postWorkBuddyChat(
+              current,
+              payload,
+              request.signal,
+            );
+            console.log(
+              "[workbuddy] token was stale; refreshed and retried (" +
+                requested + ")",
+            );
+          } catch (error) {
+            console.warn(
+              "[workbuddy] retry after 401 failed:",
+              error instanceof Error ? error.message : error,
+            );
+          }
+        } else if (failure.rejection) {
           console.warn(
-            "[workbuddy] retry after 401 failed:",
-            error instanceof Error ? error.message : error,
+            "[workbuddy] content rejection (11140) for " + requested +
+              " at the HTTP layer; not refreshing the token (the account, " +
+              "not the prompt, is blocked) - retrying will fail the same way",
           );
         }
       }
@@ -764,15 +799,21 @@ async function handleWorkBuddy(
 
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => "");
+      const failure = classifyWorkBuddyChatFailure(upstream.status, text);
       console.warn(
         "[workbuddy] chat HTTP " + upstream.status + " for " + requested +
+          (failure.rejection ? " (content rejection)" : "") +
           ": " +
           text.slice(0, 240),
       );
+      // 错误体保持 **OpenAI 的 `{error:{message,type,code}}` 形状**。原先这里回的是
+      // `{error:"…字符串",detail:…}` —— 客户端按 OpenAI 形状解析时 message 整个丢掉，
+      // 只能显示一句自造的 "HTTP 403"。而 11140 必须能一眼看出是「换号」而不是
+      // 「改内容」，所以 type/code 都取自分类结果而不是原样转发。
       return jsonResponse({
-        error: "WorkBuddy chat HTTP " + upstream.status,
+        error: failure.error,
         detail: text.slice(0, 500),
-      }, upstream.status);
+      }, failure.status);
     }
     if (upstream.body === null) {
       return jsonResponse(
@@ -800,15 +841,17 @@ async function handleWorkBuddy(
             ": " + aggregated.rejectionPayload.slice(0, 200),
         );
         // 与流式路径同一个意思，但**换一种能表达失败的形状**：非流式响应里没有
-        // 「半条流」需要续，直接回错误而不是伪装成一段空回答。
-        return jsonResponse({
-          error: {
-            message:
-              "WorkBuddy content rejection (code 11140): the account, not the prompt, was blocked; retrying on another account is the fix",
-            type: "content_rejection",
-            code: 11140,
-          },
-        }, 403);
+        // 「半条流」需要续，直接回错误而不是伪装成一段空回答。错误体取自同一个分类
+        // 函数（HTTP 层与流内层两处 11140 必须给出**逐字相同**的形状，否则客户端会
+        // 按「看它长什么样」分支，两条路径的表现就不一致了）。
+        const inStreamRejection = classifyWorkBuddyChatFailure(
+          403,
+          aggregated.rejectionPayload,
+        );
+        return jsonResponse(
+          { error: inStreamRejection.error },
+          inStreamRejection.status,
+        );
       }
       // 终止帧缺席 = 完整性无法证明。非流式响应里没有「半条流」可供下游自己判断，
       // 照发 200 会把半截回答当成完整回答交出去（实测截断与正常结束的 JSON 逐字节相同）。
