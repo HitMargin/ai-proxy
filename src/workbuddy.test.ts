@@ -20,15 +20,21 @@ import {
   isContentRejectionFrame,
   isDeepSeekModel,
   isWorkBuddyExpired,
+  isWorkBuddyThrottled,
   normalizeCreditsRate,
   normalizeDiscountedRate,
   parseModelsFromConfig,
   parsePromotions,
   parseTokenData,
+  postWorkBuddyChatWithThrottleRetry,
+  resetWorkBuddyCircuit,
   stripControlChars,
+  tripWorkBuddyCircuit,
   workBuddyBaseHeaders,
   workBuddyChatHeaders,
+  workBuddyCooldownRemaining,
   type WorkBuddyCredential,
+  workBuddyRetryAfterMs,
 } from "./workbuddy.ts";
 
 function assert(
@@ -509,4 +515,235 @@ Deno.test("拦截：流内判定必须是窄的", () => {
 Deno.test("兜底展示名由 id 推出，不查静态表", () => {
   equal(displayNameForModel("glm-5.3"), "Glm 5.3");
   equal(displayNameForModel("hy4-preview-free"), "Hy4 Preview");
+});
+
+Deno.test("限流判定：状态码与业务码任一命中就算限流", () => {
+  // 429 直接命中
+  assert(isWorkBuddyThrottled(429, undefined));
+  assert(isWorkBuddyThrottled(429, ""));
+  // 报文里的 14003（探测与真实对话的限流形状不同，状态码可能不是 429）
+  assert(isWorkBuddyThrottled(400, '{"code":14003,"msg":"too many requests"}'));
+  // 带空格与缩进的变体也要命中
+  assert(isWorkBuddyThrottled(200, '{"code" : 14003 }'));
+  // 反例：别的业务码不是限流
+  assert(
+    !isWorkBuddyThrottled(400, '{"code":11102,"msg":"service info not found"}'),
+  );
+  assert(!isWorkBuddyThrottled(400, '{"code":11140}'));
+  // 反例：限流字样出现在正文里不算 —— 上游模型可能正在讨论限流
+  assert(
+    !isWorkBuddyThrottled(
+      500,
+      "rate_limit exceeded while computing 1400 items",
+    ),
+  );
+  assert(!isWorkBuddyThrottled(500, ""));
+  assert(!isWorkBuddyThrottled(500, undefined));
+});
+
+Deno.test("Retry-After：秒数、HTTP 日期与解不出的三种形态", () => {
+  equal(workBuddyRetryAfterMs("30"), 30_000);
+  equal(workBuddyRetryAfterMs("0.5"), 500);
+  assert(workBuddyRetryAfterMs(null) === 0);
+  assert(workBuddyRetryAfterMs("") === 0);
+  assert(workBuddyRetryAfterMs("soon") === 0);
+  // 已过期的日期折算成 0，而不是负数
+  const past = new Date(Date.now() - 60_000).toUTCString();
+  assert(workBuddyRetryAfterMs(past) === 0);
+  const future = new Date(Date.now() + 45_000).toUTCString();
+  const got = workBuddyRetryAfterMs(future);
+  assert(
+    got > 40_000 && got <= 45_000,
+    "a future date must fold to ms left: " + got,
+  );
+});
+
+Deno.test("闸门：记一次限流后有窗口，清掉后归零", () => {
+  resetWorkBuddyCircuit();
+  equal(workBuddyCooldownRemaining(), 0);
+  const window = tripWorkBuddyCircuit("too many requests");
+  assert(window > 0, "tripping must open a window");
+  assert(workBuddyCooldownRemaining() > 0);
+  resetWorkBuddyCircuit();
+  equal(workBuddyCooldownRemaining(), 0);
+});
+
+Deno.test("闸门：更长的窗口不会被更短的一次覆盖掉", () => {
+  resetWorkBuddyCircuit();
+  // 先记一个 20s 的（默认），再记一个 1s 的 —— 窗口必须仍是 20s 那个。
+  const first = tripWorkBuddyCircuit("first", 20_000);
+  const second = tripWorkBuddyCircuit("second", 1_000);
+  assert(
+    second >= first - 50,
+    "the longer window must win: " + first + " -> " + second,
+  );
+  assert(workBuddyCooldownRemaining() >= 19_000);
+  resetWorkBuddyCircuit();
+});
+
+Deno.test("闸门：上游要求的冷却不超过默认上限", () => {
+  resetWorkBuddyCircuit();
+  // 上游说等 2 小时也不照做：本渠道的 429 是抖动不是封禁，照做会让用户等两小时。
+  tripWorkBuddyCircuit("sweeping ban", 2 * 60 * 60_000);
+  const left = workBuddyCooldownRemaining();
+  assert(left <= 20_000 + 50, "a 2h cooldown must be clamped: " + left);
+  assert(left > 19_000);
+  resetWorkBuddyCircuit();
+});
+
+Deno.test("闸门：过了窗口时间就自动放行", () => {
+  resetWorkBuddyCircuit();
+  tripWorkBuddyCircuit("window");
+  // 用一个远未来的时间点求剩余 —— 必须为 0，否则窗口永远不会自己关。
+  equal(workBuddyCooldownRemaining(Date.now() + 10 * 60_000), 0);
+  resetWorkBuddyCircuit();
+});
+
+/** 假的上游响应：只带重试编排要用的那几个面。 */
+function fakeUpstream(
+  status: number,
+  body: string,
+  headers: Record<string, string> = {},
+) {
+  return {
+    status,
+    headers: {
+      get: (name: string) =>
+        headers[name.toLowerCase()] ?? headers[name] ?? null,
+    },
+    text: () => Promise.resolve(body),
+  };
+}
+
+Deno.test("重试：第一次就成功时不退避也不读报文", async () => {
+  let calls = 0;
+  const slept: number[] = [];
+  const out = await postWorkBuddyChatWithThrottleRetry(
+    () => {
+      calls++;
+      return Promise.resolve(fakeUpstream(200, "ok"));
+    },
+    {
+      sleep: (ms) => {
+        slept.push(ms);
+        return Promise.resolve();
+      },
+    },
+  );
+  equal(calls, 1, "a success must not be resent");
+  equal(out.attempts, 1);
+  equal(out.backoffMs, 0);
+  equal(out.throttledBody, "");
+  equal(slept, []);
+});
+
+Deno.test("重试：429 会退避再来一次并交出第二次的响应", async () => {
+  let calls = 0;
+  const slept: number[] = [];
+  const out = await postWorkBuddyChatWithThrottleRetry(
+    () => {
+      calls++;
+      return Promise.resolve(
+        calls === 1
+          ? fakeUpstream(429, '{"code":14003}')
+          : fakeUpstream(200, "recovered"),
+      );
+    },
+    {
+      sleep: (ms) => {
+        slept.push(ms);
+        return Promise.resolve();
+      },
+    },
+  );
+  equal(calls, 2);
+  equal(out.attempts, 2);
+  equal(out.response.status, 200);
+  assert(
+    out.throttledBody.includes("14003"),
+    "the 429 body must reach the log",
+  );
+  equal(slept.length, 1, "exactly one backoff");
+});
+
+Deno.test("重试：连续两次 429 也只重试一次（不无限重发）", async () => {
+  let calls = 0;
+  const out = await postWorkBuddyChatWithThrottleRetry(
+    () => {
+      calls++;
+      return Promise.resolve(fakeUpstream(429, "still throttled"));
+    },
+    { sleep: () => Promise.resolve() },
+  );
+  equal(calls, 2, "a sustained throttle must not become a retry storm");
+  equal(out.attempts, 2);
+  equal(out.response.status, 429);
+});
+
+Deno.test("重试：非 429 的失败不重试", async () => {
+  for (const status of [400, 401, 403, 500, 502]) {
+    let calls = 0;
+    const out = await postWorkBuddyChatWithThrottleRetry(
+      () => {
+        calls++;
+        return Promise.resolve(fakeUpstream(status, "nope"));
+      },
+      { sleep: () => Promise.resolve() },
+    );
+    equal(calls, 1, "status " + status + " must not be resent");
+    equal(out.attempts, 1);
+  }
+});
+
+Deno.test("重试：退避时长上限是硬顶，上游要 30s 也只等 1.5s", async () => {
+  let slept = -1;
+  await postWorkBuddyChatWithThrottleRetry(
+    () => Promise.resolve(fakeUpstream(429, "x", { "retry-after": "30" })),
+    {
+      sleep: (ms) => {
+        slept = ms;
+        return Promise.resolve();
+      },
+    },
+  );
+  equal(slept, 1_500);
+  assert(
+    slept < 30_000,
+    "waiting the full upstream hint would strand the user",
+  );
+});
+
+Deno.test("重试：上游给的短 Retry-After 被采纳", async () => {
+  let slept = -1;
+  await postWorkBuddyChatWithThrottleRetry(
+    () => Promise.resolve(fakeUpstream(429, "x", { "retry-after": "1" })),
+    {
+      sleep: (ms) => {
+        slept = ms;
+        return Promise.resolve();
+      },
+    },
+  );
+  equal(slept, 1_000);
+});
+
+Deno.test("重试：retryOnce:false 时一次都不重试", async () => {
+  let calls = 0;
+  let slept = 0;
+  const out = await postWorkBuddyChatWithThrottleRetry(
+    () => {
+      calls++;
+      return Promise.resolve(fakeUpstream(429, "x"));
+    },
+    {
+      retryOnce: false,
+      sleep: () => {
+        slept++;
+        return Promise.resolve();
+      },
+    },
+  );
+  equal(calls, 1);
+  equal(out.attempts, 1);
+  equal(slept, 0);
 });

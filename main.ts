@@ -41,12 +41,16 @@ import {
   guardWorkBuddyStream,
   isWorkBuddyExpired,
   isWorkBuddyRefreshable,
+  postWorkBuddyChatWithThrottleRetry,
   toWorkBuddyModelCard,
+  tripWorkBuddyCircuit,
   WORKBUDDY_ENDPOINT,
   workBuddyChatHeaders,
   type WorkBuddyChatPlan,
+  workBuddyCooldownRemaining,
   type WorkBuddyCredential,
   type WorkBuddyModel,
+  workBuddyRetryAfterMs,
 } from "./src/workbuddy.ts";
 import {
   fetchWorkBuddyModels,
@@ -517,6 +521,39 @@ async function loadWorkBuddyCatalog(force = false): Promise<WorkBuddyModel[]> {
   }
 }
 
+/**
+ * 限流应答：429 + `Retry-After` + 剩余秒数。
+ *
+ * 与 deepseek-web 的冷却应答同构。客户端（DSH）读到 `Retry-After` 会自己退避，
+ * 所以这里必须给出**秒数**而不是毫秒数，也必须让状态码真的是 429 —— 少了任一
+ * 半，客户端就只会把这次限流当成一次普通的渠道故障弹给用户。
+ */
+function workBuddyThrottleResponse(
+  cooldownMs: number,
+  model: string,
+): Response {
+  const waitMs = Math.max(1, Math.ceil(cooldownMs));
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: "WorkBuddy rate limited; retry after " +
+          Math.ceil(waitMs / 1000) + "s",
+        type: "rate_limit_exceeded",
+      },
+      retry_after_ms: waitMs,
+      model,
+    }),
+    {
+      status: 429,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Retry-After": String(Math.ceil(waitMs / 1000)),
+      },
+    },
+  );
+}
+
 /** 请求上游 `/v2/chat/completions`，返回原始 Response（流不落盘）。 */
 async function postWorkBuddyChat(
   credential: WorkBuddyCredential,
@@ -653,9 +690,42 @@ async function handleWorkBuddy(
       },
     );
 
+    // 限流闸门：上一轮刚撞过 429 的话，先在本地拒一次，把上游抖动挡在外面。
+    // 过了窗口才发请求 —— 否则每次都拿一个必然 429 的请求去确认上游还在限流。
+    const cooldown = workBuddyCooldownRemaining();
+    if (cooldown > 0) {
+      return workBuddyThrottleResponse(cooldown, requested);
+    }
+
     let upstream: Response;
     try {
       upstream = await postWorkBuddyChat(current, payload);
+      // 撞到 429 就退避再来一次（编排与判据见 postWorkBuddyChatWithThrottleRetry）。
+      //
+      // 实测这个渠道的 429 是随机抖动而不是并发阈值（并发 3/5 挂 1~2 个、并发 6/8
+      // 全过），所以一次短退避重试通常就落在窗口外，而直接把 429 抛给用户等于
+      // 让一次 1~2 秒的抖动毁掉整轮对话。只重试一次：上游持续限流时，第二次的
+      // 等待由冷却窗口替我们承担。
+      const sent = await postWorkBuddyChatWithThrottleRetry(
+        () => postWorkBuddyChat(current, payload),
+      );
+      upstream = sent.response;
+      if (sent.attempts === 2) {
+        console.warn(
+          "[workbuddy] chat throttled for " + requested + "; backed off " +
+            sent.backoffMs + "ms before one retry: " +
+            sent.throttledBody.slice(0, 200),
+        );
+        // 第二次还撞 ⇒ 持续限流，记窗口并把 Retry-After 应答给客户端。
+        if (upstream.status === 429) {
+          const again = await upstream.text().catch(() => "");
+          const window = tripWorkBuddyCircuit(
+            again.slice(0, 200),
+            workBuddyRetryAfterMs(upstream.headers.get("retry-after")),
+          );
+          return workBuddyThrottleResponse(window, requested);
+        }
+      }
       if (upstream.status === 401 || upstream.status === 403) {
         // 401 之后**静默续期并重试一次**。pre-flight 的续期只覆盖 expires_at 说
         // 该续的情况；服务端也能提前吊销（改密码、后台踢下线），那时文件里的

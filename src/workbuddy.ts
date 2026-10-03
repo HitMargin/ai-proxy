@@ -610,6 +610,150 @@ export function buildModelProbeBody(model: string): Record<string, unknown> {
   return { model, stream: true, messages: [] };
 }
 
+/**
+ * 上游限流窗口（毫秒）。
+ *
+ * 实测 WorkBuddy 的 429 不是并发阈值：空 messages 探测在并发 3/5 时随机挂 1~2 个，
+ * 并发 6 和 8 反而全过。所以它更像按「最近 N 秒请求数」抖动触发的桶 —— 压测
+ * （3 轮 × 80 并发探测）里只有活模型会挨 14003，死模型 240 次全部照旧回 11102，
+ * 也就是限流不会把死模型伪装成活，判据不会被污染。
+ *
+ * 既然抖动而非封禁，重试就是有意义的：短退避一次通常就落在窗口外。
+ */
+export const WORKBUDDY_THROTTLE_COOLDOWN_MS = 20_000;
+
+/**
+ * 上游限流（HTTP 429 / 业务码 14003）判定。
+ *
+ * 判据必须同时看状态码和报文：探测走的是空 messages，服务端对它的回答形状与真实
+ * 对话不同，实测限流会以 HTTP 429 {"code":14003,...} 的形式回来。缺了报文这一半，
+ * 一个只带 rate_limit 字样的上游错误会被误判成限流并把闸门关 20 秒。
+ */
+export function isWorkBuddyThrottled(
+  status: number,
+  body: string | undefined,
+): boolean {
+  if (status === 429) return true;
+  if (typeof body !== "string" || body.length === 0) return false;
+  return /"code"\s*:\s*14003/.test(body);
+}
+
+/**
+ * Retry-After 头折算成毫秒。
+ *
+ * 与 deepseek-web 的同名函数同构：先按秒数解，解不出再当 HTTP 日期解，两种都
+ * 解不出才回 0（由调用方落回默认冷却）。
+ */
+export function workBuddyRetryAfterMs(value: string | null): number {
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds * 1000);
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : 0;
+}
+
+/**
+ * 撞到 429 之后的退避时长（毫秒）。
+ *
+ * 比冷却窗口短是故意的：这一次的职责只是「别再撞同一扇门」，真被持续限流时
+ * 第二次的 429 会记下窗口并带 Retry-After 应答，由客户端决定等多久。
+ */
+export const WORKBUDDY_THROTTLE_BACKOFF_MS = 1_500;
+
+/**
+ * 「发一次，撞到 429 就退避再来一次」这段编排的纯逻辑。
+ *
+ * 抽出来是因为 main.ts 里那段重试测不到：它的唯一触发条件是上游真的回 429，
+ * 而真限流是随机抖动（实测并发 6~12 都可能一次不撞），所以端到端跑十次也未必
+ * 进过这个分支。判据都在这里，就用假件测。
+ *
+ * 返回值里 attempts 是给日志与测试看的：调用方必须知道它重试过，否则日志会谎称
+ * 「一次就成功」。
+ */
+export interface WorkBuddyThrottleRetry<T> {
+  response: T;
+  attempts: number;
+  /** 第一次撞到的 429 报文；没撞到是空串。 */
+  throttledBody: string;
+  /** 实际退避时长（毫秒）；没退避是 0。 */
+  backoffMs: number;
+}
+
+export interface WorkBuddyThrottleRetryOptions {
+  /** 默认 true。false 时一次都不重试 —— 探测路径用它，因为重试只会拖慢整轮。 */
+  retryOnce?: boolean;
+  /** 注入的睡眠，默认真实 setTimeout。 */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+export async function postWorkBuddyChatWithThrottleRetry<
+  T extends {
+    status: number;
+    headers: { get(name: string): string | null };
+    text(): Promise<string>;
+  },
+>(
+  send: () => Promise<T>,
+  options: WorkBuddyThrottleRetryOptions = {},
+): Promise<WorkBuddyThrottleRetry<T>> {
+  const sleep = options.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const first = await send();
+  if (first.status !== 429 || options.retryOnce === false) {
+    return { response: first, attempts: 1, throttledBody: "", backoffMs: 0 };
+  }
+  const throttledBody = await first.text().catch(() => "");
+  // 上游给了 Retry-After 就听它的，但不许超过本地退避上限：这个渠道的 429 是
+  // 抖动不是封禁，照着一个 30 秒的 Retry-After 等下去反而把用户晾在那儿。
+  const requested = workBuddyRetryAfterMs(first.headers.get("retry-after"));
+  const backoffMs = Math.min(
+    requested > 0 ? requested : WORKBUDDY_THROTTLE_BACKOFF_MS,
+    WORKBUDDY_THROTTLE_BACKOFF_MS,
+  );
+  await sleep(backoffMs);
+  const second = await send();
+  return { response: second, attempts: 2, throttledBody, backoffMs };
+}
+/**
+ * 闸门的内存状态 —— 单账号设计，只有一个窗口。
+ *
+ * 与 deepseek-web 不同，这里不落盘：WorkBuddy 的 429 是抖动不是封禁，落一个跨
+ * 进程存活的冷却文件只会让重启后的第一轮对话白白撞上一次 20 秒的假闸门。
+ */
+let workBuddyBlockedUntil = 0;
+
+export function workBuddyCooldownRemaining(nowMs = Date.now()): number {
+  return workBuddyBlockedUntil > nowMs ? workBuddyBlockedUntil - nowMs : 0;
+}
+
+/** 记一次限流窗口；已存在的更长窗口不会被缩短。 */
+export function tripWorkBuddyCircuit(
+  reason: string,
+  durationMs?: number,
+): number {
+  const requested = Number(durationMs);
+  const duration = Number.isFinite(requested) && requested > 0
+    ? Math.min(requested, WORKBUDDY_THROTTLE_COOLDOWN_MS)
+    : WORKBUDDY_THROTTLE_COOLDOWN_MS;
+  workBuddyBlockedUntil = Math.max(
+    workBuddyCooldownRemaining() > 0
+      ? Date.now() + workBuddyCooldownRemaining()
+      : 0,
+    Date.now() + duration,
+  );
+  console.warn(
+    "[workbuddy] upstream throttled; pausing this account for " +
+      Math.round(workBuddyCooldownRemaining() / 1000) + "s (" +
+      String(reason).slice(0, 160) + ")",
+  );
+  return workBuddyCooldownRemaining();
+}
+
+/** 测试与运维用：清掉限流窗口。 */
+export function resetWorkBuddyCircuit(): void {
+  workBuddyBlockedUntil = 0;
+}
+
 // ---------- 倍率归一化 ----------
 
 /**

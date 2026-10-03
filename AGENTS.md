@@ -143,6 +143,9 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
 - **业务 OK ≠ 有数据**：`/v3/config` 对编造的 bearer 照样回 200 且 `models:null`，判据是「非空数组」。
 - **凭据类渠道在 `isRosterDegraded` 里必须单独判**：`auth:{type:'none'}` 的渠道凭据在文件里，共享的 `hasChannelCredential` 会一直说「有凭据」，于是从首次启动起名单就被判 degraded —— 20 倍重取 + 每次启动告警，而该渠道在用户跑登录脚本前根本不会应答。
 - **插件面板的渠道开关与渠道列表是两种东西**：workbuddy 在 `KNOWN_CHANNELS` 里（开关可见、可管用），但 `EXTRA_MODEL_ROUTES` 的 `requiresCredential` 在 `workbuddy-auth.json` 存在之前不让它进模型列表（没有它的目录，代理答 502，面板只会渲染一个空渠道而不是那句「去跑登录脚本」）。只读文件是否存在、**不读不解析**：令牌归代理管，半写状态不该有第二个读者给出第二个判断。同 `requiresDeepseekLogin`。
+- **WorkBuddy 的 429 是抖动不是封禁，退避一次即可，不必落盘冷却**：实测并发 1/2/3/4/5/6/8 分别是 0/0/1/0/2/**0**/**0** 个被拒——并发 6、8 反而全过，并发 3、5 各挂 1~2 个，说明限流桶按「最近 N 秒请求数」抖动触发，与瞬时并发数无单调关系。所以 `postWorkBuddyChatWithThrottleRetry()` 只退避重发**一次**（上限 `WORKBUDDY_THROTTLE_BACKOFF_MS=1_500`，上游 `Retry-After: 30` 也只等 1.5s——等满会把用户挂在原地），第二次仍 429 才 `tripWorkBuddyCircuit()` 开 20 秒闸门并回 429 + `Retry-After` 头。**闸门刻意不落盘**（`deepseekWebSaveCooldown` 是落盘的，这里不同）：抖动不是封禁，落盘会让重启后第一轮对话白白撞一次假闸门。`Math.min(上游时长, 20_000)` 钳制 + `Math.max(旧窗口, 新窗口)` 是两条独立约束：上游要 2 小时也不能真等 2 小时，而更短的新窗口不能覆盖更长的旧窗口。
+- **限流不会伪装成死模型，所以探测判据不会被污染**：150 次死模型压测（default-1.1 / glm-4.6 / glm-5.0 / hy4-preview-x / kimi-k2-thinking）全部 `http=400 code=11102`，masked=0；14003 只出现在活模型上（hy3-c 5/30、hy3-b 7/30）。原因是死模型在**路由解析那一步**就被拒，走不到限流层。⇒ `classifyModelProbe()` 的「11102/11103 ⇒ dead，其余 ⇒ live」不会把活模型判死，探测并发 6 安全。反过来说，若哪天上游改成先限流再解析路由，这个前提就失效了，需要重新实测。
+- **`isWorkBuddyThrottled()` 不能只搜 `rate_limit` 字样**：上游模型正文里真的会讨论「限流」，正文命中不等于本次请求被限流。判据收紧为 `status === 429` 或 `"code": 14003`。
 
 ## 行为规则
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。
