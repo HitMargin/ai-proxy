@@ -161,6 +161,17 @@ Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + 
   - **无脑补默认档是有害的**，所以回退必须窄：实测 minimax-m2.7 裸请求思考 **840** token，补上目录的 `effort:"medium"` 后变 **0**；反向例 glm-5.3 裸请求中位数 ~818 vs effort=high ~38.5（约 20 倍）。现在调用方**显式选了 `none` 就原样下发**，没选时**只对 deepseek 系**按「声明的默认档 → 有 `high` 就 `high` → 阶梯第一档」补一个。
 - **上游接受**任意字符串** effort，所以 `includes()` 校验防的不是 400 而是静默丢弃（2026-10-03）**：`reasoning_effort:"totally-bogus"` → `http=200`；只有传数字才 `http=400 code:11101 "json: cannot unmarshal number into Go struct field Request.reasoning_effort of type string"`。旧代码用 `efforts.includes(options.reasoningEffort)` 过滤，于是调用方选 **`none`**（**唯一的关闭档**，必然不在只列「开着」的 `supportedEfforts` 里）时被静默丢掉：请求照发、思考照开，而实测正是收到 `none` 才把推理从 ~1200 压到 ~0（`minimal` 也能关，`off` **不能**，仍思考 1500）。**判据：`Go 结构体类型` 就是协议说明书；「未知值会被拒」不能自证，要喂一个上游没公布过的值。**
 
+11. **单次 11102 不能定罪，`deepseek-v3-1` 是一条正在灰度下线的活路由**（真实对话 6/12 成功，内容正确、usage 真实计费 `prompt 11 / completion 24`；对照 `glm-4.6`、`deepseek-v3-1-volc` 都是 0/6）。探测侧表现为 11102 概率 p≈0.73，外加约 40% 的请求**无限挂起**（60 秒也不回）。换探测形状没用：A `messages:[]` LIVE=0/8，B 真消息 2/8，C `max_tokens:1` 2/8 且 HANG=0，D `max_tokens:0` 3/8，E 空内容 4/8 —— 而真死的 `deepseek-v3-1-volc` 在 5 种形状下全 0。判据：`dead` 需连续两次一致；第二次给 `live` ⇒ 抖动且保留；第二次挂起 ⇒ 记进进程内抖动集合并短路，之后不再对该 id 发探测请求（否则每次刷新白等一个超时，且列表在两次刷新间来回跳）；导出 `resetWorkBuddyProbeFlakiness()` 让修好的路由能回来。⚠️ 抖动集合是**进程内全局状态**，测它的用例必须各用独立 model id。
+
+12. **`status >= 500` 早退在读报文前就掐死了结论**：实测 `hunyuan-chat` / `hunyuan-2.0-instruct` / `hunyuan-2.0-thinking` 串行 12/12 稳定 `http=500 code=10000`，`classifyModelProbe` 判 live（路由已通，是上游供应商故障），但整轮扫描里三个全是 unknown。现在只有 401 早退（令牌问题），5xx 必须先读报文再判：`502` + HTML 解析不出才是 unknown。
+
+13. **探测超时有实测的 2.6 倍余量，压到 3 秒**（`WORKBUDDY_PROBE_TIMEOUT_MS=3_000`，二次确认 2_000）：两轮全量 94 个采样的非挂起延迟 p50=702ms、p95=1031ms、max=1138ms，**顶满超时的次数=0**。原来 10 秒的代价实测得到：一次挂起把整轮从 5.2 秒拖成 14 秒。
+
+14. **`unknown` 的第三种来源是挂起**（`dropUnavailableModels` 只丢 `dead`）：网络错 / 401 / 5xx / **服务端不返回**都归 unknown。真实死模型二次确认 **12/13 仍 dead**，唯一翻回的是 deepseek-v3-1（挂起）—— 这正是「挂起不算死证据」的实测依据。
+
+15. **没有便宜的按 id 查活跃度的端点**（都试过了，别再试）：`GET /v3/config/models/{id}` 与 `GET /v3/models` → TypeError（网关不存在的路径行为）；`GET {SCOPED_MODELS_PATH}/{id}` → `http=403 access_denied not_authorized`；`GET /v2/models` 与 `GET /v2/plugin/models` → `http=404 Route Not Found`。探测仍是唯一信号源。
+
+
 ## 行为规则
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。
 2. 会话被压缩或换模型后：先重读本文件定位任务，再继续；不要重新验证已确认的事实。

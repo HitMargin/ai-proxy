@@ -391,16 +391,49 @@ async function requestConfigModels(
 }
 
 /**
- * 探测单个模型的可调性。**任何异常都归为 unknown**，绝不抛出。
+ * 探测单次请求的超时。
  *
- * ⚠️ 用聊天头而不是目录头：判据是「聊天路由认不认它」，而 /v3/config 与
- * scoped 端点用的是另一套 X-Product 语义（见 workBuddyCatalogHeaders）。
+ * 实测（47 个模型 × 2 轮 = 94 次采样）：**不挂起**的探测延迟 p50=702ms、
+ * p95=1031ms、max=1138ms；挂起的那几次**顶满整段超时**（8s/8s、60s/60s）——
+ * 服务端根本不返回，不是慢。所以 3 秒有 2.6 倍余量，却能让卡死的模型 3 秒就
+ * 腾出并发额度，而不是占着 6 个 worker 之一干等 10 秒（实测挂起会把整轮从
+ * 5.2 秒拖成 14 秒）。
  */
-async function probeOneModel(
+export const WORKBUDDY_PROBE_TIMEOUT_MS = 3_000;
+
+/** 二次确认的超时。真死模型实测 350–600ms 就回 11102，所以给得更短。 */
+const WORKBUDDY_PROBE_CONFIRM_TIMEOUT_MS = 2_000;
+
+/**
+ * 「抖动过」的模型 id：进程内记忆，探测超时或结论不一致时记下，之后不再删它。
+ *
+ * 依据一条实测出来的**判别信号**：确定已死的 12 个模型 6/6 全稳定在
+ * 331–1331ms 回 11102/11103，**一次都没挂起**；而 deepseek-v3-1（正在灰度
+ * 下线、真实对话仍有约一半能成功）实测挂起率 27–40%，60 秒也不回。
+ * 挂起不是「活」的证据，但它是「这个路由不稳定」的证据 —— 对不稳定的东西，
+ * 判据必须取「宁可漏杀不可错杀」那一侧。
+ *
+ * ⚠️ 必须是 Set 而不是「本轮两次都 dead 才删」：后者在 11102 概率 p≈0.73 的
+ * 模型上仍有约 53% 的概率误删。选择器会在两次刷新之间来回跳，而用户根本没
+ * 改任何东西。记住一次抖动就把结论定死，列表才稳定。
+ *
+ * 与限流熔断一样是**进程内状态**（见 workBuddy.ts 的 tripWorkBuddyCircuit）：
+ * 重启后重新观测即可，不必落盘。
+ */
+const flakyProbeModels = new Set<string>();
+
+/** 清空抖动记忆。测试与手动重置用。 */
+export function resetWorkBuddyProbeFlakiness(): void {
+  flakyProbeModels.clear();
+}
+
+/** 发一次探测。**任何异常都归为 unknown**，绝不抛出。 */
+async function probeOnce(
   credential: WorkBuddyCredential,
   modelId: string,
   fetcher: WorkBuddyFetcher,
   signal: AbortSignal | undefined,
+  timeoutMs: number,
 ): Promise<WorkBuddyVerdict> {
   try {
     const { status, body } = await requestWorkBuddy(
@@ -409,21 +442,66 @@ async function probeOneModel(
       workBuddyChatHeaders(credential),
       {
         fetcher,
-        // 单个模型只要 300ms 量级就能判死；用 10s 而不是通用 60s，否则一批
-        // 卡住的模型会把整轮目录拉取拖成分钟级 —— 上层有 5 分钟 TTL，用户在
-        // 这期间看到的还是上一份列表（可接受），但首屏不该等这么久。
-        timeoutMs: 10_000,
+        timeoutMs,
         ...signal === undefined ? {} : { signal },
         body: JSON.stringify(buildModelProbeBody(modelId)),
       },
     );
-    // 401/5xx 都不代表模型不可用：前者是令牌问题，会走续期；后者是上游
-    // 暂时故障。把它们算成 dead 会在一次抖动里清空选择器。
-    if (status === 401 || status >= 500) return "unknown";
+    // ⚠️ 只有 401 才在读报文之前就返回：那是令牌问题，会走续期，与这个模型
+    // 能不能调无关。5xx **必须先读报文** —— 网关把「上游供应商故障」表达成
+    // HTTP 500，实测 hunyuan-chat / hunyuan-2.0-instruct / hunyuan-2.0-thinking
+    // 串行 12/12 稳定 http=500 code=10000，而 10000 是**路由解析成功之后**
+    // 才可能出现的码（判 live）。旧的「status >= 500 一律 unknown」在读报文
+    // 前就掐死了结论，把三个活模型整轮判成 unknown。
+    if (status === 401) return "unknown";
     return classifyModelProbe(body);
   } catch {
     return "unknown";
   }
+}
+
+/**
+ * 探测单个模型的可调性。**单次 11102 不定罪，要两次一致。**
+ *
+ * ⚠️ 用聊天头而不是目录头：判据是「聊天路由认不认它」，而 /v3/config 与
+ * scoped 端点用的是另一套 X-Product 语义（见 workBuddyCatalogHeaders）。
+ *
+ * 为什么要二次确认：实测 deepseek-v3-1 **真实对话 6/12 成功**（内容正确、
+ * usage 真实计费 prompt 11 / completion 24），空 messages 探测却回 11102 ——
+ * 这条路由正在灰度下线，11102 是**概率**的（p≈0.73），不是「服务端没这个
+ * 模型」。单次 11102 就删，等于把一个还能用的模型从选择器里抹掉，且用户在
+ * 两次 5 分钟刷新之间会看到它时有时无。
+ *
+ * 反向也不放宽：两次都 dead 才删（对照组 deepseek-v3-1-volc / glm-4.6 在
+ * 5 种探测形状下 0 次存活，12/13 真死二次确认仍 dead）；第二次不是 dead 就
+ * 按第二次的结论走 —— live 是活证据直接保留，unknown 是「说不准」也保留。
+ */
+async function probeOneModel(
+  credential: WorkBuddyCredential,
+  modelId: string,
+  fetcher: WorkBuddyFetcher,
+  signal: AbortSignal | undefined,
+): Promise<WorkBuddyVerdict> {
+  if (flakyProbeModels.has(modelId)) return "unknown";
+  const first = await probeOnce(
+    credential,
+    modelId,
+    fetcher,
+    signal,
+    WORKBUDDY_PROBE_TIMEOUT_MS,
+  );
+  if (first !== "dead") return first;
+  const second = await probeOnce(
+    credential,
+    modelId,
+    fetcher,
+    signal,
+    WORKBUDDY_PROBE_CONFIRM_TIMEOUT_MS,
+  );
+  if (second === "dead") return "dead";
+  // 第一次死、第二次没死：结论自相矛盾，说明这条路由在抖，记住它。
+  flakyProbeModels.add(modelId);
+  return second;
 }
 
 /**

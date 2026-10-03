@@ -577,9 +577,9 @@ export function classifyModelProbe(body: unknown): WorkBuddyVerdict {
 /**
  * 按可调性结论筛掉「服务端明确没有这个模型」的条目。
  *
- * ⚠️ **只丢 `dead`，`unknown` 一律留下**：unknown 的来源是网络抖动 / 401 / 5xx，
- * 与「这个模型不存在」毫无关系。若把未知当死，一次上游故障就会让用户的选择器
- * 在几秒内被清空 —— 而那批模型其实全都好着。判据宁可漏杀不可错杀。
+ * ⚠️ **只丢 `dead`，`unknown` 一律留下**：unknown 的来源是网络抖动 / 401 / 5xx /
+ * 挂起，与「这个模型不存在」毫无关系。若把未知当死，一次上游故障就会让用户的
+ * 选择器在几秒内被清空 —— 而那批模型其实全都好着。判据宁可漏杀不可错杀。
  */
 export function dropUnavailableModels<T extends { id: string }>(
   models: readonly T[],

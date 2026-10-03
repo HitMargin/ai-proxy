@@ -15,6 +15,7 @@ import {
   readWorkBuddyCredential,
   refreshWorkBuddyCredential,
   refreshWorkBuddyIfNeeded,
+  resetWorkBuddyProbeFlakiness,
   WORKBUDDY_REFRESH_SKEW_MS,
   type WorkBuddyFetcher,
   WorkBuddyRefreshTokenExpiredError,
@@ -493,7 +494,8 @@ Deno.test("the sweep reports one verdict per model and survives a throw", async 
   equal(verdicts.get("live-1"), "live");
   equal(verdicts.get("dead-1"), "dead");
   equal(verdicts.get("dead-2"), "unknown");
-  equal(calls.length, 3);
+  // 4 = live-1 一次 + dead-1 二次确认 + dead-2 一次。
+  equal(calls.length, 4);
 });
 Deno.test("a 401 during the sweep is unknown, not dead", async () => {
   const { fetcher } = fakeFetcher(() => ({ status: 401, body: "<html>" }));
@@ -505,14 +507,176 @@ Deno.test("a 401 during the sweep is unknown, not dead", async () => {
   equal(verdicts.get("m"), "unknown");
 });
 
-Deno.test("a 5xx during the sweep is unknown, not dead", async () => {
-  const { fetcher } = fakeFetcher(() => ({ status: 503, body: "{}" }));
+Deno.test("a 5xx that carries a routable code is live, not unknown", async () => {
+  // 实测：网关把「上游供应商故障」表达成 HTTP 500，实测 hunyuan-chat /
+  // hunyuan-2.0-instruct / hunyuan-2.0-thinking 串行 12/12 稳定
+  // http=500 code=10000 —— 而 10000 是**路由解析成功之后**才出现的码。
+  // 旧的「status >= 500 一律 unknown」在读报文前就掐死了结论。
+  const { fetcher } = fakeFetcher(() => ({
+    status: 500,
+    body: JSON.stringify({ code: 10000, msg: "upstream provider failed" }),
+  }));
+  const verdicts = await probeWorkBuddyModels(
+    credential(),
+    [{ id: "m", name: "m" }],
+    fetcher,
+  );
+  equal(verdicts.get("m"), "live");
+});
+
+Deno.test("a 5xx with no usable body is still unknown", async () => {
+  const { fetcher } = fakeFetcher(() => ({
+    status: 502,
+    body: "<html>bad gateway</html>",
+  }));
   const verdicts = await probeWorkBuddyModels(
     credential(),
     [{ id: "m", name: "m" }],
     fetcher,
   );
   equal(verdicts.get("m"), "unknown");
+});
+
+Deno.test("one 11102 does not convict: the model needs two agreeing rounds", async () => {
+  // 实测 deepseek-v3-1 是**正在灰度下线**的活路由：真实对话 6/12 成功（内容
+  // 正确、usage 真实计费），而空 messages 探测回 11102 是概率的（p≈0.73）。
+  // 单次 11102 就删 = 把还能用的模型从选择器里抹掉。
+  const seen: string[] = [];
+  const { fetcher } = fakeFetcher(() => {
+    seen.push("probe");
+    return { status: 400, body: JSON.stringify({ code: 11102 }) };
+  });
+  const verdicts = await probeWorkBuddyModels(
+    credential(),
+    [{ id: "grey-sure", name: "g" }],
+    fetcher,
+  );
+  equal(
+    verdicts.get("grey-sure"),
+    "dead",
+    "two agreeing 11102 rounds still convict",
+  );
+  equal(seen.length, 2, "a dead verdict costs exactly one confirmation probe");
+});
+
+Deno.test("a 11102 that the retry contradicts is not a verdict at all", async () => {
+  // 第一次 dead、第二次 live：结论自相矛盾，说明路由在抖，不能删。
+  let n = 0;
+  const { fetcher } = fakeFetcher(() => {
+    n++;
+    return {
+      status: 400,
+      body: JSON.stringify({ code: n === 1 ? 11102 : 11133 }),
+    };
+  });
+  const verdicts = await probeWorkBuddyModels(
+    credential(),
+    [{ id: "grey-live", name: "g" }],
+    fetcher,
+  );
+  equal(
+    verdicts.get("grey-live"),
+    "live",
+    "live evidence outranks a lone 11102",
+  );
+});
+
+Deno.test("a 11102 followed by a hang keeps the model and never probes it again", async () => {
+  // 挂起 = 服务端不返回（实测 60 秒也不回）。判据取「宁可漏杀不可错杀」。
+  let n = 0;
+  const { fetcher } = fakeFetcher(() => {
+    n++;
+    if (n === 2) throw new Error("never comes back");
+    return { status: 400, body: JSON.stringify({ code: 11102 }) };
+  });
+  const first = await probeWorkBuddyModels(
+    credential(),
+    [{ id: "grey-hang", name: "g" }],
+    fetcher,
+  );
+  equal(first.get("grey-hang"), "unknown", "a hang is not a dead sentence");
+
+  // 再来一轮：抖动过的 id 直接短路，连探测请求都不发 —— 否则每次刷新都
+  // 白等一个超时，列表还会在两次刷新之间来回跳。
+  const before = n;
+  const second = await probeWorkBuddyModels(
+    credential(),
+    [{ id: "grey-hang", name: "g" }],
+    fetcher,
+  );
+  equal(second.get("grey-hang"), "unknown");
+  equal(n, before, "a flaky id must not be probed again");
+});
+
+Deno.test("a hang-only model is never convicted either", async () => {
+  // 第一次就是挂起（连 11102 都没有）⇒ 记为抖动，不定罪。
+  const { fetcher } = fakeFetcher(() => {
+    throw new Error("socket reset");
+  });
+  const verdicts = await probeWorkBuddyModels(
+    credential(),
+    [{ id: "flaky-hang", name: "f" }],
+    fetcher,
+  );
+  equal(verdicts.get("flaky-hang"), "unknown");
+  const again = await probeWorkBuddyModels(
+    credential(),
+    [{ id: "flaky-hang", name: "f" }],
+    fetcher,
+  );
+  equal(again.get("flaky-hang"), "unknown");
+});
+
+Deno.test("the flakiness memory resets on demand so a repaired route is re-measured", async () => {
+  // 抖动过的 id 会被短路不再重测；上游修好之后，只有 reset 能让它重新回到视野里。
+  let hang = true;
+  let n = 0;
+  const { fetcher } = fakeFetcher(() => {
+    n++;
+    if (n === 2) throw new Error("never comes back");
+    if (hang === true) {
+      return { status: 400, body: JSON.stringify({ code: 11102 }) };
+    }
+    return { status: 400, body: JSON.stringify({ code: 11133 }) };
+  });
+  const models = [{ id: "grey-repair", name: "g" }];
+
+  // 第一轮：11102 之后挂起 ⇒ 抖动记忆生效。
+  equal(
+    (await probeWorkBuddyModels(credential(), models, fetcher)).get(
+      "grey-repair",
+    ),
+    "unknown",
+  );
+
+  // 上游修好了，但记忆还在 ⇒ 保持原样，一次请求都不发。
+  hang = false;
+  const before = n;
+  equal(
+    (await probeWorkBuddyModels(credential(), models, fetcher)).get(
+      "grey-repair",
+    ),
+    "unknown",
+  );
+  equal(n, before, "the memory holds the model in place until reset");
+
+  resetWorkBuddyProbeFlakiness();
+  equal(
+    (await probeWorkBuddyModels(credential(), models, fetcher)).get(
+      "grey-repair",
+    ),
+    "live",
+    "after a reset the repaired route comes back",
+  );
+});
+
+Deno.test("a live model is never probed twice", async () => {
+  const { fetcher, calls } = fakeFetcher(() => ({
+    status: 400,
+    body: JSON.stringify({ code: 11133 }),
+  }));
+  await probeWorkBuddyModels(credential(), [{ id: "ok", name: "o" }], fetcher);
+  equal(calls.length, 1, "a live verdict needs no confirmation");
 });
 
 Deno.test("the sweep asks the chat route with the chat headers", async () => {
