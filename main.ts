@@ -36,6 +36,7 @@ import {
   type TraeModel,
 } from "./src/trae.ts";
 import {
+  aggregateWorkBuddySse,
   buildChatBody,
   CHAT_COMPLETIONS_PATH,
   guardWorkBuddyStream,
@@ -684,6 +685,11 @@ async function handleWorkBuddy(
           ? body.temperature
           : undefined,
         stop: Array.isArray(body.stop) ? body.stop.map(String) : undefined,
+        // ⚠️ 工具声明必须**透传**。曾被整个漏掉，于是 DSH 的 agent 循环停在
+        // 第一轮：请求照发、模型照答，只是把工具当成不存在的话说了。上游实测
+        // 原样接受标准 OpenAI tools 并出标准 delta.tool_calls，不需要任何翻译。
+        tools: body.tools,
+        toolChoice: body.tool_choice,
       },
     );
 
@@ -759,6 +765,63 @@ async function handleWorkBuddy(
         { error: "WorkBuddy chat returned an empty body" },
         502,
       );
+    }
+
+    // 非流式调用：上游**只支持流式**（stream:false 直接 11101），所以这里必须把
+    // 流聚合成一个 chat.completion 再回。少了这一步，一个 stream:false 的调用方会
+    // 拿到一个 text/event-stream 却以为自己是非流式，解析必然失败 —— 实测就是
+    // 「http=200 + Content-Type: text/event-stream」，看起来成功，实则不可用。
+    if (body.stream !== true) {
+      let aggregated;
+      try {
+        aggregated = await aggregateWorkBuddySse(upstream.body);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn("[workbuddy] chat aggregation failed: " + message);
+        return jsonResponse({ error: message }, 502);
+      }
+      if (aggregated.rejectionPayload !== "") {
+        console.warn(
+          "[workbuddy] in-stream content rejection (11140) for " + requested +
+            ": " + aggregated.rejectionPayload.slice(0, 200),
+        );
+        // 与流式路径同一个意思，但**换一种能表达失败的形状**：非流式响应里没有
+        // 「半条流」需要续，直接回错误而不是伪装成一段空回答。
+        return jsonResponse({
+          error: {
+            message:
+              "WorkBuddy content rejection (code 11140): the account, not the prompt, was blocked; retrying on another account is the fix",
+            type: "content_rejection",
+            code: 11140,
+          },
+        }, 403);
+      }
+      const message: Record<string, unknown> = {
+        role: "assistant",
+        content: aggregated.content || null,
+      };
+      if (aggregated.reasoning !== "") {
+        message.reasoning_content = aggregated.reasoning;
+      }
+      if (aggregated.toolCalls.length > 0) {
+        message.tool_calls = aggregated.toolCalls.map((call) => ({
+          id: call.id,
+          type: call.type,
+          function: call.function,
+        }));
+      }
+      return jsonResponse({
+        id: aggregated.id,
+        object: "chat.completion",
+        created: aggregated.created,
+        model: requested,
+        choices: [{
+          index: 0,
+          message,
+          finish_reason: aggregated.finishReason,
+        }],
+        ...aggregated.usage !== undefined ? { usage: aggregated.usage } : {},
+      });
     }
 
     // 原样透传：请求体与 SSE 都是标准 OpenAI，**一个字节都不翻译**。唯一的一层

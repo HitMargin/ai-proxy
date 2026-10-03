@@ -8,6 +8,7 @@
  */
 
 import {
+  aggregateWorkBuddySse,
   buildChatBody,
   displayNameForModel,
   formatCreditsRate,
@@ -863,6 +864,238 @@ Deno.test("派发：retryOnce:false 时撞到 429 也不记窗口", async () => 
   equal(workBuddyCooldownRemaining(), 0);
 });
 
+Deno.test("请求体：工具声明与 tool_choice 必须透传（否则 agent 循环停在第一轮）", () => {
+  const tools = [{
+    type: "function",
+    function: {
+      name: "get_weather",
+      parameters: { type: "object", properties: { city: { type: "string" } } },
+    },
+  }];
+  const body = buildChatBody("hy3-c", [], "s1", undefined, {
+    tools,
+    toolChoice: "auto",
+  });
+  assert(
+    JSON.stringify(body.tools) === JSON.stringify(tools),
+    "tools must reach the upstream verbatim, not be translated or dropped",
+  );
+  equal(body.tool_choice, "auto");
+});
+
+Deno.test("请求体：空工具数组不下发（等于没给工具，透传只是噪声）", () => {
+  const body = buildChatBody("hy3-c", [], "s1", undefined, { tools: [] });
+  assert(
+    !("tools" in body),
+    "an empty tools array is indistinguishable from none",
+  );
+  assert(!("tool_choice" in body), "no tool_choice without tools");
+  const noTools = buildChatBody("hy3-c", [], "s1", undefined, {});
+  assert(
+    !("tools" in noTools),
+    "a caller that sent nothing must stay identical",
+  );
+});
+
+function sseStream(frames: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      for (const frame of frames) controller.enqueue(encoder.encode(frame));
+      controller.close();
+    },
+  });
+}
+
+const AGG_FRAME = (delta: unknown, finish: string, usage = "null") =>
+  "data: " + JSON.stringify({
+    id: "chatcmpl-x",
+    model: "hy3",
+    created: 7,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+    usage: usage === "null" ? null : JSON.parse(usage),
+  }) + "\n\n";
+
+Deno.test("聚合：流式帧拼成一个 chat.completion（非流式调用方的唯一可用形状）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    ": heartbeat\n",
+    AGG_FRAME({ role: "assistant", content: "" }, ""),
+    AGG_FRAME({ content: "Hel" }, ""),
+    AGG_FRAME({ content: "lo" }, ""),
+    AGG_FRAME({ reasoning_content: "think " }, ""),
+    AGG_FRAME(
+      {},
+      "stop",
+      JSON.stringify({ prompt_tokens: 23, total_tokens: 30 }),
+    ),
+    "data: [DONE]\n\n",
+  ]));
+  equal(out.id, "chatcmpl-x");
+  equal(out.model, "hy3");
+  equal(out.created, 7);
+  equal(out.content, "Hello");
+  equal(out.reasoning, "think ");
+  equal(out.finishReason, "stop");
+  equal(out.rejectionPayload, "");
+  equal(out.toolCalls.length, 0);
+  equal(out.usage?.total_tokens, 30);
+});
+
+Deno.test("聚合：工具调用的分片必须按 index 拼完整（id/name 只在首帧）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME(
+      {
+        tool_calls: [{
+          id: "call-1",
+          type: "function",
+          index: 0,
+          function: { name: "get_weather", arguments: '{"city":' },
+        }],
+      },
+      "",
+    ),
+    AGG_FRAME(
+      { tool_calls: [{ index: 0, function: { arguments: ' "Paris"}' } }] },
+      "",
+    ),
+    AGG_FRAME({}, "tool_calls"),
+    "data: [DONE]\n\n",
+  ]));
+  equal(out.toolCalls.length, 1);
+  equal(out.toolCalls[0].id, "call-1");
+  equal(out.toolCalls[0].function.name, "get_weather");
+  equal(
+    out.toolCalls[0].function.arguments,
+    '{"city": "Paris"}',
+    "argument fragments must concatenate in arrival order",
+  );
+  equal(out.finishReason, "tool_calls");
+});
+
+Deno.test("聚合：上游报了 stop 但有工具调用时必须改判 tool_calls", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME(
+      {
+        tool_calls: [{
+          id: "t",
+          type: "function",
+          index: 0,
+          function: { name: "f", arguments: "{}" },
+        }],
+      },
+      "",
+    ),
+    AGG_FRAME({}, "stop"),
+    "data: [DONE]\n\n",
+  ]));
+  equal(
+    out.finishReason,
+    "tool_calls",
+    'a client told "stop" will keep talking instead of running the tool',
+  );
+});
+
+Deno.test("聚合：11140 拦截帧不能被当成内容累加（否则得到一段空的平静回答）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: "let me check" }, ""),
+    "data: " + JSON.stringify({ code: 11140, msg: "request illegal" }) + "\n\n",
+    AGG_FRAME({ content: "...and that is fine" }, "stop"),
+    "data: [DONE]\n\n",
+  ]));
+  assert(
+    out.rejectionPayload !== "",
+    "the caller must be told the turn was rejected, not handed silence",
+  );
+  equal(
+    out.content,
+    "let me check",
+    "nothing after the rejection frame may be appended",
+  );
+});
+
+Deno.test("聚合：正文里出现 11140 词句的正常帧不算拦截（判据必须窄）", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME(
+      { content: "the safety review returned code 11140 for another request" },
+      "stop",
+    ),
+    "data: [DONE]\n\n",
+  ]));
+  equal(out.rejectionPayload, "");
+  assert(out.content.includes("11140"), "a content frame is content");
+});
+
+Deno.test("聚合：帧被切成半个 JSON 时必须等到完整才能判（不能切坏）", async () => {
+  const full = AGG_FRAME({ content: "split" }, "");
+  const cut = Math.floor(full.length / 2);
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(full.slice(0, cut)));
+      controller.enqueue(encoder.encode(full.slice(cut)));
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+  const out = await aggregateWorkBuddySse(stream);
+  equal(out.content, "split");
+});
+
+Deno.test("聚合：usage 缺失时不得编一个出来", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    AGG_FRAME({ content: "x" }, "stop"),
+    "data: [DONE]\n\n",
+  ]));
+  equal(
+    out.usage,
+    undefined,
+    "inventing token counts would bill the caller for a guess",
+  );
+});
+function toolNameFrame(name: string, args: string): string {
+  return AGG_FRAME(
+    {
+      tool_calls: [{
+        index: 0,
+        function: { name, arguments: args },
+      }],
+    },
+    "",
+  );
+}
+
+Deno.test("聚合：空 name 的分片帧不得抹掉首帧给的工具名", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    toolNameFrame("get_weather", ""),
+    toolNameFrame("", '{"city": "Paris"}'),
+    AGG_FRAME({}, "tool_calls"),
+    "data: [DONE]\n\n",
+  ]));
+  equal(
+    out.toolCalls[0].function.name,
+    "get_weather",
+    "an empty-name fragment must not wipe the name from the first frame",
+  );
+});
+
+Deno.test("聚合：工具名在多个分片帧重发时只能留一个", async () => {
+  const out = await aggregateWorkBuddySse(sseStream([
+    toolNameFrame("get_weather", '{"city":'),
+    toolNameFrame("get_weather", ' "Paris"}'),
+    AGG_FRAME({}, "tool_calls"),
+    "data: [DONE]\n\n",
+  ]));
+  equal(
+    out.toolCalls[0].function.name,
+    "get_weather",
+    "a repeated tool name must not concatenate into get_weatherget_weather",
+  );
+  equal(
+    out.toolCalls[0].function.arguments,
+    '{"city": "Paris"}',
+    "arguments still concatenate while the name does not",
+  );
+});
 Deno.test("重试：retryOnce:false 时一次都不重试", async () => {
   let calls = 0;
   let slept = 0;

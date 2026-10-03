@@ -1434,6 +1434,20 @@ export interface WorkBuddyBodyOptions {
   reasoningEffort?: string;
   temperature?: number;
   stop?: string[];
+  /**
+   * 工具声明，**原样透传**。
+   *
+   * ⚠️ 这里曾经完全没有这个字段，于是 DSH 的每一次工具调用都被静默丢掉：请求
+   * 照发、模型照答，只是把「工具」当成不存在的话说了。现象是 agent 循环停在第一
+   * 轮，用户看到「模型完全无视我给的工具」。而直连上游同样的请求是正常出
+   * tool_calls 的（实测 hy3-c 一次就对），所以问题只可能在我们这侧。
+   *
+   * 判据用「是不是非空数组」，而不是「字段在不在」：空数组透传上游也会当没给，
+   * 但透传它会让请求体多出噪声，且与「调用方没给工具」不可区分。
+   */
+  tools?: unknown;
+  /** 工具选择策略，原样透传（auto / none / required / 具体函数）。 */
+  toolChoice?: unknown;
 }
 
 /**
@@ -1465,6 +1479,18 @@ export function buildChatBody(
     body.stop = options.stop;
   }
   if (options.temperature !== undefined) body.temperature = options.temperature;
+
+  // 工具声明**原样透传**，不做任何形状翻译：上游实测接受标准 OpenAI 的 tools /
+  // tool_choice / parallel_tool_calls，并按标准 delta.tool_calls 应答（hy3-c 实测
+  // 一次命中 get_weather）。而 upstream 唯一不支持的是 **stream:false**（11101），
+  // 所以这里唯一需要「翻译」的也只有 stream 那一个字段。
+  //
+  // ⚠️ 只在**非空数组**时才下发：空数组等于「没给工具」，透传它只是噪声，且会让
+  // 「调用方没给」与「给了空列表」在上游侧不可区分。
+  if (Array.isArray(options.tools) && options.tools.length > 0) {
+    body.tools = options.tools;
+  }
+  if (options.toolChoice !== undefined) body.tool_choice = options.toolChoice;
 
   // 输出上限。**此前完全没下发过该字段**，于是上限由网关默认决定（实测仅
   // 32000），大段输出被截成 finish_reason:"length" —— 现象是「模型说写完了
@@ -1578,6 +1604,146 @@ export function toWorkBuddyModelCard(
 /** 拦截发生时的原因，原样带上那一帧的文本。 */
 export interface WorkBuddyRejection {
   payload: string;
+}
+
+/** 聚合后的一轮对话。字段与 OpenAI 的 `chat.completion` 一一对应。 */
+export interface WorkBuddyAggregatedCompletion {
+  id: string;
+  model: string;
+  created: number;
+  content: string;
+  reasoning: string;
+  toolCalls: WorkBuddyAggregatedToolCall[];
+  finishReason: string;
+  usage?: Record<string, unknown>;
+  /** 11140 拦截帧的原报文。非空表示这一轮是被内容拦截结束的。 */
+  rejectionPayload: string;
+}
+
+export interface WorkBuddyAggregatedToolCall {
+  id: string;
+  type: string;
+  function: { name: string; arguments: string };
+  index: number;
+}
+
+/**
+ * 把上游 SSE **聚合成一个 `chat.completion`**，供非流式调用方使用。
+ *
+ * 为什么需要：上游**只支持流式**——`stream:false` 直接被拒（`11101`，实测）。
+ * 于是代理永远只能发流式请求，但**不能把流原样回给一个 stream:false 的调用方**：
+ * 那样它会拿到一个 `text/event-stream` 却声明自己是非流式，解析必然失败。深研
+ * 网页端与 CommandCode 都是在这一层聚合的。
+ *
+ * 判据与 guardWorkBuddyStream 同源：11140 帧不能当内容累加，否则会得到一段
+ * 「模型很平静地什么都没说」的回复 —— 那正是当初要修的静默失败。
+ */
+export async function aggregateWorkBuddySse(
+  upstream: ReadableStream<Uint8Array>,
+): Promise<WorkBuddyAggregatedCompletion> {
+  const decoder = new TextDecoder();
+  const reader = upstream.getReader();
+  const toolCalls = new Map<number, WorkBuddyAggregatedToolCall>();
+  let content = "";
+  let reasoning = "";
+  let id = "";
+  let model = "";
+  let created = 0;
+  let finishReason = "stop";
+  let usage: Record<string, unknown> | undefined;
+  let rejectionPayload = "";
+  let carry = "";
+  const consume = (line: string): void => {
+    if (!line.startsWith("data:")) return;
+    const payload = line.slice(5).trim();
+    if (payload.length === 0 || payload === "[DONE]") return;
+    if (isContentRejectionFrame(payload)) {
+      rejectionPayload = payload;
+      return;
+    }
+    const parsed = safeParseJson(payload);
+    if (!isRecord(parsed)) return;
+    if (typeof parsed.id === "string") id = parsed.id;
+    if (typeof parsed.model === "string") model = parsed.model;
+    if (typeof parsed.created === "number") created = parsed.created;
+    if (isRecord(parsed.usage)) usage = parsed.usage;
+    const choices = parsed.choices;
+    if (!Array.isArray(choices) || choices.length === 0) return;
+    const choice = choices[0];
+    if (!isRecord(choice)) return;
+    if (
+      typeof choice.finish_reason === "string" && choice.finish_reason !== ""
+    ) {
+      finishReason = choice.finish_reason;
+    }
+    const delta = choice.delta;
+    if (!isRecord(delta)) return;
+    if (typeof delta.content === "string") content += delta.content;
+    if (typeof delta.reasoning_content === "string") {
+      reasoning += delta.reasoning_content;
+    }
+    if (!Array.isArray(delta.tool_calls)) return;
+    for (const call of delta.tool_calls) {
+      if (!isRecord(call)) continue;
+      const index = typeof call.index === "number" ? call.index : 0;
+      const fn = isRecord(call.function) ? call.function : undefined;
+      const existing = toolCalls.get(index) ?? {
+        id: "",
+        type: "function",
+        function: { name: "", arguments: "" },
+        index,
+      };
+      if (typeof call.id === "string" && call.id !== "") existing.id = call.id;
+      if (typeof call.type === "string" && call.type !== "") {
+        existing.type = call.type;
+      }
+      // 流式增量里 name 只在第一帧给，arguments 分片累积 —— 两者判据不同，不能一起累加。
+      // name 用「后来者覆盖」而不是「累加」：OpenAI 的形状是首帧给一次 name、后续分片给
+      // 空串，实测 hy3-c / glm-5.3 / kimi-k2.6 / minimax-m3 四个模型都是这样（每轮恰好一个
+      // 非空 name）；若某个上游改成每帧重发 name，累加会拼出 "get_weatherget_weather"。
+      if (fn !== undefined) {
+        if (typeof fn.name === "string" && fn.name !== "") {
+          existing.function.name = fn.name;
+        }
+        if (typeof fn.arguments === "string") {
+          existing.function.arguments += fn.arguments;
+        }
+      }
+      toolCalls.set(index, existing);
+    }
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      carry += decoder.decode(value, { stream: true });
+      let at = carry.indexOf("\n");
+      while (at >= 0) {
+        consume(carry.slice(0, at).trim());
+        carry = carry.slice(at + 1);
+        at = carry.indexOf("\n");
+      }
+      if (rejectionPayload !== "") break;
+    }
+    if (rejectionPayload === "") consume(carry.trim());
+  } finally {
+    reader.releaseLock();
+  }
+  const calls = [...toolCalls.values()].sort((a, b) => a.index - b.index);
+  return {
+    id: id === "" ? "chatcmpl-" + crypto.randomUUID().replace(/-/g, "") : id,
+    model,
+    created: created === 0 ? Math.floor(Date.now() / 1000) : created,
+    content,
+    reasoning,
+    toolCalls: calls,
+    // 有工具调用却沿用上游报的 stop，客户端会以为可以直接继续说话而不去执行工具。
+    finishReason: calls.length > 0 && finishReason === "stop"
+      ? "tool_calls"
+      : finishReason,
+    usage,
+    rejectionPayload,
+  };
 }
 
 /**
