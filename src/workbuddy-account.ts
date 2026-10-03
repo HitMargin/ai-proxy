@@ -12,8 +12,12 @@ import {
   AUTH_REFRESH_PATH,
   AUTH_REFRESH_SOURCE,
   buildCredential,
+  buildModelProbeBody,
+  CHAT_COMPLETIONS_PATH,
+  classifyModelProbe,
   CONFIG_PATH,
   credentialExpiresAtMs,
+  dropUnavailableModels,
   HTTP_HEADER_AUTH_REFRESH_SOURCE,
   HTTP_HEADER_DOMAIN,
   HTTP_HEADER_REFRESH_TOKEN,
@@ -33,9 +37,19 @@ import {
   type WorkBuddyAccount,
   workBuddyBaseHeaders,
   workBuddyCatalogHeaders,
+  workBuddyChatHeaders,
   type WorkBuddyCredential,
   type WorkBuddyModel,
+  type WorkBuddyVerdict,
 } from "./workbuddy.ts";
+
+/**
+ * 可调性探测的并发上限。
+ *
+ * ⚠️ 刻意保守：限流的症状恰好是 429，而 429 在我们眼里是 unknown —— 那意味
+ * 着一整轮探测白跑。慢一点（实测 47 个模型 5.7 秒）比被限流后重来划算得多。
+ */
+export const WORKBUDDY_PROBE_CONCURRENCY = 6;
 
 /** 凭据文件名。**必须加进 .gitignore** —— 它含可直接调用的 access token。 */
 export const WORKBUDDY_CREDENTIAL_FILE = "workbuddy-auth.json";
@@ -376,6 +390,76 @@ async function requestConfigModels(
   }
 }
 
+/**
+ * 探测单个模型的可调性。**任何异常都归为 unknown**，绝不抛出。
+ *
+ * ⚠️ 用聊天头而不是目录头：判据是「聊天路由认不认它」，而 /v3/config 与
+ * scoped 端点用的是另一套 X-Product 语义（见 workBuddyCatalogHeaders）。
+ */
+async function probeOneModel(
+  credential: WorkBuddyCredential,
+  modelId: string,
+  fetcher: WorkBuddyFetcher,
+  signal: AbortSignal | undefined,
+): Promise<WorkBuddyVerdict> {
+  try {
+    const { status, body } = await requestWorkBuddy(
+      "POST",
+      `${WORKBUDDY_ENDPOINT}${CHAT_COMPLETIONS_PATH}`,
+      workBuddyChatHeaders(credential),
+      {
+        fetcher,
+        // 单个模型只要 300ms 量级就能判死；用 10s 而不是通用 60s，否则一批
+        // 卡住的模型会把整轮目录拉取拖成分钟级 —— 上层有 5 分钟 TTL，用户在
+        // 这期间看到的还是上一份列表（可接受），但首屏不该等这么久。
+        timeoutMs: 10_000,
+        ...signal === undefined ? {} : { signal },
+        body: JSON.stringify(buildModelProbeBody(modelId)),
+      },
+    );
+    // 401/5xx 都不代表模型不可用：前者是令牌问题，会走续期；后者是上游
+    // 暂时故障。把它们算成 dead 会在一次抖动里清空选择器。
+    if (status === 401 || status >= 500) return "unknown";
+    return classifyModelProbe(body);
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
+ * 探测整份目录的可调性，返回 id → 结论。
+ *
+ * 并发压到 6：再高会撞上游限流，而限流的表现正是我们最不想要的形状（429 当
+ * unknown 返回 = 白跑一轮）。实测 47 个模型并发 6 整轮 5.7 秒。
+ */
+export async function probeWorkBuddyModels(
+  credential: WorkBuddyCredential,
+  models: readonly WorkBuddyModel[],
+  fetcher: WorkBuddyFetcher = fetch,
+  signal?: AbortSignal,
+): Promise<Map<string, WorkBuddyVerdict>> {
+  const verdicts = new Map<string, WorkBuddyVerdict>();
+  if (models.length === 0) return verdicts;
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < models.length) {
+      const model = models[cursor++];
+      if (model === undefined) continue;
+      verdicts.set(
+        model.id,
+        await probeOneModel(credential, model.id, fetcher, signal),
+      );
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(WORKBUDDY_PROBE_CONCURRENCY, models.length) },
+      worker,
+    ),
+  );
+  return verdicts;
+}
+
 /** 同名 id 以 primary（企业端点）为准，extra 独有的追加在后。 */
 function mergeRemoteModels(
   primary: WorkBuddyModel[],
@@ -396,18 +480,36 @@ function mergeRemoteModels(
  * 两个端点都空才回退静态表（中国版那张表是空的，见 STATIC_FALLBACK_MODELS 注释：
  * 与其给一份「选得到、调不通」的国际版别名，不如让渠道如实为空）。
  */
+/** 可调性探测开关。默认开；测试关掉以免依赖网络。 */
+export interface WorkBuddyCatalogOptions {
+  /** 默认 true。false 时原样返回目录，不发任何探测请求。 */
+  probe?: boolean;
+}
+
 export async function fetchWorkBuddyModels(
   credential: WorkBuddyCredential,
   fetcher: WorkBuddyFetcher = fetch,
   signal?: AbortSignal,
+  options: WorkBuddyCatalogOptions = {},
 ): Promise<WorkBuddyModel[]> {
   const [scoped, config] = await Promise.all([
     requestScopedModels(credential, fetcher, signal),
     requestConfigModels(credential, fetcher, signal),
   ]);
   const merged = mergeRemoteModels(scoped ?? [], config);
-  if (merged.length > 0) return merged;
-  return [...STATIC_FALLBACK_MODELS];
+  if (merged.length === 0) return [...STATIC_FALLBACK_MODELS];
+  if (options.probe === false) return merged;
+  // 探测只**减**列表。整轮全 unknown（例如上游整体故障）时结果不变 ——
+  // 「少列几个」可接受，「一个都列不出」会让渠道看起来挂了。
+  const verdicts = await probeWorkBuddyModels(
+    credential,
+    merged,
+    fetcher,
+    signal,
+  );
+  const kept = dropUnavailableModels(merged, verdicts);
+  if (kept.length === 0) return merged;
+  return kept;
 }
 /** 凭据是否已经不可用了（没令牌，或已过期且无法续期）。 */
 export function isWorkBuddyUsable(

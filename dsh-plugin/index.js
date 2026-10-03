@@ -649,14 +649,25 @@ function workBuddyStatus(settings) {
   return { configured: hasWorkBuddyCredentialFile(settings) };
 }
 
+/**
+ * One directory's answer: does it hold a non-empty WorkBuddy credential file?
+ *
+ * Exported and root-scoped on purpose. `projectCandidates` ends in fallbacks
+ * (the plugin's parent directory, the cwd), so inside a checkout that holds real
+ * credentials the *gate* reads as open regardless of what any fixture does - and
+ * an assertion written against the gate then proves nothing. Asking about one
+ * named root is the only form of the question a test can actually control.
+ */
+export function workBuddyCredentialIn(root) {
+  try {
+    return fs.statSync(path.join(root, 'workbuddy-auth.json')).size > 0;
+  } catch {
+    return false;
+  }
+}
+
 function hasWorkBuddyCredentialFile(settings) {
-  return projectCandidates(settings).some((root) => {
-    try {
-      return fs.statSync(path.join(root, 'workbuddy-auth.json')).size > 0;
-    } catch {
-      return false;
-    }
-  });
+  return projectCandidates(settings).some(workBuddyCredentialIn);
 }
 function projectCandidates(settings) {
   const candidates = [

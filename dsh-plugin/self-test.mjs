@@ -11,11 +11,25 @@ import path from 'node:path';
 // module's first settings read already lands in the sandbox.
 const sandboxHome = path.join(os.tmpdir(), `ai-proxy-self-test-${process.pid}`);
 process.env.DSH_HOME = sandboxHome;
+// The channel gates read `projectCandidates`, which ends in fallbacks - the
+// plugin's parent directory, then process.cwd(). Running from a checkout that
+// holds real credential files therefore let a gate pass on the *user's* files
+// instead of the fixture's, and every assertion written against such a gate
+// stayed green with its own fixture line deleted. This removes the one of the two
+// fallbacks a test can control; the plugin's parent is out of reach from here,
+// which is why the credential predicate is also exported root-scoped.
+const emptyCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-proxy-self-test-cwd-'));
+const originalCwd = process.cwd();
+process.chdir(emptyCwd);
+process.on('exit', () => {
+  try { process.chdir(originalCwd); } catch {}
+  try { fs.rmSync(emptyCwd, { recursive: true, force: true }); } catch {}
+});
 process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS, workBuddyCredentialIn } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -493,13 +507,29 @@ try {
   // `allChannels`. Adding a second, inline copy of that check here only perturbed
   // an unrelated request counter - the same "two ways to explain one result" trap
   // as the merge-rule fixtures.
-  // The aggregate listing plus each unblocked channel that has its own route.
+  // The aggregate listing plus each unblocked channel that has its own route, and
+  // every one of them must have been polled exactly once.
   //
-  // This count is load-bearing and it moves whenever a channel is added: it is what
-  // caught TRAE's listing being fetched on every 10-second poll. Two channels have
-  // their own route and are not blocked - deepseek-web and TRAE - so the expected
-  // number is written out rather than kept as "however many there are now".
-  assert.equal(modelCalls, 2, `paths: ${JSON.stringify(modelCallsByPath)}`);
+  // What this guards is a channel being re-polled on the panel's ten-second cadence -
+  // it is how TRAE's listing was caught being fetched every tick. A loop over the
+  // counter rather than a written-out total, because how many routes are unblocked
+  // is not a property of the code: WorkBuddy's gate walks fallback roots (the
+  // plugin's parent, then the cwd), so it is open in a checkout holding a real
+  // credential file and shut in the installed copy, whose parent is node_modules. A
+  // number named for one of those locations failed in the other. "One call each" is
+  // the part that holds everywhere.
+  //
+  // The loop is also the only thing covering a route with no assertion of its own -
+  // TRAE has none, and neutering just this line left a re-polled TRAE green.
+  //
+  // ⚠️ `modelCalls` cannot stand in for the total. It and the per-path counter are
+  // incremented on the same branch of the fake fetch, so "the total equals the sum
+  // of the per-route counts" holds by construction; that form survived having its
+  // right-hand side swapped for `modelCalls`.
+  for (const [route, count] of Object.entries(modelCallsByPath)) {
+    assert.equal(count, 1, `${route} must be polled once per discovery, not ${count} times`);
+  }
+
   // tokenharbor is held back with no key. Its filterModels drops every id without
   // a `:free` suffix, so a 401 came back as an empty list and the panel read it as
   // "no free models here" - the same thing a working channel looks like.
@@ -1287,8 +1317,32 @@ try {
   // WorkBuddy's hold is the same shape for the same reason: the proxy reads a
   // credential file, so with no file the channel's listing answers 502 and the
   // panel renders a channel at zero instead of the command that would fix it.
-  // Only the existence is read, so 'fixture' is the whole requirement.
+  // Non-empty is the requirement, not mere existence.
   fs.writeFileSync(path.join(fixtureRoot, 'workbuddy-auth.json'), 'fixture');
+  // Asked about the one directory this test controls. The gate itself resolves a
+  // list of roots ending in the plugin's parent and the cwd, so inside a checkout
+  // that holds real credentials it reads as open whatever happens here - asking
+  // about one named root is the only form of the question a fixture can pin down.
+  assert.ok(
+    workBuddyCredentialIn(fixtureRoot),
+    'the fixture must write a credential file the gate can see',
+  );
+  assert.equal(
+    workBuddyCredentialIn(path.join(sandboxHome, 'no-such-project')),
+    false,
+    'a root without the file must not read as configured',
+  );
+  // A zero-byte file is what a half-written write leaves behind, and the listing
+  // behind it answers 502 - which the panel renders as a channel at zero models.
+  const emptyRoot = path.join(sandboxHome, 'empty-project');
+  fs.mkdirSync(emptyRoot, { recursive: true });
+  fs.writeFileSync(path.join(emptyRoot, 'workbuddy-auth.json'), '');
+  assert.equal(
+    workBuddyCredentialIn(emptyRoot),
+    false,
+    'a zero-byte credential file is not a credential',
+  );
+  const beforeEnabledWorkBuddyCalls = modelCallsByPath['/workbuddy/v1/models'] ?? 0;
   const disposeEnabled = apply(enabledCtx, {
     mode: 'external',
     externalUrl: 'http://127.0.0.1:8000/commandcode/v1',
@@ -1303,8 +1357,13 @@ try {
   // variable across keyed channels means a key for one is silently used for the
   // other, which fails as a 401 at the far end with nothing in the logs.
   assert.equal(modelCallsByPath['/tokenharbor/v1/models'], 1, 'a keyed channel must be listed once keyed');
+  // The delta, not the cumulative total. The total also stood at 2 when this apply
+  // skipped the gate entirely, because the plugin's parent directory is a
+  // fallback root and this checkout holds a real credential file - so the absolute
+  // count cannot tell a lifted hold from one that was never applied. A bump
+  // *across this apply* is the part the fixture is responsible for.
   assert.equal(
-    modelCallsByPath['/workbuddy/v1/models'],
+    modelCallsByPath['/workbuddy/v1/models'] - beforeEnabledWorkBuddyCalls,
     1,
     'a channel whose credential file exists must be listed',
   );

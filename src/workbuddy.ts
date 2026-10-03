@@ -530,6 +530,86 @@ export function isChatModel(
   return true;
 }
 
+// ---------- 可调性探测（目录里判不出来的那个事实） ----------
+
+/**
+ * 「这个模型 id 服务端到底认不认」的判定结果。
+ *
+ * ⚠️ 为什么要专门去问服务端：目录元数据里**没有任何字段能区分可调与不可调**。
+ * 逐字段对照过（中国版实测 47 个 id / 34 可调 / 13 不可调）：缺失 `relatedModels.`
+ * `builtin-lite`、有没有 iconUrl、是否落在两个端点的交集里 —— 三种猜测都会同时
+ * 误杀活模型和漏放死模型。所以唯一的事实来源是服务端自己的路由表。
+ */
+export type WorkBuddyVerdict = "live" | "dead" | "unknown";
+
+/**
+ * 后端「没有这个模型的服务」的业务码。
+ *
+ * 实测（带齐全部归属头）：
+ * - `11102 model [X] service info not found` —— 路由表里没这个 id；
+ * - `11103 Backend [X] is not supported` —— 有 id 但后端被下线（实测
+ *   hunyuan-image-alpha-edit 回的是这条，不是 11102）。
+ *
+ * ⚠️ 这两个码与请求体无关：加不加 `reasoning:{effort}`、换不换 max_tokens，
+ * 返回都一样。反过来 `11101`（反序列化失败）、`11133`（上游供应商拒收参数）
+ * 都发生在路由解析**之后**，与这个模型能不能调无关 —— 判据必须窄。
+ */
+export const WORKBUDDY_MODEL_UNAVAILABLE_CODES = new Set([11102, 11103]);
+
+/**
+ * 把一次探测响应判成可调性结论。
+ *
+ * - `dead`：明确命中「服务端没有这个模型」那两个码；
+ * - `live`：请求进了路由（哪怕随后被上游以参数不合法拒绝）—— 因为 11133/
+ *   10000/11151/14003 这些码只在**路由解析成功之后**才可能出现；
+ * - `unknown`：网络错、401/5xx、解析不出报文 —— **一律不算 dead**。把未知当死
+ *   会让一次网络抖动把整个选择器清空。
+ */
+export function classifyModelProbe(body: unknown): WorkBuddyVerdict {
+  if (!isRecord(body)) return "unknown";
+  const code = readNumberField(body, "code");
+  if (code !== undefined && WORKBUDDY_MODEL_UNAVAILABLE_CODES.has(code)) {
+    return "dead";
+  }
+  return "live";
+}
+
+/**
+ * 按可调性结论筛掉「服务端明确没有这个模型」的条目。
+ *
+ * ⚠️ **只丢 `dead`，`unknown` 一律留下**：unknown 的来源是网络抖动 / 401 / 5xx，
+ * 与「这个模型不存在」毫无关系。若把未知当死，一次上游故障就会让用户的选择器
+ * 在几秒内被清空 —— 而那批模型其实全都好着。判据宁可漏杀不可错杀。
+ */
+export function dropUnavailableModels<T extends { id: string }>(
+  models: readonly T[],
+  verdicts: ReadonlyMap<string, WorkBuddyVerdict>,
+): T[] {
+  if (verdicts.size === 0) return [...models];
+  return models.filter((model) => verdicts.get(model.id) !== "dead");
+}
+
+/**
+ * 探测请求体：**故意发一个空 messages**。
+ *
+ * 这是全篇最反直觉的一处设计，代价与收益都实测过：
+ * - 空 messages 时服务端仍会**先做路由解析**，再把空参数丢给上游供应商拒绝，
+ *   于是回 `11133`（活）；
+ * - 死模型卡在路由那一步，回 `11102`（死）。
+ * 两者恰好可区分，且没有一次 token 生成。
+ *
+ * 对照：body 里带一条真消息（`max_tokens:1`）同样 0 误判，但每个模型要等
+ * 1~4 秒真推理，整轮 47 个模型 70 秒起，还得消耗额度并污染会话计数。
+ * 空 messages 整轮并发 6 跑完 5.7 秒。
+ *
+ * ⚠️ `stream` 必须为 true：`stream:false` 会被网关在**任何模型检查之前**直接
+ * 以 `11101 Non-stream chat request is currently not supported` 拒掉，那样连
+ * 死模型都测不出来（实测 47 个全部误判为活）。
+ */
+export function buildModelProbeBody(model: string): Record<string, unknown> {
+  return { model, stream: true, messages: [] };
+}
+
 // ---------- 倍率归一化 ----------
 
 /**
