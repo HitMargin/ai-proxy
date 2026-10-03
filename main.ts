@@ -223,6 +223,11 @@ const V1_AGGREGATE_MEMBERS = [
   // account's remote listing, so leaving it out would report a channel whose
   // models the harness cannot see at all.
   "trae",
+  // zlkpro joins for the plain reason openrouter does: it is keyed, so it has to
+  // withhold itself until a key exists (`needs an API key`) rather than appear and
+  // then 401. Its listing is a fixed 17 upstream models, so being a member is the
+  // only thing that puts them in the harness catalog.
+  "zlkpro",
 ];
 
 /**
@@ -971,11 +976,18 @@ async function handleWorkBuddy(
 async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
   const out: Record<string, any[]> = {};
   const now = Date.now();
-  // 干净请求：手动携带各成员需要的默认凭据（zen 要 Bearer public），避免被客户端 token 污染
+  // A clean request, so a member's listing is never read as if the client had
+  // supplied the credential. It deliberately carries no `authorization` header:
+  // `cloneHeadersForUpstream` takes the caller's token as the highest-precedence
+  // credential, so the `Bearer public` this shim used to send did not decorate the
+  // request - it *replaced* every keyed member's own key with a token the upstream
+  // rejects. The 401 body carries no `data` array, so the loop recorded zero models
+  // and called it `ok`: a keyed member was unlistable no matter how good its key
+  // was, and nothing said so. Zen, the reason the placeholder existed, never used
+  // this shim at all - it is answered by `fetchZenModels()` below.
   const shimReq = new Request("http://internal/", {
     headers: {
       "content-type": "application/json",
-      "authorization": "Bearer public",
     },
   });
   await Promise.allSettled(V1_AGGREGATE_MEMBERS.map(async (key) => {
@@ -1537,6 +1549,7 @@ export async function handler(request: Request): Promise<Response> {
         commandcode: "commandcode",
         "deepseek-web": "deepseek-web",
         tokenharbor: "tokenharbor",
+        zlkpro: "zlkpro",
         workbuddy: "workbuddy",
       };
       const prefix = channelPrefixes[provider];

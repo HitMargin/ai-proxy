@@ -4,7 +4,7 @@
 
 支持以下上游：
 
-1. **标准 OpenAI 兼容上游**（透传）：kilo.ai、opencode.ai/zen、openrouter.ai、tokenharbor.ai
+1. **标准 OpenAI 兼容上游**（透传）：kilo.ai、opencode.ai/zen、openrouter.ai、tokenharbor.ai、zlkpro.tech
 2. **网页端私有接口**：chat.deepseek.com（PoW + Cookie 会话）、api.trae.cn（协议翻译 + 签到）、cnb.cool（会话自举 + 提示词协议模拟），分别包装成标准 Chat Completions / Responses
 3. **私有 CLI 网关**：CommandCode Go（移植 `dsh-cmdgo-provider` 的模型筛选、网关协议、多账号池与额度读取）与 WorkBuddy 中国版（文件凭据 + 自动续期 + 流内内容拦截）
 4. **Anthropic Messages**：`/commandcode/v1/messages` 做 OpenAI ⇄ Messages 双向转换（原先的 `/anthropic/v1` 与 `/gemini/v1` 已下线，见下方说明）
@@ -160,6 +160,8 @@ deno task test
 | `BACKEND_URL` | 否 | 有值即进入**反向代理模式**，全部请求原样转发到该地址（如隧道 URL） |
 | `DEFAULT_BEARER_TOKEN` | 否 | 透传类上游的兜底 Bearer token |
 | `OPENROUTER_API_KEY` | 否 | `/openrouter/v1` 使用；未配置时该渠道不进模型列表 |
+| `TOKENHARBOR_API_KEY` | 否 | `/tokenharbor/v1` 使用；未配置时该渠道不进模型列表 |
+| `ZLKPRO_API_KEY` | 否 | `/zlkpro/v1` 使用；未配置时该渠道不进模型列表 |
 | `COMMANDCODE_ADMIN_KEY` | 否 | CommandCode 管理接口独立密钥；设置后需通过 `X-CommandCode-Admin-Key` 发送 |
 | `COMMANDCODE_API_KEY` | 否 | CommandCode Go 账号 key；账号池为空时作为单账号兜底 |
 | `COMMANDCODE_BASE_URL` | 否 | CommandCode 网关地址，默认 `https://api.commandcode.ai`；非 loopback 必须 HTTPS |
@@ -329,7 +331,7 @@ Zen 的 `GET /models` 只返回 `{ id, object, created, owned_by }`，没有上�
 
 `dsh-plugin/` 现在是整个项目的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。它动态发现 `/v1` 聚合模型并按模型前缀把请求路由回原始代理；浏览器侧是一个现代设置面板：每秒走动的运行时长、10 秒刷新的全渠道快照、可搜索的模型表、渠道统计、账号池状态、启停和日志；账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
 
-**模型选择器按渠道分组。** 插件向 Host 注册**两个层面**：一个可配置的 `ai-proxy` Provider（地址在设置页里改），以及 8 个 `ai-proxy-<渠道>` 的只读 adapter（`ai-proxy-commandcode` / `-cnb` / `-deepseek-web` / `-kilo` / `-tokenharbor` / `-trae` / `-workbuddy` / `-zen`，见 `dsh-plugin/index.js` 的 `CHANNEL_GROUPS`），每个 adapter 只列自己渠道的模型并带上中文标题。全部 adapter 共用同一个 `ProjectAdapter` 实例——Host 的 `registerAdapter` 一次接收一个列表，所以同一个对象按 provider id 各自收窄列表即可。
+**模型选择器按渠道分组。** 插件向 Host 注册**两个层面**：一个可配置的 `ai-proxy` Provider（地址在设置页里改），以及 9 个 `ai-proxy-<渠道>` 的只读 adapter（`ai-proxy-commandcode` / `-cnb` / `-deepseek-web` / `-kilo` / `-tokenharbor` / `-trae` / `-workbuddy` / `-zen` / `-zlkpro`，见 `dsh-plugin/index.js` 的 `CHANNEL_GROUPS`），每个 adapter 只列自己渠道的模型并带上中文标题。全部 adapter 共用同一个 `ProjectAdapter` 实例——Host 的 `registerAdapter` 一次接收一个列表，所以同一个对象按 provider id 各自收窄列表即可。
 
 三处必须照做的约束：
 
@@ -439,7 +441,7 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 
 | 路径前缀 | 上游 | 适配方式 |
 |---|---|---|
-| `/v1` | **聚合入口** | kilo / zen / cnb / commandcode / openrouter / deepseek-web / workbuddy / trae：模型加渠道名前缀统一列出与分发 |
+| `/v1` | **聚合入口** | kilo / zen / cnb / commandcode / openrouter / deepseek-web / workbuddy / trae / zlkpro：模型加渠道名前缀统一列出与分发 |
 | `/kilo/v1` | api.kilo.ai | 透传，仅保留 `isFree: true` 的模型（kilo 的直连前缀，聚合成员之一） |
 | `/zen/v1` | opencode.ai/zen | 透传，默认 token `public`，仅保留 `-free` 模型 |
 | `/deepseek-web/v1` | chat.deepseek.com 网页聊天端 | 需要登录 Cookie，支持 Chat Completions 与 Responses |
@@ -449,18 +451,19 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 | `/openrouter/v1` | openrouter.ai | 透传 |
 | `/openrouter/v1/responses` | openrouter.ai | 透传 Responses API |
 | `/tokenharbor/v1` | tokenharbor.ai | 透传，仅保留 `:free` 模型 |
+| `/zlkpro/v1` | zlkpro.tech | 透传（标准 OpenAI 契约：流式、工具调用、带斜杠的模型 id 均原样可用） |
 | `/cnb/v1` | cnb.cool | **自定义处理器**（见下节） |
 | `/health` | 本地代理 | 返回最近一次模型健康探测汇总；不会在请求时自动发起探测 |
 
 `GET /` 会返回所有可用 provider 列表。`GET /health` 返回各 provider 最近一次健康探测的状态（`available` / `degraded` / `unavailable` / `unknown`）；没有探测记录时显示 `unknown`，不会因为一次网络失败把模型清单清空。
 
-**聚合端点 `/v1`**：`GET /v1/models` 返回 **8 个成员**（`kilo` / `zen` / `cnb` / `commandcode` / `openrouter` / `deepseek-web` / `workbuddy` / `trae`，见 `main.ts` 的 `V1_AGGREGATE_MEMBERS`）全部模型的并集，id 分别加渠道名前缀防冲突；
+**聚合端点 `/v1`**：`GET /v1/models` 返回 **9 个成员**（`kilo` / `zen` / `cnb` / `commandcode` / `openrouter` / `deepseek-web` / `workbuddy` / `trae` / `zlkpro`，见 `main.ts` 的 `V1_AGGREGATE_MEMBERS`）全部模型的并集，id 分别加渠道名前缀防冲突；
 POST 时 model 写带前缀的 id（如 `cnb/deepseek-v4-pro`、`commandcode/deepseek/deepseek-v4-flash`）即自动分发到对应上游，完整复用该上游的
 处理链。不带前缀的裸 id 按 kilo→zen→cnb→commandcode 顺序解析（保持旧行为），冷启动后需先 GET 一次 `/v1/models` 暖缓存。分发时会剥掉客户端 token，让各成员用自家默认凭据；仅当本代理设置 `API_KEYS` 时才透传客户端鉴权头。
 
 ⚠️ **`/workbuddy/v1/chat/completions` 的 `model` 必须写裸 id**（如 `deepseek-v4-flash`），不能带 `workbuddy/` 前缀——带前缀会被判成未知模型并回 400。`/v1` 聚合入口的分发只认带前缀的 id，这是两条不同的解析路径。
 
-后四个成员（deepseek-web / workbuddy / trae / openrouter）加入聚合**不是为了分发**，而是 **harness 的模型目录读的是这个聚合**（`adapter.listModels()`），不是插件那份独立清单——漏掉任何一个，就会出现「面板里有该渠道、选择器里一个模型都没有」。`openrouter` 在没配 key 时主动隐身（未鉴权的目录请求会回 401，列出来再 401 比不列更糟）。
+deepseek-web / workbuddy / trae / openrouter / zlkpro 这几个成员加入聚合**不是为了让它们能被分发**（`/v1` 早就能分发），而是 **harness 的模型目录读的是这个聚合**（`adapter.listModels()`），不是插件那份独立清单——漏掉任何一个，就会出现「面板里有该渠道、选择器里一个模型都没有」。`openrouter` 在没配 key 时主动隐身（未鉴权的目录请求会回 401，列出来再 401 比不列更糟）。
 
 **模型列表**有 5 分钟内存缓存，并会在后台异步做健康探测（`testModel`，3 秒超时；200 可用，429/5xx 视为 degraded，401/403 才是 unavailable，网络失败保留为 unknown），在 Deno Deploy 上用 `EdgeRuntime.waitUntil` 挂起，不阻塞响应；加 `?health=true` 可强制同步探测。探测结果可通过 `GET /health` 查看。
 

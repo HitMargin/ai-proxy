@@ -29,6 +29,13 @@ export const ENV: Record<string, string> = {
   ANTHROPIC_API_KEY: getEnv("ANTHROPIC_API_KEY"),
   GEMINI_API_KEY: getEnv("GEMINI_API_KEY"),
   OPENROUTER_API_KEY: getEnv("OPENROUTER_API_KEY"),
+  // The provider names its variable (`auth.envToken`) and this map is what that
+  // lookup reads, so a keyed channel that is missing here silently falls through
+  // to DEFAULT_BEARER_TOKEN - the wrong key, and an upstream 401 with nothing in
+  // the logs. tokenharbor was in that state; it is listed for the same reason
+  // openrouter is.
+  TOKENHARBOR_API_KEY: getEnv("TOKENHARBOR_API_KEY"),
+  ZLKPRO_API_KEY: getEnv("ZLKPRO_API_KEY"),
   ZEN_BASE_URL: getEnv("ZEN_BASE_URL"),
   ZEN_BEARER_TOKEN: getEnv("ZEN_BEARER_TOKEN"),
   // Egress rotation: Zen meters anonymous quota per address, so a pool of
@@ -297,6 +304,26 @@ export const providers: Record<string, any> = {
         data: data.data.filter((m: any) => m.id && m.id.endsWith(":free")),
       };
     },
+  },
+  // ZLK Pro (zlkpro.tech) answers the plain OpenAI contract - /v1/models and
+  // /v1/chat/completions, bearer auth - and, unlike kilo or zen, has no vendor
+  // extension to rewrite. Probed 2026-10-03: streaming ends with `data: [DONE]`,
+  // tool calls come back in the standard `choices[].message.tool_calls` shape, and
+  // ids may carry slashes of their own (`openai/gpt-oss-20b`), which the aggregate
+  // already handles because it splits on the first one only. So it is the same
+  // passthrough shape as tokenharbor, with nothing filtered out.
+  zlkpro: {
+    prefix: "/zlkpro/v1",
+    baseUrl: "https://zlkpro.tech/v1",
+    auth: {
+      type: "bearer",
+      defaultToken: "",
+      envToken: "ZLKPRO_API_KEY",
+    },
+    pathRewrite: (path: string) => path.replace(/^\/zlkpro\/v1/, ""),
+    endpoints: { models: "/models", chat: "/chat/completions" },
+    adapter: adapters.passthrough,
+    filterModels: null,
   },
 };
 

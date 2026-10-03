@@ -76,6 +76,7 @@ const KNOWN_CHANNELS = [
   'trae',
   'workbuddy',
   'zen',
+  'zlkpro',
 ];
 
 const DEFAULT_HIDDEN_CHANNELS = [
@@ -105,6 +106,7 @@ export const CHANNEL_GROUPS = {
   'ai-proxy-trae': { channel: 'trae', label: 'TRAE' },
   'ai-proxy-workbuddy': { channel: 'workbuddy', label: 'WorkBuddy' },
   'ai-proxy-zen': { channel: 'zen', label: 'Zen' },
+  'ai-proxy-zlkpro': { channel: 'zlkpro', label: 'ZLK Pro' },
 };
 
 /**
@@ -497,6 +499,7 @@ const DEFAULT_SETTINGS = {
 const KEYED_CHANNELS = [
   { channel: 'openrouter', envToken: 'OPENROUTER_API_KEY' },
   { channel: 'tokenharbor', envToken: 'TOKENHARBOR_API_KEY' },
+  { channel: 'zlkpro', envToken: 'ZLKPRO_API_KEY' },
 ];
 
 /**
@@ -2222,7 +2225,7 @@ function cleanSettings(values) {
   return next;
 }
 
-const PROBE_CHANNELS = ['kilo', 'zen', 'cnb', 'commandcode', 'deepseek-web', 'tokenharbor'];
+const PROBE_CHANNELS = ['kilo', 'zen', 'cnb', 'commandcode', 'deepseek-web', 'tokenharbor', 'zlkpro'];
 
 function cleanProbeRequest(values) {
   const requested = Array.isArray(values?.channels) ? values.channels : [];
