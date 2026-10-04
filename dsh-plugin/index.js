@@ -1958,7 +1958,29 @@ export class AiProxyAdapter {
         let payload;
         try { payload = JSON.parse(data); } catch { continue; }
         if (payload?.error) {
-          yield { type: 'finish', reason: { kind: 'error', failure: { message: String(payload.error.message ?? 'ai-proxy stream error'), code: 'SERVER' } } };
+          // The proxy states its own failure class in `error.code`, and that value
+          // is what decides a replay. Hardcoding SERVER put every in-stream error
+          // into the retry set, so a turn that had already delivered half an answer
+          // was replayed up to maxRetries times: the tool calls it emitted ran again
+          // and the second run was billed again. zen, workbuddy, commandcode and
+          // trae all emit stream_cut for exactly this case (src/zen.ts:823,
+          // src/workbuddy.ts:1964, src/commandcode/handler.ts, src/trae.ts:899) and
+          // every one of them was silently downgraded to SERVER here.
+          //
+          // Grading still belongs to this layer, not to the proxy: only we know
+          // whether this turn had already put something in front of the client.
+          // `delivered` mirrors the same rule the missing-[DONE] branch below
+          // applies, so a cut reaches the harness as the same code no matter which
+          // way the stream ended.
+          const deliveredBeforeError = textIndex !== undefined ||
+            reasoningIndex !== undefined || toolBlocks.size > 0;
+          const upstreamCode = typeof payload.error.code === 'string'
+            ? payload.error.code
+            : '';
+          const code = upstreamCode === 'stream_cut'
+            ? (deliveredBeforeError ? 'stream_cut' : 'TRANSPORT')
+            : (upstreamCode || 'SERVER');
+          yield { type: 'finish', reason: { kind: 'error', failure: { message: String(payload.error.message ?? 'ai-proxy stream error'), code } } };
           return;
         }
         const choice = Array.isArray(payload?.choices) ? payload.choices[0] : undefined;

@@ -612,6 +612,17 @@ Deno.test("an in-stream error surfaces as a frame instead of a clean stop", asyn
     String(withError.error.message).includes("4001"),
     "the business code must survive into the frame",
   );
+  // ⚠️ 这一条是被上一轮的缺陷逼出来的：错误路径曾经紧跟着补一帧
+  // finish_reason:"stop"，把同一个病从断流入口搬到了错误入口 —— 整条 SSE
+  // 聚合起来读到的就是「模型说完了」。增量帧自带 finish_reason:null，所以
+  // 判据是「没有非 null 的那个」。
+  equal(
+    chunks.some((chunk) => chunk.choices?.[0]?.finish_reason != null),
+    false,
+    "an errored turn must not also claim a finish reason",
+  );
+  // 插件靠这个码决定要不要重放；没有它，已投递的那一轮会被重放两次。
+  equal(withError.error.code, "stream_cut");
 });
 
 Deno.test("an upstream that never sends done is reported as stream_cut", async () => {

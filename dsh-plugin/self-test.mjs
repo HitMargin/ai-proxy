@@ -411,6 +411,55 @@ globalThis.fetch = async (input, init = {}) => {
   if (streamMode === 'cut-empty') {
     return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
   }
+  // The proxy naming its failure class in the error frame. zen, workbuddy,
+  // commandcode and trae all emit stream_cut, and every one of them used to be
+  // downgraded to SERVER here - which is in retryableCodes, so a turn that had
+  // already delivered half an answer was replayed, re-running the tool calls
+  // it had emitted and billing them twice.
+  if (streamMode === 'cut-framed') {
+    return new Response(
+      [
+        'data: {"choices":[{"delta":{"content":"half an ans"},"finish_reason":null}]}\n\n',
+        'data: {"error":{"message":"TRAE closed the stream after partial output had already been delivered without an event: done frame","type":"upstream_error","code":"stream_cut"}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
+  if (streamMode === 'cut-framed-empty') {
+    return new Response(
+      [
+        'data: {"error":{"message":"TRAE closed the stream before any output without an event: done frame","type":"upstream_error","code":"stream_cut"}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
+  // A different upstream class must pass through untouched rather than being
+  // relabelled stream_cut: only stream_cut is graded on what was delivered.
+  if (streamMode === 'err-framed-other') {
+    return new Response(
+      [
+        'data: {"error":{"message":"TRAE 4008: Your requests have exceeded the quota.","type":"upstream_error","code":"RATE_LIMIT"}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
+  // An error frame with no code at all. This is what cnb and deepseek-web still
+  // emit, and what any upstream failure we do not have a class for looks like.
+  // Both are in retryableCodes, so this test can only pin that an unclassed
+  // failure keeps the generic retryable code - it cannot tell SERVER from
+  // RATE_LIMIT, because those behave identically to the harness.
+  if (streamMode === 'err-framed-nocode') {
+    return new Response(
+      [
+        'data: {"error":{"message":"cnb upstream died mid-stream","type":"upstream_error"}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
   // A well-formed stream: a reason is named and [DONE] arrives, but not a single
   // content, reasoning or tool block was ever opened. This is what the harness
   // reports as "Provider returned an empty response".
@@ -819,6 +868,66 @@ try {
   assert.equal(emptyFinish?.reason?.kind, 'error');
   assert.equal(emptyFinish?.reason?.failure?.code, 'TRANSPORT');
   assert.match(emptyFinish?.reason?.failure?.message ?? '', /no output delivered/);
+
+  // The same cut, but announced by the proxy in an error frame instead of by a
+  // missing [DONE]. This used to arrive as SERVER, and SERVER is in
+  // retryableCodes - so the turn that had already put half an answer in front of
+  // the client was replayed, re-running its tool calls and billing them twice.
+  streamMode = 'cut-framed';
+  const framedEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'do the thing' }],
+    maxTokens: 32,
+  }, resolved)) framedEvents.push(event);
+  const framedFinish = framedEvents.find((e) => e.type === 'finish');
+  assert.equal(framedFinish?.reason?.kind, 'error');
+  assert.equal(framedFinish?.reason?.failure?.code, 'stream_cut');
+  // And it must stay unretryable: the retry decision reads this code.
+  assert.ok(
+    !adapter.providerRetryPolicy().retryableCodes.includes(framedFinish?.reason?.failure?.code),
+    'a cut that already delivered output must not be replayed',
+  );
+
+  // A framed cut before anything was produced is the one a retry can help.
+  streamMode = 'cut-framed-empty';
+  const framedEmptyEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'do the thing' }],
+    maxTokens: 32,
+  }, resolved)) framedEmptyEvents.push(event);
+  const framedEmptyFinish = framedEmptyEvents.find((e) => e.type === 'finish');
+  assert.equal(framedEmptyFinish?.reason?.kind, 'error');
+  assert.equal(framedEmptyFinish?.reason?.failure?.code, 'TRANSPORT');
+
+  // A failure class the proxy named that is not a cut passes through as itself.
+  streamMode = 'err-framed-other';
+  const otherFramedEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'do the thing' }],
+    maxTokens: 32,
+  }, resolved)) otherFramedEvents.push(event);
+  const otherFramedFinish = otherFramedEvents.find((e) => e.type === 'finish');
+  assert.equal(otherFramedFinish?.reason?.failure?.code, 'RATE_LIMIT');
+
+  // An error frame that names no class keeps a generic retryable code, so the
+  // channels that have not been taught to name one (cnb, deepseek-web) still
+  // retry instead of turning every transient failure into a dead turn.
+  streamMode = 'err-framed-nocode';
+  const noCodeEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'do the thing' }],
+    maxTokens: 32,
+  }, resolved)) noCodeEvents.push(event);
+  const noCodeFinish = noCodeEvents.find((e) => e.type === 'finish');
+  assert.equal(noCodeFinish?.reason?.kind, 'error');
+  assert.ok(
+    adapter.providerRetryPolicy().retryableCodes.includes(noCodeFinish?.reason?.failure?.code),
+    'an unclassed upstream failure must stay retryable',
+  );
 
   // A stream that ends properly but delivers nothing. This finished cleanly before,
   // and a clean finish with no blocks is exactly what the harness turns into

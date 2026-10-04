@@ -909,15 +909,30 @@ export async function handleTraeChat(
         } catch (error) {
           // 报错也要走 [DONE]，否则下游一直等 —— 但内容必须说出来，
           // 不能干净收尾（与本项目「完整结束但什么都没吐」那条同纪律）。
+          //
+          // ⚠️ 这里**不能**再补一帧 finish_reason:"stop"。上一轮我把本提交
+          // 治好的病从断流入口搬到了错误入口：一帧声称「说完了」的答复紧跟着
+          // 错误帧，任何按整条 SSE 聚合的消费者读到的就是一次正常结束 ——
+          // 实测 TRAE 4008 配额耗尽时上游给出的正是这三帧。而插件之所以没被
+          // 咬到，只是因为它在第一帧 error 就 return；哪天帧顺序一变就成了真。
+          // 判据同上面那条：finish 的语义是「这一轮说完了」，出错的一轮没说。
           const message = error instanceof Error
             ? error.message
             : String(error);
+          const where = deliveredOutput
+            ? "after partial output had already been delivered"
+            : "before any output";
           send(
             "data: " + JSON.stringify({
-              error: { message, type: "upstream_error" },
+              error: {
+                message: message + " (" + where + ")",
+                type: "upstream_error",
+                // 插件读得到这个码才会用它分级（dsh-plugin/index.js 的
+                // payload.error 分支）；没读到时它回落 SERVER，那是它的兜底。
+                code: "stream_cut",
+              },
             }) + "\n\n",
           );
-          send(buildOpenAIChunk(chatId, created, modelName, {}, "stop"));
           send("data: [DONE]\n\n");
         } finally {
           try {
