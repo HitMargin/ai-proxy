@@ -585,6 +585,26 @@ window.__ModuleLoader__.load({
       // vendor would duplicate its name too, and two rows with one name is the
       // collision the proxy rejects.
       const customDrafts = Array.isArray(customProviders) ? customProviders : []
+      // Mirrors the server's rule so a bad row is visible before Save, not after.
+      // The server still enforces it - this is the message, not the fence.
+      //
+      // Declared **before** updateDraft, which calls it: both are `const`, so a
+      // reference from the earlier one to the later one throws at call time
+      // (`Cannot access 'customProblem' before initialization`). It reads fine on
+      // the page and only fails when the user first types into a field.
+      const customProblem = (row) => {
+        const name = String(row?.name ?? '').trim().toLowerCase()
+        if (name === '') return null
+        if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(name)) return t('vendorBadName')
+        const raw = String(row?.baseUrl ?? '').trim()
+        if (raw === '') return null
+        try {
+          const url = new URL(raw)
+          const loop = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(url.hostname)
+          if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loop)) return t('vendorBadUrl')
+        } catch { return t('vendorBadUrl') }
+        return null
+      }
       const updateDraft = (index, patch) => setCustomProviders((prev) => {
         const rows = Array.isArray(prev) ? [...prev] : []
         rows[index] = { ...rows[index], ...patch, test: undefined, problem: customProblem({ ...rows[index], ...patch }) }
@@ -603,21 +623,6 @@ window.__ModuleLoader__.load({
         if (gone?.name) act('/settings', { customProviders: rows, customKeys: { [gone.name]: '' } })
         return rows
       })
-      // Mirrors the server's rule so a bad row is visible before Save, not after.
-      // The server still enforces it - this is the message, not the fence.
-      const customProblem = (row) => {
-        const name = String(row?.name ?? '').trim().toLowerCase()
-        if (name === '') return null
-        if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(name)) return t('vendorBadName')
-        const raw = String(row?.baseUrl ?? '').trim()
-        if (raw === '') return null
-        try {
-          const url = new URL(raw)
-          const loop = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(url.hostname)
-          if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loop)) return t('vendorBadUrl')
-        } catch { return t('vendorBadUrl') }
-        return null
-      }
       const testVendor = async (index) => {
         const row = customDrafts[index]
         if (!row?.name) return
@@ -1023,8 +1028,11 @@ window.__ModuleLoader__.load({
                   onClick: () => removeDraft(index),
                 }, t('removeVendor')),
             ),
-            draft.problem
-              ? h('p', { className: 'apx_tag apx_bad' }, draft.problem)
+            // Computed at render, not only on edit: a row hydrated from the server
+            // (or left over from an older settings.json) never went through
+            // updateDraft, so its problem would never be shown.
+            customProblem(draft)
+              ? h('p', { className: 'apx_tag apx_bad' }, customProblem(draft))
               : null,
             draft.test
               ? h('p', { className: 'apx_tag' },

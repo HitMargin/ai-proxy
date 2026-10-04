@@ -1962,6 +1962,59 @@ try {
         fs.rmSync(root, { recursive: true, force: true });
       }
     }
+
+  // ── 前端组件的 TDZ 检查 ──
+  //
+  // `node --check` 只查语法，查不出「`const` A 引用了在它之后才定义的 `const` B」
+  // ——那是合法的语法，只在**调用时**抛 `Cannot access 'B' before initialization`。
+  // 我因此把整个面板打成过空白（运行卡片还在，因为它是本地状态；其余全没了），
+  // 而那一刻 node --check 与 self-test 都是绿的。
+  //
+  // 真正的渲染测试需要 React，这里退一步：把组件作用域内的 const 声明按行号排出来，
+  // 对每一个检查它的定义体是否调用了更晚声明的名字。够窄，但恰好覆盖那类错。
+  {
+    const clientPath = path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      'client.js',
+    );
+    const source = fs.readFileSync(clientPath, 'utf8');
+    const lines = source.split('\n');
+    // 组件作用域 = 缩进 6 空格的 const，这与文件里所有 helper 的层级一致。
+    //
+    // 必须排除已经在作用域里的名字：`t` 既是组件解构出来的参数（`props.t`），
+    // 又在别处被 `const t = ...` 绑过一次——只按「名字相同」判会把每一处 `t(...)`
+    // 都报成 TDZ，而它其实一直是参数。误报比漏报更糟：它会逼人关掉这条检查。
+    const scopeNames = new Set(['t', 'h', 'props', 'data', 'settings', 'usage']);
+    const decls = [];
+    lines.forEach((line, index) => {
+      const match = line.match(/^      const ([A-Za-z_$][\w$]*)/);
+      if (match && !scopeNames.has(match[1])) decls.push({ name: match[1], line: index });
+    });
+    assert.ok(decls.length > 20, 'the component scope must still be discoverable');
+    const offenders = [];
+    for (let i = 0; i < decls.length; i++) {
+      const end = i + 1 < decls.length ? decls[i + 1].line : lines.length;
+      const body = lines.slice(decls[i].line, end).join('\n');
+      for (let j = i + 1; j < decls.length; j++) {
+        const later = decls[j];
+        // 只认**独立**的调用：前面不能是 `.`（那是 `Math.min` 这种属性访问，
+        // 与作用域里的 `min` 毫无关系），后面必须是 `(`。
+        const pattern = new RegExp(
+          '(^|[^.\\w$])' + later.name.replace(/\$/g, '\\$') + '\\s*\\(',
+          'm',
+        );
+        if (pattern.test(body)) {
+          offenders.push(decls[i].name + ' (line ' + (decls[i].line + 1) + ') calls ' +
+            later.name + ' (line ' + (later.line + 1) + ')');
+        }
+      }
+    }
+    assert.deepEqual(
+      offenders,
+      [],
+      'a const must not call a later const: it only throws when called, which node --check cannot see',
+    );
+  }
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;
