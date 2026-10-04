@@ -145,12 +145,11 @@ function applyHiddenChannels(value) {
 }
 
 /** Why a channel is withheld, so the refusal can say something true. */
+// Only channels the proxy really serves belong here. anthropic and gemini were
+// removed as providers, so an entry for either could never be reached: a block
+// reason is looked up by the first path segment, and nothing routes those two.
 const BLOCK_REASON = {
   openrouter:
-    'this channel needs a per-user upstream key and is not served by ai-proxy',
-  anthropic:
-    'this channel needs a per-user upstream key and is not served by ai-proxy',
-  gemini:
     'this channel needs a per-user upstream key and is not served by ai-proxy',
   'deepseek-web': 'this channel is switched off in the ai-proxy panel',
   cnb: 'cnb needs a login cookie; paste one into cnb-login.txt to re-enable it',
@@ -2225,7 +2224,31 @@ function cleanSettings(values) {
   return next;
 }
 
-const PROBE_CHANNELS = ['kilo', 'zen', 'cnb', 'commandcode', 'deepseek-web', 'tokenharbor', 'zlkpro'];
+/**
+ * The channels the panel is allowed to probe on demand.
+ *
+ * This list and the proxy route that handles /health/probe answer the same
+ * question from two sides, so they have to name the same channels. A name
+ * the proxy does not know answers 400 unknown channel; a name missing here
+ * is filtered out by cleanProbeRequest and then silently widened to every
+ * channel - one click spends a full roster of upstream calls while the
+ * channel the user asked about is never probed. self-test.mjs asserts the
+ * two lists agree.
+ *
+ * openrouter is absent on purpose: it has no route of its own and needs a
+ * per-user key this proxy never holds. It is aggregate-only.
+ */
+export const PROBE_CHANNELS = [
+  'kilo',
+  'zen',
+  'cnb',
+  'commandcode',
+  'deepseek-web',
+  'tokenharbor',
+  'workbuddy',
+  'trae',
+  'zlkpro',
+];
 
 function cleanProbeRequest(values) {
   const requested = Array.isArray(values?.channels) ? values.channels : [];

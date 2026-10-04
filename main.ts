@@ -1551,6 +1551,11 @@ export async function handler(request: Request): Promise<Response> {
         tokenharbor: "tokenharbor",
         zlkpro: "zlkpro",
         workbuddy: "workbuddy",
+        // TRAE is an aggregate member served on its own prefix. Leaving it out
+        // made /health/probe?provider=trae answer "400 unknown channel", and
+        // the panel's per-channel button fell through to probing everything
+        // else. AGENTS.md records how the two probe lists drifted apart.
+        trae: "trae",
       };
       const prefix = channelPrefixes[provider];
       if (!prefix) {

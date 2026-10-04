@@ -25,9 +25,9 @@ export const ENV: Record<string, string> = {
   COMMANDCODE_ADMIN_KEY: getEnv("COMMANDCODE_ADMIN_KEY"),
   MAX_REQUEST_BODY_BYTES: getEnv("MAX_REQUEST_BODY_BYTES"),
   DEFAULT_BEARER_TOKEN: getEnv("DEFAULT_BEARER_TOKEN"),
-  // 其它 provider 可能用到的 key，按需添加
-  ANTHROPIC_API_KEY: getEnv("ANTHROPIC_API_KEY"),
-  GEMINI_API_KEY: getEnv("GEMINI_API_KEY"),
+  // 其它 provider 可能用到的 key，按需添加。anthropic / gemini 的 provider 已删除
+  // （见下方 providers 注释），所以它们的变量不再登记：ENV 的键名要等于
+  // providers[].auth.envToken 才有人读，留着只会让人以为这两个渠道还活着。
   OPENROUTER_API_KEY: getEnv("OPENROUTER_API_KEY"),
   // The provider names its variable (`auth.envToken`) and this map is what that
   // lookup reads, so a keyed channel that is missing here silently falls through

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Settings live in a file under the DSH home, so without this the suite reads the
 // real ~/.dsh/ai-proxy-dsh-bridge/settings.json and its results depend on whatever
@@ -29,7 +30,7 @@ process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS, workBuddyCredentialIn } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -1652,6 +1653,45 @@ try {
   // needs a hidden set that excludes the channel, and BLOCKED_CHANNELS is
   // module-level state, so it takes a fresh apply() with its own registration.
   // Recorded in AGENTS.md rather than faked with an assertion that cannot fail.
+
+
+  // The proxy route that answers /health/probe keeps its own copy of the channel
+  // names, in main.ts. Two lists answering one question drift the moment a channel
+  // is added to one side, and the failure is silent in the expensive direction: the
+  // panel filters the unknown name away and then probes every channel, so the user
+  // pays for a full roster of upstream calls while the channel they clicked stays
+  // unprobed. Reading main.ts here is the only place the two can be compared.
+  //
+  // An installed plugin copy does not ship main.ts, so the comparison runs only
+  // where the file is there; CI always runs it from the checkout. The keys are read
+  // line by line and comments are dropped first: a commented-out channel must not
+  // count, and a quoted key such as "deepseek-web" must.
+  {
+    const mainPath = path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '..',
+      'main.ts',
+    );
+    if (fs.existsSync(mainPath)) {
+      const source = fs.readFileSync(mainPath, 'utf8');
+      const declaration = 'const channelPrefixes: Record<string, string> = {';
+      const start = source.indexOf(declaration);
+      assert.notEqual(start, -1, 'main.ts must still declare channelPrefixes');
+      const end = source.indexOf('\n      };', start);
+      assert.notEqual(end, -1, 'channelPrefixes must still be a plain object literal');
+      const keys = source.slice(start, end).split('\n')
+        .filter((line) => !line.trim().startsWith('//'))
+        .map((line) => line.match(/^\s*(?:"([^"]+)"|([A-Za-z0-9_-]+))\s*:/))
+        .filter(Boolean)
+        .map((match) => match[1] ?? match[2]);
+      assert.ok(keys.length > 0, 'channelPrefixes must name at least one channel');
+      assert.deepEqual(
+        [...PROBE_CHANNELS].sort(),
+        [...keys].sort(),
+        'the panel probe list and the proxy probe route must name the same channels',
+      );
+    }
+  }
 
   console.log('dsh bridge self-test ok');
 } finally {

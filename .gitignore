@@ -26,6 +26,14 @@ cloudflared.exe
 # --- captured page snapshots / scratch ---
 page.html
 tmp-*.mjs
+# Local forensics probes written during an investigation. The .tmp-*.ts login and
+# cookie-capture scripts below are the deliberate exception: main.ts and the plugin
+# run them by path, so they are tracked on purpose - see AGENTS.md. Ignore the
+# dotted form only, or that machinery stops finding its own scripts.
+.tmp-*.cjs
+.tmp-*.mjs
+.tmp-*.jsonl
+.tmp-*.json
 .git-commit-msg-tmp
 
 # --- backups ---

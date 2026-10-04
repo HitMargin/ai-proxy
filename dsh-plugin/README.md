@@ -33,10 +33,13 @@ DSH 中的 `ai-proxy` Provider 会从本地代理读取完整模型目录：
 | 渠道 | 原因 |
 | --- | --- |
 | `openrouter/*` | 依赖 per-user key，本代理从不持有 |
-| `anthropic/*` | 同上 |
-| `gemini/*` | 同上 |
 | `deepseek-web/*` | 按使用者要求关闭。**它本身是可用的**（实测 HTTP 200 并返回真实文本），所以这不是能力问题，只是不再出现在选择器里 |
 | `cnb/*` | 上游要求登录，实测 `401 [NOT_LOGIN]`。把 Cookie 粘进 `cnb-login.txt` 后可恢复 |
+
+`tokenharbor/*` 不在这张表里 —— 它是开着的，只是没有 `TOKENHARBOR_API_KEY` 可用：
+面板会列出这个渠道、模型数为 0，因为 `filterModels` 把上游 401 之后剩下的东西全滤掉了。
+那个 0 是被遮住的 401，不是「这个渠道没有模型」。`anthropic/*` 与 `gemini/*` 同理：
+它们的路由已从代理删除，不再是本代理的渠道，旧会话里的 id 由代理自己回「不是 ai-proxy 的渠道」。
 
 屏蔽按**首个路径段**（即本代理用来路由的渠道名）判断，不是子串匹配。所以 `tokenharbor/openrouter/…` 同样被拦下，而 `kilo/openrouter/free`（Kilo 自己托管的免费路由模型）不受影响。
 
