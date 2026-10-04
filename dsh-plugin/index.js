@@ -361,7 +361,15 @@ function readModalities(row) {
   const parsed = MODALITY_WORDS.filter((word) =>
     shorthand.split('+').includes(word)
   );
-  return parsed.length > 0 ? parsed : ['text'];
+  if (parsed.length > 0) return parsed;
+  // A fifth spelling, and a boolean rather than a list: StepFun says
+  // `enable_vision_input: true` on a row that has no modality field at all, so
+  // `step-3.7-flash` and `step-5-preview` were read as text-only. The gate is not
+  // cosmetic - the adapter refuses to attach `image_url` for a model whose
+  // `inputModalities` lacks `image`, so a vision-capable upstream silently dropped
+  // every image the user sent.
+  if (row.enable_vision_input === true) return ['text', 'image'];
+  return ['text'];
 }
 
 function readNumber(row, keys, fallback) {
@@ -384,7 +392,14 @@ export function normalizeModel(provider, row) {
     name: readName(row),
     contextWindow: readNumber(
       row,
-      ['contextWindow', 'context_window', 'context_length'],
+      // `max_input_tokens` is StepFun's spelling of the same fact, and it is the one
+      // that actually constrains a request: `step-3.7-flash` advertises 262144 there
+      // while the fallback below would have claimed 1000000. `clampOutputBudget`
+      // divides by this number when narrowing `max_tokens`, so an inflated window
+      // means an under-clamped request and an upstream 400 - the same class of
+      // failure as the 524288-output row in AGENTS.md, arriving through a field that
+      // was never read rather than through a wrong value.
+      ['contextWindow', 'context_window', 'context_length', 'max_input_tokens'],
       readNumber(upstream, ['context_window', 'context_length'], 1000000),
     ),
     maxTokens: readNumber(
@@ -450,6 +465,27 @@ function publishedEfforts(row) {
   // simply never looked at.
   if (isRecord(row.reasoning) && Array.isArray(row.reasoning.efforts)) {
     sources.push(row.reasoning.efforts);
+  }
+  // A fourth shape, and the one a user-configured upstream is most likely to speak:
+  // StepFun publishes `reasoning_effort_support_list: ["low","high","medium"]` on
+  // each row alongside `enable_reason`. It is not a spelling this reader knew, so
+  // every `custom/step/*` model lost its whole ladder and the picker showed no
+  // Effort control - the same "field is present and simply never looked at" failure
+  // as the three above, on a channel whose listing had no mapping layer at all to
+  // rewrite the field into a known name.
+  //
+  // A custom vendor is why this cannot be solved by normalising upstreams into one
+  // spelling: the whole point of that channel is that the user pastes an arbitrary
+  // OpenAI-compatible base URL, so the reader has to know the names in the wild
+  // rather than the names this project happens to emit.
+  //
+  // Note the values are accepted verbatim. StepFun does not reject an unknown
+  // `reasoning_effort` - measured `off` and `none`, neither of which it advertises,
+  // and it answered 200 to both - so the ladder cannot be discovered by probing and
+  // must come from this field. Publishing only what it lists is therefore the only
+  // honest source; anything else would be this file inventing rungs.
+  if (Array.isArray(row.reasoning_effort_support_list)) {
+    sources.push(row.reasoning_effort_support_list);
   }
   const variants = isRecord(row.opencode) ? row.opencode.variants : undefined;
   if (isRecord(variants)) {
