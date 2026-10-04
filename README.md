@@ -129,17 +129,125 @@ Zen 侧**由各 wire 自己的终止帧判定是否完成**，而不是由 reade
 
 ## 快速开始
 
+> **第一次用？** 直接跳到下面的[「5 分钟跑通」](#5-分钟跑通从零到第一条回复)。想先了解各部署方式的区别，看方式 A–D。
+
+### 5 分钟跑通（从零到第一条回复）
+
+**前提**：装了 [Deno](https://deno.com/) 2.x。没有的话：
+
+```powershell
+# Windows (winget)
+winget install DenoLand.Deno
+# 或官方脚本（PowerShell）
+irm https://deno.land/install.ps1 | iex
+```
+
+验证：`deno --version` 能打印版本号即可。
+
+#### 第 1 步：启动
+
+```powershell
+cd D:\Projects\ai-proxy
+deno run -A main.ts
+```
+
+看到 `Listening on http://0.0.0.0:8000/` 就是起来了（**别关这个窗口**，它是前台进程）。
+
+> 改端口用环境变量：`$env:PORT=9000; deno run -A main.ts`。
+> 注意宿主插件的「端口」设置页字段与这个 `PORT` 是**同一件事**——插件就是用 `PORT` 把设置页里那个数字传给子进程的。
+
+#### 第 2 步：确认它活着（**别跳过这步**）
+
+另开一个窗口：
+
+```powershell
+# 列出可用渠道
+curl.exe -s http://127.0.0.1:8000/
+# 看模型清单（这就是客户端真正会读到的东西）
+curl.exe -s http://127.0.0.1:8000/v1/models | Select-Object -First 1
+```
+
+`/` 返回一个 `providers` 数组。**它列出的是「代码里注册了哪些渠道」，不是「哪些渠道现在能用」**——没配 key 的渠道也会在这里出现。要区分这两者看下一步。
+
+#### 第 3 步：看谁真的能用
+
+```powershell
+curl.exe -s http://127.0.0.1:8000/health
+```
+
+重点看三个字段：
+
+| 字段 | 回答什么问题 |
+|---|---|
+| `providers` | 每个渠道**上一次探测**的结果（`available` / `degraded` / `unavailable` / `unknown`） |
+| `catalogIssues` | 哪些渠道**没进模型列表**，以及原因 |
+| `credentials` | 每个渠道**有没有凭据**——没 key 和挂了是两回事 |
+
+**`unknown` 是正常的**（= 还没探测过），不等于坏。别把它当成故障。
+
+**`catalogIssues` 里混着两种性质不同的原因，要分开看**：
+
+```json
+{
+  "openrouter": { "reason": "openrouter needs an API key; set it in the ai-proxy panel" },
+  "zlkpro":     { "reason": "zlkpro needs an API key; set it in the ai-proxy panel" }
+}
+```
+
+- **`needs an API key` / `needs a login`** = **你没配**，是预期状态。对应 `credentials` 里的 `configured: false`。**不是故障**，配了就消失。
+- **其它 reason**（HTTP 4xx/5xx、`fetch failed`、`listedModels` 有数但 `keptModels` 是 0 等）= **真的有问题**。最后一种最隐蔽：上游答得好好的，但模型全被过滤器扔了（比如免费档下架），表现为「渠道静默变空」。
+
+#### 第 4 步：发第一条请求
+
+**先挑一个现在存在的模型 id**（模型清单每周都在变，README 里写死的 id 一定会过期）：
+
+```powershell
+# 挑一个 free 模型，把它记下来
+$model = ((curl.exe -s http://127.0.0.1:8000/v1/models | ConvertFrom-Json).data |
+  Where-Object { $_.id -match ':free$' } | Select-Object -First 1).id
+"用这个模型: $model"
+```
+
+然后发请求（把 `$model` 填进去）：
+
+```powershell
+$body = @{ model = $model; messages = @(@{ role = 'user'; content = '说一个字：好' }); stream = $false } |
+  ConvertTo-Json -Depth 5 -Compress
+curl.exe -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d $body
+```
+
+看到 `"choices":[...]` 就是通了。**模型 id 必须带渠道前缀**（`渠道/模型`）——`/v1` 是聚合入口，靠第一段前缀决定发给谁。不带前缀的裸 id 会按固定顺序猜渠道（见[路由表](#路由表)），容易猜错，**建议永远带前缀**。
+
+> 遇到 `model_not_found` 就是那个 id 过期了（免费档下架很常见），**换 `/v1/models` 里现在有的就行**，不是代理坏了。
+> 遇到 `FreeUsageLimitError` / `ZEN_QUOTA` 是**该渠道额度用完了**，换别的渠道（同一条命令，换个前缀）。
+
+#### 第 5 步：接进你的客户端
+
+把 `baseURL` 指到 `http://127.0.0.1:8000/v1` 即可，见[客户端用法](#客户端用法)。
+
+---
+
+> ⚠️ **`API_KEYS` 留空 = 完全不鉴权。** 默认就是这样，本机自用没问题；一旦经隧道暴露到公网，**任何人拿到地址就能白嫖你的额度和凭据**。对外暴露前务必先设 `API_KEYS`。
+
+---
+
 ### 方式 A：本地 Deno 直跑
 
 ```bash
 deno run -A main.ts        # 监听 http://localhost:8000（PORT 环境变量可改端口）
 ```
 
+最省事，适合本机自用。**不带任何上游凭据也能跑**：kilo / zlkpro 这类渠道不配 key 就能出模型。要接需要登录的渠道（deepseek-web / workbuddy / trae / cnb）见各自的章节。
+
+用 DSH 的话装插件即可（见[插件章节](#可选-dsh-provider-桥接插件)），插件会自动帮你起停这个进程、并在设置页里管各渠道的 key。
+
 ### 方式 B：Deno Deploy
 
 ```bash
 deno deploy                # 配置见 deno.jsonc（org: hitmargin, app: ai-api）
 ```
+
+⚠️ **`deno.jsonc` 里的 `org` / `app` 是原作者的**。你要部署到自己的账号，必须先把这两项改成你自己的，否则会推到别人的应用上。
 
 ### 方式 C：Cloudflare Workers + 隧道（规避边缘 CPU 配额）
 
@@ -150,11 +258,20 @@ pwsh .\restart.ps1
 `restart.ps1` 会依次：杀掉旧的 `deno main.ts` 与 `cloudflared` 进程 → 后台启动本地 8000 端口 → 启动 cloudflared 隧道 →
 从日志里正则抓出 `https://xxx.trycloudflare.com` → 用 `wrangler secret put BACKEND_URL` 写回 Worker。
 
-> 脚本会自动探测本机 Clash 的 `127.0.0.1:7897` 并设置 `HTTPS_PROXY`（wrangler 访问 npm/API 需要）。
+**前置条件**（缺一个都会失败，且报错不一定指向真正的原因）：
+
+| 需要什么 | 怎么准备 |
+|---|---|
+| `cloudflared` | `winget install Cloudflare.cloudflared`，装完确认 `cloudflared --version` 能跑 |
+| `wrangler` 登录态 | `npx wrangler login`——脚本用 `deno run npm:wrangler` 调它，**它自己认账号，本项目不存 Cloudflare 凭据** |
+| Worker 已存在 | 脚本只写 secret，**不创建 Worker**。先在 Cloudflare 建好或用 `wrangler deploy` 部署 `worker.ts` |
+| 能出网 | 脚本会自动探测本机 Clash 的 `127.0.0.1:7897` 并设 `HTTPS_PROXY`（wrangler 拉 npm 和调 API 都需要） |
+
 > 停止全部：`Get-Process deno,cloudflared | Stop-Process`
 > 服务日志：`%TEMP%\ai-proxy.log`（stderr，`[cnb-gate]` 诊断流水在这里）与 `%TEMP%\ai-proxy-out.log`（stdout）。
+> 隧道日志：`%TEMP%\cloudflared-tunnel.log`（URL 就在这里，脚本是从它里面正则抓的）。
 
-> 💡 **装了 DSH 插件的话，同一件事可以在设置页点按钮完成**：切到 `ai-proxy` 设置分区，「Cloudflared 隧道」区点**开启隧道**，地址会直接显示出来（含复制按钮），填了 Worker 名字就自动回写。见下方[「cloudflared 隧道」](#cloudflared-隧道面板里一键开关)。**两条路径选一条，不要同时跑。**
+> 💡 **装了 DSH 插件的话，同一件事可以在设置页点按钮完成**：切到 `ai-proxy` 设置分区，「Cloudflared 隧道」区点**开启隧道**，地址会直接显示出来（含复制按钮），填了 Worker 名字就自动回写。见[「cloudflared 隧道」](#cloudflared-隧道面板里一键开关)。**两条路径选一条，不要同时跑**——它们互不感知，谁后跑谁的 `BACKEND_URL` 生效。
 
 ### 方式 D：纯本地模式（不碰隧道与 Worker）
 
@@ -164,19 +281,33 @@ pwsh .\restart.ps1 -Local
 
 只做三件事：杀掉旧的 `deno main.ts` → 启动新服务（8000）→ 健康检查。**完全不触碰** cloudflared（不杀也不建）、
 Cloudflare Worker（不跑 wrangler、不动 `BACKEND_URL`）、网络代理（连 Clash 探测都跳过）——全程唯一的网络流量是对
-`127.0.0.1:8000` 的健康检查。客户端直连 `http://localhost:8000/cnb/v1`。
+`127.0.0.1:8000` 的健康检查。客户端直连 `http://localhost:8000/v1`。
 
 本地与完整模式共用同一个 8000 端口，可随时互相补位：本地模式跑着时再执行一次完整模式，隧道会接到重启后的新服务上；
 反之，完整模式的隧道在跑时执行 `-Local` 只重启本地服务，远端链路自动恢复。
 
+### 重启之后要做什么
+
+| 你改了什么 | 要做什么 |
+|---|---|
+| `main.ts` / `src/**` | **重启 Deno 服务**（面板的「重启」按钮**不一定真的重启**，见[已知限制](#已知限制)；拿不准就手动 `Stop-Process` 再起） |
+| `dsh-plugin/index.js` 的模块级函数（`listModels` / `normalizeModel` / `publishedEfforts`） | **重启 DSH Host**——热重载只换 `stream` / `resolveModel` |
+| `dsh-plugin/client.js`（面板 UI） | 刷新页面即可 |
+| 面板里的设置 | 点**保存**才落盘（输入框里改的只是草稿） |
+| `custom-providers.json` | **不用重启**，按 mtime 热加载 |
+| `cnb-login.txt` | **不用重启**，按 mtime 热加载 |
+
 ### 开发检查
 
 ```powershell
-deno task check
-deno task test
+deno task check     # deno check main.ts worker.ts
+deno task test      # deno test --allow-env src/
+node dsh-plugin/self-test.mjs   # 插件的自检（不联网、不碰真实配置）
 ```
 
 `deno task test` 使用 `--allow-env`，因为测试导入的运行时会读取 `API_KEYS` 等环境变量；不会读取或打印凭据文件。
+
+> `self-test.mjs` 会把 `DSH_HOME` 指向临时目录，所以它**不会**动你真实的 `settings.json`。这是刻意的——早期版本直接读写用户真实配置，结果套件的结果取决于「你上次在面板里存了什么」。
 
 ---
 
@@ -184,6 +315,7 @@ deno task test
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
+| `PORT` | 否 | 本地监听端口，默认 `8000`。**只影响本地 Deno 运行**；DSH 插件用它把设置页的「端口」传给子进程 |
 | `API_KEYS` | 否 | 访问本代理的白名单，逗号分隔。**留空 = 完全开放**，任何人都能用 |
 | `MAX_REQUEST_BODY_BYTES` | 否 | 通用 `/v1` 与反向代理请求体上限，默认 `12582912`（12 MiB） |
 | `BACKEND_URL` | 否 | 有值即进入**反向代理模式**，全部请求原样转发到该地址（如隧道 URL） |
@@ -540,29 +672,114 @@ deepseek-web / workbuddy / trae / openrouter / zlkpro 这几个成员加入聚�
 
 ## 客户端用法
 
-任何 OpenAI 兼容客户端都可以直接指过来：
+任何 OpenAI 兼容客户端都可以直接指过来。**两个要点**：
+
+1. **`baseURL` 用聚合入口 `/v1`**，不要用某个渠道的前缀（`/cnb/v1` 之类）——用渠道前缀会把所有请求都发给那一个渠道。
+2. **模型 id 带渠道前缀**（`kilo/xxx`、`zen/xxx`、`custom/step/xxx`），或者先 `GET /v1/models` 看有哪些。
+
+### 先看有什么模型
+
+```powershell
+curl.exe -s http://127.0.0.1:8000/v1/models > models.json
+# 只看 id
+(Get-Content models.json -Raw | ConvertFrom-Json).data.id
+```
+
+### curl
 
 ```bash
-curl https://<your-host>/cnb/v1/chat/completions \
+curl https://<your-host>/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <API_KEYS 中的一个>" \
   -d '{
-    "model": "deepseek-v4-pro",
+    "model": "<渠道>/<模型>",
     "messages": [{"role": "user", "content": "你好"}],
     "stream": true
   }'
 ```
 
+> `<渠道>/<模型>` 从 `GET /v1/models` 里抄，例如 `kilo/stepfun/step-3.7-flash:free`。**别照抄文档里的 id**——免费档每周都在下架。
+> `API_KEYS` 没设的话 **`Authorization` 头可以完全不发**。
+
+### Python（openai SDK）
+
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="https://<your-host>/cnb/v1", api_key="<API_KEYS 中的一个>")
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="<API_KEYS 中的一个，没设就随便填>")
+
+# 先看现在有哪些模型，别写死 id
+models = [m.id for m in client.models.list()]
+free = [m for m in models if m.endswith(":free")]
+print(free[:5])
+model = free[0]
+
 resp = client.chat.completions.create(
-    model="deepseek-v4-flash",
+    model=model,
     messages=[{"role": "user", "content": "你好"}],
 )
 print(resp.choices[0].message.content)
+
+# 流式
+for chunk in client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "数到五"}],
+    stream=True,
+):
+    print(chunk.choices[0].delta.content or "", end="")
 ```
+
+### 思考档位（reasoning effort）
+
+**只在模型自己发布了档位时才可调**，而且**档位字段的形状各渠道不同**——代理是**原样透传上游字段**的，归一化发生在 DSH 插件里。所以看原始 `/v1/models` 时会看到至少三种形状：
+
+| 形状 | 谁发的 | 例子 |
+|---|---|---|
+| `reasoning: { efforts: [{id,name}], defaultEffort }` | trae、workbuddy | 已经是归一化后的 |
+| `reasoning_efforts: ["off","high","max"]` | deepseek-web、commandcode、zen | 裸字符串数组 |
+| `reasoning_effort_support_list: ["low","high","medium"]` | **自定义供应商**（上游原生字段，如 StepFun） | 私有拼法 |
+
+**同一个模型在「面板/选择器」和「原始 /v1/models」里可能长得不一样**——前者经过插件归一化（认得出 `reasoning_effort_support_list` 这类旁名），后者是上游原样。**判断某个模型能不能调档位，以面板/选择器的 Effort 控件为准**，那才是你实际会用的那条路。
+
+传的时候用**档位 id**（不是显示名）：
+
+```python
+resp = client.chat.completions.create(
+    model="custom/step/step-3.7-flash",       # 该上游发布 low/high/medium
+    messages=[{"role": "user", "content": "你好"}],
+    extra_body={"reasoning_effort": "high"},
+)
+```
+
+> ⚠️ 三条约束：
+> 1. **档位不在发布列表里会被上游拒或静默忽略**，别照抄别的模型的档位；
+> 2. **没发布档位的模型不要传这个字段**（本项目不会替你编一张表——给没有档位的模型造控件是死控件）；
+> 3. **有的上游不校验**（实测 StepFun 对不认识的 `off`/`none` 也回 200），所以「发过去没报错」**不等于**这个档位有效。
+
+### 图片输入
+
+模型必须支持视觉（`input_modalities` 含 `image`），否则**整个回合 400**（不是丢一张图）：
+
+```python
+resp = client.chat.completions.create(
+    model="custom/step/step-3.7-flash",
+    messages=[{"role": "user", "content": [
+        {"type": "text", "text": "这张图里是什么？"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,<...>"}},
+    ]}],
+)
+```
+
+### 常见错误对照
+
+| 现象 | 原因 |
+|---|---|
+| `unknown custom provider` | 用了 `/custom/v1` 却带了 `custom/` 前缀。**渠道自己的口要裸 id**（`step/xxx`），聚合口才要带前缀（`custom/step/xxx`） |
+| `401` | `API_KEYS` 设了但客户端没带对 key |
+| 模型不见了 | 看 `/health` 的 `catalogIssues`——先分清是「没配 key」（正常）还是「拉取失败」（故障） |
+| 选中就 400 | 模型不支持你传的 `reasoning_effort`，或窗口超了（见[已知限制](#已知限制)） |
+| 回答到一半停住 | 上游流被掐断。现在会报 `stream_cut` 而不是假装正常结束 |
+| 面板里改了设置但没生效 | **没点保存**（输入框里改的只是草稿）；或该字段需要**重启 DSH Host**（见[重启之后要做什么](#重启之后要做什么)） |
 
 ---
 
