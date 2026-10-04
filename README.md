@@ -8,8 +8,22 @@
 2. **网页端私有接口**：chat.deepseek.com（PoW + Cookie 会话）、api.trae.cn（协议翻译 + 签到）、cnb.cool（会话自举 + 提示词协议模拟），分别包装成标准 Chat Completions / Responses
 3. **私有 CLI 网关**：CommandCode Go（移植 `dsh-cmdgo-provider` 的模型筛选、网关协议、多账号池与额度读取）与 WorkBuddy 中国版（文件凭据 + 自动续期 + 流内内容拦截）
 4. **Anthropic Messages**：`/commandcode/v1/messages` 做 OpenAI ⇄ Messages 双向转换（原先的 `/anthropic/v1` 与 `/gemini/v1` 已下线，见下方说明）
+5. **任意自填的 OpenAI 兼容上游**：面板里填名字 + 地址 + key 即可，**不用改代码、不用重启**
 
 > 同一份 `main.ts` 可以跑在 **Deno Deploy**、**本地 Deno**、**Cloudflare Workers** 三种环境。
+
+---
+
+## 它解决什么问题
+
+免费/低价模型额度散落在十几个上游，每家都要单独注册、单独填 key、单独适配协议，而且**接口形状各不相同**：
+
+- 有的只发 `reasoning_content`，有的发 `reasoning`，有的发 `thinking`——**读错一个字段，思考内容就整个消失**（不报错，只是没了）；
+- 有的把推理档位发布成裸字符串 `["low","high"]`，有的发布成对象 `[{id,name}]`，有的藏在 `opencode.variants` 里，有的干脆用私有布尔 `enable_reason`；
+- 有的窗口上限叫 `context_window`，有的叫 `max_input_tokens`——**读错就是上游 400**；
+- 网页端接口需要逆向 CSRF 握手、PoW 求解、SSE 标记过滤，而且**流被掐断和正常结束长得一模一样**。
+
+本项目把这些差异全部收在一个 `/v1` 聚合入口后面：**一个地址、一个 key、一套 OpenAI 协议**。同时把那些「静默失败」变成**可见的失败**——渠道消失会记日志、流被截断会报错、字段读不到会显示「未知」而不是 0。
 
 ---
 
@@ -31,7 +45,7 @@
 Cloudflare Worker  https://<worker>.workers.dev          ← worker.ts
       │  ENV.BACKEND_URL 有值 → 纯字节转发（流式；仅幂等请求最多重试一次，非幂等 POST 不自动重放）
       ▼
-cloudflared 快速隧道  https://xxx.trycloudflare.com      ← restart.ps1
+cloudflared 快速隧道  https://xxx.trycloudflare.com      ← restart.ps1 或面板开关
       ▼
 本机 Deno 服务  http://localhost:8000                    ← main.ts 的 Deno.serve
 ```
@@ -45,6 +59,17 @@ cloudflared 快速隧道  https://xxx.trycloudflare.com      ← restart.ps1
 if (ENV.BACKEND_URL) return await proxyToBackend(request);  // 反向代理模式
 // 否则：本地解析 + 适配 + 调用上游
 ```
+
+**隧道有两条等效的启动路径**，二选一即可：
+
+| 路径 | 怎么用 | 适合 |
+|---|---|---|
+| `restart.ps1`（完整模式） | 命令行一次跑完：起服务 → 起隧道 → 写 Worker | 纯命令行部署 |
+| **DSH 面板开关** | 设置页点「开启隧道」，地址直接显示并可复制 | 已经装了 DSH 插件 |
+
+两者做的事相同（都起 cloudflared 并回写 Worker 的 `BACKEND_URL`）。⚠️ **不要在隧道已经跑着的时候再执行不带 `-Local` 的 `restart.ps1`**：它会另起一个 cloudflared，并把 `BACKEND_URL` 改成新域名，而面板上显示的仍是旧域名——两个入口各自为政，谁后跑谁生效。
+
+---
 
 ## 源码结构
 
@@ -66,9 +91,11 @@ src/zen.ts                 Zen 请求头补齐、Responses/Messages 转换、错
 src/zen-catalog.ts         Zen 模型能力元数据（来自 models.dev）
 src/zen-compaction.ts      Zen 会话压缩
 src/zen-egress.ts          Zen 出口代理轮换
+src/custom.ts              自定义供应商：来源合并、校验、出站头、路由解析
+src/custom-handler.ts      /custom/v1 的列表聚合与推理转发
 src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度、Messages 转换与路由
 src/runtime/               响应体形状嗅探、流回放、abort/截断分类、目录健康登记
-dsh-plugin/               可选 DSH Host Provider 桥接插件（按渠道分组注册）
+dsh-plugin/               可选 DSH Host Provider 桥接插件（按渠道分组注册 + 设置面板 + 隧道开关）
 third_party/              移植来源的代码与许可说明（CommandCode Go provider）
 deepseek-sha3.wasm         DeepSeek PoW 原生求解器
 ```
@@ -127,6 +154,8 @@ pwsh .\restart.ps1
 > 停止全部：`Get-Process deno,cloudflared | Stop-Process`
 > 服务日志：`%TEMP%\ai-proxy.log`（stderr，`[cnb-gate]` 诊断流水在这里）与 `%TEMP%\ai-proxy-out.log`（stdout）。
 
+> 💡 **装了 DSH 插件的话，同一件事可以在设置页点按钮完成**：切到 `ai-proxy` 设置分区，「Cloudflared 隧道」区点**开启隧道**，地址会直接显示出来（含复制按钮），填了 Worker 名字就自动回写。见下方[「cloudflared 隧道」](#cloudflared-隧道面板里一键开关)。**两条路径选一条，不要同时跑。**
+
 ### 方式 D：纯本地模式（不碰隧道与 Worker）
 
 ```powershell
@@ -162,6 +191,8 @@ deno task test
 | `OPENROUTER_API_KEY` | 否 | `/openrouter/v1` 使用；未配置时该渠道不进模型列表 |
 | `TOKENHARBOR_API_KEY` | 否 | `/tokenharbor/v1` 使用；未配置时该渠道不进模型列表 |
 | `ZLKPRO_API_KEY` | 否 | `/zlkpro/v1` 使用；未配置时该渠道不进模型列表 |
+| `AI_PROXY_CUSTOM_PROVIDERS` | 否 | 自定义供应商表（JSON 数组）。**含明文 apiKey**，由 DSH 插件注入，也可自己设 |
+| `AI_PROXY_CUSTOM_FILE` | 否 | 自定义供应商配置文件的改道路径，默认工作目录下的 `custom-providers.json` |
 | `COMMANDCODE_ADMIN_KEY` | 否 | CommandCode 管理接口独立密钥；设置后需通过 `X-CommandCode-Admin-Key` 发送 |
 | `COMMANDCODE_API_KEY` | 否 | CommandCode Go 账号 key；账号池为空时作为单账号兜底 |
 | `COMMANDCODE_BASE_URL` | 否 | CommandCode 网关地址，默认 `https://api.commandcode.ai`；非 loopback 必须 HTTPS |
@@ -327,6 +358,43 @@ Zen 的 `GET /models` 只返回 `{ id, object, created, owned_by }`，没有上�
 
 在此之前，代理对全部 11 个模型使用同一个 `{ context: 1,000,000, output: 64,000 }` 兜底值，而压缩正是在拿这个数字做分母。真实输出上限从 32,000 到 524,288 不等，旧值对目录覆盖的 10 个模型**全都错**：mimo 高估 2 倍，`space-bunny-free` 低估 8.2 倍。
 
+### 自定义供应商：面板里加任意 OpenAI 兼容上游
+
+不想改代码就接一家新的免费上游时，在 DSH 面板的设置页填 **名字 + 地址 + key** 即可，**存下来就生效，不用重启**。
+
+模型在选择器里以 `自定义供应商/<你的名字>/<上游模型 id>` 出现，例如 `custom/step/step-3.7-flash`。
+
+**两个配置入口**（同一个能力，两条部署路径都要能用）：
+
+| 入口 | 谁写它 | 适用 |
+|---|---|---|
+| DSH 面板 | 插件写进 `settings.json`，再经 `AI_PROXY_CUSTOM_PROVIDERS` 注入进程环境 | 装了插件 |
+| 工作目录下的 `custom-providers.json` | 你手写 | 直接 `deno run -A main.ts`、隧道部署、自建客户端 |
+
+同名冲突时**环境赢**，被盖掉的那条会记进 `shadowed` 并打日志——静默让其中一条失效会让人以为文件写错了。文件读到但解析不出东西时 `fileError` **单独上报**：「没配」和「配坏了」是两种状态，混为一谈会让写错格式的人看到「去配一个」（而他明明配了）。可提交的样例见 [`custom-providers.example.json`](custom-providers.example.json)；真实文件已 gitignore（含明文 key）。
+
+**为什么所有自定义上游共用一个 `custom` 前缀**，而不是一家一个：代理的 provider 前缀表（`main.ts` 的 `channelPrefixes`、`V1_AGGREGATE_MEMBERS`、`src/core.ts`）是**进程启动时定格的**，插件的 `CHANNEL_GROUPS` 更只在 `apply()` 时注册。一家一个前缀就等于「每加一个供应商重启一次 DSH Host」，与「面板填一下就生效」直接冲突。代价是所有自定义供应商共享一个选择器分组——换来零重启。
+
+名字取路由的**第一段**，所以上游模型 id 可以自带斜杠（`deepseek-ai/deepseek-v4.1-flash`、`z-ai/glm-5.3`）；按最后一段切会在一半模型上切错。
+
+**凭据纪律**：key 只在代理进程里，面板只回 `keySet` 布尔值，**从不回传明文**（回传到会渲染的页面等于会进截图）。面板保存时只提交**这一轮重新输入的** key，服务端做**合并**而不是替换——否则给第二家填 key 会把第一家那把删掉。
+
+### cloudflared 隧道：面板里一键开关
+
+设置页可以直接**开启 / 关闭隧道**，起来的公网地址（带 `/v1` 的聚合地址）显示在按钮下方并可一键复制。填了 **Worker 名字**，就会自动把 `BACKEND_URL` 写过去，省掉手工跑 wrangler。
+
+- **启动**：`POST /api/ai-proxy/tunnel/start`
+- **关闭**：`POST /api/ai-proxy/tunnel/stop`
+- **只重写 Worker 地址**：`POST /api/ai-proxy/tunnel/sync-worker`（隧道可能好着而 `BACKEND_URL` 是旧的，为了修后者去重起 cloudflared 会白白换掉域名）
+
+三点实现说明：
+
+- **等地址真的能路由才报成功**。cloudflared 一注册就打印 URL，但**早于边缘开始服务**——实测新域名第一次请求 `ECONNRESET`、几秒后正常。在打印处就报 `running` 会把一个 502 的地址交给用户，还紧接着拿它去写 Worker。
+- **写 Worker 前先验证目标存在**。`wrangler secret put --name <打错的>` **不报错、退出码 0、还会在账号里创建一个新 Worker**——你真正的 Worker 仍指着旧地址，而面板显示成功。所以先 `wrangler secret list --name` 验存在，不存在就拒绝写入并说明原因。**凭据回写失败绝不抛异常**：隧道本身是好的，不能因为 wrangler 的问题把它一起打死，所以 `ok` / `error` / `skipped` 单独显示。
+- **不持有 Cloudflare 凭据**。面板不存 API token，只是 spawn `wrangler`，由它用自己的登录态（`wrangler login` 留下的 `~/.config/.wrangler`）认账号。这样 key 不会进 `settings.json`，也就不会进截图。
+
+> ⚠️ 快速隧道的地址**每次重启都会变**。要固定地址需要 Cloudflare 账号 + named tunnel，本项目未实现。
+
 ### 可选 DSH Provider 桥接插件
 
 `dsh-plugin/` 现在是整个项目的 DSH 安装桥接：启用后可自动启动/监控原始项目目录中的 Deno 服务，也可以切换为连接已经运行的本地或远程代理。它动态发现 `/v1` 聚合模型并按模型前缀把请求路由回原始代理；浏览器侧是一个现代设置面板：每秒走动的运行时长、10 秒刷新的全渠道快照、可搜索的模型表、渠道统计、账号池状态、启停和日志；账号池、额度、协议转换仍由原始 `ai-proxy` 代码负责。安装和自检说明见 [`dsh-plugin/README.md`](dsh-plugin/README.md)。
@@ -452,6 +520,7 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 | `/openrouter/v1/responses` | openrouter.ai | 透传 Responses API |
 | `/tokenharbor/v1` | tokenharbor.ai | 透传，仅保留 `:free` 模型 |
 | `/zlkpro/v1` | zlkpro.tech | 透传（标准 OpenAI 契约：流式、工具调用、带斜杠的模型 id 均原样可用） |
+| `/custom/v1` | **用户自填的任意 OpenAI 兼容上游** | 按 `自定义供应商/<名字>/<模型>` 路由；凭据按供应商各自配置，只发我们自己的 key，**不转发入站 authorization** |
 | `/cnb/v1` | cnb.cool | **自定义处理器**（见下节） |
 | `/health` | 本地代理 | 返回最近一次模型健康探测汇总；不会在请求时自动发起探测 |
 
@@ -586,13 +655,15 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 | `src/zen-catalog.ts` | Zen 模型能力元数据（来自 models.dev），Zen 网关自己不返回 |
 | `src/zen-compaction.ts` | Zen 会话压缩 |
 | `src/zen-egress.ts` | Zen 出口代理轮换（匿名额度按地址计费） |
+| `src/custom.ts` | 自定义供应商：两名来源合并（环境 + 文件）、名字/地址校验、出站头、路由解析 |
+| `src/custom-handler.ts` | `/custom/v1` 的列表聚合与推理转发（`custom/<vendors>/<model>`） |
+| `custom-providers.example.json` | 自定义供应商配置文件的可提交样例（真实文件已 gitignore） |
 | `third_party/dsh-deepseek-web-login/` | Apache-2.0 工具协议派生代码及许可证 |
 | `third_party/dsh-cmdgo-provider/` | dsh-cmdgo-provider 的 MIT 许可证与移植说明 |
 | `worker.ts` | Cloudflare Workers 入口 shim（把 `vars`/secrets 注入 `main.ts` 的模块级 `ENV`） |
 | `wrangler.jsonc` | Worker 配置（`name: ai-api`，`main: worker.ts`） |
 | `deno.jsonc` | Deno Deploy 配置（`org: hitmargin`，`app: ai-api`） |
-| `restart.ps1` | 一键：本地服务 + 隧道 + 更新 Worker 的 `BACKEND_URL` 密钥；`-Local` 只启动本地服务，不碰隧道/Worker/代理 |
-| `deno.lock` | 依赖锁定 |
+| `restart.ps1` | 一键：本地服务 + 隧道 + 更新 Worker 的 `BACKEND_URL` 密钥；`-Local` 只启动本地服务，不碰隧道/Worker/代理 || `deno.lock` | 依赖锁定 |
 
 本地开发还会出现（已在 `.gitignore` 中排除）：`cookies.txt`（抓包得到的 cookie）、`commandcode-accounts.json`（CommandCode OAuth 多账号 key）、`trae-auth.json` 与 `workbuddy-auth.json`（登录脚本抓取的令牌）、`.wrangler/`（Cloudflare 账号缓存）、
 `cloudflared.exe`、`page.html`（页面快照）、`main.ts.bak-*`（历史备份）。
@@ -607,7 +678,10 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 - 模型选择器里的**按渠道分组依赖重启 DSH Host** 才生效：插件的渠道分组是模块级代码，热重载只换 `stream` / `resolveModel`。不重启的话模型仍然是全挤在 `ai-proxy` 一个 provider 下（功能可用，只是没分组）。
 - CommandCode Go 同样依赖 `/alpha/*` 私有 CLI 网关，模型档位、指纹要求或 OAuth 回调发生变化时需要更新；
 - 免费上游的模型清单随时变化，且常见限流（429）与容量窗口（5xx）；
-- `trycloudflare` 快速隧道的 URL 每次重启都会变（由 `restart.ps1` 自动回写 `BACKEND_URL`），且可能有连接抖动；`proxyToBackend` 仅对幂等请求最多重试一次，非幂等 POST 不自动重放以避免重复计费；
+- `trycloudflare` 快速隧道的 URL 每次重启都会变（由 `restart.ps1` 或面板开关自动回写 `BACKEND_URL`），且可能有连接抖动；`proxyToBackend` 仅对幂等请求最多重试一次，非幂等 POST 不自动重放以避免重复计费；
+- **隧道有两条启动路径（`restart.ps1` 与面板开关），互不感知**。隧道已在运行时再执行不带 `-Local` 的 `restart.ps1`，会另起一个 cloudflared 并覆盖 `BACKEND_URL`，而面板显示的可能仍是旧域名。二选一即可；
+- **自定义供应商的推理档位依赖上游如实发布**。有的上游（如 StepFun）对不认识的 `reasoning_effort` **不报错而是照收**，所以阶梯无法靠探测推断，只能信它发布的字段；没发布就不给档位（不编造）；
+- 自定义供应商的**非对话模型**（TTS、ASR、文生图）同样会出现在模型列表里，选中后调用会失败——上游没有可用的类别字段能可靠区分；
 - 内存缓存（模型列表 5 分钟、CSRF 25 分钟）在边缘多实例下不共享。
 
 ---
