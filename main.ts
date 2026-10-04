@@ -66,8 +66,16 @@ import {
 // The credential sits next to the project sources, like the deepseek login state.
 // Resolved per request rather than once at import so a restart is not needed after
 // the capture script writes it.
-const TRAE_ROOT = new URL(".", import.meta.url).pathname.replace(/\/+$/, "")
-  .replace(/^\/(?:[A-Za-z]:)/, (m) => m.slice(1));
+// CF Workers 没有 import.meta.url（无本地文件概念）：模块全局求值必须容错，
+// 否则 new URL 抛 Invalid URL，整个 Worker 版本校验就会失败。
+const TRAE_ROOT = (() => {
+  try {
+    return new URL(".", import.meta.url).pathname.replace(/\/+$/, "")
+      .replace(/^\/(?:[A-Za-z]:)/, (m) => m.slice(1));
+  } catch {
+    return "";
+  }
+})();
 // Same resolution as TRAE_ROOT, same reason: the login script writes the
 // credential next to the sources, so picking it up must not require a restart.
 const WORKBUDDY_ROOT = TRAE_ROOT;

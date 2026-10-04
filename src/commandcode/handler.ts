@@ -57,7 +57,12 @@ const DEFAULT_MAX_PAUSE_TURNS = 2;
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_MAX_TOKENS = 64_000;
 const DEFAULT_CONTEXT_WINDOW = 1_000_000;
-const MODULE_SESSION_SALT = crypto.randomUUID().replace(/-/g, "");
+// CF Workers 的全局作用域禁止 crypto.randomUUID()（生成随机值），所以延迟到
+// 首次使用时求值；记忆化保证模块生命周期内取值稳定。
+let moduleSessionSalt: string | undefined;
+function moduleSessionSaltValue(): string {
+  return (moduleSessionSalt ??= crypto.randomUUID().replace(/-/g, ""));
+}
 const JSON_HEADERS = {
   "Content-Type": "application/json",
   "Access-Control-Allow-Origin": "*",
@@ -533,7 +538,7 @@ function sessionSeed(
     request.headers.get("x-api-key") ??
     request.headers.get("x-commandcode-client-scope");
   if (!explicit || explicit.length > 512 || !clientScope) return undefined;
-  const salt = ENV.COMMANDCODE_SESSION_SALT || MODULE_SESSION_SALT;
+  const salt = ENV.COMMANDCODE_SESSION_SALT || moduleSessionSaltValue();
   return JSON.stringify({ salt, clientScope, explicit });
 }
 
