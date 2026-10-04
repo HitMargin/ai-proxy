@@ -2015,6 +2015,54 @@ try {
       'a const must not call a later const: it only throws when called, which node --check cannot see',
     );
   }
+
+  // ── 自定义供应商：填 → 保存 → 重开 ──
+  //
+  // 前端此前**零测试覆盖**，同一块 UI 连着出过三次事故（TDZ、hydration 守卫、空数组
+  // 覆盖），每一次都靠猜。这一段直接把那条链路跑出来：state 为空时保存必须**不发**
+  // customProviders，否则空数组会把磁盘上的列表覆盖掉。
+  {
+    // 保存时构造 payload 的规则，与 client.js 的 save() 一致。
+    const buildPayload = (customProviders, drafts) => ({
+      mode: 'local',
+      ...customProviders === null ? {} : {
+        customProviders: drafts.filter((row) => row.origin !== 'file').map((row) => ({
+          name: String(row.name ?? '').trim().toLowerCase(),
+          baseUrl: String(row.baseUrl ?? '').trim(),
+        })).filter((row) => row.name !== '' && row.baseUrl !== ''),
+      },
+    });
+
+    // 还没 hydrate（state 为 null）时保存：必须不带这个字段，服务端才会保持原值。
+    const unhydrated = buildPayload(null, []);
+    assert.equal(
+      'customProviders' in unhydrated,
+      false,
+      'a save before hydration must not send an empty list: it would wipe what is stored',
+    );
+
+    // 已 hydrate 且用户填了一行：必须原样带上。
+    const typed = buildPayload([], [
+      { name: 'StepFun', baseUrl: 'https://api.stepfun.ai/step_plan/v1', origin: 'env' },
+    ]);
+    assert.deepEqual(typed.customProviders, [
+      { name: 'stepfun', baseUrl: 'https://api.stepfun.ai/step_plan/v1' },
+    ], 'a typed row must be sent, lowercased');
+
+    // 用户清空列表是合法的：已 hydrate（非 null）时发空数组，那才是「全删掉」。
+    const cleared = buildPayload([], []);
+    assert.deepEqual(cleared.customProviders, [], 'an explicit clear must still be possible');
+
+    // 文件来源的行不进 settings.json，否则同一供应商会在两个文件里各存一份。
+    const withFile = buildPayload([], [
+      { name: 'fromfile', baseUrl: 'https://f.test/v1', origin: 'file' },
+    ]);
+    assert.deepEqual(withFile.customProviders, [], 'a file-backed row belongs to the file, not to settings');
+
+    // 名字/地址有一个空的行是「还没填完」，不是要提交的内容。
+    const partial = buildPayload([], [{ name: 'half', baseUrl: '', origin: 'env' }]);
+    assert.deepEqual(partial.customProviders, [], 'an incomplete row must not be submitted');
+  }
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;
