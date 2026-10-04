@@ -1,10 +1,15 @@
-import { assertEquals, assert } from "jsr:@std/assert@1";
+import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
+  CUSTOM_FILE_EXAMPLE,
+  CUSTOM_FILE_NAME,
   CUSTOM_PREFIX,
   customEndpoint,
+  customFilePath,
+  customFileTextToEnvText,
   customModelId,
   customUpstreamHeaders,
   describeCustomProviders,
+  mergeCustomSources,
   parseCustomProviders,
   resolveCustomTarget,
   validateBaseUrl,
@@ -12,9 +17,132 @@ import {
 } from "./custom.ts";
 
 const VALID = JSON.stringify([
-  { name: "acme", baseUrl: "https://api.acme.test/v1", apiKey: "sk-aaaaaaaaaaaaaaaaaaaa" },
-  { name: "self", baseUrl: "http://127.0.0.1:9000/v1", authHeader: "x-api-key", apiKey: "k" },
+  {
+    name: "acme",
+    baseUrl: "https://api.acme.test/v1",
+    apiKey: "sk-aaaaaaaaaaaaaaaaaaaa",
+  },
+  {
+    name: "self",
+    baseUrl: "http://127.0.0.1:9000/v1",
+    authHeader: "x-api-key",
+    apiKey: "k",
+  },
 ]);
+
+Deno.test("two sources merge, and the environment wins a name collision", () => {
+  // 代理可以脱离插件运行，那时只有文件。反过来 Workers 上没有文件，只有环境。
+  // 两个来源同时存在时必须有确定的优先级——静默让其中一条失效会让人以为文件写错了。
+  const merged = mergeCustomSources({
+    envText: JSON.stringify([
+      { name: "shared", baseUrl: "https://env.test/v1" },
+      { name: "only-env", baseUrl: "https://e.test/v1" },
+    ]),
+    fileText: JSON.stringify([{
+      name: "shared",
+      baseUrl: "https://file.test/v1",
+    }, { name: "only-file", baseUrl: "https://f.test/v1" }]),
+  });
+  assertEquals(merged.parsed.providers.map((p) => p.name).sort(), [
+    "only-env",
+    "only-file",
+    "shared",
+  ]);
+  assertEquals(merged.origin.shared, "env");
+  assertEquals(merged.origin["only-file"], "file");
+  // 被盖掉的那条要说出来，否则用户改文件却看不到任何变化，只能猜。
+  assertEquals(merged.shadowed, ["shared"]);
+  const shared = merged.parsed.providers.find((p) => p.name === "shared")!;
+  assertEquals(shared.baseUrl, "https://env.test/v1");
+});
+
+Deno.test("an absent file is an empty source, not an error", () => {
+  // 大多数部署没有这个文件（插件会把表注入环境）。把它当错误会让每一次
+  // 正常启动都打一行无意义的警告。
+  const merged = mergeCustomSources({ envText: "", fileText: "" });
+  assertEquals(merged.parsed.providers, []);
+  assertEquals(merged.parsed.rejected, []);
+  assertEquals(merged.fileError, null);
+  assertEquals(merged.shadowed, []);
+});
+
+Deno.test("a file that exists but parses to nothing is reported as broken", () => {
+  // 「没配」与「配坏了」是两种状态。混为一谈的话，一个把格式写错的人看到的提示
+  // 是「去配一个」——他已经配了。
+  const merged = mergeCustomSources({
+    envText: "",
+    fileText: JSON.stringify([{
+      name: "Bad Name",
+      baseUrl: "https://a.test/v1",
+    }]),
+  });
+  assertEquals(merged.parsed.providers.length, 0);
+  assert(merged.fileError !== null);
+  assert(merged.fileError!.includes("name"));
+  // 而环境里有一条可用时，文件那份坏掉仍要报——否则它永远是静默失败的。
+  const mixed = mergeCustomSources({
+    envText: JSON.stringify([{ name: "good", baseUrl: "https://g.test/v1" }]),
+    fileText: JSON.stringify([{
+      name: "Bad Name",
+      baseUrl: "https://a.test/v1",
+    }]),
+  });
+  assertEquals(mixed.parsed.providers.length, 1);
+  assert(
+    mixed.fileError !== null,
+    "a broken file must still be reported when env has entries",
+  );
+});
+
+Deno.test("the file accepts both a providers key and a bare array", () => {
+  // 这是人手写的文件，两种写法都很自然；只认一种会让人以为格式错了。
+  const wrapped = JSON.stringify({
+    providers: [{ name: "a", baseUrl: "https://a.test/v1" }],
+  });
+  assertEquals(
+    parseCustomProviders(customFileTextToEnvText(wrapped)).providers.map((p) =>
+      p.name
+    ),
+    ["a"],
+  );
+  const bare = JSON.stringify([{ name: "b", baseUrl: "https://b.test/v1" }]);
+  assertEquals(
+    parseCustomProviders(customFileTextToEnvText(bare)).providers.map((p) =>
+      p.name
+    ),
+    ["b"],
+  );
+  // 坏 JSON 原样交回，让 parseCustomProviders 报「不是合法 JSON」——
+  // 保持单一错误路径，不在两处各说一套。
+  assertEquals(customFileTextToEnvText("{oops"), "{oops");
+  assertEquals(
+    parseCustomProviders(customFileTextToEnvText("{oops")).rejected.length,
+    1,
+  );
+});
+
+Deno.test("the file path is overridable so tests never touch a real one", () => {
+  assertEquals(customFilePath({}), "./" + CUSTOM_FILE_NAME);
+  assertEquals(
+    customFilePath({ AI_PROXY_CUSTOM_FILE: "/tmp/x.json" }),
+    "/tmp/x.json",
+  );
+  // 空串不能变成「路径是空」——那会读到当前目录本身。
+  assertEquals(
+    customFilePath({ AI_PROXY_CUSTOM_FILE: "   " }),
+    "./" + CUSTOM_FILE_NAME,
+  );
+});
+
+Deno.test("the example that ships in the error message is valid input", () => {
+  // 它印在 404 的响应体里，复制粘贴就要能用。写错的话，用户照着抄还是错的。
+  const parsed = parseCustomProviders(
+    customFileTextToEnvText(CUSTOM_FILE_EXAMPLE),
+  );
+  assert(parsed.providers.length > 0, "the shipped example must parse");
+  assertEquals(parsed.rejected, []);
+  assertEquals(parsed.providers[0].name, "stepfun");
+});
 
 Deno.test("the prefix is a single static segment, not one per provider", () => {
   // 这是整个模块的设计前提：前缀静态才不需要重启宿主。改坏它等于回到
@@ -38,8 +166,14 @@ Deno.test("a name is validated as a path segment, not just non-empty", () => {
 
 Deno.test("baseUrl is https, with loopback as the only http exception", () => {
   assertEquals(validateBaseUrl("https://a.test/v1/"), "https://a.test/v1");
-  assertEquals(validateBaseUrl("http://127.0.0.1:9000/v1"), "http://127.0.0.1:9000/v1");
-  assertEquals(validateBaseUrl("http://localhost:9000"), "http://localhost:9000");
+  assertEquals(
+    validateBaseUrl("http://127.0.0.1:9000/v1"),
+    "http://127.0.0.1:9000/v1",
+  );
+  assertEquals(
+    validateBaseUrl("http://localhost:9000"),
+    "http://localhost:9000",
+  );
   // 明文 http 到公网等于把凭据和正文都发在明处。
   assertEquals(validateBaseUrl("http://a.test/v1"), null);
   assertEquals(validateBaseUrl(""), null);
@@ -103,7 +237,10 @@ Deno.test("the name is the first segment, so upstream ids keep their own slashes
   // deepseek-ai/deepseek-v4.1-flash、z-ai/glm-5.3 这类 id 自带斜杠。
   // 按最后一段切会在一半的模型上切错，而上游收到错模型名只回 400。
   const parsed = parseCustomProviders(VALID);
-  const hit = resolveCustomTarget(parsed, "acme/deepseek-ai/deepseek-v4.1-flash");
+  const hit = resolveCustomTarget(
+    parsed,
+    "acme/deepseek-ai/deepseek-v4.1-flash",
+  );
   assert(hit !== null);
   assertEquals(hit.provider.name, "acme");
   assertEquals(hit.upstreamModel, "deepseek-ai/deepseek-v4.1-flash");
@@ -121,13 +258,23 @@ Deno.test("an unknown name resolves to null rather than guessing a provider", ()
 Deno.test("the credential goes in the header the provider named", () => {
   const parsed = parseCustomProviders(VALID);
   const bearer = resolveCustomTarget(parsed, "acme/m")!;
-  const h1 = customUpstreamHeaders(bearer.provider, bearer.upstreamModel, new Headers(), true);
+  const h1 = customUpstreamHeaders(
+    bearer.provider,
+    bearer.upstreamModel,
+    new Headers(),
+    true,
+  );
   assertEquals(h1.get("authorization"), "Bearer sk-aaaaaaaaaaaaaaaaaaaa");
   // 流式请求必须声明它，否则网关可能按非流式回一整个 JSON。
   assertEquals(h1.get("accept"), "text/event-stream");
 
   const keyed = resolveCustomTarget(parsed, "self/m")!;
-  const h2 = customUpstreamHeaders(keyed.provider, keyed.upstreamModel, new Headers(), false);
+  const h2 = customUpstreamHeaders(
+    keyed.provider,
+    keyed.upstreamModel,
+    new Headers(),
+    false,
+  );
   assertEquals(h2.get("x-api-key"), "k");
   // 用了自己的头就不该同时发一个空的 Bearer。
   assertEquals(h2.get("authorization"), null);
@@ -137,8 +284,16 @@ Deno.test("a client's own credential is never forwarded to a custom upstream", (
   // 转发了就等于把本代理的入站凭据送给第三方上游。
   const parsed = parseCustomProviders(VALID);
   const hit = resolveCustomTarget(parsed, "acme/m")!;
-  const incoming = new Headers({ authorization: "Bearer caller-key", "x-api-key": "caller" });
-  const out = customUpstreamHeaders(hit.provider, hit.upstreamModel, incoming, true);
+  const incoming = new Headers({
+    authorization: "Bearer caller-key",
+    "x-api-key": "caller",
+  });
+  const out = customUpstreamHeaders(
+    hit.provider,
+    hit.upstreamModel,
+    incoming,
+    true,
+  );
   assertEquals(out.get("authorization"), "Bearer sk-aaaaaaaaaaaaaaaaaaaa");
   assertEquals(out.get("x-api-key"), null);
 });
@@ -146,7 +301,16 @@ Deno.test("a client's own credential is never forwarded to a custom upstream", (
 Deno.test("endpoint and model id compose without doubling or dropping slashes", () => {
   const parsed = parseCustomProviders(VALID);
   const hit = resolveCustomTarget(parsed, "acme/org/model")!;
-  assertEquals(customEndpoint(hit.provider, "/chat/completions"), "https://api.acme.test/v1/chat/completions");
-  assertEquals(customEndpoint(hit.provider, "/models"), "https://api.acme.test/v1/models");
-  assertEquals(customModelId(hit.provider.name, hit.upstreamModel), "acme/org/model");
+  assertEquals(
+    customEndpoint(hit.provider, "/chat/completions"),
+    "https://api.acme.test/v1/chat/completions",
+  );
+  assertEquals(
+    customEndpoint(hit.provider, "/models"),
+    "https://api.acme.test/v1/models",
+  );
+  assertEquals(
+    customModelId(hit.provider.name, hit.upstreamModel),
+    "acme/org/model",
+  );
 });

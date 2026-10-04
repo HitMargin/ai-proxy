@@ -1,0 +1,19 @@
+{
+  "_comment": "复制成 custom-providers.json 再填。这个文件在 .gitignore 里，那个不在。",
+  "providers": [
+    {
+      "name": "stepfun",
+      "label": "StepFun",
+      "baseUrl": "https://api.stepfun.ai/step_plan/v1",
+      "apiKey": "sk-REPLACE-ME"
+    },
+    {
+      "name": "myrelay",
+      "label": "我的中转",
+      "baseUrl": "https://relay.example.com/v1",
+      "apiKey": "sk-REPLACE-ME",
+      "authHeader": "x-api-key",
+      "enabled": false
+    }
+  ]
+}

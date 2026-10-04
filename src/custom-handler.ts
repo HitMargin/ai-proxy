@@ -11,7 +11,19 @@
  * 入站凭据送给第三方。这里只发我们自己解析出来的那把 key。
  */
 
-import { CUSTOM_PREFIX, type CustomProvider, customEndpoint, customUpstreamHeaders, describeCustomProviders, parseCustomProviders, resolveCustomTarget } from "./custom.ts";
+import {
+  CUSTOM_FILE_EXAMPLE,
+  CUSTOM_PREFIX,
+  customEndpoint,
+  customFilePath,
+  customFileTextToEnvText,
+  type CustomProvider,
+  CustomProviderFile,
+  customUpstreamHeaders,
+  describeCustomProviders,
+  mergeCustomSources,
+  resolveCustomTarget,
+} from "./custom.ts";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
@@ -23,19 +35,60 @@ const LISTING_TIMEOUT_MS = 15_000;
 /** 推理超时比列表宽，但仍要有上限：没有上限的等待在面板上表现为「一直转」。 */
 const TURN_TIMEOUT_MS = 600_000;
 
-/** 代理只从环境读配置，插件把整张表序列化后注入。 */
+/**
+ * 配置来源一：进程环境。DSH 插件把面板里那张表序列化后从这里注入。
+ *
+ * 来源二：工作目录下的 `custom-providers.json`，给**不用插件**的部署用——
+ * 直接 `deno run -A main.ts`、隧道、自建客户端都走那条路。代理原本只认环境变量，
+ * 于是那种部署里自定义供应商有实现却没有入口。
+ *
+ * 文件读取器按路径缓存，所以同一个进程只会有一个实例。
+ */
+const fileReaders = new Map<string, CustomProviderFile>();
+
+function readerFor(
+  env: Record<string, string | undefined>,
+): CustomProviderFile {
+  const path = customFilePath(env);
+  let reader = fileReaders.get(path);
+  if (reader === undefined) {
+    reader = new CustomProviderFile(path);
+    fileReaders.set(path, reader);
+  }
+  return reader;
+}
+
+/** 两个来源合并后的结果，含「谁盖了谁」与文件错误。 */
 export function customProvidersFromEnv(
   env: Record<string, string | undefined>,
-): ReturnType<typeof parseCustomProviders> {
-  return parseCustomProviders(env.AI_PROXY_CUSTOM_PROVIDERS);
+) {
+  const reader = readerFor(env);
+  return mergeCustomSources({
+    envText: env.AI_PROXY_CUSTOM_PROVIDERS,
+    fileText: customFileTextToEnvText(reader.read()),
+  });
 }
 
-/** 面板/健康检查想问「现在配了哪些」，本模块自己解析一次环境。 */
-export function customProvidersSnapshot(env: Record<string, string | undefined>) {
-  return describeCustomProviders(customProvidersFromEnv(env));
+/** 面板/健康检查想问「现在配了哪些」，本模块自己解析一次环境与文件。 */
+export function customProvidersSnapshot(
+  env: Record<string, string | undefined>,
+) {
+  const merged = customProvidersFromEnv(env);
+  return {
+    ...describeCustomProviders(merged.parsed),
+    origin: merged.origin,
+    shadowed: merged.shadowed,
+    fileError: merged.fileError,
+    filePath: customFilePath(env),
+    fileExists: readerFor(env).exists(),
+  };
 }
 
-function jsonError(message: string, status: number, extra?: Record<string, unknown>): Response {
+function jsonError(
+  message: string,
+  status: number,
+  extra?: Record<string, unknown>,
+): Response {
   return new Response(JSON.stringify({ error: message, ...extra }), {
     status,
     headers: JSON_HEADERS,
@@ -54,24 +107,44 @@ export async function handleCustom(
   request: Request,
   env: Record<string, string | undefined>,
 ): Promise<Response> {
-  const parsed = customProvidersFromEnv(env);
+  const merged = customProvidersFromEnv(env);
+  const parsed = merged.parsed;
 
-  // 没配任何供应商时要说清是「没配」，不是「上游挂了」。面板靠这个区分
-  // 「去填一个」和「去检查你的地址」。
+  // 没配任何供应商时要说清是「没配」，不是「上游挂了」，并且**把两条配法都写出来**
+  // ——面板与配置文件是并列的入口，只提一条会让不用插件的人以为这条路不存在。
   if (parsed.providers.length === 0 && parsed.rejected.length === 0) {
     return jsonError("no custom providers are configured", 404, {
-      hint: "add one in the ai-proxy panel (Settings → 自定义供应商)",
+      hint:
+        "fill one in the ai-proxy panel (Settings → 自定义供应商), or write " +
+        customFilePath(env) + " in the proxy's working directory",
+      filePath: customFilePath(env),
+      example: CUSTOM_FILE_EXAMPLE,
     });
+  }
+
+  // 文件读到了但一条都没解析出来：这不是「没配」，是「配坏了」。两者必须分开报，
+  // 否则一个写错格式的人看到的提示是「去配一个」——他已经配了。
+  if (merged.fileError !== null) {
+    console.warn("[custom] " + customFilePath(env) + ": " + merged.fileError);
+  }
+  if (merged.shadowed.length > 0) {
+    console.warn(
+      "[custom] these providers came from the environment and shadow the file: " +
+        merged.shadowed.join(", "),
+    );
   }
 
   // 列表端点：聚合所有**启用**供应商的 /models，并把模型 id 前置成 <name>/<id>。
   if (path.endsWith("/models") && request.method === "GET") {
-    return await listCustomModels(parsed);
+    return await listCustomModels(merged);
   }
 
   if (!path.endsWith("/chat/completions") || request.method !== "POST") {
     return jsonError("not found", 404, {
-      routes: ["GET /" + CUSTOM_PREFIX + "/v1/models", "POST /" + CUSTOM_PREFIX + "/v1/chat/completions"],
+      routes: [
+        "GET /" + CUSTOM_PREFIX + "/v1/models",
+        "POST /" + CUSTOM_PREFIX + "/v1/chat/completions",
+      ],
     });
   }
 
@@ -92,7 +165,9 @@ export async function handleCustom(
     });
   }
   if (!target.provider.enabled) {
-    return jsonError("this custom provider is switched off", 403, { provider: target.provider.name });
+    return jsonError("this custom provider is switched off", 403, {
+      provider: target.provider.name,
+    });
   }
 
   const stream = body.stream === true;
@@ -127,7 +202,8 @@ export async function handleCustom(
     return new Response(upstream.body, {
       status: upstream.status,
       headers: {
-        "Content-Type": upstream.headers.get("content-type") ?? "text/event-stream",
+        "Content-Type": upstream.headers.get("content-type") ??
+          "text/event-stream",
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
         "Access-Control-Allow-Origin": "*",
@@ -139,7 +215,8 @@ export async function handleCustom(
   return new Response(text, {
     status: upstream.status,
     headers: {
-      "Content-Type": upstream.headers.get("content-type") ?? "application/json",
+      "Content-Type": upstream.headers.get("content-type") ??
+        "application/json",
       "Access-Control-Allow-Origin": "*",
     },
   });
@@ -155,8 +232,9 @@ export async function handleCustom(
  * 其余照常返回。整张列表因为一个坏地址变空，等于让用户以为功能整体坏了。
  */
 async function listCustomModels(
-  parsed: ReturnType<typeof parseCustomProviders>,
+  merged: ReturnType<typeof customProvidersFromEnv>,
 ): Promise<Response> {
+  const parsed = merged.parsed;
   const active = parsed.providers.filter((p) => p.enabled);
   const data: Record<string, unknown>[] = [];
   const errors: Record<string, string> = {};
@@ -183,7 +261,9 @@ async function listCustomModels(
       errors[provider.name] = String(result.reason?.message ?? result.reason);
       continue;
     }
-    const rows = Array.isArray(result.value.payload?.data) ? result.value.payload.data : [];
+    const rows = Array.isArray(result.value.payload?.data)
+      ? result.value.payload.data
+      : [];
     // 空列表当「没答上来」而不是「这里什么都没有」：上游正常但没有模型，
     // 与上游没答，在用户眼里都该是「这个供应商现在没货」。
     if (rows.length === 0) continue;
@@ -191,7 +271,10 @@ async function listCustomModels(
       if (row === null || typeof row !== "object") continue;
       const id = String((row as Record<string, unknown>).id ?? "");
       if (id === "") continue;
-      data.push({ ...row as Record<string, unknown>, id: provider.name + "/" + id });
+      data.push({
+        ...row as Record<string, unknown>,
+        id: provider.name + "/" + id,
+      });
     }
   }
 
@@ -202,6 +285,10 @@ async function listCustomModels(
       // 只在非空时出现，沿用 /health 的 catalogIssues 那条纪律。
       ...(Object.keys(errors).length > 0 ? { errors } : {}),
       ...(parsed.rejected.length > 0 ? { rejected: parsed.rejected } : {}),
+      // 来源与遮蔽关系一并给出：多来源配置最难查的就是「我改的那份没生效」。
+      origin: merged.origin,
+      ...(merged.shadowed.length > 0 ? { shadowed: merged.shadowed } : {}),
+      ...(merged.fileError !== null ? { fileError: merged.fileError } : {}),
     }),
     { headers: JSON_HEADERS },
   );
@@ -209,7 +296,8 @@ async function listCustomModels(
 
 /** 供 main.ts 判断一个路径是不是自定义渠道。 */
 export function isCustomPath(path: string): boolean {
-  return path === "/" + CUSTOM_PREFIX || path.startsWith("/" + CUSTOM_PREFIX + "/");
+  return path === "/" + CUSTOM_PREFIX ||
+    path.startsWith("/" + CUSTOM_PREFIX + "/");
 }
 
 export type { CustomProvider };

@@ -116,13 +116,19 @@ export function parseCustomProviders(raw: unknown): ParsedCustomProviders {
   } catch {
     return {
       providers: [],
-      rejected: [{ name: "(env)", reason: "AI_PROXY_CUSTOM_PROVIDERS is not valid JSON" }],
+      rejected: [{
+        name: "(env)",
+        reason: "AI_PROXY_CUSTOM_PROVIDERS is not valid JSON",
+      }],
     };
   }
   if (!Array.isArray(list)) {
     return {
       providers: [],
-      rejected: [{ name: "(env)", reason: "AI_PROXY_CUSTOM_PROVIDERS is not an array" }],
+      rejected: [{
+        name: "(env)",
+        reason: "AI_PROXY_CUSTOM_PROVIDERS is not an array",
+      }],
     };
   }
 
@@ -149,7 +155,10 @@ export function parseCustomProviders(raw: unknown): ParsedCustomProviders {
     }
     const baseUrl = validateBaseUrl(row.baseUrl);
     if (baseUrl === null) {
-      rejected.push({ name, reason: "baseUrl must be an https URL (loopback may use http)" });
+      rejected.push({
+        name,
+        reason: "baseUrl must be an https URL (loopback may use http)",
+      });
       continue;
     }
     seen.add(name);
@@ -169,6 +178,190 @@ export function parseCustomProviders(raw: unknown): ParsedCustomProviders {
     });
   }
   return { providers, rejected };
+}
+
+/**
+ * 配置文件里的一行：与 env 形状相同，只是来源不同。
+ *
+ * 文件与环境的**区别只在于谁写它**，所以两者共用同一套校验。合并时环境优先：
+ * 它是进程启动时显式给的那份，而文件是持久化的默认值——和命令行参数覆盖配置文件
+ * 是同一条规矩。
+ */
+export interface MergeInput {
+  /** `AI_PROXY_CUSTOM_PROVIDERS` 的原文，可能为空。 */
+  envText?: unknown;
+  /** `custom-providers.json` 的原文，可能为空或坏。 */
+  fileText?: unknown;
+}
+
+/**
+ * 把环境与文件两个来源合成一张表。
+ *
+ * 为什么两个来源都要有：代理可以完全脱离 DSH 插件运行（直接跑 main.ts、cloudflared
+ * 隧道、Cloudflare Worker）。那种部署里没人注入环境变量，于是「自定义供应商」这个
+ * 能力存在却没有入口。文件是给那条路径的入口。
+ *
+ * 反过来，Workers 上没有文件系统，所以文件是**可选**的：读不到就只认环境。
+ * 两个都空就是「没配」，不是错误。
+ *
+ * 同名冲突时**环境赢**，并把被覆盖的那条记进 shadowed——静默让其中一条失效
+ * 会让人以为文件写错了。
+ */
+export function mergeCustomSources(input: MergeInput): {
+  parsed: ParsedCustomProviders;
+  /** 被环境里同名条目盖掉的文件条目，供 /health 与日志说明。 */
+  shadowed: string[];
+  /** 文件读到了但解析不了时的原因（文件存在 ≠ 文件可用）。 */
+  fileError: string | null;
+  /** 每个供应商来自哪个来源，方便排查「我改的那份没生效」。 */
+  origin: Record<string, "env" | "file">;
+} {
+  const fromEnv = parseCustomProviders(input.envText);
+  const hasFile = typeof input.fileText === "string" &&
+    input.fileText.trim() !== "";
+  const fromFile = hasFile
+    ? parseCustomProviders(input.fileText)
+    : { providers: [], rejected: [] };
+
+  let fileError: string | null = null;
+  // 文件的坏条目单独说：环境那份是命令行给的，文件这份是用户手写的，出错的地方不同。
+  if (
+    hasFile && fromFile.providers.length === 0 && fromFile.rejected.length > 0
+  ) {
+    fileError = fromFile.rejected.map((r) => r.name + ": " + r.reason).join(
+      "; ",
+    );
+  }
+
+  const origin: Record<string, "env" | "file"> = {};
+  const providers: ParsedProvider[] = [];
+  const seen = new Set<string>();
+  for (const provider of fromEnv.providers) {
+    providers.push(provider);
+    seen.add(provider.name);
+    origin[provider.name] = "env";
+  }
+  const shadowed: string[] = [];
+  for (const provider of fromFile.providers) {
+    if (seen.has(provider.name)) {
+      shadowed.push(provider.name);
+      continue;
+    }
+    providers.push(provider);
+    seen.add(provider.name);
+    origin[provider.name] = "file";
+  }
+
+  return {
+    parsed: {
+      providers,
+      rejected: [...fromFile.rejected, ...fromEnv.rejected],
+    },
+    shadowed,
+    fileError,
+    origin,
+  };
+}
+
+/**
+ * 从配置文件的内容里取出 providers 数组。
+ *
+ * 接受两种顶层形状：带 providers 键的对象（推荐，能带别的说明字段）与裸数组。
+ * 两种都认是因为这个文件是人手写的，两种写法都很自然，只认一种会让人以为格式错了。
+ */
+export function customFileTextToEnvText(raw: unknown): string {
+  const text = String(raw ?? "");
+  if (text.trim() === "") return "";
+  let doc: unknown;
+  try {
+    doc = JSON.parse(text);
+  } catch {
+    // 交回去让 parseCustomProviders 报「不是合法 JSON」，保持单一错误路径。
+    return text;
+  }
+  if (Array.isArray(doc)) return text;
+  if (
+    doc !== null && typeof doc === "object" &&
+    Array.isArray((doc as Record<string, unknown>).providers)
+  ) {
+    return JSON.stringify((doc as Record<string, unknown>).providers);
+  }
+  return text;
+}
+
+/**
+ * 配置文件的读取器：按 mtime 缓存，保存即生效。
+ *
+ * 与 cnb-login.txt 同款纪律：这是**明文凭据文件**，所以在 .gitignore 里，
+ * 而且只读不写——面板那条路径写的是 settings.json，两条互不干涉。
+ *
+ * 为什么带 mtime 缓存而不是每次 readFileSync：reading 发生在**每次请求**上
+ * （列表 + 每一轮对话），而配置文件改动极少。缓存命中的代价是一次 stat，
+ * 未命中的代价是一次读——这个取舍让「保存后立刻生效」不必以每请求 IO 换取。
+ */
+export class CustomProviderFile {
+  private text = "";
+  private mtime = -1;
+  private missing = false;
+
+  constructor(private readonly path: string) {}
+
+  /** 当前文件内容。文件不存在时返回空串（不是错误——大多数部署没有这个文件）。 */
+  read(): string {
+    try {
+      const stat = Deno.statSync(this.path);
+      // Deno 的 FileInfo 上是 Date（没有 mtimeMs），取毫秒是为了让比较不受
+      // 纳秒精度在不同文件系统上的差异影响。
+      const stamp = stat.mtime === null ? -1 : stat.mtime.getTime();
+      if (this.mtime === stamp) return this.text;
+      const next = Deno.readTextFileSync(this.path);
+      // 只在内容真的变了时说一句：mtime 会因各种原因抖动，而日志一行翻一倍
+      // 会把这个项目最该看的那种信息淹掉。
+      if (next !== this.text) {
+        console.log("[custom] loaded " + this.path);
+      }
+      this.text = next;
+      this.mtime = stamp;
+      this.missing = false;
+      return this.text;
+    } catch {
+      if (!this.missing) {
+        this.missing = true;
+        this.mtime = -1;
+        this.text = "";
+      }
+      return "";
+    }
+  }
+
+  /** 文件是否真的被读到过。面板/健康检查据此区分「没配」与「配了空的」。 */
+  exists(): boolean {
+    try {
+      Deno.statSync(this.path);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** 配置文件相对进程工作目录的路径。可由环境变量改道，测试与多实例部署需要。 */
+export const CUSTOM_FILE_NAME = "custom-providers.json";
+
+/**
+ * 写进错误消息里的最小示例。
+ *
+ * 一个把格式写错的人需要的不是「解析失败」，而是「长这样」——所以这份文本直接
+ * 出现在 404 的响应体里，复制粘贴就能用。
+ */
+export const CUSTOM_FILE_EXAMPLE =
+  '{\n  "providers": [\n    {\n      "name": "stepfun",\n      "baseUrl": "https://api.stepfun.ai/step_plan/v1",\n      "apiKey": "sk-...",\n      "label": "StepFun"\n    }\n  ]\n}';
+
+export function customFilePath(
+  env: Record<string, string | undefined>,
+): string {
+  const override = String(env.AI_PROXY_CUSTOM_FILE ?? "").trim();
+  return override !== "" ? override : "./" + CUSTOM_FILE_NAME;
 }
 
 /** 只给面板看的形状——**不含 apiKey**。 */
@@ -229,7 +422,9 @@ export function customUpstreamHeaders(
   if (provider.apiKey !== "") {
     headers.set(
       header,
-      header === "authorization" ? "Bearer " + provider.apiKey : provider.apiKey,
+      header === "authorization"
+        ? "Bearer " + provider.apiKey
+        : provider.apiKey,
     );
   }
   // 只转发与本代理无关的元数据头；凭据一律用我们自己的，不跟着客户端走。
@@ -239,7 +434,10 @@ export function customUpstreamHeaders(
 }
 
 /** 拼一个供应商的端点地址。baseUrl 末尾的斜杠已在解析时去掉。 */
-export function customEndpoint(provider: ParsedProvider, endpoint: string): string {
+export function customEndpoint(
+  provider: ParsedProvider,
+  endpoint: string,
+): string {
   return provider.baseUrl + endpoint;
 }
 

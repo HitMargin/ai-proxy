@@ -49,3 +49,10 @@ desktop.ini
 .vscode/
 .idea/
 cnb-login.txt
+# 自定义供应商配置：**含明文 apiKey**，与 cnb-login.txt 同类。写了就不要提交。
+# 需要一个可提交的样例时用 custom-providers.example.json（不含 key）。
+custom-providers.json
+custom-providers.local.json
+custom-providers.*.local.json
+# 样例必须能被提交，否则没有可照抄的形状；示例里只有占位符，没有真 key。
+!custom-providers.example.json
