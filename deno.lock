@@ -2,6 +2,7 @@
   "version": "5",
   "specifiers": {
     "jsr:@std/assert@*": "1.0.19",
+    "jsr:@std/assert@1": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.14",
     "npm:playwright@*": "1.63.0",
     "npm:vercel@latest": "59.15.1_@emnapi+core@1.11.3_@emnapi+runtime@1.11.3",

@@ -1,0 +1,403 @@
+/**
+ * cnb 工具调用解析：垃圾语法清理、定向诊断、落盘、熔断。
+ *
+ * 这批用例盯的是一个具体的用户故障：模型反复写出提示词明令禁止的别家协议
+ * (复数 tool_calls / invoke+parameter / function_calls)，解析器一个都不认，
+ * 于是整块被剥掉，模型只收到一句通用的 "invalid syntax"——它不知道错在哪，
+ * 下一轮把同一种坏写法原样再写一遍。实测单会话连续 13 次大输出回合全这么来
+ * 的，输入增长 34 倍、99% 的 token 花在重发上下文上。
+ *
+ * 全部用假件，不碰磁盘也不发网络请求（deno task test 只开 --allow-env）。
+ */
+import { assert, assertEquals } from "jsr:@std/assert@1";
+import {
+  cnbDiagnoseJunkSyntax,
+  cnbJournalJunk,
+  cnbJunkLogState,
+  type CnbJunkStore,
+  cnbJunkStreak,
+  cnbParseToolCalls,
+} from "./cnb.ts";
+
+// LT 是源码里唯一允许出现尖括号的地方。测试正文到处要断言「没有一个裸的尖括号
+// 漏到客户端」，写字面量会把标签配对搞坏——这个文件正是靠这条纪律生成的。
+const LT = String.fromCharCode(60);
+const GT = String.fromCharCode(62);
+const TC = "tool_call";
+const OPEN = LT + TC + String.fromCharCode(62);
+const CLOSE = LT + "/" + TC + String.fromCharCode(62);
+
+const TOOLS = [{
+  function: {
+    name: "pwsh",
+    description: "Run a command",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string" },
+        description: { type: "string" },
+      },
+      required: ["command"],
+    },
+  },
+}];
+
+/** 复位模块级计数器，用例之间才不按执行顺序互相影响。 */
+function resetJunkState(): void {
+  cnbJunkStreak.count = 0;
+  cnbJunkStreak.at = 0;
+  cnbJunkLogState.at = 0;
+}
+
+// -- 合法形状仍然解析得出来（清理逻辑不许把好调用一起吃掉） --
+
+Deno.test("a well-formed call still parses after the junk path was added", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    "Reading now.\n" + OPEN + "\n" +
+      '{"name":"pwsh","arguments":{"command":"ls"}}' + "\n" + CLOSE,
+    TOOLS,
+  );
+  assertEquals(r.calls.length, 1);
+  assertEquals(r.calls[0].function.name, "pwsh");
+  assertEquals(r.calls[0].function.arguments, '{"command":"ls"}');
+  assert(!r.clean.includes(OPEN), "tags must be stripped");
+  assert(r.clean.startsWith("Reading"), "prose must survive");
+});
+
+// -- 別家协议必须被救回成调用，且它们的标签不得出现在正文里 --
+// 判据是**客户端会看到什么**：伪 XML 留在正文里比没有反馈更糟。
+
+Deno.test("a salvaged call hides its plural wrapper tag from the client", () => {
+  resetJunkState();
+  // 带属性的复数包裹：内层 JSON 被救回成一次**成功**调用（这里是 recover，不是
+  // 拒收）。曾经的毛病是外层标签的属性串整块留在正文里发给客户端——用户看到的
+  // 正是那堆裸露伪 XML。所以断言必须盯 clean，只盯 calls 会漏掉这个 bug。
+  const r = cnbParseToolCalls(
+    "Let me check.\n" + "<tool_calls in parallel>\n" +
+      '{"name":"pwsh","arguments":{"command":"ls"}}' + "\n" + CLOSE,
+    TOOLS,
+  );
+  assertEquals(r.calls.length, 1, "the payload is salvageable");
+  assert(
+    !r.clean.includes("parallel"),
+    "the wrapper tag must not reach the client",
+  );
+  assert(!r.clean.includes(LT), "no stray pseudo-XML may reach the client");
+  assertEquals(r.clean, "Let me check.", "prose survives, tags gone");
+});
+
+Deno.test("a salvaged function_call leaves no tag in the clean text", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    "Sure.\n" + "<function_call>\n" + '{"name":"pwsh"}',
+    TOOLS,
+  );
+  assertEquals(r.calls.length, 1, "the payload is salvageable");
+  assert(!r.clean.includes(LT), "no stray pseudo-XML may reach the client");
+  assertEquals(r.clean, "Sure.", "prose only");
+});
+
+Deno.test("a function_calls pair around an invoke block is salvaged", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    '<function_calls>\n<invoke name="pwsh"><parameter name="command">ls</parameter></invoke>\n</function_calls>',
+    TOOLS,
+  );
+  assertEquals(r.calls.length, 1, "the payload is salvageable");
+  assert(!r.clean.includes(LT), "no stray pseudo-XML may reach the client");
+  assertEquals(r.clean, "", "everything between the pair is consumed");
+});
+
+Deno.test("a bare invoke block is salvaged and the prose survives", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    "Sure, let me check.\n" +
+      '<invoke name="pwsh">\n<parameter name="command">ls</parameter>\n</invoke>',
+    TOOLS,
+  );
+  assertEquals(r.calls.length, 1, "the payload is salvageable");
+  assert(r.clean.startsWith("Sure, let me check."), "prose must survive");
+  assert(!r.clean.includes(LT), "pseudo-XML must be stripped");
+});
+
+Deno.test("plain text is untouched", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls("Nothing to do here.", TOOLS);
+  assertEquals(r.calls.length, 0);
+  assertEquals(r.clean, "Nothing to do here.");
+});
+
+Deno.test("a salvaged call with an attrs-free plural tag also leaves no tag", () => {
+  resetJunkState();
+  // 与上一条的差别只在属性：`tool_calls>`（无属性）早先就被清掉了，
+  // 带属性的那一边漏了很久。两条一起钉住，避免只修一半。
+  const r = cnbParseToolCalls(
+    "Working on it.\n" + LT + "tool_calls" + String.fromCharCode(62) + "\n" +
+      '{"name":"pwsh","arguments":{"command":"ls"}}' + "\n" + CLOSE,
+    TOOLS,
+  );
+  assertEquals(r.calls.length, 1, "the payload is salvageable");
+  assert(!r.clean.includes(LT), "no stray pseudo-XML may reach the client");
+  assertEquals(r.clean, "Working on it.");
+});
+
+// -- 真正不可救的形状：拒收 + 诊断 + 熔断 --
+
+Deno.test("a singular function_call with nothing salvageable is stripped, not leaked", () => {
+  resetJunkState();
+  // 这条走的是 **JUNK 正则**（不是上面那条 function_call 的救援路径）：
+  // 内容不是 JSON，所以 JUNK 是唯一清理出口。它若只认复数，
+  // 单数这半边的标签会整块漏到客户端——正是用户看到的裸露伪 XML。
+  const r = cnbParseToolCalls(
+    "Intro.\n" + LT + "function_call" + GT + "\nNot JSON at all.",
+    TOOLS,
+  );
+  assertEquals(r.calls.length, 0, "nothing is salvageable here");
+  assert(r.clean.includes("NOT executed"), "the rejection must be stated");
+  // 反馈说明里本来就带一个合法的 tool_call 示范，所以不能拿整段 clean 查尖括号。
+  // 判据切成两半：**说明之前**那段（= 模型原文的残留）不许有任何尖括号。
+  const beforeNote = r.clean.split("[proxy]")[0];
+  assert(
+    !beforeNote.includes(LT),
+    "no stray pseudo-XML before the note: " + beforeNote,
+  );
+  assert(
+    r.clean.includes("only reads"),
+    "the diagnosis must point at the legal shape: " + r.clean.slice(-160),
+  );
+});
+
+Deno.test("an unsalvageable payload is rejected with the diagnosis and a note", () => {
+  resetJunkState();
+  // 开闭标签都在、内容却不是 JSON：这是唯一会走拒收路径的形状。
+  const r = cnbParseToolCalls(
+    OPEN + "\n" + "Not JSON, just prose." + "\n" + CLOSE,
+    TOOLS,
+  );
+  assertEquals(r.calls.length, 0, "nothing can be parsed out of prose");
+  assert(r.clean.includes("NOT executed"), "must say the call did not run");
+  assert(r.clean.includes("What was wrong:"), "must carry the diagnosis");
+  assert(
+    !r.clean.includes("Not JSON, just prose."),
+    "the bad payload itself must not be echoed as the answer",
+  );
+});
+
+Deno.test("a note is appended to the prose, not pasted over it", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    "Here is my answer first.\n" + OPEN + "\n" + "still not JSON\n" + CLOSE,
+    TOOLS,
+  );
+  assert(
+    r.clean.startsWith("Here is my answer first."),
+    "the model's text comes first, feedback after it",
+  );
+  assert(r.clean.includes("What was wrong:"));
+});
+
+// -- 定向诊断：必须说出这一轮违反了哪一条 --
+
+Deno.test("the diagnosis names the plural wrapper, not a generic failure", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    "Let me run it." + "\n" + "<tool_calls in parallel>\n" +
+      "Not JSON, just prose.",
+    TOOLS,
+  );
+  // 判据：反馈里出现具体错因。只有一句 invalid syntax 时模型无从改起。
+  assert(/plural/i.test(r.clean), "must say which tag is illegal: " + r.clean);
+  assert(r.clean.includes("What was wrong:"), "must label the diagnosis");
+});
+
+Deno.test("the diagnosis names function_call as a foreign protocol", () => {
+  resetJunkState();
+  const d = cnbDiagnoseJunkSyntax(
+    "<function_call>\n" + '{"name":"pwsh"}',
+  );
+  assert(/function_call/i.test(d), "must name the tag: " + d);
+  assert(/another tool protocol/i.test(d), "must explain why: " + d);
+});
+
+Deno.test("the diagnosis names invoke/parameter as a foreign protocol", () => {
+  resetJunkState();
+  const d = cnbDiagnoseJunkSyntax(
+    '<invoke name="pwsh"></invoke><parameter name="command">ls</parameter>',
+  );
+  assert(/invoke|parameter/i.test(d), "must name the tag: " + d);
+  assert(/another tool protocol/i.test(d), "must explain why: " + d);
+  // 只断言「出现了 invoke 这个词」是弱断言：把说明改成
+  // "invoke/parameter is not a shape this client reads" 照样绿——
+  // 词还在，**解释**没了。所以再钉一条：必须指向唯一合法的替代形状。
+  assert(/only reads/i.test(d), "must point at the legal shape: " + d);
+});
+
+Deno.test("a missing JSON object is reported as such", () => {
+  resetJunkState();
+  const d = cnbDiagnoseJunkSyntax(
+    "I will call a tool now.\n" + OPEN + "\nLet me run ls\n",
+  );
+  assert(/no JSON object/i.test(d), "must say the object is absent: " + d);
+});
+
+Deno.test("an object without a name field is reported as missing name", () => {
+  resetJunkState();
+  const d = cnbDiagnoseJunkSyntax(
+    OPEN + "\n" + '{"arguments":{"command":"ls"}}' + "\n" + CLOSE,
+  );
+  assert(/"name"/i.test(d), "must point at the missing key: " + d);
+});
+
+Deno.test("an object without an arguments object is reported", () => {
+  resetJunkState();
+  const d = cnbDiagnoseJunkSyntax(
+    OPEN + "\n" + '{"name":"pwsh"}' + "\n" + CLOSE,
+  );
+  assert(/"arguments"/i.test(d), "must point at the missing key: " + d);
+});
+
+Deno.test("a string arguments value is reported instead of being coerced", () => {
+  resetJunkState();
+  const d = cnbDiagnoseJunkSyntax(
+    OPEN + "\n" + '{"name":"pwsh","arguments":"ls"}' + "\n" + CLOSE,
+  );
+  assert(/arguments/i.test(d), "must point at the bad shape: " + d);
+});
+
+Deno.test("a diagnosis never guesses intent, only visible facts", () => {
+  resetJunkState();
+  // 猜错会把模型引到错误方向，比没有反馈更糟。这里验证确定性：
+  // 同一个输入永远得到同一句话，且不含未观测到的指控。
+  const a = cnbDiagnoseJunkSyntax(
+    OPEN + "\n" + '{"name":"pwsh"}' + "\n" + CLOSE,
+  );
+  const b = cnbDiagnoseJunkSyntax(
+    OPEN + "\n" + '{"name":"pwsh"}' + "\n" + CLOSE,
+  );
+  assertEquals(a, b);
+  assert(!/probably|maybe|perhaps/i.test(a), "no speculation: " + a);
+});
+
+// -- 熔断：坏写法不改时不许再把长说明发一遍 --
+
+Deno.test("the first two rejections carry the full shape and the diagnosis", () => {
+  resetJunkState();
+  const first = cnbParseToolCalls(
+    OPEN + "\n" + "Not JSON, just prose." + "\n" + CLOSE,
+    TOOLS,
+  );
+  const second = cnbParseToolCalls(
+    OPEN + "\n" + "Not JSON, just prose." + "\n" + CLOSE,
+    TOOLS,
+  );
+  assert(first.clean.includes("EXACTLY this shape"), "full note on #1");
+  assert(first.clean.includes("What was wrong:"), "diagnosis on #1");
+  assert(second.clean.includes("EXACTLY this shape"), "full note on #2");
+  assert(second.clean.includes("What was wrong:"), "diagnosis on #2");
+});
+
+Deno.test("a third consecutive rejection keeps the diagnosis but drops the long shape", () => {
+  resetJunkState();
+  const notes: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    notes.push(
+      cnbParseToolCalls(
+        OPEN + "\n" + "Not JSON, just prose." + "\n" + CLOSE,
+        TOOLS,
+      ).clean,
+    );
+  }
+  // 第 3 次（索引 2）起走熔断版
+  assert(notes[2].includes("What was wrong:"), "diagnosis still delivered");
+  assert(notes[2].includes("3 times in a row"), "the streak is stated");
+  assert(
+    !notes[2].includes("EXACTLY this shape"),
+    "long shape must be dropped",
+  );
+  // 熔断版必须更短——这就是省下的上下文。若它反而更长，这个熔断是在烧 token。
+  assert(notes[2].length < notes[1].length, "circuit note must be shorter");
+});
+
+Deno.test("a fresh streak restarts at the full note", () => {
+  resetJunkState();
+  // 窗口语义：距上次拒收很久以后再来一次，算新的一串而不是继续累计。
+  cnbJunkStreak.count = 9;
+  cnbJunkStreak.at = 0; // 与 Date.now() 相差必然超过 60 秒
+  const r = cnbParseToolCalls(
+    OPEN + "\n" + "Not JSON, just prose." + "\n" + CLOSE,
+    TOOLS,
+  );
+  assert(
+    r.clean.includes("EXACTLY this shape"),
+    "a fresh streak restarts at the full note",
+  );
+  assertEquals(cnbJunkStreak.count, 1);
+});
+
+// -- 落盘：垃圾原文必须写到能留下来的地方 --
+
+interface Store extends CnbJunkStore {
+  writes: Array<{ path: string; text: string; append: boolean }>;
+}
+
+function memoryStore(size = 0): Store {
+  const writes: Store["writes"] = [];
+  return {
+    writes,
+    size: () => size,
+    write(path: string, text: string, append: boolean) {
+      writes.push({ path, text, append });
+    },
+  };
+}
+
+Deno.test("a junk line is journalled once per debounce window", () => {
+  resetJunkState();
+  const store = memoryStore();
+  cnbJournalJunk("first\n", store, 1_000_000);
+  cnbJournalJunk("second\n", store, 1_000_200); // 窗口内，合并
+  cnbJournalJunk("third\n", store, 2_000_000); // 窗口外，落盘
+  assertEquals(
+    store.writes.map((w) => w.text.trim()),
+    ["first", "third"],
+    "the debounce must collapse two writes in the same window",
+  );
+});
+
+Deno.test("the journalled path is the file the proxy can read back", () => {
+  resetJunkState();
+  const store = memoryStore();
+  cnbJournalJunk("line\n", store, 1_000_000);
+  // path 若漂移，写进去的日志谁也找不到——那等于没落盘。
+  assertEquals(store.writes[0].path, "./cnb-junk.log");
+  assert(
+    store.writes[0].append,
+    "must append, not overwrite the previous evidence",
+  );
+});
+
+Deno.test("an oversized journal restarts rather than growing without bound", () => {
+  resetJunkState();
+  const store = memoryStore(512 * 1024 + 1);
+  cnbJournalJunk("line\n", store, 1_000_000);
+  assertEquals(
+    store.writes[0].append,
+    false,
+    "past the cap the file must be rewritten, not appended to",
+  );
+});
+
+Deno.test("a journal failure never breaks the response", () => {
+  resetJunkState();
+  const hostile: CnbJunkStore = {
+    size: () => {
+      throw new Error("read-only filesystem");
+    },
+    write: () => {
+      throw new Error("read-only filesystem");
+    },
+  };
+  // 日志坏掉决不能把正常响应一起打死。
+  cnbJournalJunk("line\n", hostile, 1_000_000);
+});

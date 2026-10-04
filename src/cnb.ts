@@ -489,6 +489,167 @@ function looksDegenerated(v: string): boolean {
 const DEGENERATE_NOTE =
   "[proxy] A tool call was rejected: its command parameter looked degenerated (one character per line / broken tokens). Re-emit the tool call with the command written normally on one line.";
 
+// ---------- 垃圾工具语法：诊断 / 落盘 / 熔断 ----------
+// 提示词只教 <tool_call> 一种写法，而模型的训练先验把它写成一整座别家协议的动物园：
+// 复数 tool_calls、<invoke> + <parameter>、<function_calls>、<tool_calls in parallel>。
+// 这些解析器一个都不认，于是整块被剥掉、模型只收到一句 "invalid syntax"——它不知道
+// 错在哪，下一轮就把同一种坏写法原样再写一遍。用户实测：单会话连续 13 次大输出回合
+// 全是这么来的，输入增长 34 倍、99% 的 token 花在重发上下文上。
+// 这里补三件东西：
+//   ① 诊断（cnbDiagnoseJunkSyntax）：说出**这一轮**具体违反了哪一条。
+//      只有给出错因，改写才可能生效；一句通用的 "invalid syntax" 等于没反馈。
+//   ② 落盘（cnbJournalJunk）：把原文写到能留下来的日志里。stderr 的 warn 只进插件
+//      200 行内存日志，长会话里几秒就被冲掉，于是「模型到底写了什么」只能靠猜。
+//   ③ 熔断（cnbJunkFeedback / cnbJunkStreak）：同一种坏写法连着被拒时不再发长反馈——
+//      那句话已经发过两次且没有产生任何改写，继续原样发只是在继续把会话撑大。
+
+// 完整版反馈的公共前缀（熔断后的短版不用它，见 cnbJunkFeedback）。
+// 标签一律拼出来，不写字面量：源码里出现成对的开关标签会搞坏工具链（历史上就是
+// 这么把一个语法错误带进 cnb.ts 的），而且示例形状必须与提示词同源。
+const TC = "tool_call";
+const TC_OPEN = "<" + TC + ">";
+const TC_CLOSE = "</" + TC + ">";
+const JUNK_NOTE_SHAPE =
+  "[proxy] Your previous tool call used an invalid syntax that no client can parse, so it was NOT executed. "
+  + "Do NOT stop and do NOT apologize — immediately continue the task by re-emitting the SAME tool call "
+  + "in EXACTLY this shape, with nothing else on those two tag lines:" + "\n"
+  + TC_OPEN + "\n"
+  + '{"name": "TOOL_NAME", "arguments": { ...all required params... }}' + "\n"
+  + TC_CLOSE + "\n";
+
+/** 连续垃圾拒收达到这个次数后改用短反馈。 */
+const CNB_JUNK_FULL_NOTES = 2;
+/** 拒收间隔超过这么久算新的一串：熔断描述「连续」，不是「进程生命期内累计」。 */
+const CNB_JUNK_STREAK_WINDOW = 60_000;
+
+/**
+ * 连续拒收计数与落盘时间戳。单独放成两个可导出对象是为了测试能复位它们——
+ * 模块级私有状态会让用例之间按执行顺序互相影响，而 Deno 不保证用例顺序。
+ */
+export const cnbJunkStreak = { count: 0, at: 0 };
+export const cnbJunkLogState = { at: 0 };
+
+/**
+ * 组装发给模型的垃圾反馈。
+ *
+ * 前 CNB_JUNK_FULL_NOTES 次用完整版（正确形状 + 具体错因 + 一条出路），
+ * 之后只留诊断本身和出路。**熔断不是放弃**：诊断仍然每轮都发，模型照样知道
+ * 错在哪；砍掉的只是那段已经证明无效的长说明。
+ *
+ * 计时注入 now：窗口是这个函数自身的性质，测试要能验证它，不能等 60 秒。
+ */
+function cnbJunkFeedback(diagnosis: string, now: number = Date.now()): string {
+  if (now - cnbJunkStreak.at > CNB_JUNK_STREAK_WINDOW) cnbJunkStreak.count = 0;
+  cnbJunkStreak.count++;
+  cnbJunkStreak.at = now;
+
+  if (cnbJunkStreak.count <= CNB_JUNK_FULL_NOTES) {
+    return JUNK_NOTE_SHAPE
+      + "\nWhat was wrong: " + diagnosis
+      + "\nIf you cannot produce that exact shape, answer in plain text instead — do not repeat the invalid tags.";
+  }
+  return "[proxy] Still the same invalid tool syntax (rejected " + cnbJunkStreak.count
+    + " times in a row) — nothing can parse it, so it was NOT executed. What was wrong: " + diagnosis
+    + "\nEmit exactly one " + TC_OPEN + "\n" + '{"name":"TOOL_NAME","arguments":{...}}'
+    + "\n" + TC_CLOSE + " block, or answer in plain text. Do not repeat the invalid tags, and do not apologize.";
+}
+
+/**
+ * 定向诊断：只说看得见的事实——出现了哪个被禁用的标签、标签里有没有 JSON、
+ * JSON 缺哪个键。**不猜模型的意图**：猜错会把模型引到错误方向，比没有反馈更糟。
+ */
+export function cnbDiagnoseJunkSyntax(text: string): string {
+  const t = String(text || "");
+  const problems: string[] = [];
+  const push = (s: string) => { if (!problems.includes(s)) problems.push(s); };
+
+  // ① 外层包裹标签：提示词 RULES 1 逐条点名禁止的几种
+  if (/<tool_calls\b|<tool\s+calls\b/i.test(t)) {
+    push("the plural wrapper tag is not a legal tag — use the singular pair " + TC_OPEN + " / " + TC_CLOSE + ".");
+  }
+  if (/<function_calls?\b/i.test(t)) {
+    push('"function_call" / "function_calls" belongs to another tool protocol — this client only reads the ' + TC_OPEN + " JSON block.");
+  }
+  if (/<(?:\|?(?:XYML|QNML)\|?)?\s*(?:invoke|parameter)\b|DSML/i.test(t)) {
+    push('"invoke" / "parameter" (including the prefixed XYML and DSML forms) belongs to another tool protocol — this client only reads the ' + TC_OPEN + " JSON block.");
+  }
+  if (/<tool_call\b[^>]*>/i.test(t) && !new RegExp("</" + TC + "\\s*>", "i").test(t)) {
+    push("the opening tag was never closed with " + TC_CLOSE + ".");
+  }
+
+  // ② JSON 载荷：标签对了但内容不对，是最常见也最能救的一类
+  const brace = t.indexOf("{");
+  if (brace === -1) {
+    push("there is no JSON object at all — the tool name and its parameters must sit inside an object between the two tags, not in prose.");
+  } else {
+    const obj = extractFirstJsonObject(t.slice(brace));
+    const parsed = obj ? tryParseJsonLenient(obj) : null;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      push("the JSON object is truncated or malformed — close every brace, put double quotes around every string, and separate items with commas.");
+    } else {
+      const o = parsed as Record<string, unknown>;
+      if (typeof o.name !== "string" || !o.name.trim()) {
+        push('the object has no usable "name" field — it must name one tool from the list.');
+      } else if (o.arguments == null) {
+        push('the object has no "arguments" object — the parameters go directly inside it, e.g. {"command": "..."}.');
+      } else if (typeof o.arguments !== "object" || Array.isArray(o.arguments)) {
+        push('"arguments" must be an object such as {"command": "..."}, not a string, an array or a bare value.');
+      }
+    }
+  }
+  return problems.length ? problems.join(" ") : "the tool call could not be parsed.";
+}
+
+/**
+ * 垃圾日志的存取。生产走 Deno 文件 IO；测试注入内存假件——
+ * `deno task test` 只开 --allow-env，整个套件没有文件系统权限。
+ */
+export interface CnbJunkStore {
+  size(path: string): number;
+  write(path: string, text: string, append: boolean): void;
+}
+
+const CNB_JUNK_LOG = "./cnb-junk.log";
+/** 这个文件只回答「最近几次模型到底写了什么」，不负责历史归档，到量就重开。 */
+const CNB_JUNK_LOG_MAX = 512 * 1024;
+/** 一个回合里 think / content 两条通道会各解析一次，别把日志写成刷屏。 */
+const CNB_JUNK_LOG_MIN_GAP = 500;
+
+const cnbJunkDiskStore: CnbJunkStore = {
+  size(path: string): number {
+    try { return Deno.statSync(path).size; } catch { return 0; }
+  },
+  write(path: string, text: string, append: boolean): void {
+    if (!append) { Deno.writeTextFileSync(path, text); return; }
+    // 追加不能用 writeTextFileSync（它整体覆写）；openSync + append 同一支 fd，
+    // 写完必须 close，否则描述符随每次拒收泄漏一个。
+    const f = Deno.openSync(path, { create: true, write: true, append: true });
+    try { f.writeSync(new TextEncoder().encode(text)); } finally { f.close(); }
+  },
+};
+
+/**
+ * 把一次垃圾工具语法追加到磁盘。
+ *
+ * **同步**写：调用点在纯同步的解析路径上（cnbParseToolCalls 不是 async），
+ * 改 await 会把整个响应卡住。任何读/写失败都静默吞掉——日志坏了绝不能
+ * 把正常响应一起打死。
+ *
+ * 时间注入 now：防抖间隔是这个函数自身的性质，测试要能验证它，不能靠 sleep。
+ */
+export function cnbJournalJunk(
+  line: string,
+  store: CnbJunkStore = cnbJunkDiskStore,
+  now: number = Date.now(),
+): void {
+  if (now - cnbJunkLogState.at < CNB_JUNK_LOG_MIN_GAP) return;
+  cnbJunkLogState.at = now;
+  try {
+    const append = store.size(CNB_JUNK_LOG) <= CNB_JUNK_LOG_MAX;
+    store.write(CNB_JUNK_LOG, line, append);
+  } catch { /* 只读工作目录 / 权限不足：日志坏掉不影响响应 */ }
+}
+
 // ★ 双重嵌套 arguments：模型把参数对象又包了一层 ——
 // {"arguments": {"command": ...}, "description": ...}。拆开并合并外层多余键（内层优先）；
 // 值为字符串化 JSON 也解。★ 裸命令字符串变体：模型把命令本体直接塞进 arguments ——
@@ -581,7 +742,9 @@ function normalizeInvokeConfusion(text: string) {
   return text;
 }
 
-function cnbParseToolCalls(text: string, tools?: any[]) {
+// 导出给 src/cnb.test.ts：整个垃圾语法路径只有经过这个入口才走得通，
+// 不导出就等于那批用例只能测诊断、测不了"清理后的正文到底是什么样"。
+export function cnbParseToolCalls(text: string, tools?: any[]) {
   // ★ 常见短路：全文没有 "<" 且没有 "name": 键（tool_call/XYML/DSML/裸 JSON 全需要其一），
   // 直接原样返回，省掉全部归一化/扫描/清理（纯文本响应占大多数）
   if (!text.includes("<") && !/"name"\s*:/.test(text)) return { clean: text, calls: [] as any[] };
@@ -787,12 +950,30 @@ function cnbParseToolCalls(text: string, tools?: any[]) {
   // ★ 垃圾工具标记：解析不出任何调用时，剥掉"像工具调用但结构非法"的标签并反馈
   // （<tool_calls in parallel> / <function_calls> / 裸 <invoke> 无参数块等）
   let junkToolSyntax = false;
+  let junkDiagnosis = "";
   if (!calls.length) {
-      const JUNK = /<(?:\|?(?:XYML|QNML)\|?)?tool[_ ]?calls?\b[\s\S]*?(?:<\/[^>]*(?:call|invoke|parameter)[^>]*\s*>|$)|<function_calls\b[\s\S]*?<\/function_calls\s*>/gi;
+    // 单一 JUNK 正则是这套逻辑的**唯一清理出口**：它少认一种写法，那种写法的整块
+    // 标签就会留在正文里直接发给客户端——用户看到的是一堆裸露伪 XML，而不是一句
+    // "写错了"。新增协议形态必须同时扩这里。
+    const JUNK = new RegExp(
+      // 复数 / 带属性 / 漏闭合的 tool_calls 包裹：开到最近的闭合标签或文末
+      "<(?:\\|?(?:XYML|QNML)\\|?)?tool[_ ]?calls?\\b[\\s\\S]*?(?:<\\/[^>]*(?:call|invoke|parameter)[^>]*\\s*>|$)"
+      // function_call(s) 单复数都收：只写复数时，单数那半边的标签会原样漏出去
+      + "|<function_calls?\\b[\\s\\S]*?(?:<\\/[^>]*call[^>]*\\s*>|$)",
+      "gi",
+    );
     if (JUNK.test(text)) {
+      // JUNK 带 g 标志，test() 会推进 lastIndex；立刻归零，否则下面的 replace()
+      // 会漏掉第一处匹配（g 标志的正则共享可变状态）
+      JUNK.lastIndex = 0;
       junkToolSyntax = true;
-      // 拒收时记录原始形态（stderr 日志），下次能确诊而不是盲猜
-      console.warn("[junk] unparseable tool syntax, raw (500 chars): " + text.replace(/\s+/g, " ").slice(0, 500));
+      junkDiagnosis = cnbDiagnoseJunkSyntax(text);
+      // 拒收时记录原始形态（stderr + 落盘），下次能确诊而不是盲猜。
+      // 落盘是必需的：stderr 只进插件 200 行内存日志，长会话里几秒就被冲掉
+      // （实测：连续拒收时 warn 存活时间以秒计，日志文件里一行都没留下）。
+      const raw = "[junk] unparseable tool syntax, raw (500 chars): " + text.replace(/\s+/g, " ").slice(0, 500);
+      console.warn(raw);
+      cnbJournalJunk(raw + "\n  diagnosis: " + junkDiagnosis + "\n");
       text = text.replace(JUNK, "");
       text = text.replace(/<\/?[｜|]{0,2}(?:XYML|QNML)[｜|]{0,2}\s*\w*\s*>/gi, "");
       text = text.replace(/<\/?tool_calls?\b[^>]*>/gi, "");
@@ -817,7 +998,11 @@ function cnbParseToolCalls(text: string, tools?: any[]) {
     if (degenerated) {
       clean = clean ? clean + "\n\n" + DEGENERATE_NOTE : DEGENERATE_NOTE;
     } else if (junkToolSyntax) {
-      const note = `[proxy] Your previous tool call used an invalid syntax that no client can parse, so it was NOT executed. Do NOT stop and do NOT apologize — immediately continue the task by re-emitting the SAME tool call in EXACTLY this shape, with nothing else on those two tag lines:\n<tool_call>\n{"name": "TOOL_NAME", "arguments": { ...all required params... }}\n</tool_call>`;
+      // 第一版这里只有一句通用的 "invalid syntax"。模型不知道错在哪，于是每一轮都把
+      // 同一种坏写法再写一遍 —— 用户实测单会话连续 13 次大输出回合全是这么来的
+      // （输入 34 倍增长、99% token 花在重发）。现在附上**违反的具体那一条**，
+      // 并且连续被拒时熔断成短版（cnbJunkFeedback），诊断仍然每轮都发。
+      const note = cnbJunkFeedback(junkDiagnosis);
       clean = clean ? clean + "\n\n" + note : note;
     }
   }

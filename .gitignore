@@ -49,6 +49,9 @@ desktop.ini
 .vscode/
 .idea/
 cnb-login.txt
+# 垃圾工具语法的落盘日志（cnbJournalJunk）。不含凭据，但是运行期产物——
+# 判「模型到底写了什么」时看运行机器上的那份，不看仓库。
+cnb-junk.log
 # 自定义供应商配置：**含明文 apiKey**，与 cnb-login.txt 同类。写了就不要提交。
 # 需要一个可提交的样例时用 custom-providers.example.json（不含 key）。
 custom-providers.json
