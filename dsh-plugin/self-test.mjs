@@ -1881,6 +1881,63 @@ try {
     );
     assert.equal('apiKey' in noKey[0], false, 'an unset key must be absent, not empty');
 
+    // ---- 多个自定义供应商的 key 必须能同时存在 ----
+    //
+    // 用户报的是「自定义供应商的 apikey 只能存储一个」。根因在 `ProxyRuntime.update`：
+    // `{ ...this.settings, ...values }` 对 customKeys 是**整体替换**，而面板只发
+    // **这一轮重新输入的**那把 key（没动过的字段是空的，因为服务端从不回传 key，
+    // client.js 刻意省略它）。于是「给第二家填 key」= 把第一家那把删掉。
+    //
+    // 这一段的判据是**跨两次保存**：单次保存里带两把 key 是能过的（旧代码也能过），
+    // 只有分两次才暴露替换语义。只测一次保存的断言抓不到这个 bug。
+    {
+      const runtime = new ProxyRuntime();
+      // 只替换被测的那部分：update 会真的去停/起代理进程。
+      runtime.stop = async () => {};
+      runtime.start = async () => {};
+      runtime.snapshot = () => ({ customKeys: runtime.settings.customKeys });
+      runtime.settings = {
+        customProviders: [
+          { name: 'acme', baseUrl: 'https://a.test/v1' },
+          { name: 'globex', baseUrl: 'https://b.test/v1' },
+        ],
+        customKeys: {},
+      };
+
+      // 第一次保存：只填 acme。
+      await runtime.update({ customKeys: { acme: 'sk-acme' } });
+      // 第二次保存：只填 globex。acme 的输入框是空的，所以 acme 不出现在这次请求里。
+      await runtime.update({ customKeys: { globex: 'sk-globex' } });
+      assert.deepEqual(
+        runtime.settings.customKeys,
+        { acme: 'sk-acme', globex: 'sk-globex' },
+        'a key saved in an earlier round must survive a later save that does not mention it',
+      );
+
+      // 重输同一家：新值必须覆盖旧的。
+      await runtime.update({ customKeys: { acme: 'sk-acme-2' } });
+      assert.equal(
+        runtime.settings.customKeys.acme,
+        'sk-acme-2',
+        'retyping one vendor key must update that key',
+      );
+
+      // 显式清空仍然是「删掉这一家」，合并不能把它变成不能删。
+      await runtime.update({ customKeys: { globex: '' } });
+      assert.deepEqual(
+        runtime.settings.customKeys,
+        { acme: 'sk-acme-2' },
+        'an explicit empty string still clears that one key',
+      );
+
+      // 与 key 无关的保存不能误伤任何一把。
+      await runtime.update({ port: 8123 });
+      assert.deepEqual(
+        runtime.settings.customKeys,
+        { acme: 'sk-acme-2' },
+        'an unrelated save must not disturb stored keys',
+      );
+    }
 
     console.log('custom provider suite ok');
   }

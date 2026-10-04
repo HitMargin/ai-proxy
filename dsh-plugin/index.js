@@ -1173,7 +1173,33 @@ export class ProxyRuntime {
 
   async update(values = {}) {
     await this.stop();
-    this.settings = loadSettings({ ...this.settings, ...values });
+    // `customKeys` is a patch, not a replacement - merged before the spread so an
+    // omitted vendor keeps its stored key.
+    //
+    // This has to happen here rather than in `cleanSettings`, which is a pure
+    // function over the request body alone and therefore cannot see what is already
+    // stored. The panel sends only the keys the user typed this session (an
+    // untouched field is blank, because the server never sends a key back and
+    // client.js deliberately omits it), so a wholesale `{...this.settings, ...values}`
+    // replaced the map with just the one entry - typing a second vendor's key
+    // deleted the first vendor's. Outside it looked like "only one key can be
+    // stored", which is how the user reported it.
+    //
+    // A same-named entry in `values` still wins, and `{}` stays meaningful: an
+    // explicit empty map means "the user removed every vendor", so it clears.
+    const patch = { ...values };
+    if (isRecord(values.customKeys) && isRecord(this.settings?.customKeys)) {
+      const incoming = values.customKeys;
+      // Only names the incoming patch actually mentions count as "clear this one";
+      // a name it is silent about is not a deletion.
+      const merged = { ...this.settings.customKeys };
+      for (const [name, value] of Object.entries(incoming)) {
+        if (value === '') delete merged[name];
+        else merged[name] = value;
+      }
+      patch.customKeys = merged;
+    }
+    this.settings = loadSettings({ ...this.settings, ...patch });
     try { saveSettings(this.settings); } catch (error) { this.lastError = error.message; }
     await this.start();
     return this.snapshot();
@@ -2567,13 +2593,39 @@ export function cleanSettings(values) {
     next.customProviders = rows;
   }
   if (isRecord(values.customKeys)) {
-    const kept = {};
+    // Merged into the stored map, not substituted for it.
+    //
+    // This used to be `next.customKeys = kept`, a full replace, and the panel only
+    // ever sends the key of a vendor whose field the user retyped this session -
+    // because the server never sends a key back, so an untouched field arrives
+    // blank and is deliberately omitted (see client.js). Replace semantics therefore
+    // meant: adding a second vendor and typing *its* key silently deleted the
+    // first vendor's key. The user's own words for it were "the API key can only
+    // store one", which is exactly what it looked like from outside.
+    //
+    // An empty string stays the explicit "clear this one" signal, so merging does
+    // not remove the ability to delete a key. A name that is not a vendor any more
+    // is dropped: a key with nothing to authenticate to is a credential left on disk
+    // for no reason.
+    const kept = { ...(isRecord(next.customKeys) ? next.customKeys : {}) };
     for (const [name, value] of Object.entries(values.customKeys)) {
       if (!CUSTOM_NAME_PATTERN.test(name)) continue;
       if (typeof value !== 'string' || value.length > 512) continue;
+      if (value.trim() === '') {
+        delete kept[name];
+        continue;
+      }
       kept[name] = value.trim();
     }
-    next.customKeys = kept;
+    // Only for the settings-backed list: a file-backed vendor's key lives in the
+    // file, and dropping it here would delete a credential this route never owned.
+    const known = new Set(
+      (Array.isArray(next.customProviders) ? next.customProviders : [])
+        .map((row) => String(row?.name ?? '').toLowerCase()),
+    );
+    next.customKeys = Object.fromEntries(
+      Object.entries(kept).filter(([name]) => known.has(name)),
+    );
   }
   if (Array.isArray(values.hiddenChannels)) {
     next.hiddenChannels = [...new Set(values.hiddenChannels
