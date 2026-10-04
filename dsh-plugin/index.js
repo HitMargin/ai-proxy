@@ -545,8 +545,12 @@ export function credentialEnv(settings) {
   // read settings.json - it only sees the environment. The list is empty rather
   // than absent when nothing is configured, so the proxy can tell "no custom
   // channel set up" from "this variable was never injected".
-  const custom = customProvidersForEnv(settings);
-  env.AI_PROXY_CUSTOM_PROVIDERS = JSON.stringify(custom);
+  //
+  // Only the settings half travels here. The file half reaches the proxy by the
+  // proxy reading it, and injecting it too would send the same configuration twice
+  // - with the environment copy winning on any later edit to the file, which is
+  // the opposite of what a file-backed source should do.
+  env.AI_PROXY_CUSTOM_PROVIDERS = JSON.stringify(mergeCustomSources(settings).settingsProviders);
   return env;
 }
 
@@ -586,30 +590,168 @@ function customProviderProblem(entry) {
  * them too, but by then the user has only a channel that silently lost a vendor.
  */
 export function customProvidersForEnv(settings) {
+  return mergeCustomSources(settings).providers;
+}
+
+/**
+ * 两个来源合成的全貌：每条来自哪里、谁被谁盖了、文件有没有坏。
+ *
+ * 语义与代理侧 src/custom.ts 的 mergeCustomSources 一致——**同名时环境赢**。
+ * 两边必须一致，否则面板显示的和代理实际用的会不一样，而这正是上一版的毛病。
+ * 这边不需要重复实现优先级，因为插件本来就是把 settings 那份**注入成环境**的：
+ * 文件通过 env 之外的另一条路到达代理，代理自己再合并一次。所以这里只需要
+ * 按同一规则算出「面板该显示什么」。
+ */
+export function mergeCustomSources(settings) {
   const rows = Array.isArray(settings?.customProviders) ? settings.customProviders : [];
   const keys = isRecord(settings?.customKeys) ? settings.customKeys : {};
-  const out = [];
+  const root = resolveProjectRoot(settings ?? {});
+  const file = readCustomProviderFile(root);
+
+  const providers = [];
+  const origin = {};
   const seen = new Set();
+  const rejected = [];
+
   for (const entry of rows) {
-    if (customProviderProblem(entry) !== null) continue;
-    const name = String(entry.name).trim().toLowerCase();
-    if (seen.has(name)) continue;
-    seen.add(name);
-    const key = typeof keys[name] === 'string' ? keys[name].trim() : '';
-    out.push({
-      name,
-      baseUrl: String(entry.baseUrl).trim().replace(/\/+$/, ''),
-      ...key !== '' ? { apiKey: key } : {},
-      ...typeof entry.authHeader === 'string' && entry.authHeader.trim() !== ''
-        ? { authHeader: entry.authHeader.trim() }
-        : {},
-      ...typeof entry.label === 'string' && entry.label.trim() !== ''
-        ? { label: entry.label.trim() }
-        : {},
-      enabled: entry.enabled !== false,
-    });
+    const problem = customProviderProblem(entry);
+    if (problem !== null) {
+      rejected.push({ name: String(entry?.name ?? '(unnamed)'), reason: problem, source: 'settings' });
+      continue;
+    }
+    const normalized = normalizeCustomEntry(entry, keys);
+    if (seen.has(normalized.name)) {
+      rejected.push({ name: normalized.name, reason: 'duplicate name', source: 'settings' });
+      continue;
+    }
+    seen.add(normalized.name);
+    providers.push(normalized);
+    origin[normalized.name] = 'env';
   }
-  return out;
+
+  const shadowed = [];
+  const fileProviders = [];
+  for (const row of file.rows) {
+    if (row.rejected !== undefined) {
+      rejected.push({ name: row.name, reason: row.rejected, source: 'file' });
+      continue;
+    }
+    if (seen.has(row.name)) {
+      // 代理侧也是这个规矩：环境那份是进程启动时显式给的，文件是持久化的默认值。
+      shadowed.push(row.name);
+      continue;
+    }
+    seen.add(row.name);
+    // 文件里的条目**不进 providers**：它不该被注入环境变量，否则会把同一份配置
+    // 送给代理两次（代理自己会读那个文件）。它只用于面板显示。
+    fileProviders.push(row);
+    origin[row.name] = 'file';
+  }
+
+  return {
+    providers: [...providers, ...fileProviders],
+    settingsProviders: providers,
+    fileProviders,
+    origin,
+    shadowed,
+    rejected,
+    file: { path: customFilePath(root), exists: file.exists, error: file.error },
+  };
+}
+/**
+ * 项目目录里的供应商文件，与代理侧读的是同一个。
+ *
+ * 为什么插件也要读它：代理有两个配置来源（环境变量 + custom-providers.json），
+ * 而插件只认识 settings.json。于是手写文件配的供应商**代理能用、面板与选择器却
+ * 完全看不到**——两个界面自相矛盾，正是这个项目反复在删的那类故障。
+ *
+ * 路径必须与代理一致：那是**工作目录**下的相对路径，而代理由本插件以
+ * projectRoot 为 cwd 启动（见 ProxyRuntime.start）。所以这里也按 projectRoot 取，
+ * 而不是插件自身所在目录。
+ */
+const CUSTOM_FILE_NAME = 'custom-providers.json';
+
+function customFilePath(root) {
+  return root === '' ? '' : path.join(root, CUSTOM_FILE_NAME);
+}
+
+/**
+ * 读文件并按代理的语义解析出供应商数组。
+ *
+ * 按 mtime 缓存：面板每 10 秒拉一次快照，而文件几乎不变。**但必须每请求 stat**
+ * ——用户保存文件后要立刻看到，这正是文件这条路径相对面板的好处。
+ */
+const customFileCache = { path: '', mtime: -1, rows: [], error: null, exists: false };
+
+function readCustomProviderFile(root) {
+  const file = customFilePath(root);
+  if (file === '') {
+    customFileCache.path = '';
+    customFileCache.exists = false;
+    customFileCache.rows = [];
+    customFileCache.error = null;
+    return customFileCache;
+  }
+  let stamp = -1;
+  try {
+    stamp = fs.statSync(file).mtimeMs;
+  } catch {
+    // 文件不存在是常态（插件那条路把它注入环境变量），不是错误。
+    customFileCache.path = file;
+    customFileCache.mtime = -1;
+    customFileCache.rows = [];
+    customFileCache.error = null;
+    customFileCache.exists = false;
+    return customFileCache;
+  }
+  if (customFileCache.path === file && customFileCache.mtime === stamp) return customFileCache;
+  let rows = [];
+  let error = null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // 两种顶层形状都认，与 src/custom.ts 的 customFileTextToEnvText 一致。
+    const list = Array.isArray(parsed) ? parsed : (isRecord(parsed) && Array.isArray(parsed.providers) ? parsed.providers : null);
+    if (list === null) {
+      error = 'expected an array, or an object with a providers array';
+    } else {
+      for (const entry of list) {
+        const problem = customProviderProblem(entry);
+        if (problem === null) {
+          rows.push(normalizeCustomEntry(entry, {}));
+        } else {
+          rows.push({ name: String(entry?.name ?? '(unnamed)'), rejected: problem });
+        }
+      }
+    }
+  } catch (reason) {
+    error = reason instanceof Error ? reason.message : String(reason);
+  }
+  customFileCache.path = file;
+  customFileCache.mtime = stamp;
+  customFileCache.rows = rows;
+  customFileCache.error = error;
+  customFileCache.exists = true;
+  return customFileCache;
+}
+
+/** 一条合法条目 → 注入/展示用的规范形状。settings 与文件共用。 */
+function normalizeCustomEntry(entry, keys) {
+  const name = String(entry.name).trim().toLowerCase();
+  const key = typeof entry.apiKey === 'string' && entry.apiKey.trim() !== ''
+    ? entry.apiKey.trim()
+    : (typeof keys[name] === 'string' ? keys[name].trim() : '');
+  return {
+    name,
+    baseUrl: String(entry.baseUrl).trim().replace(/\/+$/, ''),
+    ...key !== '' ? { apiKey: key } : {},
+    ...typeof entry.authHeader === 'string' && entry.authHeader.trim() !== ''
+      ? { authHeader: entry.authHeader.trim() }
+      : {},
+    ...typeof entry.label === 'string' && entry.label.trim() !== ''
+      ? { label: entry.label.trim() }
+      : {},
+    enabled: entry.enabled !== false,
+  };
 }
 function dataDir() {
   const home = envValue('DSH_HOME') || path.join(os.homedir(), '.dsh');
@@ -826,6 +968,11 @@ export class ProxyRuntime {
   }
 
   snapshot() {
+    // Computed per call, not stored: this snapshot is built once per `apply()` and
+    // survives a window reload, so anything baked in here is stale until the Host
+    // restarts. Reading the file on every snapshot is exactly what makes saving it
+    // take effect without one.
+    const customMerge = mergeCustomSources(this.settings);
     return {
       state: this.state,
       mode: this.settings.mode,
@@ -1771,7 +1918,11 @@ export class AiProxyAdapter {
     // It is a single route however many vendors are configured - the proxy
     // aggregates them - so the id prefix stays `custom/<vendor>/<model>`.
     const activeRoutes = [...EXTRA_MODEL_ROUTES];
-    const customRows = customProvidersForEnv(this.runtime?.settings ?? {});
+    // Both sources count: a vendor the user wrote into custom-providers.json is one
+    // the proxy serves, so the panel must ask for its listing too. Counting only
+    // the settings half is what made a file-configured channel invisible in both
+    // the panel and the picker while the proxy was serving it perfectly well.
+    const customRows = mergeCustomSources(this.runtime?.settings ?? {}).providers;
     if (customRows.length > 0 && !isBlockedModelId('custom/x')) {
       activeRoutes.push({ prefix: 'custom', basePath: '/custom/v1' });
     }
@@ -2535,6 +2686,10 @@ export function healthIndex(payload) {
 }
 
 async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
+  // Both sources, computed per call. This snapshot is served on every panel poll,
+  // and reading the config file here is what makes a hand-edited
+  // custom-providers.json show up without a Host restart.
+  const customMerge = mergeCustomSources(runtime?.settings ?? {});
   let base = {};
   try {
     base = await panelSnapshot(adapter);
@@ -2589,25 +2744,33 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
       ...BLOCKED_CHANNELS,
     ])].sort(),
     hiddenChannels: [...BLOCKED_CHANNELS],
-    // The user's own upstreams, as the panel is allowed to see them: **no keys**,
-    // only a set/unset boolean per vendor - the same rule channelKeySet follows and
-    // for the same reason (a credential echoed into a rendered page is a credential
-    // in the next screenshot). `rejected` carries the entries that failed the same
-    // validation the proxy applies, so a typo is reported rather than silently gone.
-    customProviders: customProvidersForEnv(runtime.settings).map((entry) => ({
+    // The user's own upstreams from **both** sources, as the panel is allowed to see
+    // them: **no keys**, only a set/unset boolean per vendor - the same rule
+    // channelKeySet follows and for the same reason (a credential echoed into a
+    // rendered page is a credential in the next screenshot). `origin` says which
+    // source each one came from, because a file-backed vendor cannot be edited or
+    // deleted from this card - the file owns it.
+    customProviders: customMerge.providers.map((entry) => ({
       name: entry.name,
       label: entry.label ?? entry.name,
       baseUrl: entry.baseUrl,
       authHeader: entry.authHeader === 'authorization' ? '' : entry.authHeader,
       enabled: entry.enabled !== false,
       keySet: typeof entry.apiKey === 'string' && entry.apiKey !== '',
+      origin: customMerge.origin[entry.name] ?? 'env',
     })),
-    // Entries the same validation refused. Reported rather than dropped: a vendor
-    // that silently did not take effect looks identical to one that was never
-    // entered, and the user has no way to tell which mistake they made.
-    customRejected: (Array.isArray(runtime.settings.customProviders) ? runtime.settings.customProviders : [])
-      .map((entry) => ({ name: String(entry?.name ?? '(unnamed)'), reason: customProviderProblem(entry) }))
-      .filter((row) => row.reason !== null),
+    // Entries a validation refused, from either source, each saying which. Reported
+    // rather than dropped: a vendor that silently did not take effect looks
+    // identical to one that was never entered.
+    customRejected: customMerge.rejected,
+    // Where the file half comes from and whether it is readable. Shown so a user
+    // who wrote a file can tell "not picked up" from "wrong directory".
+    customFile: {
+      path: customMerge.file.path,
+      exists: customMerge.file.exists,
+      error: customMerge.file.error,
+    },
+    customShadowed: customMerge.shadowed,
     // The channels the panel offers a key for, each naming the variable the proxy
     // reads, so the field can say which one it is writing.
     keyedChannels: KEYED_CHANNELS,

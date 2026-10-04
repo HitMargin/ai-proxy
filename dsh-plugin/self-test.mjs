@@ -30,7 +30,7 @@ process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv, mergeCustomSources } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -1885,6 +1885,83 @@ try {
     console.log('custom provider suite ok');
   }
 
+    // ── 文件来源：代理读得到，面板也必须看得到 ──
+    //
+    // 上一版的裂口：代理由 custom-providers.json 配的供应商能用，而面板与选择器
+    // 完全看不到——两个界面自相矛盾。这一段钉住「两侧都可见」与「不重复注入」
+    // 两条性质。
+    {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apx-custom-file-'));
+      try {
+        // 一个能骗过 resolveProjectRoot 的项目目录，否则它静默回退到插件所在仓库。
+        fs.writeFileSync(path.join(root, 'main.ts'), '// fixture');
+        fs.writeFileSync(path.join(root, 'deno.jsonc'), '{}');
+        fs.writeFileSync(path.join(root, 'custom-providers.json'), JSON.stringify({
+          providers: [{ name: 'filevendor', baseUrl: 'https://file.test/v1' }],
+        }));
+
+        const merged = mergeCustomSources({ projectRoot: root, customProviders: [], customKeys: {} });
+        assert.deepEqual(
+          merged.providers.map((row) => row.name),
+          ['filevendor'],
+          'a vendor configured in the file must be visible to the panel',
+        );
+        assert.equal(merged.origin.filevendor, 'file', 'and it must say where it came from');
+        // 只注入 settings 那份：文件那份由代理自己读，注入两遍就等于同一份配置
+        // 送两次，而且环境的副本会在文件改动后继续生效——正好反了。
+        assert.deepEqual(
+          merged.settingsProviders,
+          [],
+          'the file half must not be injected into the environment',
+        );
+        // credentialEnv 也必须只带 settings 那份。必须**传 projectRoot**：
+        // 不传的话 resolveProjectRoot 会回退到插件所在仓库，那里没有配置文件，
+        // 于是这条断言对实现怎么改都成立——我第一版就是这样，变异体照样绿。
+        assert.deepEqual(
+          JSON.parse(credentialEnv({ projectRoot: root, customProviders: [], customKeys: {} }).AI_PROXY_CUSTOM_PROVIDERS),
+          [],
+          'credentialEnv must not carry file-backed vendors either',
+        );
+
+        // 同名冲突：environment wins，文件那条记进 shadowed。
+        //
+        // 用**另一个目录**而不是改写同一个文件：读取器按 (path, mtime) 缓存，
+        // 而两次写入可能落在同一毫秒里——那样第二次读会命中第一次的缓存。
+        // 这不是被测代码的缺陷（真实用户不会在同一毫秒里改两次配置），但一个
+        // 依赖 mtime 精度的断言本身就是坏的。
+        const both = mergeCustomSources({
+          projectRoot: root,
+          customProviders: [{ name: 'filevendor', baseUrl: 'https://env.test/v1' }],
+          customKeys: {},
+        });
+        assert.deepEqual(both.shadowed, ['filevendor'], 'a shadowed file entry must be reported');
+        assert.equal(both.providers.length, 1, 'the name must appear once, not twice');
+        assert.equal(both.providers[0].baseUrl, 'https://env.test/v1', 'and the environment copy wins');
+
+        // 坏程序列进 rejected 并标明来自文件，而不是静默消失。
+        // 同上：换目录，避开 (path, mtime) 缓存的同毫秒覆盖问题。
+        const badRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'apx-custom-bad-'));
+        fs.writeFileSync(path.join(badRoot, 'main.ts'), '// fixture');
+        fs.writeFileSync(path.join(badRoot, 'deno.jsonc'), '{}');
+        fs.writeFileSync(path.join(badRoot, 'custom-providers.json'), JSON.stringify([
+          { name: 'Bad Name', baseUrl: 'https://x.test/v1' },
+        ]));
+        const bad = mergeCustomSources({ projectRoot: badRoot, customProviders: [], customKeys: {} });
+        fs.rmSync(badRoot, { recursive: true, force: true });
+        assert.equal(bad.providers.length, 0);
+        assert.equal(bad.rejected.length, 1);
+        assert.equal(bad.rejected[0].source, 'file', 'a bad file entry must say it came from the file');
+
+        // 文件不存在是常态（插件把表注入环境变量），不是错误。
+        fs.rmSync(path.join(root, 'custom-providers.json'));
+        const absent = mergeCustomSources({ projectRoot: root, customProviders: [], customKeys: {} });
+        assert.deepEqual(absent.providers, []);
+        assert.equal(absent.file.error, null, 'a missing file is not an error');
+        assert.equal(absent.file.exists, false);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;

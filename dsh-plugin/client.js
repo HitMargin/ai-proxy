@@ -43,6 +43,8 @@ window.__ModuleLoader__.load({
     vendorBadName: '名字只能用 a-z 0-9 . _ - 且不超过 32 位',
     vendorBadUrl: '地址必须是 https（本机回环可以用 http）',
     vendorRejected: '下列配置未生效：{list}',
+    vendorFromFile: '来自配置文件 {file}（在那个文件里改，这里只读）',
+    vendorNoKey: '文件里没配 key',
         keySet: '已设置（{what}）。留空保存不会清除它。',
         keyMissing: '未设置。没有 key 时该渠道不列模型。',
         deepseekSetup: '一键配置',
@@ -110,6 +112,8 @@ window.__ModuleLoader__.load({
     vendorBadName: 'a name may use a-z 0-9 . _ - and at most 32 characters',
     vendorBadUrl: 'the address must be https (loopback may use http)',
     vendorRejected: 'These entries did not take effect: {list}',
+    vendorFromFile: 'From the config file {file} — edit it there, this row is read-only',
+    vendorNoKey: 'no key in the file',
         keySet: 'Set ({what}). Saving with the field empty leaves it alone.',
         keyMissing: 'Not set. Without a key the channel lists no models.',
         deepseekSetup: 'Set up',
@@ -208,6 +212,8 @@ window.__ModuleLoader__.load({
 .apx_cvheader{max-width:190px}
 .apx_cvrow .apx_toggle{flex:0 0 auto;margin-left:auto}
 .apx_bad{color:var(--dsw-alias-state-error-primary)}
+/* A file-backed row: dashed border so it reads as "not edited here". */
+.apx_cvfile{border-style:dashed}
 .apx_chips{display:flex;gap:8px;flex-wrap:wrap}
 .apx_chip{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);font-size:12px;color:var(--dsw-alias-label-secondary)}
 .apx_chip b{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;font-weight:620}
@@ -642,7 +648,10 @@ window.__ModuleLoader__.load({
         channelKeys,
         // Only the columns the server accepts; the panel's own bookkeeping
         // (`test`, `problem`) is not part of the stored shape.
-        customProviders: customDrafts.map((row) => ({
+        // File-backed rows are filtered out: they belong to custom-providers.json,
+        // and re-submitting them would write a second copy into settings.json - so
+        // the same vendor would then exist twice, in two files, disagreeing.
+        customProviders: customDrafts.filter((row) => row.origin !== 'file').map((row) => ({
           name: String(row.name ?? '').trim().toLowerCase(),
           baseUrl: String(row.baseUrl ?? '').trim(),
           ...row.label ? { label: row.label } : {},
@@ -653,7 +662,7 @@ window.__ModuleLoader__.load({
         // stored alone" for an untouched field, which is why the rows the user
         // did not retype are absent rather than blank.
         customKeys: Object.fromEntries(customDrafts
-          .filter((row) => typeof row.apiKey === 'string' && row.apiKey !== '')
+          .filter((row) => row.origin !== 'file' && typeof row.apiKey === 'string' && row.apiKey !== '')
           .map((row) => [String(row.name).trim().toLowerCase(), row.apiKey])),
       })
       // ---- TRAE: daily check-in ----
@@ -951,18 +960,23 @@ window.__ModuleLoader__.load({
         h('div', { className: 'apx_field', key: 'custom-vendors' },
           h('span', null, t('customVendors')),
           h('p', { className: 'apx_tag' }, t('customVendorsHint')),
-          customDrafts.map((draft, index) => h('div', { key: 'cv-' + index, className: 'apx_cvrow' },
+          customDrafts.map((draft, index) => h('div', { key: 'cv-' + index, className: 'apx_cvrow' + (draft.origin === 'file' ? ' apx_cvfile' : '') },
+            draft.origin === 'file'
+              ? h('p', { className: 'apx_tag' }, t('vendorFromFile', { file: data?.customFile?.path ?? 'custom-providers.json' }))
+              : null,
             h('div', { className: 'apx_row' },
               h('input', {
                 className: 'apx_input apx_cvname',
                 placeholder: 'name (a-z0-9._-)',
                 value: draft.name,
+                readOnly: draft.origin === 'file',
                 onChange: (event) => updateDraft(index, { name: event.target.value }),
               }),
               h('input', {
                 className: 'apx_input',
                 placeholder: 'https://api.example.com/v1',
                 value: draft.baseUrl,
+                readOnly: draft.origin === 'file',
                 onChange: (event) => updateDraft(index, { baseUrl: event.target.value }),
               }),
             ),
@@ -970,8 +984,11 @@ window.__ModuleLoader__.load({
               h('input', {
                 className: 'apx_input',
                 type: 'password',
-                placeholder: draft.keySet ? '••••••••' : 'API key',
+                placeholder: draft.origin === 'file'
+                  ? (draft.keySet ? '••••••••' : t('vendorNoKey'))
+                  : (draft.keySet ? '••••••••' : 'API key'),
                 value: draft.apiKey ?? '',
+                readOnly: draft.origin === 'file',
                 onChange: (event) => updateDraft(index, { apiKey: event.target.value }),
               }),
               h('input', {
@@ -994,12 +1011,17 @@ window.__ModuleLoader__.load({
                 disabled: busy || !draft.name,
                 onClick: () => testVendor(index),
               }, t('testVendor')),
-              h('button', {
-                className: 'apx_btn',
-                type: 'button',
-                disabled: busy,
-                onClick: () => removeDraft(index),
-              }, t('removeVendor')),
+              // A file-backed vendor has no Remove button: the file owns it, and
+              // deleting the row would only delete a settings.json entry that does
+              // not exist - the vendor would come straight back on the next read.
+              draft.origin === 'file'
+                ? null
+                : h('button', {
+                  className: 'apx_btn',
+                  type: 'button',
+                  disabled: busy,
+                  onClick: () => removeDraft(index),
+                }, t('removeVendor')),
             ),
             draft.problem
               ? h('p', { className: 'apx_tag apx_bad' }, draft.problem)
