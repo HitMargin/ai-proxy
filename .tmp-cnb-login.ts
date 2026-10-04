@@ -164,6 +164,40 @@ interface Verdict {
 }
 
 /**
+ * 抓 CSRF token —— **这一步曾经被我整个漏掉，是脚本第一版失败的真因**。
+ *
+ * 实测（2026-10-05，逐种组合）：
+ *   只带 CNBSESSION            → 403 errcode 7  "User has no permission."
+ *   带全部 cookie（含 csrfkey）→ 401 errcode 16 "Blocked by CSRF."
+ *   带 CNBSESSION + Csrftoken 头 → **200，真的出字**
+ *   只有 csrfkey 没有 Csrftoken 头 → 401 errcode 16
+ *
+ * 关键判据：**`Csrftoken` 请求头是必需的，`csrfkey` cookie 反而不是**
+ * （只带头不带 key 返回 200）。所以只回放 cookie 永远打不通——
+ * 而「403 no permission」看起来像权限问题，实际是「你没有走 CSRF 握手」。
+ *
+ * token 从首页 HTML 的 `window.csrftoken` 抓，与 src/cnb.ts 的 cnbFetchCsrf 同逻辑。
+ */
+async function fetchCsrfToken(cookieHeader: string): Promise<string | null> {
+  try {
+    const r = await fetch(CNB_ORIGIN + "/", {
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ...(cookieHeader ? { cookie: cookieHeader } : {}),
+      },
+      signal: AbortSignal.timeout(20_000),
+    });
+    const html = await r.text();
+    const m = html.match(/window\.csrftoken\s*=\s*"([0-9a-fA-F]{32,64})"/);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 发一次真实推理请求。**这是唯一的成功判据**：状态码、错误文案都不认，
  * 只认「有没有真的吐出一段文本」。
  */
@@ -173,12 +207,17 @@ async function verify(cookieHeader: string, model: string): Promise<Verdict> {
   let text = "";
   let detail = "";
   try {
+    const csrfToken = await fetchCsrfToken(cookieHeader);
     const r = await fetch(CNB_CHAT, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "cookie": cookieHeader,
         "accept": "text/event-stream, application/json",
+        "origin": CNB_ORIGIN,
+        "referer": CNB_ORIGIN + "/ai",
+        // ★ 这一行是必需项；没有它一律 401 Blocked by CSRF。
+        ...(csrfToken ? { "Csrftoken": csrfToken } : {}),
       },
       body: JSON.stringify({
         model,
@@ -295,9 +334,18 @@ async function main() {
       await browser.close().catch(() => {});
     }
 
-    cookieHeader = stripCsrfkey(cookieHeader);
-    const names = cookieNames(cookieHeader);
-    console.log("  cookie 名：" + names.join(", "));
+    // ⚠️ 这里**不能先剔 csrfkey**（第一版就是在这里剔的，验证因此永远失败）。
+    //
+    // 两件事必须分开：
+    //   · **验证**用的是「现在浏览器里真实的那套 cookie」——含 csrfkey。
+    //   · **写盘**才剔 csrfkey（src/cnb.ts 的规则：CSRF 对由代理自己抓，混入旧值不匹配）。
+    //
+    // 第一版在验证前就剔掉了 csrfkey，于是验证跑的是一个代理永远不会用的组合，
+    // 得到 403 却看起来像「账号没权限」——**测量对象和上线对象不是同一个东西**。
+    const rawCookieHeader = cookieHeader;          // 原样，给验证用
+    const names = cookieNames(stripCsrfkey(rawCookieHeader));
+    const rawNames = cookieNames(rawCookieHeader);
+    console.log("  cookie 名：" + rawNames.join(", "));
 
     if (!names.length) {
       console.error("✗ 没抓到任何 cookie，未写盘（免得用空文件覆盖掉现有凭据）。");
@@ -308,17 +356,30 @@ async function main() {
     // 验证失败时保留原文件，避免用一份坏凭据覆盖一份可能还好的。
     console.log("\n验证中（真实请求，会消耗一次极小的免费额度）...");
     const model = await resolveProbeModel();
-    const verdict = await verify(cookieHeader, model);
+    // 用**原样**的 cookie（含 csrfkey）验证——这是浏览器里真实在跑的那一套。
+    const verdict = await verify(rawCookieHeader, model);
 
     if (!verdict.ok) {
       console.error(`✗ 验证失败：HTTP ${verdict.httpStatus ?? "?"} · ${verdict.detail}`);
-      console.error("  未写盘（保留原有 cnb-login.txt）。常见原因：");
-      console.error("   · 登录了但该账号没有 cnb AI 推理权限");
-      console.error("   · 拿到的 cookie 不含会话（清一下浏览器 cookie 重试）");
+      console.error("  未写盘（保留原有 cnb-login.txt）。按状态码定位：");
+      // 第一版这里列的是「账号没权限 / cookie 不含会话」——**两条都猜错了**，
+      // 真因是脚本自己没走 CSRF 握手。现在按实测的码分流，不再列猜测。
+      if (verdict.httpStatus === 403) {
+        console.error("   · 403 errcode 7 = 这个端点没认出你的会话。cookie 没抓到，或抓错了域。");
+        console.error("     先确认浏览器里真的登录成功了（能看到头像/用户名），再重跑一次。");
+      } else if (verdict.httpStatus === 401) {
+        console.error("   · 401 errcode 16 = CSRF 握手没通过（Csrftoken 头缺失或过期）。");
+        console.error("     这通常是瞬时的，重跑一次即可。");
+      } else if (verdict.httpStatus === 200) {
+        console.error("   · 200 但没有正文 = 上游接受了请求却没出字，可能是模型名失效。");
+      } else {
+        console.error("   · 网络/传输层失败，稍后重试。");
+      }
       Deno.exit(1);
     }
 
-    await Deno.writeTextFile(OUTPUT, cookieHeader + String.fromCharCode(10));
+    // 写盘用剔除 csrfkey 之后的串（src/cnb.ts 的规则），不是验证用的那份。
+    await Deno.writeTextFile(OUTPUT, stripCsrfkey(rawCookieHeader) + String.fromCharCode(10));
     console.log(`✓ 验证通过（${verdict.model} 回：${JSON.stringify(verdict.text.slice(0, 60))}）`);
     console.log(`✓ 已写入 ${OUTPUT}（${names.length} 个 cookie，csrfkey 已剔除）`);
     console.log("  代理按 mtime 热加载，无需重启。");
