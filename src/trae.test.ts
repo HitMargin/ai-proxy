@@ -476,6 +476,7 @@ function fakeUpstream(frames: string[]): typeof fetch {
 
 async function collect(
   response: Response,
+  options: { requireDone?: boolean } = {},
 ): Promise<Array<Record<string, any>>> {
   const chunks: Array<Record<string, any>> = [];
   const text = await response.text();
@@ -491,10 +492,15 @@ async function collect(
   }
   // harness 判截断的依据就是终止帧，而收集器本来就要跳过它 —— 跳过就等于没人
   // 断言它发出去了，于是「少发 [DONE]」会是个照样绿的缺陷。
-  assert(
-    sawDone,
-    "the stream must end with [DONE] or the harness reads it as cut",
-  );
+  //
+  // 但这条断言不能一刀切：被掐断的流**必须**不以 [DONE] 收尾，所以截断用例要
+  // 关掉它。判据是「正常结束的流有没有终止帧」，不是「所有流都有终止帧」。
+  if (options.requireDone !== false) {
+    assert(
+      sawDone,
+      "a properly finished stream must end with [DONE] or the harness reads it as cut",
+    );
+  }
   return chunks;
 }
 
@@ -605,6 +611,62 @@ Deno.test("an in-stream error surfaces as a frame instead of a clean stop", asyn
   assert(
     String(withError.error.message).includes("4001"),
     "the business code must survive into the frame",
+  );
+});
+
+Deno.test("an upstream that never sends done is reported as stream_cut", async () => {
+  // 上游断了却不给终止帧：补一个 [DONE] 就是替它宣布「说完了」，断流会被记成
+  // 一次成功轮次，agent loop 拿着半句话当成完整答案继续往下走。
+  const fetcher = fakeUpstream([
+    "event:output\ndata:" + JSON.stringify({ response: "半句" }) + "\n\n",
+  ]);
+
+  const chunks = await collect(
+    await handleTraeChat(
+      CREDENTIAL,
+      DEMO,
+      { model: "demo", messages: [] },
+      fetcher,
+    ),
+    { requireDone: false },
+  );
+  const withError = chunks.find((chunk) => chunk.error !== undefined);
+  assert(withError !== undefined, "a cut stream must say so, not end clean");
+  equal(withError.error.code, "stream_cut");
+  assert(
+    String(withError.error.message).includes(
+      "after partial output had already been delivered",
+    ),
+    "output had reached the client, so the frame must grade it as delivered",
+  );
+  // 关键：不能同时补一个声称 stop 的 finish 帧 —— 那正是「断流读起来像说完」。
+  // 增量帧自带 finish_reason:null，所以要看有没有**非 null** 的那个。
+  equal(
+    chunks.some((chunk) => chunk.choices?.[0]?.finish_reason != null),
+    false,
+    "a cut stream must not also claim a finish reason",
+  );
+});
+
+Deno.test("a cut before any output is graded as retryable", async () => {
+  // 没吐出任何东西的断流，重放是安全的（没有已执行的副作用），措辞必须说清楚。
+  const fetcher = fakeUpstream([]);
+
+  const chunks = await collect(
+    await handleTraeChat(
+      CREDENTIAL,
+      DEMO,
+      { model: "demo", messages: [] },
+      fetcher,
+    ),
+    { requireDone: false },
+  );
+  const withError = chunks.find((chunk) => chunk.error !== undefined);
+  assert(withError !== undefined, "a cut stream must say so");
+  equal(withError.error.code, "stream_cut");
+  assert(
+    String(withError.error.message).includes("before any output"),
+    "nothing reached the client, so the frame must grade it as undelivered",
   );
 });
 

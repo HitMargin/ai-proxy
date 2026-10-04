@@ -810,6 +810,9 @@ export async function handleTraeChat(
         let buffer = "";
         let eventName = "";
         let finish = "stop";
+        // 上游的终止帧（`event: done`）是完整性判据。只有字面量的 done 事件算，
+        // 「看见了什么」不算 —— 见收尾处 stream_cut 分支的注释。
+        let sawDone = false;
         let usage: Record<string, unknown> | undefined;
         /**
          * 工具调用按上游给的 index 累积：参数是**分片**到达的，
@@ -823,7 +826,15 @@ export async function handleTraeChat(
         }>();
 
         const writer = createFrameWriter(controller, encoder);
-        const send = (payload: string): void => writer.send(payload);
+        // 「真的送到客户端了」是断流分级的唯一判据，所以在这里记账而不是事后
+        // 推断：writer 吞掉失败写入并把自己标记为 closed，写入前后都没变成
+        // closed 才算这一次输出到了客户端 —— 判据是输出到了，不是我们打算发。
+        let deliveredOutput = false;
+        const send = (payload: string): void => {
+          const wasClosed = writer.closed;
+          writer.send(payload);
+          if (!wasClosed && !writer.closed) deliveredOutput = true;
+        };
 
         try {
           for (;;) {
@@ -860,6 +871,38 @@ export async function handleTraeChat(
               finish = "tool_calls";
               break;
             }
+          }
+          // ⚠️ 完整性判据。上面那条「⚠️ 顺序反了会让 harness 的流截断检测误判」
+          // 的注释只说了顺序 mattered，却没说明顺序**为什么**重要：harness 判截断的
+          // 唯一依据是终止帧在不在。补一个 [DONE] 就等于替上游宣布「说完了」，
+          // 于是断流被记成一次成功轮次，agent loop 拿着半句话当成完整答案继续往下
+          // 走 —— 用户看到的是模型「突然不说了」，统计里却是一次 ok。
+          //
+          // 所以这里只在**真的见到上游 done** 时才补终止帧；没见到就是被掐断了，
+          // 补一个 stream_cut 帧由调用方决定重不重试（已吐过内容的不许重放）。
+          // 这里直接 return 而不是抛给 catch：catch 那条路径的首选退出方式是抛异常，
+          // 用异常表达「我已经完成收尾」会让收尾逻辑被当成失败再执行一次。
+          if (!sawDone) {
+            // 已经把内容送到客户端的轮次**不许重放**：重放会重复执行已发射的
+            // 工具调用并二次计费，所以判据是「输出到没到客户端」，不是「这一轮
+            // 有没有工具调用」—— 后者会把一轮只发过正文的断流也标成不可重试。
+            const where = deliveredOutput
+              ? "after partial output had already been delivered"
+              : "before any output";
+            send(
+              "data: " + JSON.stringify({
+                error: {
+                  message: "TRAE closed the stream " + where +
+                    " without an event: done frame",
+                  type: "upstream_error",
+                  code: "stream_cut",
+                },
+              }) + "\n\n",
+            );
+            // 终止帧仍然要补，否则下游一直等 —— 但插件先撞到 error 帧就 return，
+            // 所以这一帧只负责关连接，不参与完整性判断。
+            send("data: [DONE]\n\n");
+            return;
           }
           send(buildOpenAIChunk(chatId, created, modelName, {}, finish, usage));
           send("data: [DONE]\n\n");
@@ -904,6 +947,7 @@ export async function handleTraeChat(
           }
 
           if (ev.event === "done") {
+            sawDone = true;
             if (ev.finishReason !== undefined && ev.finishReason.length > 0) {
               finish = normalizeFinishReason(ev.finishReason);
             }
