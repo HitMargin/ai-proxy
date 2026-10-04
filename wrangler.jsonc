@@ -4,6 +4,11 @@
   "main": "worker.ts",
   "compatibility_date": "2025-06-01",
   "workers_dev": true,
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  // 自定义域名：裸域也由本 worker 提供（方案 B：代理占裸域，subscription-manager 挪到 sub.）
+  "routes": [
+    { "pattern": "hitmargin.dpdns.org", "custom_domain": true },
+    { "pattern": "api.hitmargin.dpdns.org", "custom_domain": true }
+  ]
   // 需要鉴权时加："vars": { "API_KEYS": "your-key" }
 }
