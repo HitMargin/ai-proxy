@@ -557,6 +557,21 @@ const DEFAULT_SETTINGS = {
   // time because it is the process that actually spends the credential.
   customProviders: [],
   customKeys: {},
+  // ---- cloudflared tunnel ----
+  //
+  // Off by default, and deliberately so: this is the one setting on the card that
+  // makes the proxy reachable from the public internet, so it is opt-in rather than
+  // started because a path happened to exist.
+  tunnelEnabled: false,
+  // Empty means "find cloudflared the same way restart.ps1 does" - PATH first, then
+  // the Program Files location the installer uses. Stored only when the user
+  // overrides it.
+  cloudflaredPath: '',
+  // The Worker whose BACKEND_URL secret is pointed at the tunnel. Empty skips the
+  // Worker step entirely rather than guessing a name: writing a secret to the wrong
+  // Worker is worse than not writing one.
+  workerName: '',
+  tunnelUrl: '',
 };
 
 /**
@@ -1204,6 +1219,377 @@ export class ProxyRuntime {
     await this.start();
     return this.snapshot();
   }
+}
+
+/**
+ * The cloudflared quick tunnel, startable from the panel.
+ *
+ * ## Why this is a sibling of ProxyRuntime rather than part of it
+ *
+ * They have different lifetimes. The proxy is what the panel starts and stops on
+ * every settings save; the tunnel is an outward-facing choice the user flips when
+ * they want to be reachable from outside, and bouncing it on every unrelated save
+ * would hand out a new trycloudflare hostname each time. Keeping them separate is
+ * also what lets `ProxyRuntime.update` keep calling `stop()` without silently
+ * dropping the public URL.
+ *
+ * ## Why the URL is parsed out of stderr
+ *
+ * `cloudflared tunnel --url` prints its hostname into stderr, not stdout, and has no
+ * machine-readable flag for it on the quick-tunnel path. `restart.ps1` already
+ * depends on this exact behaviour, so the panel does the same thing rather than
+ * inventing a second mechanism that could disagree with it.
+ *
+ * ## What is deliberately not implemented
+ *
+ * TLS fingerprinting, Cloudflare account auth and named tunnels are all out: a quick
+ * tunnel needs no credentials, which is why it can be a switch. A named tunnel would
+ * need a token stored on disk and a domain, and that is a different feature.
+ */
+export class TunnelRuntime {
+  constructor(runtime) {
+    this.proxy = runtime;
+    this.child = null;
+    this.state = 'stopped';
+    this.url = '';
+    this.lastError = '';
+    this.startedAt = 0;
+    this.logs = [];
+    this.worker = { state: 'idle', error: '', url: '' };
+    this.startPromise = null;
+    // Held separately from `runtime.settings` because the tunnel outlives a
+    // settings save that does not touch it.
+    this.desired = false;
+  }
+
+  record(message) {
+    const line = `${new Date().toISOString()} ${message}`.slice(-2000);
+    this.logs.push(line);
+    if (this.logs.length > 120) this.logs.splice(0, this.logs.length - 120);
+  }
+
+  /**
+   * Where cloudflared is, in the same order `restart.ps1` looks.
+   *
+   * An explicit setting wins; then PATH; then the location the Windows installer
+   * uses. Anything else is "not installed", reported as such rather than as a generic
+   * spawn failure - the fix for the two is different (install it vs. fix the path).
+   */
+  resolveBinary() {
+    const configured = String(this.proxy.settings.cloudflaredPath ?? '').trim();
+    if (configured !== '') return configured;
+    // Absolute candidates first, and on Windows the `.exe` matters: `spawn` without
+    // `shell: true` does no PATHEXT expansion, so a bare `cloudflared` fails with
+    // EFTYPE ("Exec format error") even though the command works in a shell. Measured
+    // on this machine: the bare name gave EFTYPE while the absolute path ran.
+    //
+    // Node's own PATH resolution is still allowed as the last resort, because it is
+    // the only thing that works when cloudflared lives somewhere neither installer
+    // put it - but it is the *last* resort, not the first.
+    const candidates = [];
+    if (process.platform === 'win32') {
+      candidates.push('C:\\Program Files (x86)\\cloudflared\\cloudflared.exe');
+      candidates.push('C:\\Program Files\\cloudflared\\cloudflared.exe');
+      candidates.push(
+        path.join(process.env.LOCALAPPDATA ?? '', 'cloudflared', 'cloudflared.exe'),
+      );
+    } else {
+      candidates.push('/usr/local/bin/cloudflared');
+      candidates.push('/usr/bin/cloudflared');
+      candidates.push('/opt/homebrew/bin/cloudflared');
+    }
+    for (const candidate of candidates) {
+      try {
+        if (candidate !== '' && fs.existsSync(candidate)) return candidate;
+      } catch {}
+    }
+    return 'cloudflared';
+  }
+
+  snapshot() {
+    return {
+      state: this.state,
+      enabled: this.proxy.settings.tunnelEnabled === true,
+      url: this.url,
+      lastError: this.lastError,
+      startedAt: this.startedAt || null,
+      pid: this.child?.pid ?? null,
+      // The address a *client* is pointed at: the tunnel origin plus the aggregate
+      // path, not the bare hostname. Handing out the bare hostname is the same
+      // mistake the panel made when it advertised `/commandcode/v1` as "the proxy".
+      baseUrl: this.url === '' ? '' : this.url.replace(/\/+$/, '') + '/v1',
+      worker: { ...this.worker },
+      logs: this.logs.slice(-40),
+    };
+  }
+
+  async start() {
+    if (this.startPromise) return this.startPromise;
+    this.startPromise = this.startInternal().finally(() => { this.startPromise = null; });
+    return this.startPromise;
+  }
+
+  async startInternal() {
+    this.desired = true;
+    if (this.state === 'running' && this.child) return;
+    this.lastError = '';
+    this.worker = { state: 'idle', error: '', url: '' };
+
+    // The tunnel forwards to the local proxy, so there has to be one. Checked here
+    // rather than left to cloudflared: cloudflared will happily tunnel to a port
+    // nothing is listening on and report a healthy connection, and the user finds
+    // out when their remote client 502s. A named error now is worth more.
+    if (!(await this.proxy.probe())) {
+      this.state = 'error';
+      this.lastError = 'the local proxy is not answering, so there is nothing to forward';
+      this.record(this.lastError);
+      return;
+    }
+
+    const binary = this.resolveBinary();
+    const target = `http://127.0.0.1:${this.proxy.settings.port}`;
+    this.state = 'starting';
+    this.record(`starting tunnel: ${binary} --url ${target}`);
+    try {
+      this.child = spawn(binary, ['tunnel', '--url', target, '--no-autoupdate'], {
+        windowsHide: true,
+        env: { ...process.env, NO_UPDATE_NOTIFIER: '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      this.state = 'error';
+      this.lastError = error instanceof Error ? error.message : String(error);
+      this.record(`spawn error: ${this.lastError}`);
+      return;
+    }
+    this.startedAt = Date.now();
+
+    // The hostname arrives on stderr, so both streams are scanned - if a future
+    // cloudflared moves it to stdout the URL is still found instead of the panel
+    // waiting out its timeout for a line that already went past.
+    const onData = (chunk) => {
+      const text = String(chunk);
+      this.record(text.trimEnd());
+      if (this.url === '') {
+        const found = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+        if (found) {
+          this.url = found[0];
+          this.record(`tunnel url: ${this.url}`);
+        }
+      }
+    };
+    this.child.stdout?.on('data', onData);
+    this.child.stderr?.on('data', onData);
+    this.child.on('error', (error) => {
+      // ENOENT here means "cloudflared is not where we looked", which is a
+      // configuration problem and is named as one.
+      this.state = 'error';
+      this.lastError = error.code === 'ENOENT'
+        ? `cloudflared was not found (tried ${binary}); set its path above`
+        : error.message;
+      this.record(`tunnel error: ${this.lastError}`);
+    });
+    this.child.on('exit', (code, signal) => {
+      this.record(`cloudflared exited code=${code} signal=${signal ?? ''}`);
+      this.child = null;
+      this.url = '';
+      // A tunnel does not survive the proxy it forwards to. When the proxy goes
+      // down, cloudflared keeps running against a dead port and the public URL
+      // starts answering 502 while the panel still shows it as up - so the child is
+      // tied to the proxy's fate rather than left as a half-working pair.
+      this.state = 'stopped';
+      if (this.desired) {
+        this.lastError = `cloudflared exited (code ${code ?? signal ?? '?'})`;
+      }
+    });
+
+    // Up to 60s, the same budget restart.ps1 allows. The URL is the readiness
+    // signal: cloudflared's own "connected" line arrives before the edge routes it.
+    for (let attempt = 0; attempt < 120; attempt++) {
+      if (this.url !== '') break;
+      if (this.state === 'error') return;
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    if (this.url === '') {
+      this.state = 'error';
+      this.lastError = 'cloudflared started but never printed a trycloudflare url';
+      this.record(this.lastError);
+      return;
+    }
+
+    // Wait until the hostname actually routes before calling it up.
+    //
+    // The URL is printed as soon as cloudflared registers the tunnel, which is
+    // *before* the edge will serve it - measured: the first request to a brand-new
+    // hostname failed with ECONNRESET and succeeded seconds later. Reporting
+    // `running` at the print would hand the user (and the Worker write, which runs
+    // right after) an address that 502s, and the failure would look like the proxy's.
+    // Retried to a bounded total; a hostname that never routes is reported as a
+    // failure rather than left looking healthy.
+    let reachable = false;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        const response = await fetch(this.url + '/', {
+          method: 'GET',
+          signal: AbortSignal.timeout(8000),
+        });
+        // Any HTTP answer means the edge routed us to the proxy; the status is the
+        // proxy's business, not the tunnel's.
+        if (response.status > 0) {
+          reachable = true;
+          response.body?.cancel?.().catch?.(() => {});
+          break;
+        }
+      } catch {
+        // Not routed yet. Try again while attempts remain.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+    if (!reachable) {
+      this.lastError = `the tunnel url ${this.url} was assigned but the edge never routed it`;
+      this.record(this.lastError);
+      // Kept `running`: cloudflared is up and the hostname may still come good, so
+      // tearing it down would be worse than reporting the uncertainty. The error
+      // rides alongside the state rather than replacing it.
+    }
+    this.state = 'running';
+
+    // Point the Worker at the new hostname. Kept out of `state`: a tunnel that is up
+    // but whose Worker write failed is a different, more actionable condition than a
+    // tunnel that never came up, and collapsing them would hide which half broke.
+    await this.syncWorker();
+  }
+
+  /**
+   * Write the tunnel URL into the Worker's BACKEND_URL secret.
+   *
+   * Skipped entirely when no Worker is named - writing a secret to a guessed Worker
+   * is worse than not writing one. Failure is reported and never thrown: the tunnel
+   * itself is up and usable directly, and failing the whole start over a wrangler
+   * problem would take that away.
+   */
+  async syncWorker() {
+    const worker = String(this.proxy.settings.workerName ?? '').trim();
+    if (worker === '') {
+      this.worker = { state: 'skipped', error: 'no worker name set', url: this.url };
+      return;
+    }
+    const deno = this.proxy.settings.denoPath || 'deno';
+    const root = resolveProjectRoot(this.proxy.settings) || PLUGIN_DIR;
+    this.worker = { state: 'running', error: '', url: this.url };
+    this.record(`updating worker ${worker} BACKEND_URL -> ${this.url}`);
+    try {
+      // Confirm the Worker exists before writing to it.
+      //
+      // Measured: `wrangler secret put --name <typo>` does not fail. It **creates**
+      // the Worker and exits 0 with "Success! Uploaded secret BACKEND_URL". So the
+      // exit code alone cannot tell "I pointed your Worker at the tunnel" from "I
+      // just created a stray Worker you did not want and pointed *that* at the
+      // tunnel" - and the user's real client is still pointed at the old one, with
+      // nothing in the panel to say so. `secret list` is the read-only way to ask,
+      // and it answers non-zero for a name that does not exist.
+      const listed = await runCapture(
+        deno,
+        ['run', '-A', 'npm:wrangler@4.130.0', 'secret', 'list', '--name', worker],
+        { cwd: root, timeoutMs: 180_000 },
+      );
+      if (listed.code !== 0) {
+        const detail = (listed.stderr || listed.stdout || '').trim().split('\n')
+          .filter((line) => line.trim() !== '').slice(-3).join(' ').slice(0, 300);
+        this.worker = {
+          state: 'error',
+          error: `Worker "${worker}" was not found, so nothing was written (${detail || 'secret list failed'})`,
+          url: this.url,
+        };
+        this.record(`worker update skipped: ${this.worker.error}`);
+        return;
+      }
+      // Spawned rather than fetched: wrangler is the tool that owns the secret, and
+      // re-implementing its API here would mean storing a Cloudflare API token in
+      // settings.json - a credential this feature otherwise never needs.
+      const result = await runCapture(
+        deno,
+        ['run', '-A', 'npm:wrangler@4.130.0', 'secret', 'put', 'BACKEND_URL', '--name', worker],
+        { cwd: root, input: this.url + '\n', timeoutMs: 180_000 },
+      );
+      // wrangler writes its progress to stderr even on success, so the exit code is
+      // the verdict and stderr is only evidence.
+      if (result.code === 0) {
+        this.worker = { state: 'ok', error: '', url: this.url };
+        this.record('worker BACKEND_URL updated');
+      } else {
+        const detail = (result.stderr || result.stdout || '').trim().split('\n')
+          .filter((line) => line.trim() !== '').slice(-3).join(' ').slice(0, 300);
+        this.worker = { state: 'error', error: detail || `wrangler exited ${result.code}`, url: this.url };
+        this.record(`worker update failed: ${this.worker.error}`);
+      }
+    } catch (error) {
+      this.worker = {
+        state: 'error',
+        error: error instanceof Error ? error.message : String(error),
+        url: this.url,
+      };
+      this.record(`worker update failed: ${this.worker.error}`);
+    }
+  }
+
+  async stop() {
+    this.desired = false;
+    const child = this.child;
+    this.child = null;
+    this.state = 'stopped';
+    this.url = '';
+    this.worker = { state: 'idle', error: '', url: '' };
+    if (child) {
+      try { child.kill(); } catch {}
+      this.record('tunnel stopped by DSH plugin');
+    }
+  }
+}
+
+/**
+ * Run a command and capture its output and exit code.
+ *
+ * `spawnSync` is used rather than the async form because the only caller is the
+ * wrangler secret write, which is already inside an await and needs the exit code
+ * and stderr together. A timeout is mandatory: wrangler retries a dead network for
+ * minutes, and a promise that never settles would leave the panel's tunnel card
+ * stuck on "updating" with no way back.
+ */
+function runCapture(command, args, options = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      windowsHide: true,
+      env: { ...process.env, NO_UPDATE_NOTIFIER: '1', DENO_NO_UPDATE_CHECK: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish(-1);
+    }, options.timeoutMs ?? 60_000);
+    child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+    child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+    child.on('error', (error) => {
+      stderr += String(error?.message ?? error);
+      finish(-1);
+    });
+    child.on('close', (code) => finish(code ?? -1));
+    if (options.input !== undefined) {
+      try { child.stdin?.end(options.input); } catch {}
+    } else {
+      try { child.stdin?.end(); } catch {}
+    }
+  });
 }
 
 function textOf(content) {
@@ -2633,6 +3019,21 @@ export function cleanSettings(values) {
       .map((entry) => entry.trim().toLowerCase())
     )];
   }
+  // ---- tunnel ----
+  // A boolean, so `false` must survive as a value: `tunnelEnabled: false` is a
+  // request to turn it off, and treating it as "absent" would make the switch
+  // impossible to turn back off.
+  if (typeof values.tunnelEnabled === 'boolean') next.tunnelEnabled = values.tunnelEnabled;
+  if (typeof values.cloudflaredPath === 'string' && values.cloudflaredPath.length <= 512) {
+    next.cloudflaredPath = values.cloudflaredPath.trim();
+  }
+  // A Worker name is handed to wrangler as an argument, so it is validated as a
+  // DNS-ish label: a stray space or slash would reach the CLI as something it
+  // cannot parse. Empty is allowed and means "skip the Worker step".
+  if (typeof values.workerName === 'string' && values.workerName.length <= 128) {
+    const name = values.workerName.trim();
+    if (name === '' || /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) next.workerName = name;
+  }
   return next;
 }
 
@@ -2897,6 +3298,13 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
       ...workBuddyStatus(runtime.settings),
       running: Boolean(runtime.workBuddyLogin),
     },
+    // The tunnel lives in the panel snapshot, not `runtime.snapshot()`. That method
+    // is built once per `apply()` and kept by an instance that outlives a window
+    // reload, so anything placed there is stale until the Host restarts - the exact
+    // way `channelKeySet` went missing while the rest of the card showed fresh data.
+    // This snapshot is recomputed per request, which is what makes the URL appear
+    // while the tunnel is still coming up.
+    tunnel: runtime.tunnel ? runtime.tunnel.snapshot() : null,
     channels,
     health,
     modelHealth: counts,
@@ -2907,7 +3315,7 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
   };
 }
 
-function apiHandler(adapter, runtime, projectAdapter) {
+function apiHandler(adapter, runtime, projectAdapter, tunnel) {
   return async (req, res) => {
     const method = String(req.method || 'GET').toUpperCase();
     const url = new URL(req.url || '/', 'http://localhost');
@@ -3114,6 +3522,38 @@ function apiHandler(adapter, runtime, projectAdapter) {
         });
         sendJson(res, 202, { ...before, started: true, reconfigured: before.configured });
         return;
+      }
+      // ---- cloudflared tunnel ----
+      //
+      // Its own routes rather than a settings field alone, because starting a tunnel
+      // is a process to spawn and a hostname to wait for - not a value to store. The
+      // switch in the panel posts here and the setting is written as a side effect,
+      // so the toggle and the process cannot disagree.
+      if (route === '/tunnel/start' && method === 'POST') {
+        // Persist the intent first: if the Host restarts while the tunnel is up, the
+        // setting is what brings it back, and a switch that silently reverts is worse
+        // than one that never turned on.
+        const before = { ...runtime.settings, tunnelEnabled: true };
+        runtime.settings = loadSettings(before);
+        try { saveSettings(runtime.settings); } catch (error) { runtime.lastError = error.message; }
+        await tunnel.start();
+        return sendJson(res, 200, tunnel.snapshot());
+      }
+      if (route === '/tunnel/stop' && method === 'POST') {
+        await tunnel.stop();
+        runtime.settings = loadSettings({ ...runtime.settings, tunnelEnabled: false, tunnelUrl: '' });
+        try { saveSettings(runtime.settings); } catch (error) { runtime.lastError = error.message; }
+        return sendJson(res, 200, tunnel.snapshot());
+      }
+      // Re-run only the Worker half. Separated because the two fail independently:
+      // the tunnel can be up with a stale BACKEND_URL, and re-spawning cloudflared to
+      // fix that would hand out a new hostname for no reason.
+      if (route === '/tunnel/sync-worker' && method === 'POST') {
+        if (tunnel.url === '') {
+          return sendJson(res, 409, { ...tunnel.snapshot(), error: 'the tunnel is not up yet' });
+        }
+        await tunnel.syncWorker();
+        return sendJson(res, 200, tunnel.snapshot());
       }
       // TRAE account: the panel asks about credits and runs the daily check-in.
       //
@@ -3377,6 +3817,10 @@ async function findNewest(files) {
 
 export function apply(ctx, config = {}) {
   const runtime = new ProxyRuntime(config);
+  // A sibling of the proxy, not a child of it: see TunnelRuntime's header for why
+  // their lifetimes are different.
+  const tunnel = new TunnelRuntime(runtime);
+  runtime.tunnel = tunnel;
   const resolveImage = installImageResolver(ctx, ctx?.logger);
   const adapter = new AiProxyAdapter({ runtime, resolveImage });
   // The roster goes through the constructor: a capability assigned afterwards
@@ -3427,7 +3871,7 @@ export function apply(ctx, config = {}) {
     return [];
   });
   ctx.inject?.(['webServer'], (scoped) => {
-    const handler = apiHandler(adapter, runtime, projectAdapter);
+    const handler = apiHandler(adapter, runtime, projectAdapter, tunnel);
     for (const path of ['/api/ai-proxy', '/api/ai-proxy-commandcode']) {
       scoped.effect(() => scoped.webServer.register({
         kind: 'prefix',

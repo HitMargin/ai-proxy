@@ -47,6 +47,19 @@ window.__ModuleLoader__.load({
     vendorNoKey: '文件里没配 key',
         keySet: '已设置（{what}）。留空保存不会清除它。',
         keyMissing: '未设置。没有 key 时该渠道不列模型。',
+        // ---- cloudflared 隧道 ----
+        tunnel: 'Cloudflared 隧道',
+        tunnelHint: '把本代理暴露到公网。快速隧道的地址每次启动都会变；填了 Worker 名字就会自动把 BACKEND_URL 写过去。',
+        tunnelStart: '开启隧道',
+        tunnelStarting: '正在启动…',
+        tunnelStop: '关闭隧道',
+        tunnelSyncWorker: '重写 Worker 地址',
+        tunnelState: '隧道状态',
+        tunnelWorker: 'Worker 回写',
+        workerName: 'Worker 名字',
+        cloudflaredPath: 'cloudflared 路径',
+        cloudflaredAuto: '留空则自动查找',
+        copy: '复制',
         deepseekSetup: '一键配置',
     deepseekRecapture: '重新配置',
     deepseekRecaptureConfirm: '重新配置会覆盖现有的 cookie / token / 浏览器头。确定继续？',
@@ -116,6 +129,18 @@ window.__ModuleLoader__.load({
     vendorNoKey: 'no key in the file',
         keySet: 'Set ({what}). Saving with the field empty leaves it alone.',
         keyMissing: 'Not set. Without a key the channel lists no models.',
+        tunnel: 'Cloudflared tunnel',
+        tunnelHint: 'Expose this proxy to the internet. A quick tunnel gets a new address on every start; set a Worker name to have BACKEND_URL written automatically.',
+        tunnelStart: 'Start tunnel',
+        tunnelStarting: 'Starting…',
+        tunnelStop: 'Stop tunnel',
+        tunnelSyncWorker: 'Rewrite Worker address',
+        tunnelState: 'Tunnel state',
+        tunnelWorker: 'Worker sync',
+        workerName: 'Worker name',
+        cloudflaredPath: 'cloudflared path',
+        cloudflaredAuto: 'leave empty to auto-detect',
+        copy: 'Copy',
         deepseekSetup: 'Set up',
     deepseekRecapture: 'Re-capture',
     deepseekRecaptureConfirm:
@@ -693,6 +718,10 @@ window.__ModuleLoader__.load({
         } finally { setBusy(false) }
       }
       const deepseek = data?.deepseekWeb || { configured: false, missing: [], running: false }
+      // Read per render from the panel snapshot, which is recomputed on every poll -
+      // so the URL shows up while the tunnel is still coming up rather than after the
+      // next ten-second tick.
+      const tunnel = data?.tunnel || { state: 'stopped', url: '', baseUrl: '', worker: null, lastError: '' }
       const save = () => act('/settings', {
         mode: settings?.mode,
         projectRoot: settings?.projectRoot,
@@ -702,6 +731,12 @@ window.__ModuleLoader__.load({
         apiKeyEnv: settings?.apiKeyEnv,
         hiddenChannels: hiddenNow,
         channelKeys,
+        // The tunnel's own fields. `tunnelEnabled` is deliberately NOT sent: it is
+        // owned by the start/stop routes, and a Save that carried the stale value
+        // from this page's snapshot would turn off a tunnel the user just started in
+        // another tab.
+        workerName: settings?.workerName,
+        cloudflaredPath: settings?.cloudflaredPath,
         // Only the columns the server accepts; the panel's own bookkeeping
         // (`test`, `problem`) is not part of the stored shape.
         // File-backed rows are filtered out: they belong to custom-providers.json,
@@ -1259,6 +1294,83 @@ window.__ModuleLoader__.load({
               ? h('button', { className: 'apx_btn danger', type: 'button', onClick: cancelCommandLogin, disabled: busy }, t('commandcodeCancel'))
               : null,
           ),
+        ),
+        // ---- cloudflared 隧道 ----
+        //
+        // Its own buttons, not the Save button: starting a tunnel spawns a process
+        // and waits for a hostname, which is not the same act as persisting a field.
+        // The switch writes the setting as a side effect of starting, so the toggle
+        // and the process cannot disagree about what is running.
+        h('div', { className: 'apx_field', key: 'tunnel' },
+          h('span', null, t('tunnel')),
+          h('p', { className: 'apx_tag' }, t('tunnelHint')),
+          h('div', { className: 'apx_row' },
+            h('button', {
+              className: 'apx_btn primary',
+              type: 'button',
+              onClick: () => act('/tunnel/start'),
+              disabled: busy || tunnel.state === 'starting' || tunnel.state === 'running',
+            }, tunnel.state === 'starting' ? t('tunnelStarting') : t('tunnelStart')),
+            h('button', {
+              className: 'apx_btn danger',
+              type: 'button',
+              onClick: () => act('/tunnel/stop'),
+              disabled: busy || tunnel.state === 'stopped',
+            }, t('tunnelStop')),
+            tunnel.state === 'running'
+              ? h('button', {
+                className: 'apx_btn',
+                type: 'button',
+                onClick: () => act('/tunnel/sync-worker'),
+                disabled: busy,
+              }, t('tunnelSyncWorker'))
+              : null,
+          ),
+          h('p', { className: 'apx_tag' },
+            t('tunnelState') + ': ' + (tunnel.state || 'stopped')
+            + (tunnel.pid ? ' · PID ' + tunnel.pid : '')),
+          // The public address a client is pointed at, and it carries `/v1` because
+          // that is the aggregate the provider registers under. Shown only once it
+          // exists: an empty box reads as "the tunnel is up but broken".
+          tunnel.url
+            ? h('div', { className: 'apx_row' },
+              h('input', {
+                className: 'apx_input',
+                readOnly: true,
+                value: tunnel.baseUrl || tunnel.url,
+                onFocus: (event) => event.target.select(),
+              }),
+              h('button', {
+                className: 'apx_btn',
+                type: 'button',
+                onClick: () => { try { navigator.clipboard?.writeText(tunnel.baseUrl || tunnel.url) } catch {} },
+              }, t('copy')))
+            : null,
+          // The Worker half fails independently of the tunnel, so it reports
+          // separately: "tunnel is up, BACKEND_URL write failed" is a different fix
+          // from "the tunnel never came up".
+          tunnel.worker && tunnel.worker.state !== 'idle'
+            ? h('p', { className: 'apx_tag' + (tunnel.worker.state === 'error' ? ' apx_bad' : '') },
+              t('tunnelWorker') + ': ' + tunnel.worker.state
+              + (tunnel.worker.error ? ' — ' + tunnel.worker.error : ''))
+            : null,
+          tunnel.lastError
+            ? h('p', { className: 'apx_tag apx_bad' }, tunnel.lastError)
+            : null,
+          h('label', { className: 'apx_field' }, h('span', null, t('workerName')),
+            h('input', {
+              className: 'apx_input',
+              placeholder: 'ai-api',
+              value: settings.workerName || '',
+              onChange: (event) => setSettings({ ...settings, workerName: event.target.value }),
+            })),
+          h('label', { className: 'apx_field' }, h('span', null, t('cloudflaredPath')),
+            h('input', {
+              className: 'apx_input',
+              placeholder: t('cloudflaredAuto'),
+              value: settings.cloudflaredPath || '',
+              onChange: (event) => setSettings({ ...settings, cloudflaredPath: event.target.value }),
+            })),
         ),
         h('div', { className: 'apx_row' },
           h('button', { className: 'apx_btn primary', type: 'button', onClick: save, disabled: busy }, t('save')),

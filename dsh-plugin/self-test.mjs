@@ -30,7 +30,7 @@ process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv, mergeCustomSources } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, TunnelRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv, mergeCustomSources } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -1940,6 +1940,120 @@ try {
     }
 
     console.log('custom provider suite ok');
+  }
+
+  // ── cloudflared 隧道 ──
+  //
+  // 这里只测**不需要网络的**那部分。真正拉起隧道的那条路已验证过（真实公网 URL，
+  // 通过隧道取到 161 个模型），但它依赖公网、会创建真进程，不适合放进每次都要跑的套件。
+  //
+  // 这一段钉住的是一条**实测踩到的** bug：`resolveBinary` 最初把裸名 `cloudflared`
+  // 排在候选表第一位并直接返回，于是 Windows 上 `spawn('cloudflared')` 报 EFTYPE
+  // （没有 shell 时不做 PATHEXT 展开，找不到 .exe）。而机器上 `cloudflared --version`
+  // 在 shell 里是能用的——**所以「命令能用」推不出「spawn 能用」**。
+  {
+    const runtime = new ProxyRuntime({ mode: 'local', projectRoot: os.tmpdir() });
+    const tunnel = new TunnelRuntime(runtime);
+
+    // 显式配置优先。
+    runtime.settings.cloudflaredPath = 'D:\\tools\\cloudflared.exe';
+    assert.equal(
+      tunnel.resolveBinary(),
+      'D:\\tools\\cloudflared.exe',
+      'an explicit cloudflared path must win over auto-detection',
+    );
+
+    // 自动查找：只要这台机器上装了，就必须解析成**绝对路径**，而不是裸名。
+    // 裸名是当初 EFTYPE 的直接原因，也正是这条断言能抓住的那处改动。
+    runtime.settings.cloudflaredPath = '';
+    const resolved = tunnel.resolveBinary();
+    if (process.platform === 'win32') {
+      const installed = fs.existsSync('C:\\Program Files (x86)\\cloudflared\\cloudflared.exe') ||
+        fs.existsSync('C:\\Program Files\\cloudflared\\cloudflared.exe');
+      if (installed) {
+        assert.ok(
+          path.isAbsolute(resolved),
+          `a detected cloudflared must be an absolute path (got ${JSON.stringify(resolved)}); ` +
+          'a bare name fails spawn with EFTYPE because Windows needs the .exe resolved',
+        );
+        assert.ok(
+          /\.exe$/i.test(resolved),
+          `a detected Windows binary must carry its .exe (got ${JSON.stringify(resolved)})`,
+        );
+      }
+    }
+
+    // 快照形状：面板读的字段必须都在，否则 UI 会渲成 undefined。
+    const snap = tunnel.snapshot();
+    for (const key of ['state', 'enabled', 'url', 'baseUrl', 'worker', 'lastError', 'logs']) {
+      assert.ok(key in snap, `the tunnel snapshot must carry \`${key}\``);
+    }
+    assert.equal(snap.state, 'stopped', 'a fresh TunnelRuntime is stopped');
+    assert.equal(snap.url, '', 'a stopped tunnel has no url');
+
+    // 没开隧道时 baseUrl 必须是空串，不能拼出一个半截地址给用户复制。
+    assert.equal(snap.baseUrl, '', 'a stopped tunnel must not advertise a base url');
+
+    // 地址形状：给客户端的是**聚合**（带 /v1），不是裸 hostname —— 与面板曾经把
+    // `/commandcode/v1` 当「代理地址」显示是同一类错。
+    tunnel.url = 'https://example-test.trycloudflare.com';
+    const up = tunnel.snapshot();
+    assert.equal(
+      up.baseUrl,
+      'https://example-test.trycloudflare.com/v1',
+      'the advertised address must be the aggregate, not the bare hostname',
+    );
+    tunnel.url = '';
+
+    // cleanSettings 必须让 `false` 活下来：把「关掉」当成「没提」会让开关按不下去。
+    // （camelCase 的来源见 index.js：这个文件用的是 `values`，不是 snake_case。）
+    const cleaned = cleanSettings({ tunnelEnabled: false });
+    assert.equal(
+      cleaned.tunnelEnabled,
+      false,
+      'tunnelEnabled:false is a request to turn it off, not an absent field',
+    );
+    assert.equal(
+      cleanSettings({ tunnelEnabled: true }).tunnelEnabled,
+      true,
+      'tunnelEnabled:true must survive',
+    );
+    // Worker 名字要挡住会变成 CLI 参数的东西。
+    assert.equal(cleanSettings({ workerName: 'ai api' }).workerName, undefined,
+      'a worker name with a space must not reach wrangler as an argument');
+    assert.equal(cleanSettings({ workerName: 'ai-api' }).workerName, 'ai-api');
+    assert.equal(cleanSettings({ workerName: '' }).workerName, '',
+      'an empty worker name means "skip the worker step" and must be storable');
+
+    // Worker 不存在时必须**拒绝写入**，而不是让 wrangler 顺手把 Worker 建出来。
+    //
+    // 实测（真实账号）：`wrangler secret put --name <打错的> --force` 不报错、退出码 0、
+    // 打印 "Success! Uploaded secret BACKEND_URL"，**并且真的创建了一个新 Worker**——
+    // 我因此在测试里真建出来一个游离 Worker，随后删掉了。所以「退出码 0」推不出
+    // 「你的 Worker 被指过来了」：用户的客户端还指着旧的那个，而面板显示成功。
+    //
+    // 这一段只能测「没配 worker 名字就跳过」这条不需要网络的分支；真正的不存在检查
+    // 需要访问 Cloudflare，已手工验证（打错的名字 -> error，真实名字 -> ok）。
+    {
+      const runtime = new ProxyRuntime({ mode: 'local', projectRoot: os.tmpdir() });
+      const tunnel = new TunnelRuntime(runtime);
+      runtime.settings.workerName = '';
+      tunnel.url = 'https://example.trycloudflare.com';
+      await tunnel.syncWorker();
+      assert.equal(
+        tunnel.worker.state,
+        'skipped',
+        'no worker name must skip the write rather than guess a target',
+      );
+      // 跳过时 URL 仍然要留着：隧道本身是好的，不能因为少了一步就丢掉地址。
+      assert.equal(
+        tunnel.url,
+        'https://example.trycloudflare.com',
+        'skipping the worker step must not clear the tunnel url',
+      );
+    }
+
+    console.log('tunnel suite ok');
   }
 
     // ── 文件来源：代理读得到，面板也必须看得到 ──
