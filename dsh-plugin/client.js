@@ -435,6 +435,30 @@ window.__ModuleLoader__.load({
       // elapse. `loadRef` likewise keeps the interval from closing over a stale
       // closure, which is what left the panel frozen until a tab switch.
       const loadRef = useRef(() => {})
+      // Whether the vendor/key drafts have been seeded from a server snapshot yet.
+      //
+      // A ref, not state. This used to be `useState(false)` read from inside the
+      // polling effect below - and that effect has an empty dependency array, so it
+      // runs once at mount and its closure keeps the `false` it captured forever.
+      // `setHydrated(true)` re-renders the panel but cannot reach into a closure
+      // that already exists, so the guard kept reading "not hydrated yet" while the
+      // inner `prev !== null` test made every reseed a no-op. Net effect: a vendor
+      // list that only appeared once the poll happened to land.
+      //
+      // A ref is the same mutable object for the life of the component, so every
+      // closure - the mount-time one included - reads its current value. Adding
+      // `hydrated` to the effect's dependencies instead would tear down and rebuild
+      // the polling loop on every render, which is a different bug.
+      const hydratedRef = useRef(false)
+
+      // The seeding function is installed into a ref *later*, once the two setters it
+      // closes over exist. See `seedRef` below: `setHiddenChannels` and
+      // `setCustomProviders` are declared further down this component, and a closure
+      // that named them from here would be in their temporal dead zone - fine only
+      // while nothing calls it, which is exactly the class of bug this file has been
+      // bitten by before (a `const` calling a later `const` throws at call time and
+      // `node --check` cannot see it).
+      const seedRef = useRef(() => {})
 
       const load = () => {
         // A failing /usage must not be swallowed into a null that renders as
@@ -444,6 +468,10 @@ window.__ModuleLoader__.load({
         Promise.all([api('/panel'), api('/settings'), api('/usage').catch((reason) => ({ failed: reason }))])
           .then(([panel, nextSettings, usage]) => {
             setData(panel)
+            // Seed here as well as in the poll - see seedDrafts. `load` runs at
+            // mount and after every action, so this is what closes the ten-second
+            // gap that made a configured vendor look unconfigured on re-entry.
+            seedRef.current(panel)
             setSettings(nextSettings)
             if (usage && usage.failed) {
               setUsageError(usage.failed instanceof Error ? usage.failed.message : String(usage.failed))
@@ -504,39 +532,10 @@ window.__ModuleLoader__.load({
               ])
               if (cancelled) return
               setData(panel)
-              // Seed the draft fields exactly once, on the first snapshot that
-              // carries them. After that the server value would stomp a choice the
-              // user has made but not yet saved, which is the same trap that made
-              // the usage tab read as permanently empty.
-              //
-              // Both seeds share ONE guard, and the guard is only set once BOTH
-              // have landed. They used to be two independent `if (!hydrated)`
-              // blocks with `setHydrated(true)` inside the first one - so the
-              // second never ran at all: `customProviders` stayed `null` forever,
-              // and the first "add vendor" click built its new array from an empty
-              // one. Whatever the user had typed was not lost by a refresh; it was
-              // never in state to begin with.
-              if (!hydrated && Array.isArray(panel.hiddenChannels)) {
-                setHiddenChannels(panel.hiddenChannels)
-                // Vendors are seeded from the SAME first snapshot, but only if the
-                // user has not touched the list yet. Without that second condition
-                // there is a ten-second window - the gap before this very poll -
-                // during which clicking "add vendor" writes into a still-null
-                // state; the arriving snapshot would then overwrite what was typed.
-                // The user sees their input vanish and reasonably calls it a refresh.
-                const seeded = Array.isArray(panel.customProviders) ? panel.customProviders : []
-                setCustomProviders((prev) => prev !== null
-                  ? prev
-                  : seeded.map((row) => ({
-                    ...row,
-                    // The server never sends a key back, only whether one is set, so
-                    // the field starts blank and an empty submission leaves the stored
-                    // one alone.
-                    apiKey: '',
-                    authHeader: row.authHeader ?? '',
-                  })))
-                setHydrated(true)
-              }
+              // Seeding is shared with `load` (see seedDrafts) rather than
+              // duplicated here: two copies of this rule is how the two halves drifted
+              // apart the last time, and only one of them was ever executed.
+              seedRef.current(panel)
               if (usage && usage.failed) {
                 setUsageError(usage.failed instanceof Error ? usage.failed.message : String(usage.failed))
                 setUsage(null)
@@ -577,7 +576,6 @@ window.__ModuleLoader__.load({
       // until Save is pressed, the same as every other field on this card.
       const [hiddenChannels, setHiddenChannels] = useState(null)
       const [customProviders, setCustomProviders] = useState(null)
-      const [hydrated, setHydrated] = useState(false)
       const channelList = Array.isArray(data?.allChannels) ? data.allChannels : []
       const hiddenNow = hiddenChannels ?? (Array.isArray(data?.hiddenChannels) ? data.hiddenChannels : [])
       const toggleChannel = (channel) => setHiddenChannels(
@@ -603,6 +601,40 @@ window.__ModuleLoader__.load({
       // starts empty rather than as a copy of an existing one: duplicating a
       // vendor would duplicate its name too, and two rows with one name is the
       // collision the proxy rejects.
+      //
+      // Seed the editable drafts from one server snapshot, exactly once.
+      //
+      // Installed here, not where `seedRef` is declared, because it closes over
+      // `setHiddenChannels` / `setCustomProviders` above - naming them earlier would
+      // be a temporal-dead-zone reference that only throws when called.
+      //
+      // Called from the panel load as well as from the poll: the load is what runs at
+      // mount and after every action, the poll only fires on a ten-second timer. When
+      // seeding lived *only* in the poll, re-entering the settings page showed an
+      // empty vendor card for up to ten seconds - and pressing any button (a channel
+      // toggle included) appeared to "make the config show up", because the action
+      // reloaded the panel. The button was never the cause; it just skipped the wait.
+      //
+      // The `prev !== null` test is kept and is load-bearing: it is what stops a
+      // snapshot arriving mid-edit from stomping a field the user has typed into but
+      // not yet saved.
+      seedRef.current = (panel) => {
+        if (hydratedRef.current) return
+        if (!Array.isArray(panel?.hiddenChannels)) return
+        setHiddenChannels(panel.hiddenChannels)
+        const seeded = Array.isArray(panel.customProviders) ? panel.customProviders : []
+        setCustomProviders((prev) => prev !== null
+          ? prev
+          : seeded.map((row) => ({
+            ...row,
+            // The server never sends a key back, only whether one is set, so
+            // the field starts blank and an empty submission leaves the stored
+            // one alone.
+            apiKey: '',
+            authHeader: row.authHeader ?? '',
+          })))
+        hydratedRef.current = true
+      }
       const customDrafts = Array.isArray(customProviders) ? customProviders : []
       // Mirrors the server's rule so a bad row is visible before Save, not after.
       // The server still enforces it - this is the message, not the fence.
