@@ -422,6 +422,20 @@ function readDefaultEffort(row) {
     const value = row[key];
     if (typeof value === 'string' && value !== '') return value;
   }
+  // The nested spelling. workbuddy publishes the whole ladder as one object -
+  // `reasoning: { efforts: [{id,name}], defaultEffort }` - so the default sits one
+  // level below the two flat spellings above and was never read. `publishedEfforts`
+  // already walks into that object for the rungs; this reader did not, so every
+  // workbuddy model came back with a full ladder and no default.
+  //
+  // The consequence is not cosmetic: `resolveModel` falls back to `high` when the
+  // published default is unknown, so `space-bunny` - which declares `max` - was
+  // silently downgraded on every turn. Same failure as the deepseek-web one this
+  // reader was written for, arriving through a nested key instead of a flat one.
+  if (isRecord(row.reasoning)) {
+    const nested = row.reasoning.defaultEffort ?? row.reasoning.default_effort;
+    if (typeof nested === 'string' && nested !== '') return nested;
+  }
   return undefined;
 }
 
