@@ -797,16 +797,39 @@ cnb 的网页端接口需要 CSRF 双因子（token + cookie）：
 
 ### 1.5 登录态（cnb-login.txt）
 
-cnb.cool 已要求登录才能调用推理接口（匿名会话 401 [NOT_LOGIN]）。登录态通过项目根目录的
+cnb.cool 已要求登录才能调用推理接口（**2026-10-05 实测**：匿名打 `POST /ai/chat/completions`
+得到 **HTTP 403 + `errcode 7 "User has no permission."`**；早期是 `401 [NOT_LOGIN]`，
+上游已改过行为，所以别照着记忆判断）。登录态通过项目根目录的
 `cnb-login.txt` 提供（已在 .gitignore 排除）：
+
+**一键脚本（推荐）**
+
+```powershell
+deno run -A .tmp-cnb-login.ts      # 拉起浏览器 → 你正常登录 → 自动抓 Cookie → 真实请求验证 → 写盘
+deno run -A .tmp-cnb-login.ts -v   # 只想验证已有凭据，不拉浏览器
+```
+
+脚本做的事：打开 Edge/Chrome → 你在窗口里登录 cnb.cool（扫码或账号密码都行，**不用回终端按键**）
+→ 检测到会话 cookie → **先发一次真实请求确认能出字** → 成功才写盘。
+失败时**不写盘**，保留原有凭据并打印原因。
+
+这样设计是因为「粘对了没有」本来没人回答：手工粘完只能等下一次推理撞 403 才发现。
+判据只有一条——**带凭据的请求能不能拿到真的模型输出**，状态码和错误文案都不算数
+（文案会漂：`401 [NOT_LOGIN]` → `403 errcode 7` 就是一次漂移）。
+
+**手工方式（脚本不好使时的退路）**
 
 1. 浏览器登录 cnb.cool；
 2. F12 → Network → 刷新页面 → 点任一 cnb.cool 请求 → Request Headers 里复制完整 `Cookie:` 头的值；
 3. 单行粘贴进 `cnb-login.txt` 保存（也支持 Netscape cookies.txt 导出格式）。
 
 行为：按 mtime 热加载，刷新 Cookie 无需重启代理；`csrfkey` 会自动从登录串剔除
-（CSRF token+cookie 对仍由代理匿名抓取配对）；文件不存在 = 退回匿名模式（当前上游会 401，
+（CSRF token+cookie 对仍由代理匿名抓取配对）；文件不存在 = 退回匿名模式（当前上游会 403，
 错误信息里带粘贴指引）。
+
+> ⚠️ **`cnb-login.txt` 是活的账号凭据**，等同于你的登录态。别贴进聊天窗口、issue、截图或提交。
+> 万一泄露，去 cnb.cool 退出登录（或轮换会话）即可让旧值在服务端失效。
+> 脚本自己在终端**只打印 cookie 的名字、不打印值**，就是为了不把它漏进日志和截图。
 
 ### 2. 工具调用的「文本协议」模拟
 
