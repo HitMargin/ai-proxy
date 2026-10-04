@@ -12,6 +12,11 @@ import {
 } from "./src/core.ts";
 export { ENV } from "./src/core.ts";
 import { CatalogRegistry, isRosterDegraded } from "./src/runtime/health.ts";
+import {
+  customProvidersSnapshot,
+  handleCustom,
+  isCustomPath,
+} from "./src/custom-handler.ts";
 import { CNB_MODELS, handleCnb } from "./src/cnb.ts";
 import { readJsonBodyLimited } from "./src/deepseek-responses.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
@@ -236,6 +241,11 @@ const V1_AGGREGATE_MEMBERS = [
   // then 401. Its listing is a fixed 17 upstream models, so being a member is the
   // only thing that puts them in the harness catalog.
   "zlkpro",
+  // custom joins for exactly the same reason every other channel does: the harness
+  // catalog is built from this aggregate, so a channel absent here is a channel the
+  // picker cannot see no matter what the panel shows. One static segment carries
+  // every user-added upstream - see src/custom.ts for why it is not one per vendor.
+  "custom",
 ];
 
 /**
@@ -1564,6 +1574,9 @@ export async function handler(request: Request): Promise<Response> {
         // the panel's per-channel button fell through to probing everything
         // else. AGENTS.md records how the two probe lists drifted apart.
         trae: "trae",
+        // User-added upstreams. One entry, however many vendors are configured -
+        // the probe asks for the channel, and the channel is `custom`.
+        custom: "custom",
       };
       const prefix = channelPrefixes[provider];
       if (!prefix) {
@@ -1689,6 +1702,9 @@ export async function handler(request: Request): Promise<Response> {
     }
     if (provider.customHandler === "commandcode") {
       return await handleCommandCode(path, request, url);
+    }
+    if (provider.customHandler === "custom") {
+      return await handleCustom(path, request, ENV);
     }
 
     const baseUrl = provider.baseUrl;

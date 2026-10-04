@@ -68,6 +68,10 @@ export const ENV: Record<string, string> = {
   COMMANDCODE_TIMEOUT_MS: getEnv("COMMANDCODE_TIMEOUT_MS"),
   COMMANDCODE_SESSION_SALT: getEnv("COMMANDCODE_SESSION_SALT"),
   COMMANDCODE_ALLOW_REMOTE_IMAGES: getEnv("COMMANDCODE_ALLOW_REMOTE_IMAGES"),
+  // 用户在面板里加的自定义 OpenAI 兼容上游。**这张表里带 apiKey**，所以它
+  // 只进请求头：本项目没有一处把它写进日志、错误消息或 API 响应（`describe`
+  // 只给 keySet 布尔值）。插件在 spawn 时注入，代理侧由 src/custom-handler.ts 解析。
+  AI_PROXY_CUSTOM_PROVIDERS: getEnv("AI_PROXY_CUSTOM_PROVIDERS"),
   // 反向代理模式：指向本地隧道等后端时，Worker 只做字节转发（CPU 趋近于零）
   BACKEND_URL: getEnv("BACKEND_URL"),
 };
@@ -324,6 +328,24 @@ export const providers: Record<string, any> = {
     endpoints: { models: "/models", chat: "/chat/completions" },
     adapter: adapters.passthrough,
     filterModels: null,
+  },
+  // 用户自己加的 OpenAI 兼容上游，路由与凭据都按请求里的供应商名解析
+  // （`custom/<name>/<model>`），所以这里只有一条占位条目：它存在的意义是让
+  // 派发循环与 `/health/probe` 认得 `custom` 这个前缀，真实上游由
+  // `src/custom-handler.ts` 从 AI_PROXY_CUSTOM_PROVIDERS 里取。
+  // baseUrl/endpoints 永远不会被 fetch —— 走的是 customHandler 分支。
+  custom: {
+    prefix: "/custom/v1",
+    // 故意留成不可路由的地址：customHandler 分支一旦没命中，请求会在这里
+    // 立刻失败，而不是悄悄打到一个真的（但错误的）主机上。占位值只要看起来
+    // 像能通，就会把一个分派 bug 变成一次发错上游的调用。
+    baseUrl: "http://custom-disabled.invalid",
+    auth: { type: "none" },
+    pathRewrite: (path: string) => path.replace(/^\/custom\/v1/, ""),
+    endpoints: { models: "/models", chat: "/chat/completions" },
+    adapter: adapters.passthrough,
+    filterModels: null,
+    customHandler: "custom",
   },
 };
 
