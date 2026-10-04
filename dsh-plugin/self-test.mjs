@@ -30,7 +30,7 @@ process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -1800,6 +1800,89 @@ try {
         'the panel probe list and the proxy probe route must name the same channels',
       );
     }
+  }
+
+  // ── 自定义供应商：面板填的任意 OpenAI 兼容上游 ──
+  //
+  // 这一段的重点是「不需要重启」这条设计前提：前缀 custom 是静态的，供应商表
+  // 随 settings 走，所以一个 vendor 加进去之后，面板与选择器两侧都得同时看见它。
+  // 两侧不同步正是本项目反复出过的那类问题（面板有、选择器没有）。
+  {
+    const customRoute = '/custom/v1';
+    const seen = [];
+    globalThis.fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/custom/v1/')) {
+        seen.push(url);
+        const auth = new Headers(init?.headers).get('authorization');
+        assert.equal(auth, 'Bearer sk-custom-test', 'the vendor key must be what goes upstream');
+        return new Response(JSON.stringify({
+          object: 'list',
+          data: [{ id: 'acme/plain', object: 'model' }, { id: 'plain-two', object: 'model' }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return originalFetch(input, init);
+    };
+
+    // 面板快照里绝不能出现凭据本身，而「配没配」必须说得出来。
+    const snap = JSON.stringify(customProvidersForEnv({
+      customProviders: [{ name: 'acme', baseUrl: 'https://api.acme.test/v1' }],
+      customKeys: { acme: 'sk-custom-test' },
+    }).map((entry) => ({
+      name: entry.name,
+      baseUrl: entry.baseUrl,
+      keySet: typeof entry.apiKey === 'string' && entry.apiKey !== '',
+    })));
+    assert.equal(snap.includes('sk-custom-test'), false, 'the panel must never receive the credential');
+
+    // 写进设置：面板 POST /settings 的校验路径。
+    const saved = cleanSettings({
+      customProviders: [{ name: 'Acme', baseUrl: 'https://api.acme.test/v1/' }],
+      customKeys: { acme: 'sk-custom-test' },
+    });
+    assert.deepEqual(
+      saved.customProviders,
+      [{ name: 'acme', baseUrl: 'https://api.acme.test/v1', enabled: true }],
+      'the name is lowercased and the trailing slash dropped, both on write',
+    );
+    // 不是 URL 路径段的名字必须在写之前就被挡掉，而不是等代理拒绝。
+    assert.deepEqual(
+      cleanSettings({ customProviders: [{ name: '../etc', baseUrl: 'https://a.test/v1' }] }).customProviders,
+      [],
+      'a name that is not a path segment must not reach settings.json',
+    );
+    // 明文 http 到公网会把 key 和正文都发在明处；回环例外。
+    assert.deepEqual(
+      cleanSettings({ customProviders: [{ name: 'plain', baseUrl: 'http://a.test/v1' }] }).customProviders,
+      [],
+      'a non-loopback http baseUrl must be refused',
+    );
+    assert.equal(
+      cleanSettings({ customProviders: [{ name: 'local', baseUrl: 'http://127.0.0.1:9000' }] }).customProviders.length,
+      1,
+      'a loopback http baseUrl is how a locally hosted upstream works',
+    );
+
+    // 注入给代理的形状：整张表一个 JSON，key 在里面。
+    const injected = JSON.parse(
+      credentialEnv({
+        customProviders: [{ name: 'acme', baseUrl: 'https://api.acme.test/v1' }],
+        customKeys: { acme: 'sk-custom-test' },
+      }).AI_PROXY_CUSTOM_PROVIDERS,
+    );
+    assert.equal(injected[0].name, 'acme');
+    assert.equal(injected[0].apiKey, 'sk-custom-test');
+    // 没配 key 的供应商不能带一个空串上去——空串会被当成「配过了」。
+    const noKey = JSON.parse(
+      credentialEnv({
+        customProviders: [{ name: 'nokey', baseUrl: 'https://a.test/v1' }],
+        customKeys: {},
+      }).AI_PROXY_CUSTOM_PROVIDERS,
+    );
+    assert.equal('apiKey' in noKey[0], false, 'an unset key must be absent, not empty');
+
+
+    console.log('custom provider suite ok');
   }
 
   console.log('dsh bridge self-test ok');

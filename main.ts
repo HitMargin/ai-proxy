@@ -315,7 +315,13 @@ const catalog = new CatalogRegistry();
  * of variants the proxy answers from its own state.
  */
 async function v1FetchOwnListing(prefix: string): Promise<any[]> {
-  const port = ENV.PORT || 8000;
+  // The port this process actually bound, read the same way `Deno.serve` reads it
+  // below. `ENV.PORT` was never registered in src/core.ts, so this looked up an
+  // undefined key and always fell back to 8000 - correct only because 8000 is also
+  // the default. On any other port every self-call went to whatever else was
+  // listening there: a stale proxy answers it, the rows come back looking real,
+  // and the channel reports models that belong to a different process.
+  const port = Number(Deno.env.get("PORT") ?? 8000);
   try {
     const response = await fetch(
       `http://127.0.0.1:${port}/${prefix}/v1/models`,
@@ -1087,6 +1093,28 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
       if (models.length > 0) catalog.ok(key, models.length, models.length, now);
       else {
         const reason = "CommandCode returned no models";
+        catalog.failed(key, reason, now);
+        console.warn(`[v1] ${key}: ${reason}`);
+      }
+      return;
+    }
+    if (key === "custom") {
+      // Asked of this proxy rather than of the vendor: src/custom-handler.ts is
+      // where the per-vendor fan-out and the id prefixing live, and there is no
+      // single upstream URL to fetch. Asking the handler also means a vendor whose
+      // own listing failed is reported per-vendor instead of collapsing the
+      // channel - which is what the panel needs to say *which* one is broken.
+      const models = await v1FetchOwnListing("custom");
+      out[key] = models;
+      if (models.length > 0) {
+        catalog.ok(key, models.length, models.length, now);
+      } else {
+        // Empty has two meanings here and neither is "the channel is broken":
+        // nothing configured yet, or every configured vendor answered with nothing.
+        const configured = customProvidersSnapshot(ENV).providers.length;
+        const reason = configured === 0
+          ? "no custom providers are configured yet"
+          : "the configured custom providers listed no models";
         catalog.failed(key, reason, now);
         console.warn(`[v1] ${key}: ${reason}`);
       }

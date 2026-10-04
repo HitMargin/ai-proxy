@@ -69,6 +69,11 @@ const IMAGE_TOKEN_ESTIMATE = 1600;
 const KNOWN_CHANNELS = [
   'commandcode',
   'cnb',
+  // User-added OpenAI-compatible upstreams. One channel however many vendors are
+  // configured: the prefix is a single static path segment, so a provider added in
+  // the panel appears without restarting the Host (see the comment on
+  // CUSTOM_CHANNEL below).
+  'custom',
   'deepseek-web',
   'kilo',
   'openrouter',
@@ -107,6 +112,13 @@ export const CHANNEL_GROUPS = {
   'ai-proxy-workbuddy': { channel: 'workbuddy', label: 'WorkBuddy' },
   'ai-proxy-zen': { channel: 'zen', label: 'Zen' },
   'ai-proxy-zlkpro': { channel: 'zlkpro', label: 'ZLK Pro' },
+  // One group for every user-added upstream. Registering one provider per vendor
+  // is impossible without a Host restart: the Host builds its catalog once per
+  // generation and this map is read at `apply()` time, so a vendor added in the
+  // panel would not have a provider to appear under. A single shared group trades
+  // per-vendor headings for zero restarts, and the model rows still carry the
+  // vendor name (`custom/<vendor>/<model>`).
+  'ai-proxy-custom': { channel: 'custom', label: '自定义供应商' },
 };
 
 /**
@@ -207,6 +219,12 @@ const EXTRA_MODEL_ROUTES = [
 const CHANNEL_ROUTES = [
   { prefix: 'deepseek-web', basePath: '/deepseek-web/v1' },
   ...EXTRA_MODEL_ROUTES,
+  // Static here even though the vendors behind it are not: the *route* is a fixed
+  // path segment, and this table answers "how is an id of this shape addressed".
+  // Leaving it out would make every custom id fall through to the default route,
+  // so a call would be sent to the aggregate with a vendor id the proxy cannot
+  // resolve - a 404 for a model the panel just offered.
+  { prefix: 'custom', basePath: '/custom/v1' },
 ];
 
 function blockReasonFor(modelId) {
@@ -484,6 +502,11 @@ const DEFAULT_SETTINGS = {
   // defaults apply and nothing that was reachable becomes reachable by accident.
   hiddenChannels: DEFAULT_HIDDEN_CHANNELS,
   channelKeys: {},
+  // User-added OpenAI-compatible upstreams. Shapes are validated on write and again
+  // on read (the file is editable outside the panel); the proxy re-validates a third
+  // time because it is the process that actually spends the credential.
+  customProviders: [],
+  customKeys: {},
 };
 
 /**
@@ -510,7 +533,7 @@ const KEYED_CHANNELS = [
  * falsy to the consumer either way, but exporting it would override a real value the
  * process inherited from its own environment.
  */
-function credentialEnv(settings) {
+export function credentialEnv(settings) {
   const env = {};
   for (const entry of KEYED_CHANNELS) {
     const value = settings.channelKeys?.[entry.channel];
@@ -518,7 +541,75 @@ function credentialEnv(settings) {
       env[entry.envToken] = value.trim();
     }
   }
+  // The whole custom table travels as one JSON document, because the proxy cannot
+  // read settings.json - it only sees the environment. The list is empty rather
+  // than absent when nothing is configured, so the proxy can tell "no custom
+  // channel set up" from "this variable was never injected".
+  const custom = customProvidersForEnv(settings);
+  env.AI_PROXY_CUSTOM_PROVIDERS = JSON.stringify(custom);
   return env;
+}
+
+/**
+ * The name a custom upstream is addressed by, and the same rule the proxy enforces.
+ *
+ * It is a URL path segment, so it is validated as one. This is duplicated with
+ * src/custom.ts on purpose rather than shared: the two live in different runtimes
+ * (Node plugin vs Deno proxy) and the panel must reject a bad name *before* it is
+ * written, not after the proxy refuses it silently at call time.
+ */
+const CUSTOM_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,31}$/;
+
+/** Why a vendor entry was refused, so the panel can say which and why. */
+function customProviderProblem(entry) {
+  if (!isRecord(entry)) return 'not an object';
+  const name = String(entry.name ?? '').trim().toLowerCase();
+  if (!CUSTOM_NAME_PATTERN.test(name)) {
+    return 'name must be lowercase letters, digits, dot, dash or underscore (max 32)';
+  }
+  const raw = String(entry.baseUrl ?? '').trim().replace(/\/+$/, '');
+  let url;
+  try { url = new URL(raw); } catch { return 'baseUrl is not a URL'; }
+  // Loopback http is allowed so a locally hosted upstream works; anything else in
+  // the clear would put the credential and the conversation on the wire in plaintext.
+  const loopback = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(url.hostname);
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) {
+    return 'baseUrl must be https (http is allowed only for loopback)';
+  }
+  return null;
+}
+
+/**
+ * Normalise the stored list into what the proxy is given.
+ *
+ * Invalid entries are dropped here rather than forwarded: the proxy would reject
+ * them too, but by then the user has only a channel that silently lost a vendor.
+ */
+export function customProvidersForEnv(settings) {
+  const rows = Array.isArray(settings?.customProviders) ? settings.customProviders : [];
+  const keys = isRecord(settings?.customKeys) ? settings.customKeys : {};
+  const out = [];
+  const seen = new Set();
+  for (const entry of rows) {
+    if (customProviderProblem(entry) !== null) continue;
+    const name = String(entry.name).trim().toLowerCase();
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const key = typeof keys[name] === 'string' ? keys[name].trim() : '';
+    out.push({
+      name,
+      baseUrl: String(entry.baseUrl).trim().replace(/\/+$/, ''),
+      ...key !== '' ? { apiKey: key } : {},
+      ...typeof entry.authHeader === 'string' && entry.authHeader.trim() !== ''
+        ? { authHeader: entry.authHeader.trim() }
+        : {},
+      ...typeof entry.label === 'string' && entry.label.trim() !== ''
+        ? { label: entry.label.trim() }
+        : {},
+      enabled: entry.enabled !== false,
+    });
+  }
+  return out;
 }
 function dataDir() {
   const home = envValue('DSH_HOME') || path.join(os.homedir(), '.dsh');
@@ -1674,7 +1765,17 @@ export class AiProxyAdapter {
     // without this gate the panel would offer ten models whose every call answers
     // 400 "deepseek-cookies.txt missing". An unusable row is the dead control this
     // project has been removing all evening.
-    const extras = await Promise.all(EXTRA_MODEL_ROUTES.map(async (route) => {
+    // One extra route, computed per call rather than stored in the module-level
+    // list above: the custom channel exists only because vendors can be added
+    // without a restart, so its routes cannot be frozen at import time either.
+    // It is a single route however many vendors are configured - the proxy
+    // aggregates them - so the id prefix stays `custom/<vendor>/<model>`.
+    const activeRoutes = [...EXTRA_MODEL_ROUTES];
+    const customRows = customProvidersForEnv(this.runtime?.settings ?? {});
+    if (customRows.length > 0 && !isBlockedModelId('custom/x')) {
+      activeRoutes.push({ prefix: 'custom', basePath: '/custom/v1' });
+    }
+    const extras = await Promise.all(activeRoutes.map(async (route) => {
       // Two conditions, and both have to hold before this listing is worth a
       // request: the channel is switched on, and it can actually answer. A hidden
       // channel's rows would be discarded, so polling it every snapshot was pure
@@ -2215,7 +2316,7 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-function cleanSettings(values) {
+export function cleanSettings(values) {
   const next = {};
   if (values.mode === 'local' || values.mode === 'external') next.mode = values.mode;
   if (typeof values.projectRoot === 'string' && values.projectRoot.length <= 512) next.projectRoot = values.projectRoot;
@@ -2236,6 +2337,42 @@ function cleanSettings(values) {
       if (typeof value === 'string' && value.length <= 512) keys[entry.channel] = value.trim();
     }
     next.channelKeys = keys;
+  }
+  // The custom vendor list. Each entry is validated as it arrives and stored
+  // normalised, so a name that would not survive being a URL path segment never
+  // reaches settings.json. Keys live in their own map for the same reason
+  // channelKeys does: the panel is write-only about credentials, so the list it
+  // reads back carries a set/unset boolean instead of the key.
+  if (Array.isArray(values.customProviders)) {
+    const rows = [];
+    const seen = new Set();
+    for (const entry of values.customProviders.slice(0, 32)) {
+      if (customProviderProblem(entry) !== null) continue;
+      const name = String(entry.name).trim().toLowerCase();
+      if (seen.has(name)) continue;
+      seen.add(name);
+      rows.push({
+        name,
+        baseUrl: String(entry.baseUrl).trim().replace(/\/+$/, ''),
+        ...typeof entry.label === 'string' && entry.label.trim() !== ''
+          ? { label: entry.label.trim().slice(0, 64) }
+          : {},
+        ...typeof entry.authHeader === 'string' && entry.authHeader.trim() !== ''
+          ? { authHeader: entry.authHeader.trim().slice(0, 64) }
+          : {},
+        enabled: entry.enabled !== false,
+      });
+    }
+    next.customProviders = rows;
+  }
+  if (isRecord(values.customKeys)) {
+    const kept = {};
+    for (const [name, value] of Object.entries(values.customKeys)) {
+      if (!CUSTOM_NAME_PATTERN.test(name)) continue;
+      if (typeof value !== 'string' || value.length > 512) continue;
+      kept[name] = value.trim();
+    }
+    next.customKeys = kept;
   }
   if (Array.isArray(values.hiddenChannels)) {
     next.hiddenChannels = [...new Set(values.hiddenChannels
@@ -2270,6 +2407,7 @@ export const PROBE_CHANNELS = [
   'workbuddy',
   'trae',
   'zlkpro',
+  'custom',
 ];
 
 function cleanProbeRequest(values) {
@@ -2451,6 +2589,18 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
       ...BLOCKED_CHANNELS,
     ])].sort(),
     hiddenChannels: [...BLOCKED_CHANNELS],
+    // The user's own upstreams, as the panel is allowed to see them: **no keys**,
+    // only a set/unset boolean per vendor - the same rule channelKeySet follows and
+    // for the same reason (a credential echoed into a rendered page is a credential
+    // in the next screenshot). `rejected` carries the entries that failed the same
+    // validation the proxy applies, so a typo is reported rather than silently gone.
+    customProviders: customProvidersForEnv(runtime.settings).map((entry) => ({
+      name: entry.name,
+      label: entry.label ?? entry.name,
+      baseUrl: entry.baseUrl,
+      enabled: entry.enabled !== false,
+      keySet: typeof entry.apiKey === 'string' && entry.apiKey !== '',
+    })),
     // The channels the panel offers a key for, each naming the variable the proxy
     // reads, so the field can say which one it is writing.
     keyedChannels: KEYED_CHANNELS,
@@ -2522,6 +2672,54 @@ function apiHandler(adapter, runtime, projectAdapter) {
           results[channel] = payload?.models ?? {};
         }
         return sendJson(res, 200, { probed: Object.keys(results), models: results });
+      }
+      // 测试一个自定义供应商能不能通。放在这里而不是让面板直接打上游：
+      // 浏览器的跨域请求会被上游拒绝（而且会把 key 暴露给页面），代理侧
+      // 没有跨域问题，且 key 只经过一次服务端到服务端的调用。
+      if (method === 'POST' && route === '/custom/test') {
+        const body = await readBody(req);
+        const name = String(body?.name ?? '').trim().toLowerCase();
+        const vendor = customProvidersForEnv(runtime.settings)
+          .find((entry) => entry.name === name);
+        if (vendor === undefined) {
+          return sendJson(res, 404, { ok: false, error: 'no such custom provider: ' + name });
+        }
+        const started = Date.now();
+        try {
+          const response = await adapter.requestAt('/custom/v1', '/models', {
+            signal: AbortSignal.timeout(15_000),
+          });
+          const payload = await response.json().catch(() => null);
+          const rows = Array.isArray(payload?.data) ? payload.data : [];
+          const own = rows.filter((row) => typeof row?.id === 'string' && row.id.startsWith(name + '/'));
+          // 「连不上」和「连上了但没有模型」要分开说：前者是地址或 key 的问题，
+          // 后者是上游目录的问题，修法不同。
+          if (!response.ok) {
+            return sendJson(res, 200, {
+              ok: false,
+              provider: name,
+              status: response.status,
+              error: payload?.error?.message ?? 'listing failed',
+              latencyMs: Date.now() - started,
+            });
+          }
+          return sendJson(res, 200, {
+            ok: own.length > 0,
+            provider: name,
+            status: response.status,
+            modelCount: own.length,
+            sample: own.slice(0, 3).map((row) => row.id),
+            latencyMs: Date.now() - started,
+            ...own.length === 0 ? { error: 'the upstream answered but listed no models' } : {},
+          });
+        } catch (error) {
+          return sendJson(res, 200, {
+            ok: false,
+            provider: name,
+            error: String(error?.message ?? error),
+            latencyMs: Date.now() - started,
+          });
+        }
       }
       if (method === 'POST' && route === '/settings') {
         const body = cleanSettings(await readBody(req));
