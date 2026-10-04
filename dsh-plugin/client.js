@@ -504,19 +504,38 @@ window.__ModuleLoader__.load({
               ])
               if (cancelled) return
               setData(panel)
-              // Seed the toggles once. After that the server value would stomp a
-              // choice the user has made but not yet saved, which is the same trap
-              // that made the usage tab read as permanently empty.
+              // Seed the draft fields exactly once, on the first snapshot that
+              // carries them. After that the server value would stomp a choice the
+              // user has made but not yet saved, which is the same trap that made
+              // the usage tab read as permanently empty.
+              //
+              // Both seeds share ONE guard, and the guard is only set once BOTH
+              // have landed. They used to be two independent `if (!hydrated)`
+              // blocks with `setHydrated(true)` inside the first one - so the
+              // second never ran at all: `customProviders` stayed `null` forever,
+              // and the first "add vendor" click built its new array from an empty
+              // one. Whatever the user had typed was not lost by a refresh; it was
+              // never in state to begin with.
               if (!hydrated && Array.isArray(panel.hiddenChannels)) {
                 setHiddenChannels(panel.hiddenChannels)
+                // Vendors are seeded from the SAME first snapshot, but only if the
+                // user has not touched the list yet. Without that second condition
+                // there is a ten-second window - the gap before this very poll -
+                // during which clicking "add vendor" writes into a still-null
+                // state; the arriving snapshot would then overwrite what was typed.
+                // The user sees their input vanish and reasonably calls it a refresh.
+                const seeded = Array.isArray(panel.customProviders) ? panel.customProviders : []
+                setCustomProviders((prev) => prev !== null
+                  ? prev
+                  : seeded.map((row) => ({
+                    ...row,
+                    // The server never sends a key back, only whether one is set, so
+                    // the field starts blank and an empty submission leaves the stored
+                    // one alone.
+                    apiKey: '',
+                    authHeader: row.authHeader ?? '',
+                  })))
                 setHydrated(true)
-              }
-              // Vendors are seeded the same way and for the same reason. Their
-              // apiKey is deliberately absent from the server shape, so a row
-              // that already has a key shows the write-only placeholder instead
-              // of a value.
-              if (!hydrated && Array.isArray(panel.customProviders)) {
-                setCustomProviders(panel.customProviders.map((row) => ({ ...row, apiKey: '', authHeader: row.authHeader ?? '' })))
               }
               if (usage && usage.failed) {
                 setUsageError(usage.failed instanceof Error ? usage.failed.message : String(usage.failed))
@@ -656,19 +675,29 @@ window.__ModuleLoader__.load({
         // File-backed rows are filtered out: they belong to custom-providers.json,
         // and re-submitting them would write a second copy into settings.json - so
         // the same vendor would then exist twice, in two files, disagreeing.
-        customProviders: customDrafts.filter((row) => row.origin !== 'file').map((row) => ({
+        //
+        // `customDrafts` falls back to [] when the state is still null. That is
+        // what silently wiped the stored list: hydration never ran (see the guard
+        // in the poll effect), so every save sent `customProviders: []` and
+        // overwrote whatever was on disk. Sending nothing at all is the safe
+        // answer when there is nothing to say - the server leaves the stored list
+        // alone, exactly as it does for `channelKeys`.
+        ...customProviders === null ? {} : { customProviders: customDrafts.filter((row) => row.origin !== 'file').map((row) => ({
           name: String(row.name ?? '').trim().toLowerCase(),
           baseUrl: String(row.baseUrl ?? '').trim(),
           ...row.label ? { label: row.label } : {},
           ...row.authHeader ? { authHeader: String(row.authHeader).trim() } : {},
           enabled: row.enabled !== false,
-        })).filter((row) => row.name !== '' && row.baseUrl !== ''),
+        })).filter((row) => row.name !== '' && row.baseUrl !== '') },
         // Keys travel in their own map. An empty string means "leave what is
         // stored alone" for an untouched field, which is why the rows the user
         // did not retype are absent rather than blank.
-        customKeys: Object.fromEntries(customDrafts
+        // Same reasoning as the list above: an empty map is the honest answer for
+        // "the user typed no new keys", and the server treats an absent map that
+        // way. Sending `{}` instead would read as "clear every stored key".
+        ...customProviders === null ? {} : { customKeys: Object.fromEntries(customDrafts
           .filter((row) => row.origin !== 'file' && typeof row.apiKey === 'string' && row.apiKey !== '')
-          .map((row) => [String(row.name).trim().toLowerCase(), row.apiKey])),
+          .map((row) => [String(row.name).trim().toLowerCase(), row.apiKey])) },
       })
       // ---- TRAE: daily check-in ----
       //
