@@ -32,6 +32,17 @@ window.__ModuleLoader__.load({
         efforts: '推理档位', noEfforts: '—',
         channels: '渠道显示', channelsHint: '取消勾选的渠道不会出现在模型列表里。保存后立即生效。',
         clearKey: '清除',
+    customVendors: '自定义供应商',
+    customVendorsHint: '填入任意 OpenAI 兼容上游。模型会以 自定义供应商/<名字>/<模型> 出现在选择器里，加完点保存即可，无需重启。名字只能用小写字母、数字、点、横线、下划线。',
+    addVendor: '添加供应商',
+    removeVendor: '删除',
+    testVendor: '测试连接',
+    enabled: '启用',
+    vendorOk: '连通 · {count} 个模型 · {ms}ms',
+    vendorFailed: '失败：{error}',
+    vendorBadName: '名字只能用 a-z 0-9 . _ - 且不超过 32 位',
+    vendorBadUrl: '地址必须是 https（本机回环可以用 http）',
+    vendorRejected: '下列配置未生效：{list}',
         keySet: '已设置（{what}）。留空保存不会清除它。',
         keyMissing: '未设置。没有 key 时该渠道不列模型。',
         deepseekSetup: '一键配置',
@@ -88,6 +99,17 @@ window.__ModuleLoader__.load({
         efforts: 'Efforts', noEfforts: '—',
         channels: 'Channels', channelsHint: 'Unchecked channels are withheld from the model list. Takes effect on save.',
         clearKey: 'Clear',
+    customVendors: 'Custom providers',
+    customVendorsHint: 'Any OpenAI-compatible upstream. Its models appear in the picker as 自定义供应商/<name>/<model>. Saving is enough — no restart. A name may use lowercase letters, digits, dot, dash and underscore.',
+    addVendor: 'Add provider',
+    removeVendor: 'Remove',
+    testVendor: 'Test',
+    enabled: 'Enabled',
+    vendorOk: 'Reachable · {count} models · {ms}ms',
+    vendorFailed: 'Failed: {error}',
+    vendorBadName: 'a name may use a-z 0-9 . _ - and at most 32 characters',
+    vendorBadUrl: 'the address must be https (loopback may use http)',
+    vendorRejected: 'These entries did not take effect: {list}',
         keySet: 'Set ({what}). Saving with the field empty leaves it alone.',
         keyMissing: 'Not set. Without a key the channel lists no models.',
         deepseekSetup: 'Set up',
@@ -179,6 +201,13 @@ window.__ModuleLoader__.load({
 .apx_btn.primary{background:var(--dsw-alias-state-business-primary);border-color:var(--dsw-alias-state-business-primary);color:var(--dsw-alias-label-on-accent)}
 .apx_btn.danger{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
 .apx_row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+/* One bordered block per vendor: several vendors coexist, so each needs a visible
+   boundary or the fields of two of them read as one form. */
+.apx_cvrow{display:flex;flex-direction:column;gap:7px;padding:10px;margin-top:8px;border-radius:12px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}
+.apx_cvname{max-width:190px}
+.apx_cvheader{max-width:190px}
+.apx_cvrow .apx_toggle{flex:0 0 auto;margin-left:auto}
+.apx_bad{color:var(--dsw-alias-state-error-primary)}
 .apx_chips{display:flex;gap:8px;flex-wrap:wrap}
 .apx_chip{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);font-size:12px;color:var(--dsw-alias-label-secondary)}
 .apx_chip b{color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums;font-weight:620}
@@ -476,6 +505,13 @@ window.__ModuleLoader__.load({
                 setHiddenChannels(panel.hiddenChannels)
                 setHydrated(true)
               }
+              // Vendors are seeded the same way and for the same reason. Their
+              // apiKey is deliberately absent from the server shape, so a row
+              // that already has a key shows the write-only placeholder instead
+              // of a value.
+              if (!hydrated && Array.isArray(panel.customProviders)) {
+                setCustomProviders(panel.customProviders.map((row) => ({ ...row, apiKey: '', authHeader: row.authHeader ?? '' })))
+              }
               if (usage && usage.failed) {
                 setUsageError(usage.failed instanceof Error ? usage.failed.message : String(usage.failed))
                 setUsage(null)
@@ -515,6 +551,7 @@ window.__ModuleLoader__.load({
       // Held separately from `settings` because the panel owns the choice locally
       // until Save is pressed, the same as every other field on this card.
       const [hiddenChannels, setHiddenChannels] = useState(null)
+      const [customProviders, setCustomProviders] = useState(null)
       const [hydrated, setHydrated] = useState(false)
       const channelList = Array.isArray(data?.allChannels) ? data.allChannels : []
       const hiddenNow = hiddenChannels ?? (Array.isArray(data?.hiddenChannels) ? data.hiddenChannels : [])
@@ -534,6 +571,65 @@ window.__ModuleLoader__.load({
         setChannelKeys((prev) => ({ ...prev, [channel]: '' }))
         act('/settings', { channelKeys: { [channel]: '' } })
       }
+      // ---- 自定义供应商（多个） ----
+      //
+      // Hydrated once from the server snapshot, then owned locally until Save -
+      // the same discipline every other field on this card follows. A new row
+      // starts empty rather than as a copy of an existing one: duplicating a
+      // vendor would duplicate its name too, and two rows with one name is the
+      // collision the proxy rejects.
+      const customDrafts = Array.isArray(customProviders) ? customProviders : []
+      const updateDraft = (index, patch) => setCustomProviders((prev) => {
+        const rows = Array.isArray(prev) ? [...prev] : []
+        rows[index] = { ...rows[index], ...patch, test: undefined, problem: customProblem({ ...rows[index], ...patch }) }
+        return rows
+      })
+      const addDraft = () => setCustomProviders((prev) => [
+        ...(Array.isArray(prev) ? prev : []),
+        { name: '', baseUrl: '', apiKey: '', authHeader: '', enabled: true },
+      ])
+      const removeDraft = (index) => setCustomProviders((prev) => {
+        const rows = (Array.isArray(prev) ? [...prev] : []).filter((_, i) => i !== index)
+        // Removing a row clears its key on the server too. Leaving the secret
+        // behind for a vendor that no longer exists is a credential nobody can
+        // see or delete from this page.
+        const gone = (Array.isArray(prev) ? prev : [])[index]
+        if (gone?.name) act('/settings', { customProviders: rows, customKeys: { [gone.name]: '' } })
+        return rows
+      })
+      // Mirrors the server's rule so a bad row is visible before Save, not after.
+      // The server still enforces it - this is the message, not the fence.
+      const customProblem = (row) => {
+        const name = String(row?.name ?? '').trim().toLowerCase()
+        if (name === '') return null
+        if (!/^[a-z0-9][a-z0-9._-]{0,31}$/.test(name)) return t('vendorBadName')
+        const raw = String(row?.baseUrl ?? '').trim()
+        if (raw === '') return null
+        try {
+          const url = new URL(raw)
+          const loop = ['127.0.0.1', 'localhost', '[::1]', '::1'].includes(url.hostname)
+          if (url.protocol !== 'https:' && !(url.protocol === 'http:' && loop)) return t('vendorBadUrl')
+        } catch { return t('vendorBadUrl') }
+        return null
+      }
+      const testVendor = async (index) => {
+        const row = customDrafts[index]
+        if (!row?.name) return
+        setBusy(true)
+        try {
+          // Through the proxy, never straight from the page: the upstream would
+          // refuse a cross-origin request and the key would be exposed to the
+          // browser's network log for no benefit.
+          const result = await fetch('/api/ai-proxy/custom/test', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name: row.name }),
+          }).then((response) => response.json())
+          updateDraft(index, { test: result })
+        } catch (reason) {
+          updateDraft(index, { test: { ok: false, error: reason instanceof Error ? reason.message : String(reason) } })
+        } finally { setBusy(false) }
+      }
       const deepseek = data?.deepseekWeb || { configured: false, missing: [], running: false }
       const save = () => act('/settings', {
         mode: settings?.mode,
@@ -544,6 +640,21 @@ window.__ModuleLoader__.load({
         apiKeyEnv: settings?.apiKeyEnv,
         hiddenChannels: hiddenNow,
         channelKeys,
+        // Only the columns the server accepts; the panel's own bookkeeping
+        // (`test`, `problem`) is not part of the stored shape.
+        customProviders: customDrafts.map((row) => ({
+          name: String(row.name ?? '').trim().toLowerCase(),
+          baseUrl: String(row.baseUrl ?? '').trim(),
+          ...row.label ? { label: row.label } : {},
+          ...row.authHeader ? { authHeader: String(row.authHeader).trim() } : {},
+          enabled: row.enabled !== false,
+        })).filter((row) => row.name !== '' && row.baseUrl !== ''),
+        // Keys travel in their own map. An empty string means "leave what is
+        // stored alone" for an untouched field, which is why the rows the user
+        // did not retype are absent rather than blank.
+        customKeys: Object.fromEntries(customDrafts
+          .filter((row) => typeof row.apiKey === 'string' && row.apiKey !== '')
+          .map((row) => [String(row.name).trim().toLowerCase(), row.apiKey])),
       })
       // ---- TRAE: daily check-in ----
       //
@@ -830,6 +941,89 @@ window.__ModuleLoader__.load({
               : null,
           ),
         )),
+        // ---- 自定义供应商：多个，每个一行 ----
+        //
+        // A list rather than a single form, because the point of the feature is
+        // that several upstreams coexist. Each row owns its own draft state, so
+        // editing one does not disturb another, and the key field is write-only
+        // the same way the keyed channels above are: the server reports whether a
+        // key is set and never sends it back.
+        h('div', { className: 'apx_field', key: 'custom-vendors' },
+          h('span', null, t('customVendors')),
+          h('p', { className: 'apx_tag' }, t('customVendorsHint')),
+          customDrafts.map((draft, index) => h('div', { key: 'cv-' + index, className: 'apx_cvrow' },
+            h('div', { className: 'apx_row' },
+              h('input', {
+                className: 'apx_input apx_cvname',
+                placeholder: 'name (a-z0-9._-)',
+                value: draft.name,
+                onChange: (event) => updateDraft(index, { name: event.target.value }),
+              }),
+              h('input', {
+                className: 'apx_input',
+                placeholder: 'https://api.example.com/v1',
+                value: draft.baseUrl,
+                onChange: (event) => updateDraft(index, { baseUrl: event.target.value }),
+              }),
+            ),
+            h('div', { className: 'apx_row' },
+              h('input', {
+                className: 'apx_input',
+                type: 'password',
+                placeholder: draft.keySet ? '••••••••' : 'API key',
+                value: draft.apiKey ?? '',
+                onChange: (event) => updateDraft(index, { apiKey: event.target.value }),
+              }),
+              h('input', {
+                className: 'apx_input apx_cvheader',
+                placeholder: 'Authorization',
+                value: draft.authHeader ?? '',
+                onChange: (event) => updateDraft(index, { authHeader: event.target.value }),
+              }),
+              h('label', { className: 'apx_toggle' },
+                h('input', {
+                  type: 'checkbox',
+                  checked: draft.enabled !== false,
+                  onChange: () => updateDraft(index, { enabled: draft.enabled === false }),
+                }),
+                h('span', null, t('enabled')),
+              ),
+              h('button', {
+                className: 'apx_btn',
+                type: 'button',
+                disabled: busy || !draft.name,
+                onClick: () => testVendor(index),
+              }, t('testVendor')),
+              h('button', {
+                className: 'apx_btn',
+                type: 'button',
+                disabled: busy,
+                onClick: () => removeDraft(index),
+              }, t('removeVendor')),
+            ),
+            draft.problem
+              ? h('p', { className: 'apx_tag apx_bad' }, draft.problem)
+              : null,
+            draft.test
+              ? h('p', { className: 'apx_tag' },
+                draft.test.ok
+                  ? t('vendorOk', { count: String(draft.test.modelCount ?? 0), ms: String(draft.test.latencyMs ?? 0) })
+                  : t('vendorFailed', { error: draft.test.error ?? 'unknown' }))
+              : null,
+          )),
+          h('div', { className: 'apx_row' },
+            h('button', {
+              className: 'apx_btn',
+              type: 'button',
+              disabled: busy || customDrafts.length >= 32,
+              onClick: addDraft,
+            }, t('addVendor')),
+          ),
+          Array.isArray(data?.customRejected) && data.customRejected.length > 0
+            ? h('p', { className: 'apx_tag apx_bad' },
+              t('vendorRejected', { list: data.customRejected.map((r) => r.name + ': ' + r.reason).join('; ') }))
+            : null,
+        ),
         h('div', { className: 'apx_field' },
           h('span', null, 'TRAE'),
           h('p', { className: 'apx_tag' },

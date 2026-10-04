@@ -2598,9 +2598,16 @@ async function projectPanelSnapshot(adapter, projectAdapter, runtime) {
       name: entry.name,
       label: entry.label ?? entry.name,
       baseUrl: entry.baseUrl,
+      authHeader: entry.authHeader === 'authorization' ? '' : entry.authHeader,
       enabled: entry.enabled !== false,
       keySet: typeof entry.apiKey === 'string' && entry.apiKey !== '',
     })),
+    // Entries the same validation refused. Reported rather than dropped: a vendor
+    // that silently did not take effect looks identical to one that was never
+    // entered, and the user has no way to tell which mistake they made.
+    customRejected: (Array.isArray(runtime.settings.customProviders) ? runtime.settings.customProviders : [])
+      .map((entry) => ({ name: String(entry?.name ?? '(unnamed)'), reason: customProviderProblem(entry) }))
+      .filter((row) => row.reason !== null),
     // The channels the panel offers a key for, each naming the variable the proxy
     // reads, so the field can say which one it is writing.
     keyedChannels: KEYED_CHANNELS,
