@@ -55,9 +55,56 @@ async function cnbFetchCsrf() {
 // 把浏览器登录 cnb.cool 后的完整 Cookie 头（F12 → Network → 任一 cnb.cool 请求 → 复制 Cookie 请求头）
 // 单行粘贴到本目录 cnb-login.txt。按 mtime 热加载，刷新 Cookie 无需重启代理。
 // csrfkey 从登录串中剔除：CSRF token+cookie 对由本代理匿名抓取配对，混入旧 csrfkey 会不匹配。
+//
+// **环境变量 CNB_LOGIN_COOKIES 是并列的第二来源，且优先于文件。**
+// 云端部署（Deno Deploy 的 `ai-api`）没有工作目录，`cnb-login.txt` 不存在也不
+// 可能被写进去——实测 2026-10-05：那边打 cnb/deepseek-v4-flash 一律
+// `401 cnb requires login`，而同一份代码跑在本机就能出字（本机有那个文件）。
+// 所以凭据必须能走环境变量进去。env 优先而不是文件优先，是为了让本地也能
+// 用 env 覆盖文件做验证——与 `credentialEnv` 里「环境的副本最权威」一致。
 const CNB_LOGIN_FILE = "./cnb-login.txt";
+const CNB_LOGIN_ENV = "CNB_LOGIN_COOKIES";
 let cnbLoginCache: { mtime: number | null; cookies: string } = { mtime: null, cookies: "" };
+
+/** 把任意一种粘贴形状归一成 `k=v; k=v`。两种来源共用，避免两处各写一遍而漂开。 */
+function normalizeCnbCookies(raw: string): { cookies: string; count: number } {
+  let text = raw.trim();
+  if (text.includes("	")) {
+    // Netscape cookies.txt 格式（tab 分列）→ name=value 拼接
+    text = text.split(String.fromCharCode(10)).filter((l) => l && !l.startsWith("#")).map((l) => {
+      const c = l.split("	");
+      return c.length >= 7 ? c[5] + "=" + c[6] : "";
+    }).filter(Boolean).join("; ");
+  }
+  const m = new Map<string, string>();
+  for (const p of text.split(";").map((x) => x.trim()).filter(Boolean)) {
+    if (/^csrfkey=/i.test(p)) continue; // CSRF 对由代理自己抓，登录串里的旧值剔除
+    const eq = p.indexOf("=");
+    if (eq <= 0) continue; // 没有 `=` 的片段不是 cookie，跳过而不是存一个空键
+    m.set(p.slice(0, eq), p.slice(eq + 1)); // 同名后者覆盖（浏览器最新值优先）
+  }
+  return { cookies: [...m].map(([k, v]) => k + "=" + v).join("; "), count: m.size };
+}
+
 function cnbLoginCookies(): string {
+  // 环境变量优先。
+  //
+  // 每次调用都读 `Deno.env.get`，不缓存：Deno Deploy 的环境变量随部署固定，
+  // 而本机进程可能被 `restart.ps1` 或面板用不同的 env 重新拉起——缓存住的话
+  // 第二次启动会沿用上一份凭据，看起来像「改了没生效」。
+  let fromEnv = "";
+  try { fromEnv = Deno.env.get(CNB_LOGIN_ENV) ?? ""; } catch { /* 无权限读环境 */ }
+  if (fromEnv.trim()) {
+    const { cookies, count } = normalizeCnbCookies(fromEnv);
+    if (cookies !== cnbLoginCache.cookies) {
+      console.log(`[cnb-login] loaded ${count} cookies from ${CNB_LOGIN_ENV}`);
+    }
+    // mtime 记 -1（而不是 null）：null 表示「文件不存在」，用它会让下面文件分支
+    // 每次都重读一遍磁盘。环境变量在就不需要碰文件。
+    cnbLoginCache = { mtime: -1, cookies };
+    return cookies;
+  }
+
   let st: Deno.FileInfo | null = null;
   try { st = Deno.statSync(CNB_LOGIN_FILE); } catch { /* 文件不存在 = 匿名模式 */ }
   if (!st || !st.isFile) { cnbLoginCache = { mtime: null, cookies: "" }; return ""; }
@@ -65,21 +112,9 @@ function cnbLoginCookies(): string {
   if (cnbLoginCache.mtime !== mtime) {
     let raw = "";
     try { raw = Deno.readTextFileSync(CNB_LOGIN_FILE).trim(); } catch {}
-    if (raw.includes("	")) {
-      // Netscape cookies.txt 格式（tab 分列）→ name=value 拼接
-      raw = raw.split(String.fromCharCode(10)).filter((l) => l && !l.startsWith("#")).map((l) => {
-        const c = l.split("	");
-        return c.length >= 7 ? c[5] + "=" + c[6] : "";
-      }).filter(Boolean).join("; ");
-    }
-    const m = new Map<string, string>();
-    for (const p of raw.split(";").map((x) => x.trim()).filter(Boolean)) {
-      if (/^csrfkey=/i.test(p)) continue; // CSRF 对由代理自己抓，登录串里的旧值剔除
-      const eq = p.indexOf("=");
-      m.set(p.slice(0, eq), p.slice(eq + 1)); // 同名后者覆盖（浏览器最新值优先）
-    }
-    cnbLoginCache = { mtime, cookies: [...m].map(([k, v]) => k + "=" + v).join("; ") };
-    console.log("[cnb-login] loaded " + m.size + " cookies from cnb-login.txt");
+    const { cookies, count } = normalizeCnbCookies(raw);
+    cnbLoginCache = { mtime, cookies };
+    console.log("[cnb-login] loaded " + count + " cookies from cnb-login.txt");
   }
   return cnbLoginCache.cookies;
 }

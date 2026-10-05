@@ -1272,6 +1272,29 @@ try {
   }
   assert.equal(panel.hiddenChannels.includes('deepseek-web'), true);
 
+  // The block list is exactly the stored list, with no default leaking in.
+  //
+  // Seeding it from DEFAULT_HIDDEN_CHANNELS opened a window at module load,
+  // before loadSettings ran, in which the Host judged unlisted channels as
+  // switched off. The Host builds its model catalog once per generation, right
+  // as the plugin loads, and never rebuilds it - so the verdict stuck. Measured
+  // 2026-10-05: a session opened after a restart showed
+  // `CONFIG_DISABLED / cnb needs a login cookie` while settings.json and /panel
+  // both showed cnb enabled, with blockedModelCount at 0.
+  //
+  // This asserts the observable property - a channel the stored list never
+  // mentions is absent - rather than the initialiser itself. The load-time
+  // window cannot be reproduced from here: apply() always runs loadSettings
+  // first, so a seeded initialiser is already cleared by the time any test can
+  // look. An assertion claiming to cover that window would pass under the bug,
+  // which is worse than no assertion (measured: reverting the initialiser left
+  // this suite green either way).
+  assert.equal(
+    panel.hiddenChannels.includes('kilo'),
+    false,
+    'a channel the stored list never mentions must not appear in the block list',
+  );
+
   // Everything the panel renders has to come from the panel snapshot, which is
   // computed per request. The runtime snapshot is built once per apply() and kept
   // by an instance that outlives a window reload, so a field placed there is stale

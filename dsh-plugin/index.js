@@ -161,8 +161,19 @@ function channelOf(modelId) {
  * would only add a way for them to disagree. `applyHiddenChannels` replaces the
  * contents rather than mutating a shared array, so a read in progress keeps
  * seeing one consistent set.
+ *
+ * **Starts empty, not at the defaults.** The Host builds its model catalog once
+ * per generation and does it as soon as the plugin loads - before `loadSettings`
+ * has had its say. Seeding this with `DEFAULT_HIDDEN_CHANNELS` meant that window
+ * judged cnb (and the other defaults) as switched off, and the Host does not
+ * rebuild a catalog: measured 2026-10-05, a session opened right after a restart
+ * got `CONFIG_DISABLED / cnb needs a login cookie` while the panel and
+ * `settings.json` both showed cnb enabled and `/panel` reported
+ * `blockedModelCount: 0`. The list that governs calls is the stored one, so the
+ * stored one is what it waits for; nothing is more reachable than before, because
+ * `loadSettings()` runs during `apply()` and every caller is downstream of it.
  */
-const BLOCKED_CHANNELS = new Set(DEFAULT_HIDDEN_CHANNELS);
+const BLOCKED_CHANNELS = new Set();
 
 function applyHiddenChannels(value) {
   const next = Array.isArray(value)
