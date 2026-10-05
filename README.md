@@ -45,7 +45,9 @@
 Cloudflare Worker  https://<worker>.workers.dev          ← worker.ts
       │  ENV.BACKEND_URL 有值 → 纯字节转发（流式；仅幂等请求最多重试一次，非幂等 POST 不自动重放）
       ▼
-cloudflared 快速隧道  https://xxx.trycloudflare.com      ← restart.ps1 或面板开关
+cloudflared 隧道
+      ├─ 快速：https://xxx.trycloudflare.com   （免账号，地址每次变，有配额）
+      └─ 命名：https://<你的域名>              （地址固定，无配额，需先 tunnel login）
       ▼
 本机 Deno 服务  http://localhost:8000                    ← main.ts 的 Deno.serve
 ```
@@ -124,6 +126,14 @@ CommandCode 已接入 abort/timeout 分类；DeepSeek 网页端和 cnb 已接入
 **插件侧同样如此。** `dsh-plugin/index.js` 的 `readSse` 是插件注入模型独有的手写 SSE 读取器（配置里手写的模型走 DSH 内置的 OpenAI 客户端，不经过它），过去同样不检查 `[DONE]` 是否到达：流提前断开时循环正常退出、`finish` 保持 `undefined`，而 `finishKind(undefined)` 返回 `'stop'`——被掐断的流和正常结束的流对 agent loop 完全一样，于是它判定这一轮说完、标记目标完成、起下一个。这就是「所有供应商的插件注入模型都有概率要干活却直接停止，而配置里手写的没有」的原因。现在缺终止帧即报失败，并区分两种情况：**已经输出过内容的**用非重试码 `stream_cut`（重放会重复执行并二次付费），**一个字都还没输出**的用 `TRANSPORT`（这是重试真正有意义的唯一情形）。已到达的部分照常收尾，文字不会随失败一起丢掉；统计记 `ok: false / truncated: true`，截断第一次在用量面板里变得可见。
 
 Zen 侧**由各 wire 自己的终止帧判定是否完成**，而不是由 reader：`[DONE]`（chat）、`response.completed` / `failed` / `incomplete`（responses）、`message_stop`（messages）。没有终止帧就结束 = 截断，会先补一帧 `{"error":{"code":"stream_cut"…}}` 再收尾——插件会把这种帧变成可见的错误。客户端主动取消**不算故障**（走 `StreamAbort`，静默结束），否则用户点停止也会被报成上游问题。
+
+**用量面板的缓存命中率一度有个 50% 的天花板。** harness 把插件返回的 `TokenUsage.inputTokens` 当作 **`uncachedInputTokens`** 用（`app.asar` 里那行的 i18n 原文就是「未缓存输入」），命中率分母是 `uncachedInput + cacheRead + cacheWrite`。而 OpenAI 的 `prompt_tokens` **本身就含缓存部分**，插件原样传就等于把缓存算了两遍：
+
+```
+分母 ≈ cacheRead + (cacheRead + 未命中) ≈ 2 × cacheRead   →  命中率收敛到 50%
+```
+
+实测用户 14,891 次请求里，六个渠道的 `cacheRead/input` 中位数在 0.97～0.999（**真实命中率 93%～99.7%**），面板却一律显示 ~49%。现在 `inputTokens` 会扣掉缓存部分——**但只在缓存数确实来自 `prompt_tokens_details.cached_tokens` 时才扣**：Anthropic 的 `input_tokens` 本身不含缓存，减了会把未命中压成 0，而 harness 在 `missed === 0` 时直接显示 `100%`，那等于用一个假 100% 换一个假 49%。
 
 ---
 
@@ -244,10 +254,20 @@ deno run -A main.ts        # 监听 http://localhost:8000（PORT 环境变量可
 ### 方式 B：Deno Deploy
 
 ```bash
-deno deploy                # 配置见 deno.jsonc（org: hitmargin, app: ai-api）
+deno deploy --org <你的org> --app <你的app> --prod -y
 ```
 
-⚠️ **`deno.jsonc` 里的 `org` / `app` 是原作者的**。你要部署到自己的账号，必须先把这两项改成你自己的，否则会推到别人的应用上。
+⚠️ **`deno.jsonc` 里的 `org: hitmargin` / `app: ai-api` 是原作者的**。你要部署到自己的账号，必须先把这两项改成你自己的，否则会推到别人的应用上。
+
+⚠️ **CLI 需要 `DENO_DEPLOY_TOKEN`，浏览器登录不算。** `dash.deno.com` 里登着不代表命令行有权限——`deno deploy` 只认 Access Token（[dash.deno.com/account#access-tokens](https://dash.deno.com/account#access-tokens)）或 `--token`。没有 token 时报的是 `This command requires interactive input`，那句话并不指向真正的原因。
+
+⚠️ **cnb 渠道在云端必须先配 `CNB_LOGIN_COOKIES` 环境变量**，否则打 `cnb/*` 一律 `401 cnb requires login`。云端没有工作目录，读不到本机的 `cnb-login.txt`：
+
+```powershell
+deno deploy env add CNB_LOGIN_COOKIES "$(Get-Content cnb-login.txt -Raw)" --org <org> --app <app>
+```
+
+**为什么本地能用、云端不能用**：同一个 `main.ts`，本机跑能读到 `cnb-login.txt`，Deno Deploy 上读不到——所以「本地好好的」推不出「云端也能用」，两边的凭据来源不同。
 
 ### 方式 C：Cloudflare Workers + 隧道（规避边缘 CPU 配额）
 
@@ -270,6 +290,16 @@ pwsh .\restart.ps1
 > 停止全部：`Get-Process deno,cloudflared | Stop-Process`
 > 服务日志：`%TEMP%\ai-proxy.log`（stderr，`[cnb-gate]` 诊断流水在这里）与 `%TEMP%\ai-proxy-out.log`（stdout）。
 > 隧道日志：`%TEMP%\cloudflared-tunnel.log`（URL 就在这里，脚本是从它里面正则抓的）。
+
+> ⚠️ **快速隧道有配额，用完就只能换命名隧道。** `restart.ps1` 只会起**快速隧道**（免账号、地址每次变）；一天内启停几次后上游会回 `429` + `error code: 1015`，cloudflared 随后什么都不打印。要固定地址、无限额，得先做一次账号侧的准备（各一次即可）：
+>
+> ```powershell
+> cloudflared tunnel login                      # 浏览器授权
+> cloudflared tunnel create ai-proxy            # 建命名隧道
+> cloudflared tunnel route dns ai-proxy <你的域名>  # 绑一个固定 hostname
+> ```
+>
+> 然后在**设置页**把「隧道模式」改成命名隧道、填隧道名字。`restart.ps1` **不支持命名隧道**（它只解析 `trycloudflare` 那行日志）。详见[「cloudflared 隧道」](#cloudflared-隧道面板里一键开关)。
 
 > 💡 **装了 DSH 插件的话，同一件事可以在设置页点按钮完成**：切到 `ai-proxy` 设置分区，「Cloudflared 隧道」区点**开启隧道**，地址会直接显示出来（含复制按钮），填了 Worker 名字就自动回写。见[「cloudflared 隧道」](#cloudflared-隧道面板里一键开关)。**两条路径选一条，不要同时跑**——它们互不感知，谁后跑谁的 `BACKEND_URL` 生效。
 
@@ -325,6 +355,7 @@ node dsh-plugin/self-test.mjs   # 插件的自检（不联网、不碰真实配�
 | `ZLKPRO_API_KEY` | 否 | `/zlkpro/v1` 使用；未配置时该渠道不进模型列表 |
 | `AI_PROXY_CUSTOM_PROVIDERS` | 否 | 自定义供应商表（JSON 数组）。**含明文 apiKey**，由 DSH 插件注入，也可自己设 |
 | `AI_PROXY_CUSTOM_FILE` | 否 | 自定义供应商配置文件的改道路径，默认工作目录下的 `custom-providers.json` |
+| `CNB_LOGIN_COOKIES` | 否 | cnb 登录态，**并列于 `cnb-login.txt` 且优先于它**。云端部署（Deno Deploy）用它——那边没有工作目录、读不到文件，不配就一律 `401 cnb requires login` |
 | `COMMANDCODE_ADMIN_KEY` | 否 | CommandCode 管理接口独立密钥；设置后需通过 `X-CommandCode-Admin-Key` 发送 |
 | `COMMANDCODE_API_KEY` | 否 | CommandCode Go 账号 key；账号池为空时作为单账号兜底 |
 | `COMMANDCODE_BASE_URL` | 否 | CommandCode 网关地址，默认 `https://api.commandcode.ai`；非 loopback 必须 HTTPS |
@@ -519,13 +550,21 @@ Zen 的 `GET /models` 只返回 `{ id, object, created, owned_by }`，没有上�
 - **关闭**：`POST /api/ai-proxy/tunnel/stop`
 - **只重写 Worker 地址**：`POST /api/ai-proxy/tunnel/sync-worker`（隧道可能好着而 `BACKEND_URL` 是旧的，为了修后者去重起 cloudflared 会白白换掉域名）
 
-三点实现说明：
+四点实现说明：
 
 - **等地址真的能路由才报成功**。cloudflared 一注册就打印 URL，但**早于边缘开始服务**——实测新域名第一次请求 `ECONNRESET`、几秒后正常。在打印处就报 `running` 会把一个 502 的地址交给用户，还紧接着拿它去写 Worker。
 - **写 Worker 前先验证目标存在**。`wrangler secret put --name <打错的>` **不报错、退出码 0、还会在账号里创建一个新 Worker**——你真正的 Worker 仍指着旧地址，而面板显示成功。所以先 `wrangler secret list --name` 验存在，不存在就拒绝写入并说明原因。**凭据回写失败绝不抛异常**：隧道本身是好的，不能因为 wrangler 的问题把它一起打死，所以 `ok` / `error` / `skipped` 单独显示。
 - **不持有 Cloudflare 凭据**。面板不存 API token，只是 spawn `wrangler`，由它用自己的登录态（`wrangler login` 留下的 `~/.config/.wrangler`）认账号。这样 key 不会进 `settings.json`，也就不会进截图。
+- **失败原因取 cloudflared 自己的话**。它的 stderr 里写着真因（`429` / `error code: 1015` 是快速隧道配额耗尽），早先那句自造的 "never printed a url" 会把排查引向二进制路径。现在只要输出里出现 `failed` / `error` / `429` / `1015` / `refused` / `unauthorized`，那一行就被提成 `lastError`。
 
-> ⚠️ 快速隧道的地址**每次重启都会变**。要固定地址需要 Cloudflare 账号 + named tunnel，本项目未实现。
+> ⚠️ **两种隧道，地址是否固定取决于模式。**
+>
+> | 模式 | 地址 | 需要什么 | 配额 |
+> |---|---|---|---|
+> | `quick`（默认） | `https://xxx.trycloudflare.com` | 无 | **有配额**：一天内启停几次后上游回 `429` + `error code: 1015`，随后 cloudflared 什么都不打印 |
+> | `named` | 你自己绑定的固定域名 | `cloudflared tunnel login` + `tunnel create` + `tunnel route dns`（各一次） | 无 |
+>
+> 在设置页选「隧道模式」= 命名隧道并填「隧道名字」即可。**命名隧道必须有一个不被 Worker custom domain 占用的域名**：`BACKEND_URL` 会写成那个地址，若它恰好是 Worker 自己的域名，Worker 就会转发给自己（见下面那条约束）。
 
 ### 可选 DSH Provider 桥接插件
 
@@ -827,6 +866,23 @@ deno run -A .tmp-cnb-login.ts -v   # 只想验证已有凭据，不拉浏览器
 （CSRF token+cookie 对仍由代理匿名抓取配对）；文件不存在 = 退回匿名模式（当前上游会 403，
 错误信息里带粘贴指引）。
 
+**云端部署用环境变量 `CNB_LOGIN_COOKIES`（并列来源，优先于文件）**
+
+Deno Deploy 这类环境**没有工作目录**，`cnb-login.txt` 既不存在也不可能被写进去，
+所以凭据必须能走环境变量：
+
+```powershell
+# 值就是 cnb-login.txt 的整行内容（三种粘贴形状都认：单行 k=v、分号串、Netscape 导出）
+deno deploy env add CNB_LOGIN_COOKIES "$(Get-Content cnb-login.txt -Raw)" --org <org> --app <app>
+```
+
+**env 优先于文件**，所以本机也可以用它临时覆盖文件做验证。两种来源共用同一个归一化函数
+（剔除 `csrfkey`、同名后者覆盖、跳过没有 `=` 的片段），不会因为两处各写一遍而漂开。
+
+> ⚠️ **写这类 secret 时不要跑 `env list`**——它会把值明文打印出来。
+> 实测 `deno deploy env list` 就直接回显了 cookie 全文。写完用**功能验证**（打一次真实推理）
+> 确认，而不是用 `list` 确认。
+>
 > ⚠️ **`cnb-login.txt` 是活的账号凭据**，等同于你的登录态。别贴进聊天窗口、issue、截图或提交。
 > 万一泄露，去 cnb.cool 退出登录（或轮换会话）即可让旧值在服务端失效。
 > 脚本自己在终端**只打印 cookie 的名字、不打印值**，就是为了不把它漏进日志和截图。
@@ -851,7 +907,7 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 - `deepseek-v4-flash` 连续 5xx 时**自动降级到 `deepseek-v4-pro`**；
 - `cnbCall` 带 **30 秒无响应头超时**——cnb 偶发无限挂起，中止后交给退避重试（只罩到响应头返回，不限流式生成总时长）；
 - **串行闸**：cnb 网页会话按 cookie 归属，多客户端并发共用一个 cookie 会互踩（曾观测到跨会话内容泄漏）。所有 cnb 上游调用同一时刻只放行一个，锁持有到**响应流真正消费完**（流结束/出错/消费方取消/2 分钟无数据/10 分钟硬安全阀任一条件释放），日志以 `[cnb-gate] fp=...` 记录排队与释放（fp 为会话指纹，重叠且 fp 不同即跨会话并发）；
-- **1 MiB 请求体预检**：cnb 网关（nginx）硬性拒绝超过 1 MiB 的请求体，超过则毫秒级本地返回 413，不浪费隧道往返。
+- **请求体大小不做本地预检，交给上游判**：cnb 对 >1 MiB 的请求体回 `413 [BODY_TOO_LARGE]`（实测：1.000 MiB 通过、1.050 MiB 起拒绝）。这里**曾有一道 `>1MiB 直接本地回 413` 的闸，已拆掉**——它比上游还严，会拦掉上游本来会接受的请求（实测一个 1060926 字节的请求被本地拒死，而那个尺寸上游很可能接受）。现在只写一行 `[cnb-gate] large body … sending anyway` 日志，由上游自己判，用户拿到的是上游原文而不是我们猜的线。
 
 ### 5. 其它
 
@@ -918,8 +974,9 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 - 模型选择器里的**按渠道分组依赖重启 DSH Host** 才生效：插件的渠道分组是模块级代码，热重载只换 `stream` / `resolveModel`。不重启的话模型仍然是全挤在 `ai-proxy` 一个 provider 下（功能可用，只是没分组）。
 - CommandCode Go 同样依赖 `/alpha/*` 私有 CLI 网关，模型档位、指纹要求或 OAuth 回调发生变化时需要更新；
 - 免费上游的模型清单随时变化，且常见限流（429）与容量窗口（5xx）；
-- `trycloudflare` 快速隧道的 URL 每次重启都会变（由 `restart.ps1` 或面板开关自动回写 `BACKEND_URL`），且可能有连接抖动；`proxyToBackend` 仅对幂等请求最多重试一次，非幂等 POST 不自动重放以避免重复计费；
-- **隧道有两条启动路径（`restart.ps1` 与面板开关），互不感知**。隧道已在运行时再执行不带 `-Local` 的 `restart.ps1`，会另起一个 cloudflared 并覆盖 `BACKEND_URL`，而面板显示的可能仍是旧域名。二选一即可；
+- **快速隧道的 URL 每次重启都会变，且有配额**（由 `restart.ps1` 或面板开关自动回写 `BACKEND_URL`），且可能有连接抖动；**命名隧道的地址固定、无配额**，但需要先做一次 `cloudflared tunnel login` / `create` / `route dns`。`proxyToBackend` 仅对幂等请求最多重试一次，非幂等 POST 不自动重放以避免重复计费；
+- **命名隧道的地址绝不能是 Worker 自己的域名**。`BACKEND_URL` 就是从 ingress 取的，若取到 Worker 的 custom domain，Worker 会转发给自己。插件已从 `wrangler.jsonc` 的 routes 读出 Worker 拥有的域名并跳过它们（多份 ingress 时取第一条不属于 Worker 的），全被占用时报错而不是硬凑一个地址；
+- **隧道有两条启动路径（`restart.ps1` 与面板开关），互不感知**。隧道已在运行时再执行不带 `-Local` 的 `restart.ps1`，会另起一个 cloudflared 并覆盖 `BACKEND_URL`，而面板显示的可能仍是旧域名。二选一即可。**`restart.ps1` 的清理也只认快速隧道**：它按 `CommandLine -match "tunnel --url"` 找进程，而命名隧道跑的是 `tunnel --config … run <name>`，所以命名隧道不会被它杀掉——两个进程可能同时连同一个 tunnel；
 - **自定义供应商的推理档位依赖上游如实发布**。有的上游（如 StepFun）对不认识的 `reasoning_effort` **不报错而是照收**，所以阶梯无法靠探测推断，只能信它发布的字段；没发布就不给档位（不编造）；
 - 自定义供应商的**非对话模型**（TTS、ASR、文生图）同样会出现在模型列表里，选中后调用会失败——上游没有可用的类别字段能可靠区分；
 - 内存缓存（模型列表 5 分钟、CSRF 25 分钟）在边缘多实例下不共享。
