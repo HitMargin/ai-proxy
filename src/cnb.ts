@@ -1350,6 +1350,11 @@ async function cnbCallUpstream(upBody: any): Promise<Response> {
     console.warn(`[cnb-gate] large body ${bodyBytes}B (${(bodyBytes / 1048576).toFixed(3)} MiB), sending anyway (fp=${cnbFingerprint(upBody)})`);
   }
   const fp = cnbFingerprint(upBody);
+  // 串行闸的两条慢日志阈值。cnb 上游单次生成实测 30 秒上下，闸又是串行的，
+  // 所以「等 30~50 秒」是**正常**的竞争结果、不是故障。默认值取在正常量级
+  // 之上，只有真正卡住（闸被吊、上游挂起）才会记；两个都可用环境变量调。
+  const CNB_GATE_SLOW_WAIT_MS = Number(Deno.env.get("CNB_GATE_SLOW_WAIT_MS") ?? 60_000) || 60_000;
+  const CNB_GATE_SLOW_HOLD_MS = Number(Deno.env.get("CNB_GATE_SLOW_HOLD_MS") ?? 120_000) || 120_000;
   const prev = cnbGate;
   let release!: () => void;
   cnbGate = new Promise<void>((r) => (release = r));
@@ -1360,7 +1365,13 @@ async function cnbCallUpstream(upBody: any): Promise<Response> {
     if (released) return;
     released = true;
     clearTimeout(safety);
-    console.warn(`[cnb-gate] fp=${fp} released +${Date.now() - t0}ms`);
+    // 同样只在异常时记：正常释放（流跑完/取消）是一条流水账，每个请求都打
+    // 一次会把日志刷成同样的墙。这里只在**持有时间明显超过一次正常生成**时
+    // 记账，正常的十几到几十秒不再逐条输出。
+    const held = Date.now() - t0;
+    if (held > CNB_GATE_SLOW_HOLD_MS) {
+      console.warn(`[cnb-gate] fp=${fp} released after ${held}ms (slow hold; ${CNB_GATE_SLOW_HOLD_MS}ms threshold)`);
+    }
     release();
   };
   // 安全阀：流挂死时 10 分钟强制放行，避免闸被永久占死（正常释放时清除，不留误报日志）
@@ -1368,7 +1379,18 @@ async function cnbCallUpstream(upBody: any): Promise<Response> {
   const queuedAt = Date.now();
   await prev;
   const waited = Date.now() - queuedAt;
-  if (waited > 200) console.warn(`[cnb-gate] fp=${fp} waited ${waited}ms for previous stream`);
+  // 只在**异常**排队时记一行。
+  //
+  // 阈值原本是 200ms，而 cnb 上游单次生成实测就要 30 秒上下、闸又是串行的，
+  // 所以每个并发请求必然等几十秒——那条日志于是变成每请求必打，把真正该看
+  // 的东西（渠道报错、额度、上游 5xx）挤出了插件的 200 行环形缓冲。用户看到
+  // 的就是「一直在刷屏」，而它描述的全是正常竞争。
+  //
+  // 判据改成「等得明显超过一次正常生成的量级」：默认 60 秒。真正的异常等待
+  // （闸被吊住、上游挂起）会远超这个数，仍然会被记下来。阈值在函数开头声明。
+  if (waited > CNB_GATE_SLOW_WAIT_MS) {
+    console.warn(`[cnb-gate] fp=${fp} waited ${waited}ms for previous stream (slow; ${CNB_GATE_SLOW_WAIT_MS}ms threshold)`);
+  }
   try {
     const resp = await cnbCallUpstreamInner(upBody);
     return cnbGatedResponse(resp, done);
