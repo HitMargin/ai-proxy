@@ -452,6 +452,20 @@ globalThis.fetch = async (input, init = {}) => {
   // downgraded to SERVER here - which is in retryableCodes, so a turn that had
   // already delivered half an answer was replayed, re-running the tool calls
   // it had emitted and billing them twice.
+  // A turn whose tool-call syntax the proxy refused. The proxy strips the bad
+  // block and appends a `[proxy] ... invalid tool syntax` notice to the text, so
+  // the turn arrives here as an ordinary clean stop - and the agent loop read it
+  // as the model finishing its turn and stopped, leaving the user to prod the
+  // session by hand. That is the stall this fixture exists to prevent.
+  if (streamMode === 'junk-rejected') {
+    return new Response(
+      [
+        'data: {"choices":[{"delta":{"content":"Let me check.\\n[proxy] Your previous tool call used an invalid syntax that no client can parse, so it was NOT executed."},"finish_reason":"stop"}]}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
   if (streamMode === 'cut-framed') {
     return new Response(
       [
@@ -980,6 +994,36 @@ try {
   assert.equal(doneEmptyFinish?.reason?.kind, 'error', 'a stream that delivered nothing is not a clean stop');
   assert.equal(doneEmptyFinish?.reason?.failure?.code, 'TRANSPORT');
   assert.match(doneEmptyFinish?.reason?.failure?.message ?? '', /without delivering any content/);
+
+  // A refused tool call must FAIL the turn, not merely be mentioned in it.
+  //
+  // The proxy's notice reads as a normal assistant message, so a clean stop here
+  // means the agent loop stops and waits - measured 2026-10-05, the user had to
+  // prod the session manually after being told "immediately continue the task".
+  // Failing the turn is the only lever that makes the harness retry, and
+  // TRANSPORT is the only code it retries.
+  streamMode = 'junk-rejected';
+  const junkEvents = [];
+  for await (const event of adapter.stream({
+    model: resolved.id,
+    messages: [{ role: 'user', content: 'run the tool' }],
+    maxTokens: 32,
+  }, resolved)) junkEvents.push(event);
+  const junkFinish = junkEvents.find((e) => e.type === 'finish');
+  assert.equal(
+    junkFinish?.reason?.kind,
+    'error',
+    'a rejected tool call must fail the turn so the harness retries instead of stalling',
+  );
+  assert.equal(junkFinish?.reason?.failure?.code, 'TRANSPORT');
+  // The text still has to arrive: the user needs to see what happened, and the
+  // notice is what the retry reminder is built from. The plugin closes text with a
+  // `block-end` carrying the whole string rather than a stream of deltas.
+  const junkText = junkEvents
+    .filter((e) => e.type === 'block-end' && e.block?.type === 'text')
+    .map((e) => e.block.text)
+    .join('');
+  assert.match(junkText, /invalid tool syntax|invalid syntax/, 'the rejection notice must still reach the caller');
 
   // A stream that carried its terminal marker is still reported as a stop.
   streamMode = 'normal';

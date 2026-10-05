@@ -3103,6 +3103,69 @@ export class AiProxyAdapter {
       origin: 'harness',
       noUsage: usage === undefined,
     });
+    // A rejected tool call has to fail the turn, not merely be mentioned in it.
+    //
+    // The proxy detects the bad syntax, strips it, and appends an explanation to
+    // the text. That is honest, but it reaches the harness as an ordinary
+    // assistant message on a turn that finished cleanly - so the agent loop reads
+    // "the model said its piece" and STOPS, waiting for input. Measured
+    // 2026-10-05: the user got the rejection notice and then had to prod the
+    // session by hand, which is precisely the stall the notice exists to prevent.
+    //
+    // The only way to make the turn continue on its own is to fail it so the
+    // harness retries (maxRetries: 2 in providerRetryPolicy), and TRANSPORT is
+    // the only code it retries.
+    //
+    // Retrying after output has been delivered is normally forbidden here - the
+    // stream_cut branch below explains why a replay repeats work and bills it
+    // twice - and the user chose this trade-off explicitly after being shown the
+    // cost. Nothing executed in this case, which is the whole reason the proxy
+    // refused the call, so the replay re-sends the same prompt and the injected
+    // retry reminder is what makes the second attempt differ from the first.
+    if (finish === 'stop' && !options.signal?.aborted) {
+      // The proxy has two spellings for this notice - the full one ("used an
+      // invalid syntax that no client can parse") for the first two rejections and
+      // the circuit-breaker's shorter "Still the same invalid tool syntax" after
+      // that. An earlier version of this check matched only the second, so the
+      // FIRST rejection - the one most worth retrying - fell through and the turn
+      // still ended cleanly. The patterns below cover both while staying anchored
+      // on `[proxy]`, which is what makes them ours rather than text the model wrote.
+      const rejection = text.match(/\[proxy\][^\n]*(?:invalid tool syntax|invalid syntax)[^\n]*/i);
+      if (rejection) {
+        for (const block of toolBlocks.values()) {
+          yield { type: 'block-end', index: block.index, block: { type: 'tool-call', id: block.id, name: block.name, arguments: block.args || '{}' } };
+        }
+        if (usage) yield { type: 'usage', usage };
+        this.runtime?.record?.(
+          `${modelId}: rejected tool syntax; failing the turn so the harness retries instead of stalling`,
+        );
+        recordUsage({
+          at: startedAt,
+          model: modelId,
+          effort: typeof options.reasoningEffort === 'string' ? options.reasoningEffort : '',
+          ok: false,
+          input: usage?.inputTokens ?? 0,
+          output: usage?.outputTokens ?? 0,
+          reasoning: usage?.reasoningTokens ?? 0,
+          decodeTokens: Math.max(0, (usage?.outputTokens ?? 0) - (usage?.reasoningTokens ?? 0)),
+          ttftMs: firstDeltaAt === undefined ? undefined : firstDeltaAt - startedAt,
+          decodeMs: firstDeltaAt === undefined ? undefined : Date.now() - firstDeltaAt,
+          origin: 'harness',
+          noUsage: usage === undefined,
+        });
+        yield {
+          type: 'finish',
+          reason: {
+            kind: 'error',
+            failure: {
+              message: 'ai-proxy rejected the tool call syntax; retrying so the model can re-emit it',
+              code: 'TRANSPORT',
+            },
+          },
+        };
+        return;
+      }
+    }
     yield { type: 'finish', reason: { kind: finishKind(finish) } };
   }
 }

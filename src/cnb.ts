@@ -562,6 +562,8 @@ const CNB_JUNK_STREAK_WINDOW = 60_000;
  * 模块级私有状态会让用例之间按执行顺序互相影响，而 Deno 不保证用例顺序。
  */
 export const cnbJunkStreak = { count: 0, at: 0 };
+/** 上一次拒收的诊断原文，供下一轮重试时写进 prompt（见 cnbBuildUpstream）。 */
+export const cnbJunkLastDiagnosis = { text: "" };
 export const cnbJunkLogState = { at: 0 };
 
 /**
@@ -1003,6 +1005,10 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
       JUNK.lastIndex = 0;
       junkToolSyntax = true;
       junkDiagnosis = cnbDiagnoseJunkSyntax(text);
+      // 留给下一轮：harness 重试时会重发同一个请求体，那时 prompt 里没有任何
+      // 「你上次写错了」的信息，模型会写出同样的坏语法。这条诊断由
+      // cnbBuildUpstream 读出来补进 system 消息（见那里的长注释）。
+      cnbJunkLastDiagnosis.text = junkDiagnosis;
       // 拒收时记录原始形态（stderr + 落盘），下次能确诊而不是盲猜。
       // 落盘是必需的：stderr 只进插件 200 行内存日志，长会话里几秒就被冲掉
       // （实测：连续拒收时 warn 存活时间以秒计，日志文件里一行都没留下）。
@@ -1221,6 +1227,36 @@ function cnbBuildUpstream(openaiBody: any) {
       }
     } else {
       msgs.unshift({ role: "system", content: prompt });
+    }
+  }
+
+  // ★ 重试提示：上一轮刚因为工具语法被拒、而 harness 正把**同一个请求体**重发
+  // 过来时，把「你上次写错了」这条信息补进 prompt。
+  //
+  // 为什么必须有这一步：模型写出坏语法时，harness 收到的是一个**正常结束的
+  // 回合**（反馈只是正文里的一段文字），它因此停下来等用户。要让它自己继续，
+  // 唯一的路是让这一轮判失败、触发 harness 重试——但**重试重发的是同一个请求
+  // 体**，而坏语法那一轮的 assistant 消息并没有被提交，所以模型看到的 prompt
+  // 一字不差，它会写出**一模一样的坏语法**，重试两次全废。
+  //
+  // 判据是「同一会话在 60 秒内刚被拒过」（cnbJunkStreak 已经在记这件事）。
+  // 用一条 system 消息而不是伪造 user/assistant——伪造历史是往 transcript 里
+  // 塞假话，而 system 本来就是我们放协议说明的地方，语义正确。
+  const recentJunk = Date.now() - cnbJunkStreak.at <= CNB_JUNK_STREAK_WINDOW;
+  if (hasTools && recentJunk && cnbJunkStreak.count > 0) {
+    const reminder =
+      `RETRY REMINDER: your previous attempt was rejected for invalid tool syntax ` +
+      `(rejected ${cnbJunkStreak.count} time(s) just now). Nothing from it was executed. ` +
+      `Reason: ${cnbJunkLastDiagnosis.text || "the tool call was not in the required shape"}. ` +
+      `This time emit EXACTLY one block, with nothing else on those two tag lines:\n` +
+      TC_OPEN + "\n" +
+      '{"name": "TOOL_NAME", "arguments": { ...all required params... }}' + "\n" +
+      TC_CLOSE;
+    const first = msgs[0];
+    if (first && first.role === "system" && typeof first.content === "string") {
+      msgs[0] = { role: "system", content: first.content + "\n\n" + reminder };
+    } else {
+      msgs.unshift({ role: "system", content: reminder });
     }
   }
 
