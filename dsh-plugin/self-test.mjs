@@ -2152,6 +2152,136 @@ try {
       );
     }
 
+    // ---- named tunnel ----
+    //
+    // Measured on this machine 2026-10-05: several quick-tunnel starts in one day
+    // got `quick tunnel provisioning failed with status 429: error code: 1015`
+    // from Cloudflare. cloudflared then printed nothing, so the panel blamed
+    // itself with "never printed a trycloudflare url" and the hunt went to the
+    // binary instead of the rate limit.
+    {
+      const runtime = new ProxyRuntime({ mode: 'local', projectRoot: os.tmpdir() });
+      const tunnel = new TunnelRuntime(runtime);
+      runtime.settings.tunnelMode = 'named';
+      runtime.settings.tunnelName = 'ai-proxy';
+
+      // The hostname has to come from somewhere: a named tunnel never prints one.
+      const cfg = path.join(os.tmpdir(), 'cf-ingress-test.yml');
+      fs.writeFileSync(cfg, [
+        'tunnel: 02812882-0169-49c1-8a8b-4ee135383bce',
+        'ingress:',
+        '  - hostname: ai.example.dpdns.org',
+        '    service: http://127.0.0.1:8000',
+        '  - service: http_status:404',
+      ].join('\n'));
+      assert.equal(
+        tunnel.hostnameFromConfig(cfg),
+        'ai.example.dpdns.org',
+        'the first ingress hostname is the address the tunnel serves',
+      );
+      // Second hostname must not win: cloudflared matches the first rule too, so
+      // reporting the other one would advertise an address the tunnel never sees.
+      fs.writeFileSync(cfg, [
+        'ingress:',
+        '  - hostname: first.example.org',
+        '    service: http://127.0.0.1:8000',
+        '  - hostname: second.example.org',
+        '    service: http://127.0.0.1:8000',
+      ].join('\n'));
+      assert.equal(
+        tunnel.hostnameFromConfig(cfg),
+        'first.example.org',
+        'the first ingress rule is the one cloudflared matches',
+      );
+      // A config with no hostname admits there is none rather than inventing one.
+      fs.writeFileSync(cfg, 'ingress:\n  - service: http_status:404\n');
+      assert.equal(
+        tunnel.hostnameFromConfig(cfg),
+        '',
+        'no hostname in the config must yield no address, not a guess',
+      );
+      fs.rmSync(cfg, { force: true });
+
+      // The enum is closed: an unknown value would reach the CLI as a tunnel name.
+      assert.equal(cleanSettings({ tunnelMode: 'named' }).tunnelMode, 'named');
+      assert.equal(cleanSettings({ tunnelMode: 'banana' }).tunnelMode, undefined,
+        'an unknown tunnel mode must not reach the command line');
+      assert.equal(cleanSettings({ tunnelMode: 'quick' }).tunnelMode, 'quick');
+      // Same DNS-label rule as the worker name, and for the same reason.
+      assert.equal(cleanSettings({ tunnelName: 'ai proxy' }).tunnelName, undefined,
+        'a tunnel name with a space must not reach the command line');
+      assert.equal(cleanSettings({ tunnelName: 'ai-proxy' }).tunnelName, 'ai-proxy');
+      assert.equal(cleanSettings({ tunnelName: '' }).tunnelName, '');
+
+      // A named runtime with no hostname recorded must not look like a started
+      // tunnel: the panel, the reachability probe and the Worker write all use
+      // this url, and an empty one would silently skip every one of them.
+      const snap = tunnel.snapshot();
+      assert.equal(snap.mode, 'named', 'the panel needs the mode to know what to show');
+      assert.equal(snap.tunnelName, 'ai-proxy');
+      assert.equal(snap.baseUrl, '', 'no hostname means no advertised address yet');
+
+      // ---- the argv a named tunnel is started with ----
+      //
+      // This is the case the earlier suite could not kill: `--config` only shows
+      // up in spawn's argv, and no assertion read it, so a version that dropped
+      // it stayed green. Dropping it is the measured 503: run without a config,
+      // cloudflared warns "No ingress rules were defined" and answers 503 for
+      // every request while reporting a healthy connection.
+      const argsBuilt = [];
+      const realSpawn = tunnel.spawnForTest?.bind(tunnel);
+      // Spy on the module's spawn by swapping the one TunnelRuntime reaches
+      // through, then start just far enough to capture the command line.
+      const probe = new TunnelRuntime(runtime);
+      const capturedArgs = [];
+      const fakeChild = {
+        stdout: { on: () => {} },
+        stderr: { on: () => {} },
+        on: (event, handler) => {
+          if (event === 'error') { /* never called */ }
+        },
+        kill: () => {},
+      };
+      // Re-point the spawn the runtime uses at a recorder.
+      const index = await import('./index.js');
+      const before = index.__spawnForTest;
+      index.__setSpawnForTest?.((bin, args) => {
+        capturedArgs.push([bin, args]);
+        return fakeChild;
+      });
+      // Point the proxy probe at success so startInternal gets to the spawn.
+      probe.proxy.probe = async () => true;
+      probe.proxy.settings.port = 8000;
+      probe.proxy.settings.tunnelMode = 'named';
+      probe.proxy.settings.tunnelName = 'ai-proxy';
+      const cfg2 = path.join(os.tmpdir(), 'cf-argv-test.yml');
+      fs.writeFileSync(cfg2, 'ingress:\n  - hostname: ai.example.dpdns.org\n    service: http://127.0.0.1:8000\n');
+      // The default config location is under the real home; give this one an
+      // explicit path so the test does not read the machine's own config.
+      const homeBefore = process.env.USERPROFILE;
+      process.env.USERPROFILE = os.tmpdir();
+      fs.mkdirSync(path.join(os.tmpdir(), '.cloudflared'), { recursive: true });
+      fs.copyFileSync(cfg2, path.join(os.tmpdir(), '.cloudflared', 'config.yml'));
+      try {
+        await probe.start();
+      } catch { /* the fake child never connects; the argv is what matters */ }
+      process.env.USERPROFILE = homeBefore;
+      if (before !== undefined) index.__setSpawnForTest?.(before);
+      fs.rmSync(cfg2, { force: true });
+      void realSpawn;
+
+      assert.ok(capturedArgs.length > 0, 'a named tunnel must be spawned, not skipped');
+      const [, namedArgv] = capturedArgs[0];
+      assert.ok(
+        namedArgv.includes('--config'),
+        'a named tunnel must be started with --config, or cloudflared answers 503 for every request',
+      );
+      assert.ok(namedArgv.includes('run') && namedArgv.includes('ai-proxy'),
+        'the named tunnel must be run by its name');
+      assert.ok(!namedArgv.includes('--url'),
+        'a named tunnel gets its hostname from DNS, not --url');
+    }
+
     console.log('tunnel suite ok');
   }
 

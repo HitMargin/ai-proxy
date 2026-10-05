@@ -13,7 +13,24 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { spawn as nodeSpawn } from 'node:child_process'
+
+// The tunnel's command line is only observable at the spawn, and what it guards
+// against is measured: run a named tunnel without `--config`, cloudflared warns
+// "No ingress rules were defined" and answers **503 for every request** while
+// reporting a healthy connection. Nothing downstream of that says 503, so a test
+// that only reads the panel state passes with the flag missing. This seam lets
+// the test read the argv; production never calls it.
+let spawnOverride = null
+function spawn(bin, args, options) {
+  return spawnOverride ? spawnOverride(bin, args, options) : nodeSpawn(bin, args, options)
+}
+export function __setSpawnForTest(fn) {
+  spawnOverride = fn
+}
+export function __getSpawnForTest() {
+  return spawnOverride
+}
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   applyRecord,
@@ -1273,6 +1290,26 @@ export class TunnelRuntime {
     this.desired = false;
   }
 
+  /**
+   * The first hostname in a cloudflared config file's ingress, or ''.
+   *
+   * A hand-written YAML is not worth a parser here, and guessing at one is how a
+   * config with several hostnames silently reports the wrong address: the ingress
+   * is scanned in order and the first `- hostname:` line wins, which is the same
+   * rule cloudflared itself applies. A config with none is answered with '' rather
+   * than a fallback, because inventing a hostname would point the panel at an
+   * address nothing serves.
+   */
+  hostnameFromConfig(configPath) {
+    try {
+      const text = fs.readFileSync(configPath, 'utf8');
+      const found = text.match(/^\s*-\s*hostname:\s*([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})\s*$/m);
+      return found ? found[1] : '';
+    } catch {
+      return '';
+    }
+  }
+
   record(message) {
     const line = `${new Date().toISOString()} ${message}`.slice(-2000);
     this.logs.push(line);
@@ -1377,9 +1414,29 @@ export class TunnelRuntime {
     // A named tunnel gets its hostname from the ingress the user configured with
     // `cloudflared tunnel route dns`, so there is no trycloudflare URL to scrape
     // out of the output - readiness is the registered hostname itself.
+    //
+    // `--config` matters more than it looks: run without one, cloudflared warns
+    // "No ingress rules were defined" and answers **503 for every request** while
+    // still reporting a healthy connection. Measured 2026-10-05. So the config
+    // file is passed whenever there is one, and the tunnel is only called up once
+    // its hostname is recorded on the Cloudflare side.
+    const configPath = String(this.proxy.settings.cloudflaredConfig ?? '').trim()
+      || path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.cloudflared', 'config.yml');
+    const hasConfig = fs.existsSync(configPath);
     const args = named
-      ? ['tunnel', '--no-autoupdate', 'run', tunnelName]
+      ? [
+          'tunnel',
+          ...(hasConfig ? ['--config', configPath] : []),
+          '--no-autoupdate',
+          'run',
+          tunnelName,
+        ]
       : ['tunnel', '--url', target, '--no-autoupdate'];
+    if (named && !hasConfig) {
+      this.record(
+        `no cloudflared config at ${configPath}; running without ingress rules would answer 503`,
+      );
+    }
     this.state = 'starting';
     this.record(`starting tunnel: ${binary} ${args.join(' ')}`);
     try {
@@ -1450,6 +1507,17 @@ export class TunnelRuntime {
       if (this.url !== '') break;
       if (this.state === 'error') return;
       await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    // A named tunnel never prints a URL - the hostname is configured, not
+    // assigned. Take it from the config file so the panel, the reachability
+    // probe below and the Worker write all answer with a real address instead
+    // of staying empty and looking like a failure to start.
+    if (this.url === '' && named) {
+      const hostname = this.hostnameFromConfig(configPath);
+      if (hostname !== '') {
+        this.url = `https://${hostname}`;
+        this.record(`tunnel hostname from config: ${this.url}`);
+      }
     }
     if (this.url === '') {
       this.state = 'error';
