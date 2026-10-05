@@ -30,7 +30,7 @@ process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, TunnelRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv, mergeCustomSources, workerCustomDomainsIn } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, TunnelRuntime, healthIndex, normalizeModel, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv, mergeCustomSources, workerCustomDomainsIn } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -194,8 +194,10 @@ globalThis.fetch = async (input, init = {}) => {
       return new Response(JSON.stringify({
         data: [
           { id: 'openrouter/paid/model', name: 'Paid', context_window: 128000, max_output_tokens: 32000 },
-          { id: 'cnb/deepseek-v4-flash', name: 'CNB Flash', context_window: 131072, max_output_tokens: 8192 },
-          { id: 'cnb/deepseek-v4-pro', name: 'CNB Pro', context_window: 131072, max_output_tokens: 8192 },
+          // cnb's real listing: a static array with no modality metadata (see
+          // CNB_MODELS in src/cnb.ts), which is exactly why the channel had to
+          // be read specially rather than defaulted to text-only.
+          { id: 'cnb/deepseek-v4.1-flash', name: 'CNB Flash', object: 'model', created: 0, owned_by: 'cnb' },
           {
             id: 'deepseek/test',
             name: 'DeepSeek Test',
@@ -653,6 +655,38 @@ try {
   const shorthand = models.find((model) => model.id === 'kilo/shorthand-only');
   assert.deepEqual(shorthand.inputModalities, ['text', 'image']);
   assert.equal(shorthand.contextWindow, 256000);
+  // cnb's static list carries no modality metadata, so its vision has to come
+  // from the channel. Without it the harness blocks the image before the request
+  // is sent, which is how a vision-capable upstream ended up refusing pictures.
+  //
+  // Asserted through `normalizeModel` directly, NOT through the roster above:
+  // this suite's fixture hides cnb (hiddenChannels: ['cnb','openrouter']), so a
+  // roster assertion here would be vacuously true — the row is filtered out
+  // before it can be looked up, which is exactly why the first version of this
+  // assertion passed with the fix removed.
+  assert.deepEqual(
+    normalizeModel('ai-proxy', {
+      id: 'cnb/deepseek-v4.1-flash',
+      name: 'CNB Flash',
+      object: 'model',
+      created: 0,
+      owned_by: 'cnb',
+    }).inputModalities,
+    ['text', 'image'],
+    'cnb must be published as vision-capable',
+  );
+  // The control for the assertion above: no metadata and no known channel stays
+  // text-only. Without it the cnb line would pass on a blanket default.
+  assert.deepEqual(
+    normalizeModel('ai-proxy', {
+      id: 'mystery/no-metadata',
+      name: 'No Metadata',
+      object: 'model',
+      owned_by: 'nobody',
+    }).inputModalities,
+    ['text'],
+    'an unknown channel must not gain vision from cnb',
+  );
   // A channel that publishes only `id` must still get a readable display name.
   const zenModel = models.find((model) => model.id === 'zen/jev-1.13-free');
   assert.equal(zenModel.name, 'Jev 1.13');
@@ -714,12 +748,12 @@ try {
     true,
     'a key-only channel still gets the key explanation',
   );
-  // The withheld count describes rows that were actually seen and dropped: the 3
-  // blocked rows inside the aggregate listing (1 openrouter, 2 cnb). A blocked
+  // The withheld count describes rows that were actually seen and dropped: the 2
+  // blocked rows inside the aggregate listing (1 openrouter, 1 cnb). A blocked
   // channel that has its own route is never fetched at all, so it contributes
   // nothing here - asking the proxy for a listing whose rows would all be discarded
   // cost one request per poll for nothing.
-  assert.equal(adapter.blockedModelCount, 3);
+  assert.equal(adapter.blockedModelCount, 2);
   for (const prefix of ['deepseek-web/', 'cnb/', 'openrouter/']) {
     assert.equal(
       models.some((model) => model.id.startsWith(prefix)),

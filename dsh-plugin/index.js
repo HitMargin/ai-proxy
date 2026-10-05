@@ -397,6 +397,15 @@ function readModalities(row) {
   // `inputModalities` lacks `image`, so a vision-capable upstream silently dropped
   // every image the user sent.
   if (row.enable_vision_input === true) return ['text', 'image'];
+  // cnb publishes a static model list with no modality metadata at all
+  // (src/cnb.ts:CNB_MODELS is a hardcoded array), so every row fell through to
+  // text-only and the harness refused to attach an image before the request ever
+  // left. Measured 2026-10-06 against the deployed channel: a data-URL PNG came
+  // back described correctly ("粉色") and prompt_tokens rose from 35 to 222, so
+  // the upstream really does read images. This is the same class of gap as the
+  // StepFun one above, one channel over.
+  const channel = String(row.owned_by ?? row.provider ?? '').toLowerCase();
+  if (channel === 'cnb') return ['text', 'image'];
   return ['text'];
 }
 
