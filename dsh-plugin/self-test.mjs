@@ -30,7 +30,7 @@ process.on('exit', () => {
   try { fs.rmSync(sandboxHome, { recursive: true, force: true }); } catch {}
 });
 
-const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, TunnelRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv, mergeCustomSources } = await import('./index.js');
+const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, TunnelRuntime, healthIndex, CHANNEL_GROUPS, PROBE_CHANNELS, workBuddyCredentialIn, cleanSettings, credentialEnv, customProvidersForEnv, mergeCustomSources, workerCustomDomainsIn } = await import('./index.js');
 
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
@@ -2309,6 +2309,78 @@ try {
         'the named tunnel must be run by its name');
       assert.ok(!namedArgv.includes('--url'),
         'a named tunnel gets its hostname from DNS, not --url');
+    }
+
+    // ---- a hostname the Worker owns must never become BACKEND_URL ----
+    //
+    // This is the bug that shipped on 2026-10-05. The ingress listed
+    // `api.hitmargin.dpdns.org` first, that hostname is the Worker's own custom
+    // domain, and `BACKEND_URL` is written from whatever this function returns -
+    // so the Worker was about to be told to forward to itself. It only worked
+    // because the value was corrected by hand. Relying on ingress order is not a
+    // fix: the next edit reorders the file and the loop is back.
+    {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apx-worker-domain-'));
+      // A real project root, so resolveProjectRoot accepts it (it requires both
+      // main.ts and deno.jsonc) and the routes file is the one read here.
+      fs.writeFileSync(path.join(root, 'main.ts'), '// fixture\n');
+      fs.writeFileSync(path.join(root, 'deno.jsonc'), '{}\n');
+      fs.writeFileSync(path.join(root, 'wrangler.jsonc'), [
+        '{',
+        '  // A commented-out route keeps the same shape as a live one, which is the',
+        '  // only way this line can witness anything: { "pattern": "old.example.org", "custom_domain": false }',
+        '  "routes": [',
+        '    { "pattern": "hitmargin.dpdns.org", "custom_domain": true },',
+        '    { "pattern": "api.hitmargin.dpdns.org", "custom_domain": true }',
+        '  ]',
+        '}',
+      ].join('\n'));
+
+      const domains = workerCustomDomainsIn(root);
+      assert.equal(domains.has('api.hitmargin.dpdns.org'), true,
+        'the Worker custom domains must be read from wrangler.jsonc');
+      assert.equal(domains.has('hitmargin.dpdns.org'), true);
+      // The commented route above carries a real `"pattern": "..."` pair. Checking
+      // for a plain hostname mentioned in prose would have been vacuously true:
+      // the extractor only ever looks at `"pattern"` values, so a comment that
+      // does not contain that key could never have produced a hit either way.
+      assert.equal(domains.has('old.example.org'), false,
+        'a commented-out route must not count as a route');
+
+      const runtime = new ProxyRuntime({ mode: 'local', projectRoot: root });
+      const tunnel = new TunnelRuntime(runtime);
+      runtime.settings.tunnelMode = 'named';
+      runtime.settings.tunnelName = 'ai-proxy';
+
+      const cfg = path.join(root, 'config.yml');
+      // The exact shape that caused it: the Worker's own domain comes first.
+      fs.writeFileSync(cfg, [
+        'ingress:',
+        '  - hostname: api.hitmargin.dpdns.org',
+        '    service: http://127.0.0.1:8000',
+        '  - hostname: ai.hitmargin.dpdns.org',
+        '    service: http://127.0.0.1:8000',
+      ].join('\n'));
+      assert.equal(
+        tunnel.hostnameFromConfig(cfg),
+        'ai.hitmargin.dpdns.org',
+        'a hostname the Worker serves must be skipped even when it comes first',
+      );
+
+      // If the config offers nothing but the Worker's own domains there is no
+      // address to hand out, and inventing one is what builds the loop.
+      fs.writeFileSync(cfg, [
+        'ingress:',
+        '  - hostname: api.hitmargin.dpdns.org',
+        '    service: http://127.0.0.1:8000',
+      ].join('\n'));
+      assert.equal(
+        tunnel.hostnameFromConfig(cfg),
+        '',
+        'a config with only Worker-owned hostnames must yield no address, not a self-loop',
+      );
+
+      fs.rmSync(root, { recursive: true, force: true });
     }
 
     console.log('tunnel suite ok');

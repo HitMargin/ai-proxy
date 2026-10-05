@@ -1012,6 +1012,40 @@ function resolveProjectRoot(settings) {
   return '';
 }
 
+/**
+ * The hostnames the Worker serves, from `wrangler.jsonc`'s routes.
+ *
+ * `custom_domain` routes are the ones that matter: Cloudflare refuses to let a
+ * hostname be both a Worker custom domain and a tunnel route, so a hostname in
+ * this set can never be the tunnel's address. That makes this list the authority
+ * for "which hostname must not become BACKEND_URL" - and getting it wrong is not
+ * cosmetic, it points the Worker at itself.
+ *
+ * Read from the file rather than configured separately on purpose: a hand-kept
+ * second copy of the routes drifts, and the two probe rosters already showed how
+ * that ends. An unreadable or absent file yields an empty set, which restores the
+ * old behaviour (first hostname wins) rather than blocking the tunnel.
+ */
+export function workerCustomDomainsIn(root) {
+  try {
+    const text = fs.readFileSync(path.join(root, 'wrangler.jsonc'), 'utf8');
+    // Comments are stripped first: the routes block is documented inline, and a
+    // hostname quoted inside a comment must not count as a route.
+    const stripped = text.replace(/^\s*\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+    const hosts = new Set();
+    for (const match of stripped.matchAll(/"pattern"\s*:\s*"([^"]+)"/g)) {
+      const pattern = match[1].trim().toLowerCase();
+      // A pattern may carry a path (`example.com/*`); the hostname is what is
+      // compared, and it is the part before the first slash.
+      const host = pattern.split('/')[0].replace(/^\*\./, '');
+      if (host.includes('.')) hosts.add(host);
+    }
+    return hosts;
+  } catch {
+    return new Set();
+  }
+}
+
 function healthUrl(baseUrl) {
   const url = new URL('/health', baseUrl);
   return url.href;
@@ -1027,6 +1061,20 @@ export class ProxyRuntime {
     this.startedAt = 0;
     this.logs = [];
     this.startPromise = null;
+  }
+
+  /**
+   * The hostnames the Worker serves, so the tunnel can avoid them.
+   *
+   * Read on each call rather than cached in the constructor: the project root is
+   * a setting the user can change, and a set captured at construction would keep
+   * answering for the old root - the same shape of staleness that made
+   * `channelKeySet` report the wrong thing from a snapshot built once per apply().
+   */
+  workerCustomDomains() {
+    const root = resolveProjectRoot(this.settings);
+    if (!root) return new Set();
+    return workerCustomDomainsIn(root);
   }
 
   originUrl() {
@@ -1291,7 +1339,7 @@ export class TunnelRuntime {
   }
 
   /**
-   * The first hostname in a cloudflared config file's ingress, or ''.
+   * The first ingress hostname the Worker does not own, or ''.
    *
    * A hand-written YAML is not worth a parser here, and guessing at one is how a
    * config with several hostnames silently reports the wrong address: the ingress
@@ -1299,12 +1347,35 @@ export class TunnelRuntime {
    * rule cloudflared itself applies. A config with none is answered with '' rather
    * than a fallback, because inventing a hostname would point the panel at an
    * address nothing serves.
+   *
+   * **Hostnames the Worker owns are skipped**, and that is the load-bearing part.
+   * This value becomes `BACKEND_URL`, so naming a hostname the Worker serves
+   * makes the Worker forward to itself. Measured 2026-10-05: the ingress listed
+   * `api.hitmargin.dpdns.org` first, it was picked here, the reachability probe
+   * against it failed (the Worker answered 522), and the write that follows would
+   * have pointed the Worker at its own domain. The chain worked only because the
+   * value had been corrected by hand. Depending on file order to avoid that is
+   * not a fix - the next edit reorders it and the loop returns - so the check
+   * lives here, where the value is chosen.
    */
   hostnameFromConfig(configPath) {
     try {
       const text = fs.readFileSync(configPath, 'utf8');
-      const found = text.match(/^\s*-\s*hostname:\s*([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})\s*$/m);
-      return found ? found[1] : '';
+      const all = [...text.matchAll(
+        /^\s*-\s*hostname:\s*([A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,})\s*$/gm,
+      )].map((match) => match[1]);
+      if (all.length === 0) return '';
+      const workerHosts = this.proxy.workerCustomDomains();
+      const usable = all.find((host) => !workerHosts.has(host.toLowerCase()));
+      if (usable) return usable;
+      // Every hostname here belongs to the Worker, so there is no address to hand
+      // out. Reporting one anyway is what builds the loop; empty is the honest
+      // answer, and the caller then leaves `url` empty instead of poisoning the
+      // Worker with its own domain.
+      this.record(
+        `every ingress hostname (${all.join(', ')}) belongs to the Worker; no tunnel address to use`,
+      );
+      return '';
     } catch {
       return '';
     }
@@ -1524,8 +1595,16 @@ export class TunnelRuntime {
       // cloudflared's own reason beats a guess about what went wrong. It names
       // the rate limit (429 / 1015) and a bad credential in terms the user can
       // act on; "never printed a url" sent the hunt toward the binary.
+      //
+      // The named case is spelled out separately: that mode never prints a url at
+      // all, so the quick-tunnel wording would send the reader looking for a line
+      // that was never going to appear. The likely cause there is the ingress
+      // listing only hostnames the Worker owns (see hostnameFromConfig).
       this.lastError = this.failureReason !== ''
         ? `cloudflared did not come up: ${this.failureReason}`
+        : named
+        ? `the named tunnel ${tunnelName} has no usable ingress hostname in ${configPath}` +
+          ' (none set, or every one of them belongs to the Worker)'
         : 'cloudflared started but never printed a trycloudflare url';
       this.record(this.lastError);
       return;
