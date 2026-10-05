@@ -1,5 +1,10 @@
 import { safeJsonParse } from "./core.ts";
 import {
+  anthropicMessagesToChat,
+  chatResponseToAnthropic,
+  openAiStreamToAnthropic,
+} from "./commandcode/anthropic-messages.ts";
+import {
   inspectResponseBody,
   readInspectedText,
   replayResponse,
@@ -1293,8 +1298,22 @@ export function cnbBuildUpstream(openaiBody: any) {
   //   ① `off` 落进 else 分支变成 `high`——**选"关闭"反而开满**；
   //   ② `minimal` / `xhigh` 也在白名单外，同样被降级成 high（档位悄悄丢失）；
   //   ③ `enable_thinking` 永真，即使 effort 是 off。
-  // 现在 off 是真的关（`enable_thinking: false` 且不带 effort），未知值**报错**
-  // 而不是静默回落——静默回落会让调用方以为自己的选择生效了。
+  // 现在 off 是真的关：`enable_thinking: false` 且**完全不带** reasoning_effort。
+  //
+  // ⚠️ 不带 effort 是必须的，不是风格选择：实测（2026-10-06，四种发法对比）
+  // 上游**拒绝** `reasoning_effort: "off"`——
+  //     enable_thinking=false, 不带 effort        → 200，思考 0
+  //     enable_thinking=false, effort="off"       → 400 code 11150
+  //     enable_thinking=true,  effort="off"       → 400 code 11150
+  // 所以 "off" 属于调用方能说的语言，不属于上游的。代理的职责就是把前者的
+  // off 翻译成后者的「关掉思考 + 不提档位」，而不是把 off 原样转过去。
+  // （第一版我把 off 原样发了，线上直接 400。）
+  //
+  // 顺带一个反直觉的实测：`enable_thinking:false` + `effort:"high"` 仍然出了
+  // 73 字符思考——**enable_thinking 不是总开关**，档位才是。所以别指望靠它
+  // 关掉思考。
+  //
+  // 未知值**报错**而不是静默回落——静默回落会让调用方以为自己的选择生效了。
   const CNB_EFFORTS = ["off", "minimal", "low", "medium", "high", "max", "xhigh"];
   const effortRaw = openaiBody.reasoning_effort || openaiBody.reasoning?.effort;
   const effort = String(effortRaw ?? "").toLowerCase();
@@ -1304,7 +1323,7 @@ export function cnbBuildUpstream(openaiBody: any) {
     );
   }
   up.enable_thinking = effort !== "off";
-  up.reasoning_effort = effort === "off" ? "off" : (effort || "high");
+  if (effort !== "off") up.reasoning_effort = effort || "high";
 
   return { upstream: up, hasTools };
 }
@@ -1838,10 +1857,93 @@ async function handleCnbResponses(request: Request): Promise<Response> {
   });
 }
 
+/**
+ * Anthropic Messages → cnb。
+ *
+ * 形状转换复用 commandcode 那一套（它已经有 20 个单测），cnb 只做三件自己的事：
+ *   ① 读请求体、跑 anthropicMessagesToChat；
+ *   ② 把转换出的 Chat 请求交给**本文件的 chat 路径**（而不是重新实现一遍上游
+ *      调用）——用一个指向自己的 Request，这样串行闸、退避重试、工具协议那些
+ *      逻辑全都自动生效，不会出现「Messages 路径少一层保护」这种分叉；
+ *   ③ 把结果按 stream / 非 stream 翻译回 Anthropic 形状。
+ *
+ * 第二步是关键：**不复制上游调用**。cnb 的 chat 路径有闸（串行，cookie 互踩
+ * 会泄漏会话）、退避、30 秒无响应头中止、工具协议解析——这些每一条都是实测踩
+ * 出来的。另起一个调用点就等于给 Messages 开一条没有这些保护的路。
+ */
+async function handleCnbMessages(request: Request): Promise<Response> {
+  let raw = "";
+  try { raw = await request.text(); } catch (e: any) { return cnbErr(400, "Failed to read body", e.message); }
+  const parsed = safeJsonParse(raw);
+  if (parsed.error) return cnbErr(400, "Invalid JSON", parsed.error.message);
+
+  let converted;
+  try { converted = anthropicMessagesToChat(parsed.data || {}); }
+  catch (e: any) { return cnbErr(400, "Bad request", e.message); }
+  if (!converted.ok) {
+    return cnbErr(400, "Bad request", (converted as any).message);
+  }
+
+  // 转成本渠道自己的 chat 请求（路径指向自己，method/body 换成转换结果）
+  const chatUrl = new URL(request.url);
+  chatUrl.pathname = "/cnb/v1/chat/completions";
+  const headers = new Headers();
+  headers.set("Content-Type", "application/json");
+  for (const name of ["authorization", "x-api-key", "x-session-id", "x-conversation-id"]) {
+    const value = request.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  const chatRequest = new Request(chatUrl.toString(), {
+    method: "POST",
+    headers,
+    body: JSON.stringify(converted.body),
+    signal: request.signal,
+  });
+  const chatResponse = await handleCnb(chatUrl.pathname, chatRequest, chatUrl);
+
+  if (converted.body.stream === true) {
+    if (!chatResponse.ok) {
+      const text = await chatResponse.text().catch(() => "");
+      return cnbErr(chatResponse.status, "Upstream error", text.slice(0, 500));
+    }
+    // 上游给的是 OpenAI SSE，这里翻成 Anthropic 的事件流
+    return openAiStreamToAnthropic(chatResponse, String(converted.body.model));
+  }
+
+  const text = await chatResponse.text().catch(() => "");
+  let payload: unknown = null;
+  try { payload = JSON.parse(text); } catch { payload = null; }
+  if (!chatResponse.ok) {
+    const message = payload && typeof payload === "object" &&
+      (payload as Record<string, any>).error?.message
+      ? String((payload as Record<string, any>).error.message)
+      : "cnb upstream request failed";
+    return cnbErr(chatResponse.status, "Upstream error", message);
+  }
+  return new Response(JSON.stringify(chatResponseToAnthropic(payload, String(converted.body.model))), {
+    status: 200,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  });
+}
+
 export async function handleCnb(path: string, request: Request, url: URL) {
   // OpenAI Responses API
   if (path.endsWith("/responses") && request.method === "POST") {
     return await handleCnbResponses(request);
+  }
+
+  // Anthropic Messages API —— 2026-10-06 补上。
+  //
+  // 起因：用户在 Deno Deploy 日志里看到 `POST /cnb/v1/v1/messages -> 404`。
+  // cnb 原先只有 models/chat/responses 三个路由，客户端（Anthropic SDK 形态）
+  // 打 /messages 只能拿到一句 "Not found"，既不说缺什么也不说有什么。
+  //
+  // 转换直接复用 `src/commandcode/anthropic-messages.ts` —— 那是一套完整的
+  // Anthropic Messages 双射（请求→Chat、Chat 响应→Anthropic、OpenAI 流→
+  // Anthropic 流），已经带 20 个单测。再写一份 cnb 专用的只会让两份实现漂开。
+  // zen 的 `chatToClaude` 是同类能力的另一个副本，这里是第三处接线。
+  if (path.endsWith("/messages") && request.method === "POST") {
+    return await handleCnbMessages(request);
   }
 
   if (path.endsWith("/models") && request.method === "GET") {
@@ -2056,5 +2158,16 @@ export async function handleCnb(path: string, request: Request, url: URL) {
     });
   }
 
-  return cnbErr(404, "Not found");
+  // 404 要说清**这个渠道有什么**。实测 2026-10-06：客户端打
+  // `/cnb/v1/v1/messages` 得到一句 "Not found"，完全看不出是路由写错还是渠道
+  // 不支持。用户看到的 Deno Deploy 日志里那条 404 就是这么来的——它在 baseURL
+  // 后面又拼了一次 /v1/messages。一句带路由清单的 404 能让这种自查变成一眼的事。
+  //
+  // 清单必须和上面的分支一致：写过 "messages is NOT served" 之后我就给它加了
+  // 路由，那句话于是变成假的——**文案是实现的一部分**，改分支要回来改它。
+  return cnbErr(404, "Not found",
+    "cnb serves: GET /models, POST /chat/completions, POST /responses, "
+    + "POST /messages (Anthropic Messages shape). "
+    + "Check the path for a duplicated /v1 segment — /cnb/v1/v1/messages also "
+    + "matches, so a duplicate is not what breaks it.");
 }

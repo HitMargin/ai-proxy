@@ -13,6 +13,7 @@ import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
   CNB_MODELS,
   cnbBuildUpstream,
+  handleCnb,
   cnbDiagnoseJunkSyntax,
   cnbJournalJunk,
   cnbJunkLogState,
@@ -430,7 +431,10 @@ const build = (effort?: string) =>
 Deno.test("effort off really switches thinking off", () => {
   const up = build("off");
   assertEquals(up.enable_thinking, false, "off must set enable_thinking false, not fall through to high");
-  assertEquals(up.reasoning_effort, "off");
+  // 不发 reasoning_effort 是**必需**的，不是整洁：实测上游拒绝 effort="off"
+  // （400 code 11150），它只认「enable_thinking=false 且不提档位」。
+  // 第一版我把 off 原样转发，线上直接 400。
+  assertEquals("reasoning_effort" in up, false, "off must omit reasoning_effort entirely - the upstream 400s on it");
 });
 
 Deno.test("every published effort survives the request body verbatim", () => {
@@ -482,4 +486,60 @@ Deno.test("the default model matches the published one", () => {
     messages: [{ role: "user", content: "hi" }],
   }).upstream;
   assertEquals(up.model, CNB_MODELS[0].id);
+});
+
+
+// ─── Anthropic Messages 路由 ───
+//
+// 2026-10-06 起因：用户在 Deno Deploy 日志里看到 `POST /cnb/v1/v1/messages -> 404`。
+// cnb 原本只有 models/chat/responses，Anthropic 形态的客户端打 /messages 只能拿到
+// 一句 "Not found"。现在补上了，转换复用 commandcode 那套（已带 20 个单测）。
+//
+// 这三条只验证**路由边界**，不打上游：发一次真实 cnb 请求要 30 秒且需要登录
+// cookie，把那种耗时放进套件会让 `deno task test` 从 2 秒变成几分钟。
+
+const msgReq = (path: string, body: unknown) => new Request("http://x" + path, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+Deno.test("an Anthropic Messages route exists on cnb", async () => {
+  // 判据： malformed 的 Anthropic 请求得到 **Anthropic 形状的 400**
+  // （"max_tokens is required"），而不是裸 404 —— 这条错误消息来自
+  // anthropicMessagesToChat，只有路由接对了才可能出现。
+  const r = await handleCnb("/cnb/v1/messages", msgReq("/cnb/v1/messages", {
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: "hi" }],
+  }), new URL("http://x/cnb/v1/messages"));
+  assertEquals(r.status, 400, "the messages route must answer, not 404");
+  const text = await r.text();
+  assert(/max_tokens/.test(text), "the Anthropic converter's own error must surface: " + text);
+});
+
+Deno.test("a path with a duplicated v1 segment still reaches messages", async () => {
+  // 用户日志里就是 /cnb/v1/v1/messages。endsWith 匹配让它也能用——所以
+  // "路径拼重了"不是这条请求失败的原因，别让人往那个方向查。
+  const r = await handleCnb("/cnb/v1/v1/messages", msgReq("/cnb/v1/v1/messages", {
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: "hi" }],
+  }), new URL("http://x/cnb/v1/v1/messages"));
+  assertEquals(r.status, 400);
+  assert(/max_tokens/.test(await r.text()), "the duplicated segment must not change which route answers");
+});
+
+Deno.test("an unknown path says what this channel does serve", async () => {
+  // 一句 "Not found" 让人分不清是拼错了还是渠道不支持。清单要和上面的分支
+  // 一致——这里同时断言它提到了 messages（我加过路由之后就修正过这条文案）。
+  const r = await handleCnb("/cnb/v1/nope", msgReq("/cnb/v1/nope", {}), new URL("http://x/cnb/v1/nope"));
+  assertEquals(r.status, 404);
+  const text = await r.text();
+  assert(/chat\/completions/.test(text), "the 404 must list the real routes: " + text);
+  // 断言 "POST /messages" 而不是 "/messages"：文案后半段的
+  // "/cnb/v1/v1/messages also matches" 也含 /messages，只查子串时分不清
+  // 两处——实测把 "POST /messages" 那行删掉后这条仍然全绿。
+  assert(/POST \/messages/.test(text), "the 404 must list the messages route that now exists: " + text);
+  // 路由数也要对：清单漏一条等于把用户引向 404
+  const listed = (text.match(/POST \/[a-z]+/g) || []).length;
+  assertEquals(listed, 3, "three POST routes must be listed, got " + listed + " in: " + text);
 });
