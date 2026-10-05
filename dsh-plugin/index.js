@@ -1874,8 +1874,16 @@ function imageDataUrl(block, resolveImage) {
   if (block?.offloaded === true) return undefined;
   const resolved = resolveImage?.(block?.attachment);
   if (typeof resolved === 'string' && resolved !== '') return resolved;
-  const url = block?.attachment?.url;
-  return typeof url === 'string' && url !== '' ? url : undefined;
+  // No URL fallback. `attachment.url` is an http(s) address, and the cnb
+  // upstream refuses those outright - measured 2026-10-06:
+  //   data:image/png;base64,...  -> 200
+  //   https://...                -> 400 code 11135 "replace the image"
+  // Falling back meant an unresolvable attachment became a request that was
+  // guaranteed to fail, and the error that came back named something else
+  // entirely (413 BODY_TOO_LARGE) - so the real cause was invisible. Returning
+  // undefined lets the caller drop the block and say so, which is the honest
+  // answer.
+  return undefined;
 }
 
 /**

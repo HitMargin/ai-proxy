@@ -1157,6 +1157,22 @@ export function cnbBuildUpstream(openaiBody: any) {
       );
       const hasImage = parts.some((p: any) => p.type === "image_url");
       if (hasImage && (role === "user" || role === "system")) {
+        // cnb 上游**只认内联 data URL**。实测 2026-10-06：
+        //   "data:image/png;base64,..." -> 200
+        //   "https://..."               -> 400 code 11135 "Please start a new
+        //                                  conversation, replace the image"
+        // 所以这里必须拒收 http(s) 形态，而不是转发出去让上游回一句看不懂的
+        // 11135。上游那句错误还会被我们包成 "Upstream error"，跟真正的原因
+        // （该用 data URL）完全对不上——用户 03:15 那次就是这么烧掉两次重试的。
+        const httpImage = parts.find((p: any) =>
+          p.type === "image_url" && typeof p.image_url?.url === "string" &&
+          /^https?:\/\//i.test(p.image_url.url));
+        if (httpImage) {
+          throw new Error(
+            "cnb only accepts inline images (data:image/...;base64,...); an http(s) image_url "
+            + "is rejected upstream with code 11135. Read the attachment bytes and inline them.",
+          );
+        }
         c = parts.map((p: any) =>
           p.type === "text"
             ? { type: "text", text: p.text || "" }

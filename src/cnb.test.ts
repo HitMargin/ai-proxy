@@ -543,3 +543,60 @@ Deno.test("an unknown path says what this channel does serve", async () => {
   const listed = (text.match(/POST \/[a-z]+/g) || []).length;
   assertEquals(listed, 3, "three POST routes must be listed, got " + listed + " in: " + text);
 });
+
+
+// ─── 图片形态：cnb 只收内联 data URL ───
+//
+// 实测 2026-10-06 对着部署好的渠道：
+//   "data:image/png;base64,..." -> 200（模型答得出颜色）
+//   "https://..."               -> 400 code 11135 "Please start a new conversation,
+//                                  replace the image, and try again"
+// 上游这句话还会被我们包成 "Upstream error"，于是 413 body-too-large 这种毫不想干
+// 的错成了用户看到的东西——真正的原因（该用 data URL）一个字都不出现。
+// 03:15 那次连烧两次重试就是这么来的。
+const DATA_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+const imgBody = (url: string) => ({
+  model: "cnb/deepseek-v4.1-flash",
+  max_tokens: 16,
+  messages: [{
+    role: "user",
+    content: [
+      { type: "text", text: "一个词" },
+      { type: "image_url", image_url: { url } },
+    ],
+  }],
+});
+
+Deno.test("an inline data URL image is passed through", () => {
+  const up = cnbBuildUpstream(imgBody(DATA_PNG)).upstream;
+  const imgs = up.messages[0].content.filter((p: any) => p.type === "image_url");
+  assertEquals(imgs.length, 1, "the image must survive into the upstream body");
+  assertEquals(imgs[0].image_url.url, DATA_PNG, "the data URL is forwarded verbatim");
+});
+
+Deno.test("an http(s) image URL is refused with the reason", () => {
+  // 不该转发出去让上游回 11135——那句错误被包成 "Upstream error" 之后，
+  // 跟真正的原因完全对不上。
+  for (const url of ["https://example.com/a.png", "http://cnb.cool/favicon.ico"]) {
+    const thrown = capture(() => cnbBuildUpstream(imgBody(url)));
+    assert(/inline images|data:image/.test(thrown), "must say the inline requirement: " + thrown);
+  }
+});
+
+Deno.test("one bad image refuses the whole body rather than half-sending", () => {
+  // 半套发出去 = 上游收到一个没有图的请求，模型答"没有图"，而用户以为图发出去了。
+  const thrown = capture(() => cnbBuildUpstream({
+    model: "cnb/deepseek-v4.1-flash",
+    max_tokens: 16,
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: "x" },
+        { type: "image_url", image_url: { url: DATA_PNG } },
+        { type: "image_url", image_url: { url: "https://example.com/b.png" } },
+      ],
+    }],
+  }));
+  assert(/inline images/.test(thrown), "a single non-inline image must refuse the request");
+});
