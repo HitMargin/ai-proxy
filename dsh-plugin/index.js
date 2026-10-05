@@ -572,6 +572,14 @@ const DEFAULT_SETTINGS = {
   // Worker is worse than not writing one.
   workerName: '',
   tunnelUrl: '',
+  // 'quick' is the account-less trycloudflare tunnel. 'named' uses a tunnel
+  // created with `cloudflared tunnel login` + `cloudflared tunnel create`, which
+  // is the only way out of the quick tunnel's rate limit: measured 2026-10-05,
+  // several starts in one day got `quick tunnel provisioning failed with status
+  // 429: error code: 1015` and cloudflared then printed nothing at all.
+  tunnelMode: 'quick',
+  // The named tunnel to run. Required when tunnelMode is 'named'.
+  tunnelName: '',
 };
 
 /**
@@ -1253,6 +1261,9 @@ export class TunnelRuntime {
     this.state = 'stopped';
     this.url = '';
     this.lastError = '';
+    // cloudflared's own account of why it did not come up, lifted out of its
+    // output instead of guessed at. See onData.
+    this.failureReason = '';
     this.startedAt = 0;
     this.logs = [];
     this.worker = { state: 'idle', error: '', url: '' };
@@ -1319,6 +1330,12 @@ export class TunnelRuntime {
       // mistake the panel made when it advertised `/commandcode/v1` as "the proxy".
       baseUrl: this.url === '' ? '' : this.url.replace(/\/+$/, '') + '/v1',
       worker: { ...this.worker },
+      // The mode lives in the snapshot rather than being read from settings by the
+      // panel: `tunnelUrl` is already computed per request there (a snapshot field
+      // that outlived `apply()` stayed stale and hid a value that had changed), and
+      // the mode decides which fields the panel has to show at all.
+      mode: this.proxy.settings.tunnelMode === 'named' ? 'named' : 'quick',
+      tunnelName: String(this.proxy.settings.tunnelName ?? ''),
       logs: this.logs.slice(-40),
     };
   }
@@ -1333,6 +1350,7 @@ export class TunnelRuntime {
     this.desired = true;
     if (this.state === 'running' && this.child) return;
     this.lastError = '';
+    this.failureReason = '';
     this.worker = { state: 'idle', error: '', url: '' };
 
     // The tunnel forwards to the local proxy, so there has to be one. Checked here
@@ -1348,10 +1366,24 @@ export class TunnelRuntime {
 
     const binary = this.resolveBinary();
     const target = `http://127.0.0.1:${this.proxy.settings.port}`;
+    const named = this.proxy.settings.tunnelMode === 'named';
+    const tunnelName = String(this.proxy.settings.tunnelName ?? '').trim();
+    if (named && tunnelName === '') {
+      this.state = 'error';
+      this.lastError = 'tunnel mode is "named" but no tunnel name is set';
+      this.record(this.lastError);
+      return;
+    }
+    // A named tunnel gets its hostname from the ingress the user configured with
+    // `cloudflared tunnel route dns`, so there is no trycloudflare URL to scrape
+    // out of the output - readiness is the registered hostname itself.
+    const args = named
+      ? ['tunnel', '--no-autoupdate', 'run', tunnelName]
+      : ['tunnel', '--url', target, '--no-autoupdate'];
     this.state = 'starting';
-    this.record(`starting tunnel: ${binary} --url ${target}`);
+    this.record(`starting tunnel: ${binary} ${args.join(' ')}`);
     try {
-      this.child = spawn(binary, ['tunnel', '--url', target, '--no-autoupdate'], {
+      this.child = spawn(binary, args, {
         windowsHide: true,
         env: { ...process.env, NO_UPDATE_NOTIFIER: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -1364,12 +1396,21 @@ export class TunnelRuntime {
     }
     this.startedAt = Date.now();
 
-    // The hostname arrives on stderr, so both streams are scanned - if a future
-    // cloudflared moves it to stdout the URL is still found instead of the panel
-    // waiting out its timeout for a line that already went past.
+    // The hostname arrives on stderr for a quick tunnel, so both streams are
+    // scanned. A named tunnel prints its own connected lines but no URL, so the
+    // hostname is derived from the tunnel name and confirmed against the output.
     const onData = (chunk) => {
       const text = String(chunk);
       this.record(text.trimEnd());
+      // cloudflared names its failures in the output before it gives up:
+      // `quick tunnel provisioning failed with status 429: error code: 1015`
+      // is the rate limit, and it is a completely different remedy from a
+      // missing binary. Leaving it as a log line made the panel blame itself
+      // ("never printed a url") and sent the hunt toward EFTYPE instead.
+      if (this.failureReason === '' && /failed|error|429|1015|refused|unauthorized/i.test(text)) {
+        const line = text.split('\n').find((l) => /failed|error|429|1015|refused|unauthorized/i.test(l));
+        if (line) this.failureReason = line.trim().slice(0, 240);
+      }
       if (this.url === '') {
         const found = text.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
         if (found) {
@@ -1412,7 +1453,12 @@ export class TunnelRuntime {
     }
     if (this.url === '') {
       this.state = 'error';
-      this.lastError = 'cloudflared started but never printed a trycloudflare url';
+      // cloudflared's own reason beats a guess about what went wrong. It names
+      // the rate limit (429 / 1015) and a bad credential in terms the user can
+      // act on; "never printed a url" sent the hunt toward the binary.
+      this.lastError = this.failureReason !== ''
+        ? `cloudflared did not come up: ${this.failureReason}`
+        : 'cloudflared started but never printed a trycloudflare url';
       this.record(this.lastError);
       return;
     }
@@ -3054,6 +3100,18 @@ export function cleanSettings(values) {
   // A Worker name is handed to wrangler as an argument, so it is validated as a
   // DNS-ish label: a stray space or slash would reach the CLI as something it
   // cannot parse. Empty is allowed and means "skip the Worker step".
+  // 'quick' is the default and the only other legal value is 'named' - the
+  // enum is closed because each mode changes the argv handed to cloudflared,
+  // and an unrecognised string would otherwise reach it as a tunnel name.
+  if (values.tunnelMode === 'quick' || values.tunnelMode === 'named') {
+    next.tunnelMode = values.tunnelMode;
+  }
+  // Same DNS-ish validation as the Worker name: this is a tunnel name from
+  // `cloudflared tunnel create`, and it reaches the CLI verbatim.
+  if (typeof values.tunnelName === 'string' && values.tunnelName.length <= 128) {
+    const name = values.tunnelName.trim();
+    if (name === '' || /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) next.tunnelName = name;
+  }
   if (typeof values.workerName === 'string' && values.workerName.length <= 128) {
     const name = values.workerName.trim();
     if (name === '' || /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) next.workerName = name;
