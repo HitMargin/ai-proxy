@@ -1295,24 +1295,24 @@ function cnbGatedResponse(resp: Response, done: () => void): Response {
   return new Response(t.readable, { status: resp.status, headers: resp.headers });
 }
 async function cnbCallUpstream(upBody: any): Promise<Response> {
-  // 字节预检：**上游**拒绝 >1MiB 的请求体；直接快速失败，不占用隧道往返和串行闸。
+  // 这里**曾经**有一道字节预检：body > 1MiB 就在本地直接回 413，不发出去。
+  // 2026-10-05 把它删了。两条理由，第二条是主因：
   //
-  // 判据是 2026-10-05 直接打上游实测出来的（.tmp-cnb-1mib-probe.ts，绕过代理
-  // 只发给 cnb.cool）：1.000MiB 通过、1.050MiB 起回 413
-  // `[BODY_TOO_LARGE]Request body too large`，1.5/3/8MiB 同样。
-  // 也就是说这条**不是猜的**，别按"听起来合理"把它删掉。
+  // ① 它没有省下任何东西。预检的用意是"不占用隧道往返和串行闸"，但真超限时
+  //    上游回 413 也很快（实测 8MiB 的请求 9 秒就答完），省不下多少。
+  // ② **它比上游还严，于是在拒绝上游本来会接受的请求。** 实测：上游 1.000MiB
+  //    收、1.050MiB 起才回 413 `[BODY_TOO_LARGE]`（真实上限在两点之间某处，
+  //    没精确定位）。而预检的阈值正好是 1048576 = 1.00MiB——用户一个 1060926
+  //    字节（1.0109MiB）的请求被我们拦死，那个尺寸上游很可能会收。
   //
-  // 但报错必须说清是谁拒的：这句文案是我们自己产的，请求根本没发出去。
-  // 写成 "cnb gateway rejects..." 会让排查的人去查上游——我犯过这个错，
-  // 用户拿到这句时以为上游炸了，实际是我们单方面拦的。
+  // 现在改成：**不预检，发出去，让上游自己判**。真超限时用户拿到的是上游原文
+  // （`errcode:413` + `[BODY_TOO_LARGE]`），那才是权威答案，而不是我们猜的线。
+  //
+  // 只留一条日志：过 1MiB 时记一行尺寸。不拦，只为下次真要知道上游的线在哪时
+  // 有数据可看（fp 与闸的日志同一个算法，能对上同一次请求）。
   const bodyBytes = new TextEncoder().encode(JSON.stringify(upBody)).length;
   if (bodyBytes > 1048576) {
-    console.warn(`[cnb-gate] rejected pre-flight: body ${bodyBytes}B > 1MiB (fp=${cnbFingerprint(upBody)})`);
-    return cnbErr(413, "Request body too large",
-      `ai-proxy refused this request before sending it: its body is ${bodyBytes} bytes ` +
-      `(${(bodyBytes / 1048576).toFixed(2)} MiB), and cnb upstream rejects bodies over 1 MiB ` +
-      `(verified upstream: 413 "[BODY_TOO_LARGE]Request body too large" at 1.05 MiB and above). ` +
-      `Nothing was sent. Reduce the context size and retry.`);
+    console.warn(`[cnb-gate] large body ${bodyBytes}B (${(bodyBytes / 1048576).toFixed(3)} MiB), sending anyway (fp=${cnbFingerprint(upBody)})`);
   }
   const fp = cnbFingerprint(upBody);
   const prev = cnbGate;
