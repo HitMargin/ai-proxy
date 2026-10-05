@@ -400,6 +400,42 @@ globalThis.fetch = async (input, init = {}) => {
       { status: 200, headers: { 'content-type': 'text/event-stream' } },
     );
   }
+  // Anthropic spelling: input_tokens there already excludes the cache, so
+  // subtracting it here would drive uncached input to zero and make the panel
+  // report a 100% hit (formatCacheHitPercent short-circuits on missed===0).
+  if (streamMode === 'usage-anthropic-cached') {
+    return new Response(
+      [
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"input_tokens":731,"output_tokens":3,"cache_read_input_tokens":1021120,"cache_creation_input_tokens":0}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
+  // Near-total OpenAI hit: the arithmetic must not overshoot into a fake 100%.
+  if (streamMode === 'usage-cached-near-total') {
+    return new Response(
+      [
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1092798,"completion_tokens":8062,"prompt_tokens_details":{"cached_tokens":1021312,"cache_write_tokens":0}}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
+  // The shape that tells the two candidate predicates apart: prompt_tokens is
+  // present (so `prompt_tokens !== undefined` would answer yes) but the cache
+  // number did NOT come from prompt_tokens_details (so the real predicate
+  // answers no). A gateway that mixes the two spellings lands exactly here, and
+  // subtracting would drop the remainder by the whole Anthropic cache read.
+  if (streamMode === 'usage-mixed-cached') {
+    return new Response(
+      [
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":3,"cache_read_input_tokens":900}}\n\n',
+        'data: [DONE]\n\n',
+      ].join(''),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+  }
   if (streamMode === 'reasoning-kilo') {
     return new Response([
       'data: {"choices":[{"delta":{"reasoning":"kilo spells it "},"finish_reason":null}]}\n\n',
@@ -1054,9 +1090,72 @@ try {
   }, toolResolved)) {
     if (event.type === 'usage') cachedUsage = event.usage;
   }
-  assert.equal(cachedUsage.inputTokens, 880);
+  // inputTokens is the harness's `uncachedInputTokens` (app.asar offset 19498839:
+  // `uncachedInputTokens: inputTokens`), and its cache-hit denominator is
+  // uncachedInput + cacheRead + cacheWrite (offset 19369104). So the OpenAI
+  // prompt_tokens must have the cache subtracted here, or the cache is counted
+  // twice and the hit rate has a 50% ceiling: 880 - 149 - 12 = 719.
+  assert.equal(cachedUsage.inputTokens, 719, 'inputTokens must exclude the cached parts, or the hit rate caps at 50%');
   assert.equal(cachedUsage.cacheReadTokens, 149, 'a reported cache read must survive into TokenUsage');
   assert.equal(cachedUsage.cacheWriteTokens, 12, 'a reported cache write must survive into TokenUsage');
+
+  // The arithmetic that produced the 49% the user saw, replayed with their own
+  // numbers: 1,092,798 prompt tokens of which 1,021,312 came from cache.
+  // Denom = 71486 + 1021312 = 1,092,798 -> 93.5%, not 48.3%.
+  streamMode = 'usage-cached-near-total';
+  let nearTotal = null;
+  for await (const event of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    maxTokens: 32,
+  }, toolResolved)) {
+    if (event.type === 'usage') nearTotal = event.usage;
+  }
+  assert.equal(nearTotal.inputTokens, 71486, 'prompt minus cache is the uncached remainder');
+  const denominator = nearTotal.inputTokens + nearTotal.cacheReadTokens + (nearTotal.cacheWriteTokens ?? 0);
+  assert.equal(denominator, 1092798, 'the denominator is the full prompt, not twice the cache');
+  const hitRate = (nearTotal.cacheReadTokens / denominator) * 100;
+  assert.equal(hitRate > 93 && hitRate < 94, true, 'the real hit rate is 93.5%, not the 48% the panel used to show');
+
+  // Anthropic spelling: input_tokens already excludes the cache, so it must NOT
+  // be subtracted again. Doing so would zero the remainder and the panel's
+  // missed===0 short-circuit would print 100% - trading one lie for another.
+  streamMode = 'usage-anthropic-cached';
+  let anthropicUsage = null;
+  for await (const event of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    maxTokens: 32,
+  }, toolResolved)) {
+    if (event.type === 'usage') anthropicUsage = event.usage;
+  }
+  assert.equal(
+    anthropicUsage.inputTokens,
+    731,
+    'an Anthropic input_tokens is already uncached and must pass through untouched',
+  );
+  assert.equal(anthropicUsage.cacheReadTokens, 1021120, 'the Anthropic cache read still survives');
+
+  // The mixed spelling is the only shape that separates the two candidate
+  // predicates. "Did the cache number come from prompt_tokens_details?" is the
+  // real one; "is prompt_tokens present?" also answers yes here - so a suite
+  // that only exercises the pure shapes passes under both, and the wrong
+  // predicate survives review. This case is what kills it.
+  streamMode = 'usage-mixed-cached';
+  let mixedUsage = null;
+  for await (const event of adapter.stream({
+    model: toolResolved.id,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    maxTokens: 32,
+  }, toolResolved)) {
+    if (event.type === 'usage') mixedUsage = event.usage;
+  }
+  assert.equal(
+    mixedUsage.inputTokens,
+    1000,
+    'a cacheRead taken from cache_read_input_tokens must not be subtracted, whatever else the payload says',
+  );
+  assert.equal(mixedUsage.cacheReadTokens, 900, 'the mixed-shape cache read still survives');
 
   // Images reach the wire now. The block shape is { type:'image', attachment }
   // - the old code read `part.source`, which does not exist in the harness, so

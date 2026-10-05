@@ -1869,8 +1869,32 @@ function mapUsage(usage) {
   const cacheWrite = Number(
     promptDetails.cache_write_tokens ?? usage.cache_creation_input_tokens ?? 0,
   ) || 0;
+  // ★ inputTokens 必须**扣掉缓存部分**，否则命中率有 50% 的天花板。
+  //
+  // harness 的判据（2026-10-05 从 app.asar 读出，offset 19498839 / 19369104 /
+  // 19336758）：它把TokenUsage.inputTokens 映射成 uncachedInputTokens，而
+  //   * 面板那一行的 i18n 原文是「未缓存输入」（message.turnUsage.input）
+  //   * 分母 = uncachedInputTokens + cacheReadTokens + cacheWriteTokens
+  //   * 命中率 = cacheRead / 分母，missed === 0 时直接显示 "100"
+  // 所以 inputTokens 的语义是"扣掉缓存后的未命中输入"，不是 OpenAI 的
+  // prompt_tokens。原样传 prompt_tokens 等于把缓存算两遍：
+  //     分母 ≈ cacheRead + (cacheRead + 未命中) ≈ 2×cacheRead
+  // 高命中时命中率必然收敛到 50%——那不是缓存坏了，是双重计数的天花板。
+  // 实测用户 14,891 次请求里六个渠道的 cacheRead/input 中位数在 0.97~0.999
+  // （真实命中率 93%~99.7%），面板却一律显示 ~49%。
+  //
+  // 减法的条件由**这个数从哪来**决定，不由"看起来像哪种形状"决定：
+  //   * cached_tokens 在 prompt_tokens_details 里（OpenAI）→ 它已被包含在
+  //     prompt_tokens 中，必须减。
+  //   * cache_read_input_tokens（Anthropic）→ 它的 input_tokens 本身就不含
+  //     缓存，减了会把未命中压成 0，命中率反而显示成 100%（missed===0 的短路）。
+  //     那等于用一个假 100% 换一个假 49%，不是修复。
+  const readCameFromOpenAiDetails = promptDetails.cached_tokens !== undefined;
+  const uncachedInput = readCameFromOpenAiDetails
+    ? Math.max(0, prompt - cacheRead - cacheWrite)
+    : Math.max(0, prompt);
   return {
-    inputTokens: Math.max(0, prompt),
+    inputTokens: uncachedInput,
     outputTokens: Math.max(0, completion),
     reasoningTokens: Math.max(0, Number(details.reasoning_tokens ?? 0) || 0),
     // Omitted rather than zeroed: a gateway that does not report a cache is
