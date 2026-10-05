@@ -59,6 +59,13 @@ window.__ModuleLoader__.load({
         workerName: 'Worker 名字',
         cloudflaredPath: 'cloudflared 路径',
         cloudflaredAuto: '留空则自动查找',
+        tunnelMode: '隧道模式',
+        tunnelModeQuick: '快速隧道（免账号，地址每次会变，有配额限制）',
+        tunnelModeNamed: '命名隧道（需 cloudflared tunnel login，地址固定）',
+        tunnelName: '隧道名字',
+        tunnelNameAuto: '例如 ai-proxy',
+        tunnelModeHint:
+            '改成命名隧道后要点一次「开启隧道」才生效；快速隧道的配额用完时 Cloudflare 会回 429（error code 1015）。',
         copy: '复制',
         deepseekSetup: '一键配置',
     deepseekRecapture: '重新配置',
@@ -140,6 +147,13 @@ window.__ModuleLoader__.load({
         workerName: 'Worker name',
         cloudflaredPath: 'cloudflared path',
         cloudflaredAuto: 'leave empty to auto-detect',
+        tunnelMode: 'Tunnel mode',
+        tunnelModeQuick: 'Quick tunnel (no account, new address each start, rate limited)',
+        tunnelModeNamed: 'Named tunnel (needs cloudflared tunnel login, fixed address)',
+        tunnelName: 'Tunnel name',
+        tunnelNameAuto: 'e.g. ai-proxy',
+        tunnelModeHint:
+            'A change here takes effect the next time the tunnel is started; Cloudflare answers 429 (error code 1015) once a quick tunnel runs out of quota.',
         copy: 'Copy',
         deepseekSetup: 'Set up',
     deepseekRecapture: 'Re-capture',
@@ -737,6 +751,14 @@ window.__ModuleLoader__.load({
         // another tab.
         workerName: settings?.workerName,
         cloudflaredPath: settings?.cloudflaredPath,
+        // The two that choose between a quick tunnel and a named one. They are
+        // sent with the save because they are ordinary settings, but they are
+        // *not* like `tunnelEnabled`: an edit here does not restart the tunnel,
+        // so the change shows up the next time the tunnel is started. (That is
+        // deliberate - restarting a running tunnel from a settings save is how
+        // the previous design kept handing out a new hostname.)
+        tunnelMode: settings?.tunnelMode,
+        tunnelName: settings?.tunnelName,
         // Only the columns the server accepts; the panel's own bookkeeping
         // (`test`, `problem`) is not part of the stored shape.
         // File-backed rows are filtered out: they belong to custom-providers.json,
@@ -1328,7 +1350,14 @@ window.__ModuleLoader__.load({
           ),
           h('p', { className: 'apx_tag' },
             t('tunnelState') + ': ' + (tunnel.state || 'stopped')
-            + (tunnel.pid ? ' · PID ' + tunnel.pid : '')),
+            + (tunnel.pid ? ' · PID ' + tunnel.pid : '')
+            // Which mode the running process was started in. Read from the
+            // snapshot rather than from the settings state, because the two
+            // legitimately differ: the mode is only picked up when the tunnel is
+            // started, so after a save the fields say "named" while the process
+            // out there is still a quick one. Showing the settings value here
+            // would claim a change that has not happened yet.
+            + ' · ' + (tunnel.mode === 'named' ? t('tunnelModeNamed') : t('tunnelModeQuick'))),
           // The public address a client is pointed at, and it carries `/v1` because
           // that is the aggregate the provider registers under. Shown only once it
           // exists: an empty box reads as "the tunnel is up but broken".
@@ -1357,6 +1386,27 @@ window.__ModuleLoader__.load({
           tunnel.lastError
             ? h('p', { className: 'apx_tag apx_bad' }, tunnel.lastError)
             : null,
+          // 隧道模式 + 名字。放在 Worker 之前：模式决定 cloudflared 的 argv，
+          // 而 Worker 回写依赖隧道给出的地址，顺序就是依赖顺序。
+          h('label', { className: 'apx_field' }, h('span', null, t('tunnelMode')),
+            h('select', {
+              className: 'apx_input',
+              value: settings.tunnelMode || 'quick',
+              onChange: (event) => setSettings({ ...settings, tunnelMode: event.target.value }),
+            },
+              h('option', { value: 'quick' }, t('tunnelModeQuick')),
+              h('option', { value: 'named' }, t('tunnelModeNamed')),
+            )),
+          settings.tunnelMode === 'named'
+            ? h('label', { className: 'apx_field' }, h('span', null, t('tunnelName')),
+                h('input', {
+                  className: 'apx_input',
+                  placeholder: t('tunnelNameAuto'),
+                  value: settings.tunnelName || '',
+                  onChange: (event) => setSettings({ ...settings, tunnelName: event.target.value }),
+                }))
+            : null,
+          h('p', { className: 'apx_muted' }, t('tunnelModeHint')),
           h('label', { className: 'apx_field' }, h('span', null, t('workerName')),
             h('input', {
               className: 'apx_input',

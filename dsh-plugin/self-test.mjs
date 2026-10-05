@@ -2213,6 +2213,35 @@ try {
       assert.equal(cleanSettings({ tunnelName: 'ai-proxy' }).tunnelName, 'ai-proxy');
       assert.equal(cleanSettings({ tunnelName: '' }).tunnelName, '');
 
+      // The panel has to send these two, or a save silently drops them.
+      //
+      // `cleanSettings` validates them on the server, but a field only reaches the
+      // server if the client puts it in the payload - and a field the client
+      // forgets is invisible in the panel: the box keeps whatever React state
+      // holds, so it looks configured while settings.json never learns about it,
+      // and the next save writes the default back over it. That is exactly what
+      // happened here: the mode and the name existed server-side with no way to
+      // set either, so the tunnel stayed in quick mode until this was added.
+      // Same class as the two probe rosters that had to be asserted equal
+      // across files.
+      const clientSrc = fs.readFileSync(
+        path.join(path.dirname(fileURLToPath(import.meta.url)), 'client.js'), 'utf8');
+      for (const field of ['tunnelMode', 'tunnelName']) {
+        assert.ok(
+          clientSrc.includes(`${field}: settings?.${field},`),
+          `the panel's save payload must carry ${field}, or a save overwrites it with the default`,
+        );
+      }
+      // And the control has to exist for the field to ever be set. Checked by the
+      // option element, not by `tunnelMode === 'named'`: that substring also
+      // appears in the conditional that renders the name box, so asserting on it
+      // stayed green after the option was deleted - the test would have been
+      // satisfied by a panel that shows a name box nothing can reach. A string
+      // that occurs in more than one place cannot witness the absence of one of
+      // them.
+      assert.ok(/h\('option',\s*\{\s*value:\s*'named'\s*\}/.test(clientSrc),
+        'the panel must offer a way to pick the named tunnel mode');
+
       // A named runtime with no hostname recorded must not look like a started
       // tunnel: the panel, the reachability probe and the Worker write all use
       // this url, and an empty one would silently skip every one of them.
