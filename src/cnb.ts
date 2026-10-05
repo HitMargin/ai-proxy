@@ -1295,12 +1295,24 @@ function cnbGatedResponse(resp: Response, done: () => void): Response {
   return new Response(t.readable, { status: resp.status, headers: resp.headers });
 }
 async function cnbCallUpstream(upBody: any): Promise<Response> {
-  // 字节预检：cnb 网关（nginx）拒绝 >1MiB 请求体；直接快速失败，不占用隧道往返和串行闸
+  // 字节预检：**上游**拒绝 >1MiB 的请求体；直接快速失败，不占用隧道往返和串行闸。
+  //
+  // 判据是 2026-10-05 直接打上游实测出来的（.tmp-cnb-1mib-probe.ts，绕过代理
+  // 只发给 cnb.cool）：1.000MiB 通过、1.050MiB 起回 413
+  // `[BODY_TOO_LARGE]Request body too large`，1.5/3/8MiB 同样。
+  // 也就是说这条**不是猜的**，别按"听起来合理"把它删掉。
+  //
+  // 但报错必须说清是谁拒的：这句文案是我们自己产的，请求根本没发出去。
+  // 写成 "cnb gateway rejects..." 会让排查的人去查上游——我犯过这个错，
+  // 用户拿到这句时以为上游炸了，实际是我们单方面拦的。
   const bodyBytes = new TextEncoder().encode(JSON.stringify(upBody)).length;
   if (bodyBytes > 1048576) {
     console.warn(`[cnb-gate] rejected pre-flight: body ${bodyBytes}B > 1MiB (fp=${cnbFingerprint(upBody)})`);
     return cnbErr(413, "Request body too large",
-      `cnb gateway rejects bodies over 1 MiB (this request ${bodyBytes} bytes = ${(bodyBytes / 1048576).toFixed(2)} MiB); reduce context size`);
+      `ai-proxy refused this request before sending it: its body is ${bodyBytes} bytes ` +
+      `(${(bodyBytes / 1048576).toFixed(2)} MiB), and cnb upstream rejects bodies over 1 MiB ` +
+      `(verified upstream: 413 "[BODY_TOO_LARGE]Request body too large" at 1.05 MiB and above). ` +
+      `Nothing was sent. Reduce the context size and retry.`);
   }
   const fp = cnbFingerprint(upBody);
   const prev = cnbGate;
