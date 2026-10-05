@@ -542,6 +542,31 @@ function publishedEfforts(row) {
       return { id: effort, name: key };
     }));
   }
+  // cnb publishes no ladder at all - its /models is a static array with no
+  // reasoning metadata (src/cnb.ts:CNB_MODELS). Without this the picker shows no
+  // Effort control and every request goes out at the default, which is how "off"
+  // came to be sent as `high` for so long.
+  //
+  // The rungs are **measured, not copied**: each one was sent to the real upstream
+  // on 2026-10-06 and observed. `off` produced 0 reasoning characters, the rest
+  // produced 80-144, and an unsupported value got
+  // `400 code 11150 the reasoning effort value is not supported by the current
+  // model` - so the upstream validates, which is what makes this table usable.
+  // A ladder this way is only honest when the upstream rejects what it does not
+  // accept; where it silently accepts anything (StepFun, above) the published
+  // field is the only source.
+  const channel = String(row.provider ?? row.owned_by ?? '').toLowerCase();
+  if (channel === 'cnb') {
+    return [
+      { id: 'off', name: 'off' },
+      { id: 'minimal', name: 'minimal' },
+      { id: 'low', name: 'low' },
+      { id: 'medium', name: 'medium' },
+      { id: 'high', name: 'high' },
+      { id: 'max', name: 'max' },
+      { id: 'xhigh', name: 'xhigh' },
+    ];
+  }
   return sources.length > 0 ? sources.flat() : undefined;
 }
 function isRecord(value) {

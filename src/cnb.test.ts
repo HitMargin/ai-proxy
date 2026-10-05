@@ -11,6 +11,8 @@
  */
 import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
+  CNB_MODELS,
+  cnbBuildUpstream,
   cnbDiagnoseJunkSyntax,
   cnbJournalJunk,
   cnbJunkLogState,
@@ -400,4 +402,84 @@ Deno.test("a journal failure never breaks the response", () => {
   };
   // 日志坏掉决不能把正常响应一起打死。
   cnbJournalJunk("line\n", hostile, 1_000_000);
+});
+
+
+// ─── 推理档位：off 必须真的关掉，未知值必须报错 ───
+//
+// 判据全部来自 2026-10-06 的实测：off 使上游输出 0 个思考字符，minimal ~ xhigh
+// 都出 80~144 个，而喂 `banana` 上游回 `400 code 11150 the reasoning effort
+// value is not supported by the current model`——上游校验，所以这张表可信。
+//
+// 旧代码写成 `enable_thinking = true` 硬编码 + `["low","medium","high","max"]`
+// 白名单，后果正是用户报过的那个：**选 off 反而开满思考**，minimal/xhigh 也被
+// 悄悄降级成 high。
+// 这个文件的 assert 是自己写的、不含 throws；把抛出捕获成字符串来比对。
+function capture(fn: () => unknown): string {
+  try { fn(); return "(did not throw)"; } catch (e: any) { return String(e?.message ?? e); }
+}
+
+const build = (effort?: string) =>
+  cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    max_tokens: 32,
+    messages: [{ role: "user", content: "hi" }],
+    ...(effort === undefined ? {} : { reasoning_effort: effort }),
+  }).upstream;
+
+Deno.test("effort off really switches thinking off", () => {
+  const up = build("off");
+  assertEquals(up.enable_thinking, false, "off must set enable_thinking false, not fall through to high");
+  assertEquals(up.reasoning_effort, "off");
+});
+
+Deno.test("every published effort survives the request body verbatim", () => {
+  // 这是"档位丢失"那条 bug 的回归：白名单里没有的档位曾被静默改成 high，
+  // 调用方看到自己的选择被接受，实际发出去的是另一个值。
+  for (const effort of ["minimal", "low", "medium", "high", "max", "xhigh"]) {
+    const up = build(effort);
+    assertEquals(up.reasoning_effort, effort, effort + " must be sent as itself");
+    assertEquals(up.enable_thinking, true, effort + " keeps thinking on");
+  }
+});
+
+Deno.test("no effort asked for means the upstream default", () => {
+  const up = build(undefined);
+  assertEquals(up.reasoning_effort, "high", "the default stays high when the caller says nothing");
+  assertEquals(up.enable_thinking, true);
+});
+
+Deno.test("an effort the upstream rejects is an error, not a silent downgrade", () => {
+  // 静默回落比报错更糟：调用方以为自己选的档位生效了。
+  const thrown = capture(() => build("banana"));
+  assert(/not supported/.test(thrown), "an unsupported effort must be reported, not rewritten to high");
+});
+
+Deno.test("effort is case-insensitive but never invented", () => {
+  const up = build("HIGH");
+  assertEquals(up.reasoning_effort, "high", "spelling is normalised, the rung is not");
+  assert(/not supported/.test(capture(() => build("ultra"))), "an invented rung is also refused");
+});
+
+// ─── 模型列表：只发布上游实际在跑的那个 id ───
+//
+// 实测：上游把所有模型名（deepseek-v4-flash / -pro / deepseek-v4.1-flash / -max）
+// 都路由到同一个后端，响应里一律回 "model":"deepseek-v4.1-flash"。所以旧表里的
+// `pro` 不是"更强的模型"，只是会被静默重定向的旧名——把它留在选择器里等于
+// 给用户一个假的等级。
+Deno.test("the published model list names only what the upstream actually runs", () => {
+  const ids = CNB_MODELS.map((m: any) => m.id);
+  assertEquals(ids, ["deepseek-v4.1-flash"]);
+  // 旧名不能留在表里：它会被重定向，用户却以为那是另一个池子
+  assert(!ids.includes("deepseek-v4-pro"), "a redirected alias must not be published as its own model");
+  assert(!ids.includes("deepseek-v4-flash"));
+});
+
+Deno.test("the default model matches the published one", () => {
+  // 默认值和表必须一致：默认一个已下架的 id 会让"没指定模型"的请求悄悄走旧名
+  const up = cnbBuildUpstream({
+    max_tokens: 32,
+    messages: [{ role: "user", content: "hi" }],
+  }).upstream;
+  assertEquals(up.model, CNB_MODELS[0].id);
 });

@@ -14,9 +14,18 @@ const CNB_HOME = "https://cnb.cool/";
 const CNB_CHAT = "https://cnb.cool/ai/chat/completions";
 const CNB_TTL = 25 * 60 * 1000;
 
+// 模型列表**不是从上游拉的**——上游没有任何 models 端点（实测 2026-10-06：
+// /ai/models、/ai/v1/models、/api/models、/v1/models、/ai/chat/models 五个路径
+// 全是 404 或 Next.js 的 "Page not found"）。所以这里只能写死，而写死的值就
+// 必须来自实测。
+//
+// 实测（2026-10-06，逐个真调）：上游把**所有**模型名都路由到同一个后端，
+// 响应里一律回 `"model":"deepseek-v4.1-flash"`——包括旧名 deepseek-v4-flash /
+// deepseek-v4-pro。所以 `pro` 不是"更强的模型"，那两个 id 只是会被静默重定向
+// 的旧名。留着旧名会让选择器里出现一个假的等级（用户以为 pro 更强，实际同一
+// 个后端），因此只发布**上游实际在跑**的那个 id。
 export const CNB_MODELS = [
-  { id: "deepseek-v4-flash", object: "model", created: 0, owned_by: "cnb" },
-  { id: "deepseek-v4-pro",   object: "model", created: 0, owned_by: "cnb" },
+  { id: "deepseek-v4.1-flash", object: "model", created: 0, owned_by: "cnb" },
 ];
 
 const cnbState: any = { token: null, csrfkey: null, ts: 0, pending: null };
@@ -1119,8 +1128,10 @@ function commonPrefixLen(a: string, b: string) {
   return i;
 }
 
-function cnbBuildUpstream(openaiBody: any) {
-  const model = openaiBody.model || "deepseek-v4-flash";
+// 导出给 src/cnb.test.ts：推理档位那一组断言（off 真的关掉思考、未知值报错
+// 而不是静默回落）只能对着这个函数的输出来测。它不发网络，纯构造请求体。
+export function cnbBuildUpstream(openaiBody: any) {
+  const model = openaiBody.model || "deepseek-v4.1-flash";
   const rawMsgs = openaiBody.messages || [];
   if (!rawMsgs.length) throw new Error("messages is required");
 
@@ -1265,15 +1276,35 @@ function cnbBuildUpstream(openaiBody: any) {
     messages: msgs,
     stream: true,
     // flash 思考 token 波动大（实测最多吃掉一半输出预算），默认给 120000；pro 思考量小维持 60000
-    maxTokens: openaiBody.max_tokens || (model === "deepseek-v4-flash" ? 120000 : 60000),
+    maxTokens: openaiBody.max_tokens || 120000,
   };
   if (openaiBody.temperature != null) up.temperature = openaiBody.temperature;
   if (openaiBody.top_p != null) up.top_p = openaiBody.top_p;
 
-  // ★ 思考强度：客户端指定优先（reasoning_effort 或 reasoning.effort），默认 high
+  // ★ 思考强度。客户端指定优先（reasoning_effort 或 reasoning.effort），默认 high。
+  //
+  // 档位表是 **2026-10-06 逐个真调出来的**，不是从别处抄的：off 实测思考 0 字符
+  // （真的关掉了），minimal/low/medium/high/max/xhigh 实测都 200 且都出思考，
+  // 而喂 `banana` 上游回 `400 code 11150 the reasoning effort value is not
+  // supported by the current model`——**上游校验，不照收**。所以这张表可以信。
+  //
+  // 旧代码把它写成 `["low","medium","high","max"]` + `enable_thinking = true`
+  // 硬编码，后果是三条：
+  //   ① `off` 落进 else 分支变成 `high`——**选"关闭"反而开满**；
+  //   ② `minimal` / `xhigh` 也在白名单外，同样被降级成 high（档位悄悄丢失）；
+  //   ③ `enable_thinking` 永真，即使 effort 是 off。
+  // 现在 off 是真的关（`enable_thinking: false` 且不带 effort），未知值**报错**
+  // 而不是静默回落——静默回落会让调用方以为自己的选择生效了。
+  const CNB_EFFORTS = ["off", "minimal", "low", "medium", "high", "max", "xhigh"];
   const effortRaw = openaiBody.reasoning_effort || openaiBody.reasoning?.effort;
-  up.enable_thinking = true;
-  up.reasoning_effort = ["low", "medium", "high", "max"].includes(String(effortRaw)) ? String(effortRaw) : "high";
+  const effort = String(effortRaw ?? "").toLowerCase();
+  if (effortRaw !== undefined && effortRaw !== null && !CNB_EFFORTS.includes(effort)) {
+    throw new Error(
+      `cnb: reasoning_effort "${effortRaw}" is not supported (upstream accepts ${CNB_EFFORTS.join("/")})`,
+    );
+  }
+  up.enable_thinking = effort !== "off";
+  up.reasoning_effort = effort === "off" ? "off" : (effort || "high");
 
   return { upstream: up, hasTools };
 }
@@ -1475,15 +1506,12 @@ async function cnbCallUpstreamInner(upBody: any): Promise<Response> {
       cnbState.ts = 0;
     }
   }
-  // ★ flash 全线 5xx（容量窗口）：换 deepseek-v4-pro 的后端池兜一次
-  if (last && last.status >= 500 && upBody.model === "deepseek-v4-flash") {
-    console.warn(`[cnb] flash exhausted (${last.status} after ${waits.length} tries), fallback to deepseek-v4-pro`);
-    try {
-      const resp = await cnbCall({ ...upBody, model: "deepseek-v4-pro" });
-      if (resp.status === 200) return resp;
-      last = resp;
-    } catch {}
-  }
+  // 这里**曾经**有一段「flash 全线 5xx 就换 deepseek-v4-pro 兜一次」的降级。
+  // 2026-10-06 删掉：实测上游把所有模型名（deepseek-v4-flash / -pro /
+  // deepseek-v4.1-flash / -max）都路由到同一个后端，响应里一律回
+  // `"model":"deepseek-v4.1-flash"`——所以 `pro` 不是另一个池子，换成它不会
+  // 改变任何结果，只是多打一次注定同样失败的请求。真出现全线 5xx 时，退避重试
+  // （waits 最多 20s）已经把"上游临时抽风"这一种情况覆盖掉了。
   if (last) return last;
   return cnbErr(502, "Upstream error", "network failure after retries");
 }
@@ -1546,7 +1574,7 @@ function responsesToChat(rb: any) {
     // reasoning / item_reference 等其它 item 忽略
   }
 
-  const chat: any = { model: rb.model || "deepseek-v4-flash", messages, stream: !!rb.stream };
+  const chat: any = { model: rb.model || "deepseek-v4.1-flash", messages, stream: !!rb.stream };
   // Responses 的 reasoning.effort 透传到 chat 形态，供 cnbBuildUpstream 读取
   if (rb.reasoning?.effort) chat.reasoning_effort = rb.reasoning.effort;
   if (rb.max_output_tokens) chat.max_tokens = rb.max_output_tokens;
