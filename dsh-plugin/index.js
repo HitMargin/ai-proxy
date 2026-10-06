@@ -442,7 +442,20 @@ export function normalizeModel(provider, row) {
     maxTokens: readNumber(
       row,
       ['maxTokens', 'max_tokens', 'max_output_tokens', 'max_completion_tokens'],
-      readNumber(upstream, ['max_output_tokens', 'max_completion_tokens'], DEFAULT_MAX_TOKENS),
+      // cnb publishes no metadata at all (its listing is a static array in
+      // src/cnb.ts), so before this it fell through to DEFAULT_MAX_TOKENS.
+      // The value is the one DeepSeek's own models declare in the user's
+      // cordis.patch.yml (kilo/deepseek/deepseek-v4-flash-0731:free:
+      // maxTokens=393216, context=1048576), chosen by the user on 2026-10-06.
+      //
+      // Deliberately per-channel rather than a new DEFAULT_MAX_TOKENS: every
+      // other channel without metadata would silently inherit 6x its output
+      // budget, and output budget is subtracted from the input side - a
+      // channel whose real ceiling is lower would start failing on long
+      // sessions with nothing here to explain it.
+      String(row.owned_by ?? '').toLowerCase() === 'cnb'
+        ? readNumber(upstream, ['max_output_tokens', 'max_completion_tokens'], 393216)
+        : readNumber(upstream, ['max_output_tokens', 'max_completion_tokens'], DEFAULT_MAX_TOKENS),
     ),
     inputModalities: modalities,
     reasoningEfforts: publishedEfforts(row),
