@@ -13,13 +13,14 @@ import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
   CNB_MODELS,
   cnbBuildUpstream,
-  handleCnb,
   cnbDiagnoseJunkSyntax,
   cnbJournalJunk,
   cnbJunkLogState,
   type CnbJunkStore,
   cnbJunkStreak,
   cnbParseToolCalls,
+  handleCnb,
+  maybeCompactCnb,
 } from "./cnb.ts";
 
 // LT 是源码里唯一允许出现尖括号的地方。测试正文到处要断言「没有一个裸的尖括号
@@ -405,7 +406,6 @@ Deno.test("a journal failure never breaks the response", () => {
   cnbJournalJunk("line\n", hostile, 1_000_000);
 });
 
-
 // ─── 推理档位：off 必须真的关掉，未知值必须报错 ───
 //
 // 判据全部来自 2026-10-06 的实测：off 使上游输出 0 个思考字符，minimal ~ xhigh
@@ -417,7 +417,12 @@ Deno.test("a journal failure never breaks the response", () => {
 // 悄悄降级成 high。
 // 这个文件的 assert 是自己写的、不含 throws；把抛出捕获成字符串来比对。
 function capture(fn: () => unknown): string {
-  try { fn(); return "(did not throw)"; } catch (e: any) { return String(e?.message ?? e); }
+  try {
+    fn();
+    return "(did not throw)";
+  } catch (e: any) {
+    return String(e?.message ?? e);
+  }
 }
 
 const build = (effort?: string) =>
@@ -430,11 +435,19 @@ const build = (effort?: string) =>
 
 Deno.test("effort off really switches thinking off", () => {
   const up = build("off");
-  assertEquals(up.enable_thinking, false, "off must set enable_thinking false, not fall through to high");
+  assertEquals(
+    up.enable_thinking,
+    false,
+    "off must set enable_thinking false, not fall through to high",
+  );
   // 不发 reasoning_effort 是**必需**的，不是整洁：实测上游拒绝 effort="off"
   // （400 code 11150），它只认「enable_thinking=false 且不提档位」。
   // 第一版我把 off 原样转发，线上直接 400。
-  assertEquals("reasoning_effort" in up, false, "off must omit reasoning_effort entirely - the upstream 400s on it");
+  assertEquals(
+    "reasoning_effort" in up,
+    false,
+    "off must omit reasoning_effort entirely - the upstream 400s on it",
+  );
 });
 
 Deno.test("every published effort survives the request body verbatim", () => {
@@ -442,27 +455,45 @@ Deno.test("every published effort survives the request body verbatim", () => {
   // 调用方看到自己的选择被接受，实际发出去的是另一个值。
   for (const effort of ["minimal", "low", "medium", "high", "max", "xhigh"]) {
     const up = build(effort);
-    assertEquals(up.reasoning_effort, effort, effort + " must be sent as itself");
+    assertEquals(
+      up.reasoning_effort,
+      effort,
+      effort + " must be sent as itself",
+    );
     assertEquals(up.enable_thinking, true, effort + " keeps thinking on");
   }
 });
 
 Deno.test("no effort asked for means the upstream default", () => {
   const up = build(undefined);
-  assertEquals(up.reasoning_effort, "high", "the default stays high when the caller says nothing");
+  assertEquals(
+    up.reasoning_effort,
+    "high",
+    "the default stays high when the caller says nothing",
+  );
   assertEquals(up.enable_thinking, true);
 });
 
 Deno.test("an effort the upstream rejects is an error, not a silent downgrade", () => {
   // 静默回落比报错更糟：调用方以为自己选的档位生效了。
   const thrown = capture(() => build("banana"));
-  assert(/not supported/.test(thrown), "an unsupported effort must be reported, not rewritten to high");
+  assert(
+    /not supported/.test(thrown),
+    "an unsupported effort must be reported, not rewritten to high",
+  );
 });
 
 Deno.test("effort is case-insensitive but never invented", () => {
   const up = build("HIGH");
-  assertEquals(up.reasoning_effort, "high", "spelling is normalised, the rung is not");
-  assert(/not supported/.test(capture(() => build("ultra"))), "an invented rung is also refused");
+  assertEquals(
+    up.reasoning_effort,
+    "high",
+    "spelling is normalised, the rung is not",
+  );
+  assert(
+    /not supported/.test(capture(() => build("ultra"))),
+    "an invented rung is also refused",
+  );
 });
 
 // ─── 模型列表：只发布上游实际在跑的那个 id ───
@@ -475,7 +506,10 @@ Deno.test("the published model list names only what the upstream actually runs",
   const ids = CNB_MODELS.map((m: any) => m.id);
   assertEquals(ids, ["deepseek-v4.1-flash"]);
   // 旧名不能留在表里：它会被重定向，用户却以为那是另一个池子
-  assert(!ids.includes("deepseek-v4-pro"), "a redirected alias must not be published as its own model");
+  assert(
+    !ids.includes("deepseek-v4-pro"),
+    "a redirected alias must not be published as its own model",
+  );
   assert(!ids.includes("deepseek-v4-flash"));
 });
 
@@ -488,7 +522,6 @@ Deno.test("the default model matches the published one", () => {
   assertEquals(up.model, CNB_MODELS[0].id);
 });
 
-
 // ─── Anthropic Messages 路由 ───
 //
 // 2026-10-06 起因：用户在 Deno Deploy 日志里看到 `POST /cnb/v1/v1/messages -> 404`。
@@ -498,52 +531,80 @@ Deno.test("the default model matches the published one", () => {
 // 这三条只验证**路由边界**，不打上游：发一次真实 cnb 请求要 30 秒且需要登录
 // cookie，把那种耗时放进套件会让 `deno task test` 从 2 秒变成几分钟。
 
-const msgReq = (path: string, body: unknown) => new Request("http://x" + path, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(body),
-});
+const msgReq = (path: string, body: unknown) =>
+  new Request("http://x" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
 Deno.test("an Anthropic Messages route exists on cnb", async () => {
   // 判据： malformed 的 Anthropic 请求得到 **Anthropic 形状的 400**
   // （"max_tokens is required"），而不是裸 404 —— 这条错误消息来自
   // anthropicMessagesToChat，只有路由接对了才可能出现。
-  const r = await handleCnb("/cnb/v1/messages", msgReq("/cnb/v1/messages", {
-    model: "deepseek-v4.1-flash",
-    messages: [{ role: "user", content: "hi" }],
-  }), new URL("http://x/cnb/v1/messages"));
+  const r = await handleCnb(
+    "/cnb/v1/messages",
+    msgReq("/cnb/v1/messages", {
+      model: "deepseek-v4.1-flash",
+      messages: [{ role: "user", content: "hi" }],
+    }),
+    new URL("http://x/cnb/v1/messages"),
+  );
   assertEquals(r.status, 400, "the messages route must answer, not 404");
   const text = await r.text();
-  assert(/max_tokens/.test(text), "the Anthropic converter's own error must surface: " + text);
+  assert(
+    /max_tokens/.test(text),
+    "the Anthropic converter's own error must surface: " + text,
+  );
 });
 
 Deno.test("a path with a duplicated v1 segment still reaches messages", async () => {
   // 用户日志里就是 /cnb/v1/v1/messages。endsWith 匹配让它也能用——所以
   // "路径拼重了"不是这条请求失败的原因，别让人往那个方向查。
-  const r = await handleCnb("/cnb/v1/v1/messages", msgReq("/cnb/v1/v1/messages", {
-    model: "deepseek-v4.1-flash",
-    messages: [{ role: "user", content: "hi" }],
-  }), new URL("http://x/cnb/v1/v1/messages"));
+  const r = await handleCnb(
+    "/cnb/v1/v1/messages",
+    msgReq("/cnb/v1/v1/messages", {
+      model: "deepseek-v4.1-flash",
+      messages: [{ role: "user", content: "hi" }],
+    }),
+    new URL("http://x/cnb/v1/v1/messages"),
+  );
   assertEquals(r.status, 400);
-  assert(/max_tokens/.test(await r.text()), "the duplicated segment must not change which route answers");
+  assert(
+    /max_tokens/.test(await r.text()),
+    "the duplicated segment must not change which route answers",
+  );
 });
 
 Deno.test("an unknown path says what this channel does serve", async () => {
   // 一句 "Not found" 让人分不清是拼错了还是渠道不支持。清单要和上面的分支
   // 一致——这里同时断言它提到了 messages（我加过路由之后就修正过这条文案）。
-  const r = await handleCnb("/cnb/v1/nope", msgReq("/cnb/v1/nope", {}), new URL("http://x/cnb/v1/nope"));
+  const r = await handleCnb(
+    "/cnb/v1/nope",
+    msgReq("/cnb/v1/nope", {}),
+    new URL("http://x/cnb/v1/nope"),
+  );
   assertEquals(r.status, 404);
   const text = await r.text();
-  assert(/chat\/completions/.test(text), "the 404 must list the real routes: " + text);
+  assert(
+    /chat\/completions/.test(text),
+    "the 404 must list the real routes: " + text,
+  );
   // 断言 "POST /messages" 而不是 "/messages"：文案后半段的
   // "/cnb/v1/v1/messages also matches" 也含 /messages，只查子串时分不清
   // 两处——实测把 "POST /messages" 那行删掉后这条仍然全绿。
-  assert(/POST \/messages/.test(text), "the 404 must list the messages route that now exists: " + text);
+  assert(
+    /POST \/messages/.test(text),
+    "the 404 must list the messages route that now exists: " + text,
+  );
   // 路由数也要对：清单漏一条等于把用户引向 404
   const listed = (text.match(/POST \/[a-z]+/g) || []).length;
-  assertEquals(listed, 3, "three POST routes must be listed, got " + listed + " in: " + text);
+  assertEquals(
+    listed,
+    3,
+    "three POST routes must be listed, got " + listed + " in: " + text,
+  );
 });
-
 
 // ─── 图片形态：cnb 只收内联 data URL ───
 //
@@ -554,7 +615,8 @@ Deno.test("an unknown path says what this channel does serve", async () => {
 // 上游这句话还会被我们包成 "Upstream error"，于是 413 body-too-large 这种毫不想干
 // 的错成了用户看到的东西——真正的原因（该用 data URL）一个字都不出现。
 // 03:15 那次连烧两次重试就是这么来的。
-const DATA_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const DATA_PNG =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 const imgBody = (url: string) => ({
   model: "cnb/deepseek-v4.1-flash",
@@ -570,33 +632,141 @@ const imgBody = (url: string) => ({
 
 Deno.test("an inline data URL image is passed through", () => {
   const up = cnbBuildUpstream(imgBody(DATA_PNG)).upstream;
-  const imgs = up.messages[0].content.filter((p: any) => p.type === "image_url");
+  const imgs = up.messages[0].content.filter((p: any) =>
+    p.type === "image_url"
+  );
   assertEquals(imgs.length, 1, "the image must survive into the upstream body");
-  assertEquals(imgs[0].image_url.url, DATA_PNG, "the data URL is forwarded verbatim");
+  assertEquals(
+    imgs[0].image_url.url,
+    DATA_PNG,
+    "the data URL is forwarded verbatim",
+  );
 });
 
 Deno.test("an http(s) image URL is refused with the reason", () => {
   // 不该转发出去让上游回 11135——那句错误被包成 "Upstream error" 之后，
   // 跟真正的原因完全对不上。
-  for (const url of ["https://example.com/a.png", "http://cnb.cool/favicon.ico"]) {
+  for (
+    const url of ["https://example.com/a.png", "http://cnb.cool/favicon.ico"]
+  ) {
     const thrown = capture(() => cnbBuildUpstream(imgBody(url)));
-    assert(/inline images|data:image/.test(thrown), "must say the inline requirement: " + thrown);
+    assert(
+      /inline images|data:image/.test(thrown),
+      "must say the inline requirement: " + thrown,
+    );
   }
 });
 
 Deno.test("one bad image refuses the whole body rather than half-sending", () => {
   // 半套发出去 = 上游收到一个没有图的请求，模型答"没有图"，而用户以为图发出去了。
-  const thrown = capture(() => cnbBuildUpstream({
-    model: "cnb/deepseek-v4.1-flash",
-    max_tokens: 16,
-    messages: [{
+  const thrown = capture(() =>
+    cnbBuildUpstream({
+      model: "cnb/deepseek-v4.1-flash",
+      max_tokens: 16,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "x" },
+          { type: "image_url", image_url: { url: DATA_PNG } },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/b.png" },
+          },
+        ],
+      }],
+    })
+  );
+  assert(
+    /inline images/.test(thrown),
+    "a single non-inline image must refuse the request",
+  );
+});
+
+// ─── cnb 会话压缩：打破 1 MiB 死锁 ───
+//
+// 2026-10-06 用户会话涨到 89 轮/576M token，请求体超过上游 1 MiB 硬限
+// （实测边界 1,048,169 B 通过、1,049,193 B 起 413 [BODY_TOO_LARGE]），
+// 而 harness 自己的压缩请求同样超限 —— 它得发一次模型调用来写摘要。
+// 死锁：上下文 1.2 MiB → 压缩要发请求 → 请求体同样超 → 413 → 压不掉。
+//
+// 实现接的是 src/zen-compaction.ts（Zen 已在用的 opencode 官方移植），
+// 关键约束是**压缩必须发生在 cnbBuildUpstream 之前**，否则改写的 messages
+// 不会进入实际请求（AGENTS.md 里 Zen 那条踩过）。
+
+Deno.test("a cnb transcript above the body budget is compacted", async () => {
+  // 用中文填充：一个字符三字节，正是「按字符估算会漏掉」的那种输入。
+  const filler =
+    "这是一段用来把请求体撑过上游 1 MiB 硬限制的中文填充文本，每个汉字占三个字节。";
+  const messages: any[] = [{ role: "system", content: "You are helpful." }];
+  for (let i = 0; i < 600; i++) {
+    messages.push({
       role: "user",
-      content: [
-        { type: "text", text: "x" },
-        { type: "image_url", image_url: { url: DATA_PNG } },
-        { type: "image_url", image_url: { url: "https://example.com/b.png" } },
-      ],
-    }],
-  }));
-  assert(/inline images/.test(thrown), "a single non-inline image must refuse the request");
+      content: "第 " + i + " 轮：" + filler.repeat(12),
+    });
+    messages.push({ role: "assistant", content: "收到。" + filler.repeat(8) });
+  }
+  messages.push({
+    role: "user",
+    content: "只回答一个字：好（这是最新一轮，压缩后必须原样保留）",
+  });
+  const body: any = { model: "deepseek-v4.1-flash", max_tokens: 32, messages };
+  const before = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(
+    before > 1048576,
+    "fixture must actually exceed the upstream limit, got " + before,
+  );
+
+  let summaryAsked = false;
+  // 摘要写入器换成桩：不打上游，返回一段合法摘要。
+  await maybeCompactCnb(body, "test-session", async () => {
+    summaryAsked = true;
+    return "## Objective\n- 讨论 TechniqueSimulator.cpp\n\n## Work State\n### Active\n- 压缩验证";
+  });
+
+  const after = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(summaryAsked, "compaction must ask for a summary");
+  assert(
+    after < before,
+    "the rebuilt body must be smaller: " + before + " -> " + after,
+  );
+  assert(
+    after < 1048576,
+    "the rebuilt body must fit under the upstream limit, got " + after,
+  );
+  // 摘要必须以 system 消息落在重建后的 transcript 里
+  assert(
+    body.messages.some((m: any) =>
+      typeof m.content === "string" &&
+      m.content.includes("Conversation Summary")
+    ),
+    "the anchored summary must be in the rebuilt transcript",
+  );
+  // 尾部必须保留原文：只留摘要会让模型看不到最近几轮
+  assert(
+    body.messages.some((m: any) =>
+      typeof m.content === "string" && m.content.includes("最新一轮")
+    ),
+    "the newest turn must survive verbatim",
+  );
+});
+
+Deno.test("a transcript under the budget is left completely alone", async () => {
+  // 对照组：没超限就不许动。缺了它，实现里「无条件压缩」也会让上一条通过。
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 32,
+    messages: [
+      { role: "system", content: "You are helpful." },
+      { role: "user", content: "你好" },
+    ],
+  };
+  const snapshot = JSON.stringify(body);
+  await maybeCompactCnb(body, "test-session", async () => {
+    throw new Error("must not be called for a small transcript");
+  });
+  assertEquals(
+    JSON.stringify(body),
+    snapshot,
+    "a small transcript must be untouched",
+  );
 });

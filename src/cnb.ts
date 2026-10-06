@@ -1,5 +1,11 @@
 import { safeJsonParse } from "./core.ts";
 import {
+  compactIfNeeded,
+  fallbackTruncate,
+  selectTail,
+  serializeMessage,
+} from "./zen-compaction.ts";
+import {
   anthropicMessagesToChat,
   chatResponseToAnthropic,
   openAiStreamToAnthropic,
@@ -14,7 +20,8 @@ import {
 // cnb.cool 集成模块
 // ============================================
 
-const CNB_UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36";
+const CNB_UA =
+  "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/126.0 Mobile Safari/537.36";
 const CNB_HOME = "https://cnb.cool/";
 const CNB_CHAT = "https://cnb.cool/ai/chat/completions";
 const CNB_TTL = 25 * 60 * 1000;
@@ -39,7 +46,8 @@ async function cnbFetchCsrf() {
   const r = await fetch(CNB_HOME, {
     headers: {
       "User-Agent": CNB_UA,
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept":
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     },
   });
   const html = await r.text();
@@ -59,7 +67,10 @@ async function cnbFetchCsrf() {
   let csrfkey: string | null = null;
   for (const c of cookies) {
     const m = c.match(/csrfkey=([0-9a-fA-F]{32,64})/);
-    if (m) { csrfkey = m[1]; break; }
+    if (m) {
+      csrfkey = m[1];
+      break;
+    }
   }
   if (!csrfkey) throw new Error("csrfkey not found in Set-Cookie");
   return { token: tm[1], csrfkey };
@@ -78,14 +89,19 @@ async function cnbFetchCsrf() {
 // 用 env 覆盖文件做验证——与 `credentialEnv` 里「环境的副本最权威」一致。
 const CNB_LOGIN_FILE = "./cnb-login.txt";
 const CNB_LOGIN_ENV = "CNB_LOGIN_COOKIES";
-let cnbLoginCache: { mtime: number | null; cookies: string } = { mtime: null, cookies: "" };
+let cnbLoginCache: { mtime: number | null; cookies: string } = {
+  mtime: null,
+  cookies: "",
+};
 
 /** 把任意一种粘贴形状归一成 `k=v; k=v`。两种来源共用，避免两处各写一遍而漂开。 */
 function normalizeCnbCookies(raw: string): { cookies: string; count: number } {
   let text = raw.trim();
   if (text.includes("	")) {
     // Netscape cookies.txt 格式（tab 分列）→ name=value 拼接
-    text = text.split(String.fromCharCode(10)).filter((l) => l && !l.startsWith("#")).map((l) => {
+    text = text.split(String.fromCharCode(10)).filter((l) =>
+      l && !l.startsWith("#")
+    ).map((l) => {
       const c = l.split("	");
       return c.length >= 7 ? c[5] + "=" + c[6] : "";
     }).filter(Boolean).join("; ");
@@ -97,7 +113,10 @@ function normalizeCnbCookies(raw: string): { cookies: string; count: number } {
     if (eq <= 0) continue; // 没有 `=` 的片段不是 cookie，跳过而不是存一个空键
     m.set(p.slice(0, eq), p.slice(eq + 1)); // 同名后者覆盖（浏览器最新值优先）
   }
-  return { cookies: [...m].map(([k, v]) => k + "=" + v).join("; "), count: m.size };
+  return {
+    cookies: [...m].map(([k, v]) => k + "=" + v).join("; "),
+    count: m.size,
+  };
 }
 
 function cnbLoginCookies(): string {
@@ -107,7 +126,9 @@ function cnbLoginCookies(): string {
   // 而本机进程可能被 `restart.ps1` 或面板用不同的 env 重新拉起——缓存住的话
   // 第二次启动会沿用上一份凭据，看起来像「改了没生效」。
   let fromEnv = "";
-  try { fromEnv = Deno.env.get(CNB_LOGIN_ENV) ?? ""; } catch { /* 无权限读环境 */ }
+  try {
+    fromEnv = Deno.env.get(CNB_LOGIN_ENV) ?? "";
+  } catch { /* 无权限读环境 */ }
   if (fromEnv.trim()) {
     const { cookies, count } = normalizeCnbCookies(fromEnv);
     if (cookies !== cnbLoginCache.cookies) {
@@ -120,12 +141,19 @@ function cnbLoginCookies(): string {
   }
 
   let st: Deno.FileInfo | null = null;
-  try { st = Deno.statSync(CNB_LOGIN_FILE); } catch { /* 文件不存在 = 匿名模式 */ }
-  if (!st || !st.isFile) { cnbLoginCache = { mtime: null, cookies: "" }; return ""; }
+  try {
+    st = Deno.statSync(CNB_LOGIN_FILE);
+  } catch { /* 文件不存在 = 匿名模式 */ }
+  if (!st || !st.isFile) {
+    cnbLoginCache = { mtime: null, cookies: "" };
+    return "";
+  }
   const mtime = st.mtime?.getTime() ?? 0;
   if (cnbLoginCache.mtime !== mtime) {
     let raw = "";
-    try { raw = Deno.readTextFileSync(CNB_LOGIN_FILE).trim(); } catch {}
+    try {
+      raw = Deno.readTextFileSync(CNB_LOGIN_FILE).trim();
+    } catch {}
     const { cookies, count } = normalizeCnbCookies(raw);
     cnbLoginCache = { mtime, cookies };
     console.log("[cnb-login] loaded " + count + " cookies from cnb-login.txt");
@@ -154,15 +182,21 @@ async function cnbEnsure() {
 // 前缀宽容：两侧竖线都可能被模型丢掉一根（|XYML| / XYML| / |XYML / XYML）
 const P = String.raw`(?:\|?(?:XYML|QNML)\|?)?`;
 // invoke 开标签：name 关键字可省略（invoke="grep"）、支持 "x"/'x'/等号空格
-const XYML_INVOKE_OPEN  = new RegExp(`<${P}invoke\\s*(?:name)?\\s*=?\\s*["']([^"']+)["'][^>]*>`, "gi");
+const XYML_INVOKE_OPEN = new RegExp(
+  `<${P}invoke\\s*(?:name)?\\s*=?\\s*["']([^"']+)["'][^>]*>`,
+  "gi",
+);
 const XYML_INVOKE_CLOSE = new RegExp(`</${P}invoke\\s*>`, "gi");
-const XYML_BOUNDARY     = new RegExp(`<\\/?${P}tool_calls\\s*>|<${P}invoke`, "gi");
+const XYML_BOUNDARY = new RegExp(`<\\/?${P}tool_calls\\s*>|<${P}invoke`, "gi");
 // ★ 参数级宽容：name 支持 "x"/'x'/等号空格；值可来自属性（value="..."）、
 // 可用属性名直接当参数名（file_path="..."）；值不强制 </parameter> 闭合——
 // 长字符串参数（old_string/new_string 等）最容易漏写闭合导致整参被丢；
 // 闭合标签还容忍丢 </ 前缀的 |XYML|parameter> 变体
-const XYML_PARAM_OPEN   = new RegExp(`<${P}parameter\\s+([^>]*)>`, "gi");
-const XYML_PARAM_CLOSE  = new RegExp(`<\\/?${P}parameter\\s*>|\\|(?:XYML|QNML)\\|parameter\\s*>`, "gi");
+const XYML_PARAM_OPEN = new RegExp(`<${P}parameter\\s+([^>]*)>`, "gi");
+const XYML_PARAM_CLOSE = new RegExp(
+  `<\\/?${P}parameter\\s*>|\\|(?:XYML|QNML)\\|parameter\\s*>`,
+  "gi",
+);
 
 function parseTagAttrs(s: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -174,11 +208,17 @@ function parseTagAttrs(s: string): Record<string, string> {
 
 function parseXymlParams(body: string, knownTypes?: Record<string, string>) {
   const args: any = {};
-  const opens: Array<{ attrs: Record<string, string>; start: number; valueStart: number }> = [];
+  const opens: Array<
+    { attrs: Record<string, string>; start: number; valueStart: number }
+  > = [];
   let pm;
   XYML_PARAM_OPEN.lastIndex = 0;
   while ((pm = XYML_PARAM_OPEN.exec(body)) !== null) {
-    opens.push({ attrs: parseTagAttrs(pm[1]), start: pm.index, valueStart: pm.index + pm[0].length });
+    opens.push({
+      attrs: parseTagAttrs(pm[1]),
+      start: pm.index,
+      valueStart: pm.index + pm[0].length,
+    });
   }
 
   for (let j = 0; j < opens.length; j++) {
@@ -190,8 +230,13 @@ function parseXymlParams(body: string, knownTypes?: Record<string, string>) {
       // 无 name 属性：属性名直接当参数名（<parameter file_path="x"/>），
       // 仅当该名字在工具 schema 里才认，防误配
       const k = Object.keys(o.attrs).find((a) =>
-        !["string", "type", "value"].includes(a) && knownTypes && a in knownTypes);
-      if (k) { name = k; v = o.attrs[k]; }
+        !["string", "type", "value"].includes(a) && knownTypes &&
+        a in knownTypes
+      );
+      if (k) {
+        name = k;
+        v = o.attrs[k];
+      }
     } else if (o.attrs["value"] !== undefined) {
       // 属性式取值：<parameter name="x" value="y"/>
       v = o.attrs["value"];
@@ -211,12 +256,17 @@ function parseXymlParams(body: string, knownTypes?: Record<string, string>) {
     if (!name) continue;
 
     let s = v.trim();
-    try { args[name] = JSON.parse(s); }
-    catch {
+    try {
+      args[name] = JSON.parse(s);
+    } catch {
       if (s.startsWith("<![CDATA[") && s.endsWith("]]>")) {
         const inner = s.slice(9, -3);
         // CDATA 里可能包着 JSON（对象/数组参数常用），解包后重试
-        try { args[name] = JSON.parse(inner); } catch { args[name] = inner; }
+        try {
+          args[name] = JSON.parse(inner);
+        } catch {
+          args[name] = inner;
+        }
       } else {
         args[name] = s;
       }
@@ -324,7 +374,9 @@ function parseToolCallPayload(payload: string): any[] {
       if (typeof c.tool === "string") c.name = c.tool;
       else if (c.function && typeof c.function.name === "string") {
         c.name = c.function.name;
-        if (c.arguments === undefined && c.function.arguments !== undefined) c.arguments = c.function.arguments;
+        if (c.arguments === undefined && c.function.arguments !== undefined) {
+          c.arguments = c.function.arguments;
+        }
       }
     }
     // arguments 字符串化（OpenAI wire 习惯）：能解成对象就解；
@@ -353,12 +405,15 @@ function parseToolCallPayload(payload: string): any[] {
 // 旧正则用 `\\s>` 要求 `>` 紧跟 tag 名（只允许空白），导致整块匹配不上、
 // 透传成正文泄漏给客户端。改为 `\\b[^>]*>` 容忍标签名后到 `>` 之间的任意
 // 非-`>` 字符（属性、散文、引号残渣），归一化后由 JUNK 检测器统一清理。
-const DSML_TOK         = String.raw`[｜|]{2}DSML[｜|]{2}`;
-const DSML_PARAM       = new RegExp(`<${DSML_TOK}\\s*parameter\\s+name="([^"]+)"([^>]*)>([\\s\\S]*?)</${DSML_TOK}\\s*parameter\\b[^>]*>`, "gi");
+const DSML_TOK = String.raw`[｜|]{2}DSML[｜|]{2}`;
+const DSML_PARAM = new RegExp(
+  `<${DSML_TOK}\\s*parameter\\s+name="([^"]+)"([^>]*)>([\\s\\S]*?)</${DSML_TOK}\\s*parameter\\b[^>]*>`,
+  "gi",
+);
 const DSML_INVOKE_OPEN = new RegExp(`<${DSML_TOK}\\s*invoke\\s+([^>]*)>`, "gi");
 const DSML_INVOKE_CLOSE = new RegExp(`</${DSML_TOK}\\s*invoke\\b[^>]*>`, "gi");
-const DSML_CALLS_OPEN   = new RegExp(`<${DSML_TOK}\\s*calls\\b[^>]*>`, "gi");
-const DSML_CALLS_CLOSE  = new RegExp(`</${DSML_TOK}\\s*calls\\b[^>]*>`, "gi");
+const DSML_CALLS_OPEN = new RegExp(`<${DSML_TOK}\\s*calls\\b[^>]*>`, "gi");
+const DSML_CALLS_CLOSE = new RegExp(`</${DSML_TOK}\\s*calls\\b[^>]*>`, "gi");
 
 function normalizeDsml(text: string) {
   // 常见路径没有 DSML 标记：一次 indexOf 短路，省掉下面 6 趟全文正则
@@ -366,12 +421,20 @@ function normalizeDsml(text: string) {
   return text
     .replace(DSML_PARAM, (_m, name: string, attrs: string, val: string) => {
       // string="true" 表示字面字符串：JSON 字面量化，防止 "42" 被解析成数字
-      const v = /string\s*=\s*"true"/i.test(attrs) ? JSON.stringify(val.trim()) : val;
+      const v = /string\s*=\s*"true"/i.test(attrs)
+        ? JSON.stringify(val.trim())
+        : val;
       return `<|XYML|parameter name="${name}">${v}</|XYML|parameter>`;
     })
     // 未配对的 parameter 开/闭标签（值边界交给宽容解析器；混合协议时模型常留 DSML 残骸）
-    .replace(new RegExp(`<${DSML_TOK}\\s*parameter\\s+name="([^"]+)"[^>]*>`, "gi"), (_m, n: string) => `<|XYML|parameter name="${n}">`)
-    .replace(new RegExp(`</${DSML_TOK}\\s*parameter\\b[^>]*>`, "gi"), "</|XYML|parameter>")
+    .replace(
+      new RegExp(`<${DSML_TOK}\\s*parameter\\s+name="([^"]+)"[^>]*>`, "gi"),
+      (_m, n: string) => `<|XYML|parameter name="${n}">`,
+    )
+    .replace(
+      new RegExp(`</${DSML_TOK}\\s*parameter\\b[^>]*>`, "gi"),
+      "</|XYML|parameter>",
+    )
     .replace(DSML_INVOKE_OPEN, "<|XYML|invoke $1>")
     .replace(DSML_INVOKE_CLOSE, "</|XYML|invoke>")
     .replace(DSML_CALLS_OPEN, "<|XYML|tool_calls>")
@@ -389,7 +452,9 @@ function cnbBuildToolPrompt(tools: any[]) {
 
     const params = fn.parameters || {};
     const props: Record<string, any> = params.properties || {};
-    const required: string[] = Array.isArray(params.required) ? params.required : [];
+    const required: string[] = Array.isArray(params.required)
+      ? params.required
+      : [];
 
     const paramLines = Object.entries(props).map(([k, v]: [string, any]) => {
       const isReq = required.includes(k);
@@ -399,8 +464,8 @@ function cnbBuildToolPrompt(tools: any[]) {
 
     blocks.push(
       `Tool: ${fn.name}\nDescription: ${d}\n` +
-      (required.length ? `Required: ${required.join(", ")}\n` : "") +
-      `Parameters:\n${paramLines || "  (none)"}`
+        (required.length ? `Required: ${required.join(", ")}\n` : "") +
+        `Parameters:\n${paramLines || "  (none)"}`,
     );
   }
 
@@ -433,7 +498,14 @@ RULES:
 }
 
 function buildToolSchemaMap(tools?: any[]) {
-  const map = new Map<string, { types: Record<string, string>; required: string[]; schemas: Record<string, any> }>();
+  const map = new Map<
+    string,
+    {
+      types: Record<string, string>;
+      required: string[];
+      schemas: Record<string, any>;
+    }
+  >();
   if (!Array.isArray(tools)) return map;
   for (const t of tools) {
     const fn = t.function || {};
@@ -446,7 +518,11 @@ function buildToolSchemaMap(tools?: any[]) {
       schemas[k] = v;
       types[k] = (v && v.type) || "";
     }
-    map.set(fn.name, { types, required: Array.isArray(params.required) ? params.required : [], schemas });
+    map.set(fn.name, {
+      types,
+      required: Array.isArray(params.required) ? params.required : [],
+      schemas,
+    });
   }
   return map;
 }
@@ -466,7 +542,11 @@ function coerceBySchema(value: any, schema: any): any {
     // schema 要对象、值是字符串 → 字符串属性统一填该值（选项文本当 label/description）
     if (typeof value === "string" && value.trim() && schema.properties) {
       const out: any = {};
-      for (const [k, v] of Object.entries(schema.properties) as Array<[string, any]>) {
+      for (
+        const [k, v] of Object.entries(schema.properties) as Array<
+          [string, any]
+        >
+      ) {
         if (v?.type === "string") out[k] = value;
       }
       return Object.keys(out).length ? out : value;
@@ -493,7 +573,14 @@ function coerceBySchema(value: any, schema: any): any {
   return value;
 }
 
-function coerceArgsBySchema(args: any, entry?: { types: Record<string, string>; required: string[]; schemas: Record<string, any> }) {
+function coerceArgsBySchema(
+  args: any,
+  entry?: {
+    types: Record<string, string>;
+    required: string[];
+    schemas: Record<string, any>;
+  },
+) {
   if (!entry) return;
   for (const [k, sch] of Object.entries(entry.schemas)) {
     if (k in args) args[k] = coerceBySchema(args[k], sch);
@@ -503,13 +590,17 @@ function coerceArgsBySchema(args: any, entry?: { types: Record<string, string>; 
 // ★ 显示类必填参数（description）缺失/为空时的定向救援：从命令内容派生一个
 // 透明标签（[auto] 前缀明确非模型原文）。弱模型反复漏写 description 会陷入
 // 三连失败循环；该字段只用于展示，派生值无破坏性。语义参数（file_path 等）绝不做此处理
-function rescueDisplayParam(args: any, entry?: { types: Record<string, string>; required: string[] }) {
+function rescueDisplayParam(
+  args: any,
+  entry?: { types: Record<string, string>; required: string[] },
+) {
   if (!entry || !entry.required.includes("description")) return;
   const d = args["description"];
   if (typeof d === "string" && d.trim()) return;
   const cmd = args["command"] ?? args["cmd"] ?? args["script"];
   if (typeof cmd === "string" && cmd.trim()) {
-    args["description"] = "[auto] " + cmd.trim().replace(/\s+/g, " ").slice(0, 60);
+    args["description"] = "[auto] " +
+      cmd.trim().replace(/\s+/g, " ").slice(0, 60);
   }
 }
 
@@ -559,12 +650,12 @@ const TC = "tool_call";
 const TC_OPEN = "<" + TC + ">";
 const TC_CLOSE = "</" + TC + ">";
 const JUNK_NOTE_SHAPE =
-  "[proxy] Your previous tool call used an invalid syntax that no client can parse, so it was NOT executed. "
-  + "Do NOT stop and do NOT apologize — immediately continue the task by re-emitting the SAME tool call "
-  + "in EXACTLY this shape, with nothing else on those two tag lines:" + "\n"
-  + TC_OPEN + "\n"
-  + '{"name": "TOOL_NAME", "arguments": { ...all required params... }}' + "\n"
-  + TC_CLOSE + "\n";
+  "[proxy] Your previous tool call used an invalid syntax that no client can parse, so it was NOT executed. " +
+  "Do NOT stop and do NOT apologize — immediately continue the task by re-emitting the SAME tool call " +
+  "in EXACTLY this shape, with nothing else on those two tag lines:" + "\n" +
+  TC_OPEN + "\n" +
+  '{"name": "TOOL_NAME", "arguments": { ...all required params... }}' + "\n" +
+  TC_CLOSE + "\n";
 
 /** 连续垃圾拒收达到这个次数后改用短反馈。 */
 const CNB_JUNK_FULL_NOTES = 2;
@@ -595,14 +686,18 @@ function cnbJunkFeedback(diagnosis: string, now: number = Date.now()): string {
   cnbJunkStreak.at = now;
 
   if (cnbJunkStreak.count <= CNB_JUNK_FULL_NOTES) {
-    return JUNK_NOTE_SHAPE
-      + "\nWhat was wrong: " + diagnosis
-      + "\nIf you cannot produce that exact shape, answer in plain text instead — do not repeat the invalid tags.";
+    return JUNK_NOTE_SHAPE +
+      "\nWhat was wrong: " + diagnosis +
+      "\nIf you cannot produce that exact shape, answer in plain text instead — do not repeat the invalid tags.";
   }
-  return "[proxy] Still the same invalid tool syntax (rejected " + cnbJunkStreak.count
-    + " times in a row) — nothing can parse it, so it was NOT executed. What was wrong: " + diagnosis
-    + "\nEmit exactly one " + TC_OPEN + "\n" + '{"name":"TOOL_NAME","arguments":{...}}'
-    + "\n" + TC_CLOSE + " block, or answer in plain text. Do not repeat the invalid tags, and do not apologize.";
+  return "[proxy] Still the same invalid tool syntax (rejected " +
+    cnbJunkStreak.count +
+    " times in a row) — nothing can parse it, so it was NOT executed. What was wrong: " +
+    diagnosis +
+    "\nEmit exactly one " + TC_OPEN + "\n" +
+    '{"name":"TOOL_NAME","arguments":{...}}' +
+    "\n" + TC_CLOSE +
+    " block, or answer in plain text. Do not repeat the invalid tags, and do not apologize.";
 }
 
 /**
@@ -612,43 +707,71 @@ function cnbJunkFeedback(diagnosis: string, now: number = Date.now()): string {
 export function cnbDiagnoseJunkSyntax(text: string): string {
   const t = String(text || "");
   const problems: string[] = [];
-  const push = (s: string) => { if (!problems.includes(s)) problems.push(s); };
+  const push = (s: string) => {
+    if (!problems.includes(s)) problems.push(s);
+  };
 
   // ① 外层包裹标签：提示词 RULES 1 逐条点名禁止的几种
   if (/<tool_calls\b|<tool\s+calls\b/i.test(t)) {
-    push("the plural wrapper tag is not a legal tag — use the singular pair " + TC_OPEN + " / " + TC_CLOSE + ".");
+    push(
+      "the plural wrapper tag is not a legal tag — use the singular pair " +
+        TC_OPEN + " / " + TC_CLOSE + ".",
+    );
   }
   if (/<function_calls?\b/i.test(t)) {
-    push('"function_call" / "function_calls" belongs to another tool protocol — this client only reads the ' + TC_OPEN + " JSON block.");
+    push(
+      '"function_call" / "function_calls" belongs to another tool protocol — this client only reads the ' +
+        TC_OPEN + " JSON block.",
+    );
   }
   if (/<(?:\|?(?:XYML|QNML)\|?)?\s*(?:invoke|parameter)\b|DSML/i.test(t)) {
-    push('"invoke" / "parameter" (including the prefixed XYML and DSML forms) belongs to another tool protocol — this client only reads the ' + TC_OPEN + " JSON block.");
+    push(
+      '"invoke" / "parameter" (including the prefixed XYML and DSML forms) belongs to another tool protocol — this client only reads the ' +
+        TC_OPEN + " JSON block.",
+    );
   }
-  if (/<tool_call\b[^>]*>/i.test(t) && !new RegExp("</" + TC + "\\s*>", "i").test(t)) {
+  if (
+    /<tool_call\b[^>]*>/i.test(t) &&
+    !new RegExp("</" + TC + "\\s*>", "i").test(t)
+  ) {
     push("the opening tag was never closed with " + TC_CLOSE + ".");
   }
 
   // ② JSON 载荷：标签对了但内容不对，是最常见也最能救的一类
   const brace = t.indexOf("{");
   if (brace === -1) {
-    push("there is no JSON object at all — the tool name and its parameters must sit inside an object between the two tags, not in prose.");
+    push(
+      "there is no JSON object at all — the tool name and its parameters must sit inside an object between the two tags, not in prose.",
+    );
   } else {
     const obj = extractFirstJsonObject(t.slice(brace));
     const parsed = obj ? tryParseJsonLenient(obj) : null;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      push("the JSON object is truncated or malformed — close every brace, put double quotes around every string, and separate items with commas.");
+      push(
+        "the JSON object is truncated or malformed — close every brace, put double quotes around every string, and separate items with commas.",
+      );
     } else {
       const o = parsed as Record<string, unknown>;
       if (typeof o.name !== "string" || !o.name.trim()) {
-        push('the object has no usable "name" field — it must name one tool from the list.');
+        push(
+          'the object has no usable "name" field — it must name one tool from the list.',
+        );
       } else if (o.arguments == null) {
-        push('the object has no "arguments" object — the parameters go directly inside it, e.g. {"command": "..."}.');
-      } else if (typeof o.arguments !== "object" || Array.isArray(o.arguments)) {
-        push('"arguments" must be an object such as {"command": "..."}, not a string, an array or a bare value.');
+        push(
+          'the object has no "arguments" object — the parameters go directly inside it, e.g. {"command": "..."}.',
+        );
+      } else if (
+        typeof o.arguments !== "object" || Array.isArray(o.arguments)
+      ) {
+        push(
+          '"arguments" must be an object such as {"command": "..."}, not a string, an array or a bare value.',
+        );
       }
     }
   }
-  return problems.length ? problems.join(" ") : "the tool call could not be parsed.";
+  return problems.length
+    ? problems.join(" ")
+    : "the tool call could not be parsed.";
 }
 
 /**
@@ -668,14 +791,25 @@ const CNB_JUNK_LOG_MIN_GAP = 500;
 
 const cnbJunkDiskStore: CnbJunkStore = {
   size(path: string): number {
-    try { return Deno.statSync(path).size; } catch { return 0; }
+    try {
+      return Deno.statSync(path).size;
+    } catch {
+      return 0;
+    }
   },
   write(path: string, text: string, append: boolean): void {
-    if (!append) { Deno.writeTextFileSync(path, text); return; }
+    if (!append) {
+      Deno.writeTextFileSync(path, text);
+      return;
+    }
     // 追加不能用 writeTextFileSync（它整体覆写）；openSync + append 同一支 fd，
     // 写完必须 close，否则描述符随每次拒收泄漏一个。
     const f = Deno.openSync(path, { create: true, write: true, append: true });
-    try { f.writeSync(new TextEncoder().encode(text)); } finally { f.close(); }
+    try {
+      f.writeSync(new TextEncoder().encode(text));
+    } finally {
+      f.close();
+    }
   },
 };
 
@@ -706,8 +840,13 @@ export function cnbJournalJunk(
 // 值为字符串化 JSON 也解。★ 裸命令字符串变体：模型把命令本体直接塞进 arguments ——
 // {"arguments": "Set-Location ..."}，映射到 schema 的 command 类参数。
 // 工具 schema 真有名为 arguments/args/parameters 的参数时不做任何拆解
-function unwrapNestedArgs(args: any, entry?: { types: Record<string, string> }): any {
-  const guarded = !!(entry && ("arguments" in entry.types || "args" in entry.types || "parameters" in entry.types));
+function unwrapNestedArgs(
+  args: any,
+  entry?: { types: Record<string, string> },
+): any {
+  const guarded = !!(entry &&
+    ("arguments" in entry.types || "args" in entry.types ||
+      "parameters" in entry.types));
   for (let d = 0; d < 2; d++) {
     if (guarded) break;
     const raw = args["arguments"] ?? args["args"] ?? args["parameters"];
@@ -719,7 +858,9 @@ function unwrapNestedArgs(args: any, entry?: { types: Record<string, string> }):
         // 字符串里包着 JSON 对象：按对象路径拆
         const merged = { ...p };
         for (const [k, v] of Object.entries(args)) {
-          if (!["arguments", "args", "parameters"].includes(k) && !(k in merged)) merged[k] = v;
+          if (
+            !["arguments", "args", "parameters"].includes(k) && !(k in merged)
+          ) merged[k] = v;
         }
         args = merged;
         continue;
@@ -733,7 +874,10 @@ function unwrapNestedArgs(args: any, entry?: { types: Record<string, string> }):
         delete merged["arguments"];
         delete merged["args"];
         delete merged["parameters"];
-        if (!(cmdKey in merged) || typeof merged[cmdKey] !== "string" || !merged[cmdKey].trim()) {
+        if (
+          !(cmdKey in merged) || typeof merged[cmdKey] !== "string" ||
+          !merged[cmdKey].trim()
+        ) {
           merged[cmdKey] = raw;
         }
         args = merged;
@@ -744,7 +888,9 @@ function unwrapNestedArgs(args: any, entry?: { types: Record<string, string> }):
     if (typeof raw !== "object" || Array.isArray(raw)) break;
     const merged = { ...raw };
     for (const [k, v] of Object.entries(args)) {
-      if (!["arguments", "args", "parameters"].includes(k) && !(k in merged)) merged[k] = v;
+      if (!["arguments", "args", "parameters"].includes(k) && !(k in merged)) {
+        merged[k] = v;
+      }
     }
     args = merged;
   }
@@ -752,7 +898,10 @@ function unwrapNestedArgs(args: any, entry?: { types: Record<string, string> }):
 }
 
 // invoke 开标签整个漏写时，按参数名与各工具 schema 的重合度推断工具名
-function guessToolFromParams(pnames: Set<string>, tools?: any[]): string | null {
+function guessToolFromParams(
+  pnames: Set<string>,
+  tools?: any[],
+): string | null {
   if (!Array.isArray(tools)) return null;
   let best: string | null = null;
   let bestScore = 0;
@@ -764,7 +913,10 @@ function guessToolFromParams(pnames: Set<string>, tools?: any[]): string | null 
     const hit = names.filter((n) => pnames.has(n)).length;
     const extra = [...pnames].filter((n) => !names.includes(n)).length;
     const score = hit * 2 - extra; // 命中加分、未知参数降权，防误配
-    if (score > bestScore) { bestScore = score; best = fn.name; }
+    if (score > bestScore) {
+      bestScore = score;
+      best = fn.name;
+    }
   }
   return best;
 }
@@ -777,18 +929,18 @@ function normalizeInvokeConfusion(text: string) {
   // 变体1：伪属性 name="invoke" + 随后还有第二个 name 属性
   text = text.replace(
     /<([｜|]{2}DSML[｜|]{2}|\|?(?:XYML|QNML)\|?)?\s*parameter\s+name\s*=\s*["']invoke["']\s+(?=[^>]*\bname\s*=\s*["'])/gi,
-    (_m, tok: string) => `<${tok || ""}invoke `
+    (_m, tok: string) => `<${tok || ""}invoke `,
   );
   // 变体2：name 的值粘连了 "invoke name="，真名被挤到引号外
   text = text.replace(
     /<([｜|]{2}DSML[｜|]{2}|\|?(?:XYML|QNML)\|?)?\s*parameter\s+name\s*=\s*["']invoke\s+name=["']?\s*([^"'>\s]+)["']?\s*>/gi,
-    (_m, tok: string, nm: string) => `<${tok || ""}invoke name="${nm}">`
+    (_m, tok: string, nm: string) => `<${tok || ""}invoke name="${nm}">`,
   );
   // 变体3：name="invoke"（可带 string="true" 等杂属性）+ 标签闭合后紧跟裸工具名和引号残渣
   // 尾部强制要求 ["']?\\s*> 残渣，避免误伤值为多词文本的合法 name="invoke" 参数
   text = text.replace(
     /<([｜|]{2}DSML[｜|]{2}|\|?(?:XYML|QNML)\|?)?\s*parameter\s+name\s*=\s*["']invoke["'][^>]*>\s*([^"'>\s]+)\s*["']?\s*>/gi,
-    (_m, tok: string, nm: string) => `<${tok || ""}invoke name="${nm}">`
+    (_m, tok: string, nm: string) => `<${tok || ""}invoke name="${nm}">`,
   );
   return text;
 }
@@ -798,7 +950,9 @@ function normalizeInvokeConfusion(text: string) {
 export function cnbParseToolCalls(text: string, tools?: any[]) {
   // ★ 常见短路：全文没有 "<" 且没有 "name": 键（tool_call/XYML/DSML/裸 JSON 全需要其一），
   // 直接原样返回，省掉全部归一化/扫描/清理（纯文本响应占大多数）
-  if (!text.includes("<") && !/"name"\s*:/.test(text)) return { clean: text, calls: [] as any[] };
+  if (!text.includes("<") && !/"name"\s*:/.test(text)) {
+    return { clean: text, calls: [] as any[] };
+  }
   // DeepSeek 原生 DSML 标记 → XYML 归一化（含 invoke 混淆形式修正）
   text = normalizeDsml(normalizeInvokeConfusion(text));
   // 注意：模型漏写必需参数时保持原样缺失，不再填充占位值——
@@ -814,11 +968,17 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
 
   // ★ 宽容解析：不强制 </invoke> 闭合——
   // DeepSeek 常漏写 </invoke> 或重复 </tool_calls>，严格配对会让整块泄漏成正文
-  const opens: Array<{ name: string; start: number; bodyStart: number; synthesized?: boolean }> = [];
+  const opens: Array<
+    { name: string; start: number; bodyStart: number; synthesized?: boolean }
+  > = [];
   let om;
   XYML_INVOKE_OPEN.lastIndex = 0;
   while ((om = XYML_INVOKE_OPEN.exec(text)) !== null) {
-    opens.push({ name: om[1], start: om.index, bodyStart: om.index + om[0].length });
+    opens.push({
+      name: om[1],
+      start: om.index,
+      bodyStart: om.index + om[0].length,
+    });
   }
 
   // ★ invoke 开标签整个漏写（只剩参数块）：按参数名推断工具名，合成一个 invoke。
@@ -835,7 +995,12 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     }
     const guess = guessToolFromParams(pnames, tools);
     if (guess && firstIdx !== -1) {
-      opens.push({ name: guess, start: firstIdx, bodyStart: firstIdx, synthesized: true });
+      opens.push({
+        name: guess,
+        start: firstIdx,
+        bodyStart: firstIdx,
+        synthesized: true,
+      });
     }
   }
 
@@ -856,7 +1021,9 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     if (boundary !== -1) bodyEnd = Math.min(bodyEnd, boundary);
 
     // 闭合标签紧跟 body 时，连同它一起从 clean 里删掉
-    const spanEnd = closeStart === bodyEnd ? closeStart + cm![0].length : bodyEnd;
+    const spanEnd = closeStart === bodyEnd
+      ? closeStart + cm![0].length
+      : bodyEnd;
 
     const body = text.slice(o.bodyStart, bodyEnd);
     const entry = schemaMap.get(o.name);
@@ -876,12 +1043,16 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     coerceArgsBySchema(args, entry);
     // 合成 invoke（模型漏写开标签、工具名是猜的）时，丢掉 schema 外的幻觉参数
     if (o.synthesized && entry && Object.keys(entry.types).length) {
-      for (const k of Object.keys(args)) if (!(k in entry.types)) delete args[k];
+      for (const k of Object.keys(args)) {
+        if (!(k in entry.types)) delete args[k];
+      }
     }
     rescueDisplayParam(args, entry);
 
     // 命令类参数：混淆字符归一化 + 退化检测（拒收并反馈，避免执行乱码命令）
-    const cmdKeys = ["command", "cmd", "script"].filter((k) => typeof args[k] === "string");
+    const cmdKeys = ["command", "cmd", "script"].filter((k) =>
+      typeof args[k] === "string"
+    );
     for (const k of cmdKeys) args[k] = normalizeConfusables(args[k]);
     if (cmdKeys.some((k) => looksDegenerated(args[k]))) {
       degenerated = true;
@@ -899,7 +1070,10 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
 
   // ★ <tool_call> JSON 块（主协议）：容忍 ```json 围栏与漏写闭合
   const pushJsonCall = (o: any) => {
-    let args = (o.arguments && typeof o.arguments === "object" && !Array.isArray(o.arguments)) ? o.arguments : null;
+    let args = (o.arguments && typeof o.arguments === "object" &&
+        !Array.isArray(o.arguments))
+      ? o.arguments
+      : null;
     if (!args) {
       // 裸参数形态：对象本身就是参数（{"pattern":...}），剥掉元字段。
       // 注意不剥 arguments——字符串形态的 arguments 由 unwrapNestedArgs 映射到 command
@@ -912,7 +1086,8 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     if (!name) {
       // 无名：先拆双层嵌套（按参数形状猜依赖真实参数名；此时无从查 schema 守卫）
       args = unwrapNestedArgs(args);
-      name = guessToolFromParams(new Set(Object.keys(args)), tools) || undefined;
+      name = guessToolFromParams(new Set(Object.keys(args)), tools) ||
+        undefined;
     }
     if (!name) return;
     const entry = schemaMap.get(name);
@@ -936,15 +1111,24 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
         o._tagName = tm[1] || "";
         pushJsonCall(o);
       }
-      if (calls.length > before) spans.push([tm.index, tm.index + tm[0].length]);
+      if (calls.length > before) {
+        spans.push([tm.index, tm.index + tm[0].length]);
+      }
     }
 
     // 漏写 </tool_call>（或闭合串台成旧协议标签）：每个开标签取到下一个开标签/文末
     if (!calls.length) {
       const OPEN_RE = /<tool[_ ]call(\s[^>]*)?>/gi;
-      const opens: Array<{ tagStart: number; start: number; attrs: string }> = [];
+      const opens: Array<{ tagStart: number; start: number; attrs: string }> =
+        [];
       let t2;
-      while ((t2 = OPEN_RE.exec(text)) !== null) opens.push({ tagStart: t2.index, start: t2.index + t2[0].length, attrs: t2[1] || "" });
+      while ((t2 = OPEN_RE.exec(text)) !== null) {
+        opens.push({
+          tagStart: t2.index,
+          start: t2.index + t2[0].length,
+          attrs: t2[1] || "",
+        });
+      }
       for (let j = 0; j < opens.length; j++) {
         const end = j + 1 < opens.length ? opens[j + 1].tagStart : text.length;
         let seg = text.slice(opens[j].start, end);
@@ -986,7 +1170,8 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
   // ★ <function_call> 标签对（Claude/自创格式，垃圾拒收的主要来源）：
   // 标签间内容按 JSON 载荷解析，能救回来就不走拒收
   if (!calls.length) {
-    const FC = /<function_call(\s[^>]*)?>([\s\S]*?)(?:<\/function_call\s*>|$)/gi;
+    const FC =
+      /<function_call(\s[^>]*)?>([\s\S]*?)(?:<\/function_call\s*>|$)/gi;
     let fm;
     while ((fm = FC.exec(text)) !== null) {
       const before = calls.length;
@@ -994,7 +1179,9 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
         o._tagName = fm[1] || "";
         pushJsonCall(o);
       }
-      if (calls.length > before) spans.push([fm.index, fm.index + fm[0].length]);
+      if (calls.length > before) {
+        spans.push([fm.index, fm.index + fm[0].length]);
+      }
     }
   }
 
@@ -1008,9 +1195,9 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     // "写错了"。新增协议形态必须同时扩这里。
     const JUNK = new RegExp(
       // 复数 / 带属性 / 漏闭合的 tool_calls 包裹：开到最近的闭合标签或文末
-      "<(?:\\|?(?:XYML|QNML)\\|?)?tool[_ ]?calls?\\b[\\s\\S]*?(?:<\\/[^>]*(?:call|invoke|parameter)[^>]*\\s*>|$)"
-      // function_call(s) 单复数都收：只写复数时，单数那半边的标签会原样漏出去
-      + "|<function_calls?\\b[\\s\\S]*?(?:<\\/[^>]*call[^>]*\\s*>|$)",
+      "<(?:\\|?(?:XYML|QNML)\\|?)?tool[_ ]?calls?\\b[\\s\\S]*?(?:<\\/[^>]*(?:call|invoke|parameter)[^>]*\\s*>|$)" +
+        // function_call(s) 单复数都收：只写复数时，单数那半边的标签会原样漏出去
+        "|<function_calls?\\b[\\s\\S]*?(?:<\\/[^>]*call[^>]*\\s*>|$)",
       "gi",
     );
     if (JUNK.test(text)) {
@@ -1026,11 +1213,15 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
       // 拒收时记录原始形态（stderr + 落盘），下次能确诊而不是盲猜。
       // 落盘是必需的：stderr 只进插件 200 行内存日志，长会话里几秒就被冲掉
       // （实测：连续拒收时 warn 存活时间以秒计，日志文件里一行都没留下）。
-      const raw = "[junk] unparseable tool syntax, raw (500 chars): " + text.replace(/\s+/g, " ").slice(0, 500);
+      const raw = "[junk] unparseable tool syntax, raw (500 chars): " +
+        text.replace(/\s+/g, " ").slice(0, 500);
       console.warn(raw);
       cnbJournalJunk(raw + "\n  diagnosis: " + junkDiagnosis + "\n");
       text = text.replace(JUNK, "");
-      text = text.replace(/<\/?[｜|]{0,2}(?:XYML|QNML)[｜|]{0,2}\s*\w*\s*>/gi, "");
+      text = text.replace(
+        /<\/?[｜|]{0,2}(?:XYML|QNML)[｜|]{0,2}\s*\w*\s*>/gi,
+        "",
+      );
       text = text.replace(/<\/?tool_calls?\b[^>]*>/gi, "");
     }
   }
@@ -1068,15 +1259,25 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
 // 有 tools 的流式响应：正文/思考实时放行；一旦撞见疑似工具标记开头（XYML/QNML/DSML/<tool_call>）
 // 就锁定该通道，后续全部缓冲，流结束后交给 cnbParseToolCalls 统一解析
 const TOOL_OPENERS = [
-  "<|xyml|tool_calls", "<|qnml|tool_calls",
-  "<|xyml|invoke", "<|qnml|invoke", "<invoke",
-  "<|xyml|parameter", "<|qnml|parameter",
-  "<xyml|tool_calls", "<qnml|tool_calls",
-  "<xyml|invoke", "<qnml|invoke",
-  "<xyml|parameter", "<qnml|parameter",
-  "<tool_call", "<tool_calls",           // 单复数都收
-  "<function_call", "<function_calls",   // OpenAI 遗留格式
-  "<｜｜dsml", "<||dsml",
+  "<|xyml|tool_calls",
+  "<|qnml|tool_calls",
+  "<|xyml|invoke",
+  "<|qnml|invoke",
+  "<invoke",
+  "<|xyml|parameter",
+  "<|qnml|parameter",
+  "<xyml|tool_calls",
+  "<qnml|tool_calls",
+  "<xyml|invoke",
+  "<qnml|invoke",
+  "<xyml|parameter",
+  "<qnml|parameter",
+  "<tool_call",
+  "<tool_calls", // 单复数都收
+  "<function_call",
+  "<function_calls", // OpenAI 遗留格式
+  "<｜｜dsml",
+  "<||dsml",
 ];
 const MAX_OPENER_LEN = Math.max(...TOOL_OPENERS.map((s) => s.length));
 
@@ -1089,7 +1290,10 @@ function createLiveFilter() {
     state,
     push(delta: string): string {
       state.full += delta;
-      if (locked) { held += delta; return ""; }
+      if (locked) {
+        held += delta;
+        return "";
+      }
       // ★ 快路径：没有未决前缀且本段不含 '<'，不可能构成任何标记开头（流式 CPU 热点）
       if (!held && !delta.includes("<")) {
         state.emitted += delta;
@@ -1115,7 +1319,10 @@ function createLiveFilter() {
       let keep = 0;
       for (let k = Math.min(MAX_OPENER_LEN, held.length); k > 0; k--) {
         const tail = low.slice(held.length - k);
-        if (TOOL_OPENERS.some((o) => o.startsWith(tail))) { keep = k; break; }
+        if (TOOL_OPENERS.some((o) => o.startsWith(tail))) {
+          keep = k;
+          break;
+        }
       }
       const out = held.slice(0, held.length - keep);
       held = held.slice(held.length - keep);
@@ -1166,22 +1373,21 @@ export function cnbBuildUpstream(openaiBody: any) {
         // （该用 data URL）完全对不上——用户 03:15 那次就是这么烧掉两次重试的。
         const httpImage = parts.find((p: any) =>
           p.type === "image_url" && typeof p.image_url?.url === "string" &&
-          /^https?:\/\//i.test(p.image_url.url));
+          /^https?:\/\//i.test(p.image_url.url)
+        );
         if (httpImage) {
           throw new Error(
-            "cnb only accepts inline images (data:image/...;base64,...); an http(s) image_url "
-            + "is rejected upstream with code 11135. Read the attachment bytes and inline them.",
+            "cnb only accepts inline images (data:image/...;base64,...); an http(s) image_url " +
+              "is rejected upstream with code 11135. Read the attachment bytes and inline them.",
           );
         }
         c = parts.map((p: any) =>
-          p.type === "text"
-            ? { type: "text", text: p.text || "" }
-            : {
-              type: "image_url",
-              image_url: typeof p.image_url === "string"
-                ? { url: p.image_url }
-                : (p.image_url || { url: "" }),
-            }
+          p.type === "text" ? { type: "text", text: p.text || "" } : {
+            type: "image_url",
+            image_url: typeof p.image_url === "string"
+              ? { url: p.image_url }
+              : (p.image_url || { url: "" }),
+          }
         );
         multimodal = true;
       } else {
@@ -1210,7 +1416,9 @@ export function cnbBuildUpstream(openaiBody: any) {
           } catch {
             args = {};
           }
-          return `<tool_call>\n${JSON.stringify({ name, arguments: args })}\n</tool_call>`;
+          return `<tool_call>\n${
+            JSON.stringify({ name, arguments: args })
+          }\n</tool_call>`;
         }).join("\n");
 
         body = body ? `${body}\n${blocks}` : blocks;
@@ -1279,10 +1487,14 @@ export function cnbBuildUpstream(openaiBody: any) {
     const reminder =
       `RETRY REMINDER: your previous attempt was rejected for invalid tool syntax ` +
       `(rejected ${cnbJunkStreak.count} time(s) just now). Nothing from it was executed. ` +
-      `Reason: ${cnbJunkLastDiagnosis.text || "the tool call was not in the required shape"}. ` +
+      `Reason: ${
+        cnbJunkLastDiagnosis.text ||
+        "the tool call was not in the required shape"
+      }. ` +
       `This time emit EXACTLY one block, with nothing else on those two tag lines:\n` +
       TC_OPEN + "\n" +
-      '{"name": "TOOL_NAME", "arguments": { ...all required params... }}' + "\n" +
+      '{"name": "TOOL_NAME", "arguments": { ...all required params... }}' +
+      "\n" +
       TC_CLOSE;
     const first = msgs[0];
     if (first && first.role === "system" && typeof first.content === "string") {
@@ -1330,12 +1542,25 @@ export function cnbBuildUpstream(openaiBody: any) {
   // 关掉思考。
   //
   // 未知值**报错**而不是静默回落——静默回落会让调用方以为自己的选择生效了。
-  const CNB_EFFORTS = ["off", "minimal", "low", "medium", "high", "max", "xhigh"];
+  const CNB_EFFORTS = [
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "max",
+    "xhigh",
+  ];
   const effortRaw = openaiBody.reasoning_effort || openaiBody.reasoning?.effort;
   const effort = String(effortRaw ?? "").toLowerCase();
-  if (effortRaw !== undefined && effortRaw !== null && !CNB_EFFORTS.includes(effort)) {
+  if (
+    effortRaw !== undefined && effortRaw !== null &&
+    !CNB_EFFORTS.includes(effort)
+  ) {
     throw new Error(
-      `cnb: reasoning_effort "${effortRaw}" is not supported (upstream accepts ${CNB_EFFORTS.join("/")})`,
+      `cnb: reasoning_effort "${effortRaw}" is not supported (upstream accepts ${
+        CNB_EFFORTS.join("/")
+      })`,
     );
   }
   up.enable_thinking = effort !== "off";
@@ -1350,23 +1575,29 @@ async function cnbCall(body: any) {
   // 30 秒无响应头视为 cnb 挂死：中止抛错交给上层退避重试（实测 cnb 偶发无限挂起）。
   // 只罩到响应头返回为止，不限制流式生成的总时长。
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(new Error("cnb: no response headers in 30s")), 30_000);
+  const timer = setTimeout(
+    () => ac.abort(new Error("cnb: no response headers in 30s")),
+    30_000,
+  );
   try {
-  return await fetch(CNB_CHAT, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Accept": "text/event-stream, application/json, text/plain, */*",
-      "Origin": "https://cnb.cool",
-      "Referer": "https://cnb.cool/",
-      "Csrftoken": st.token,
-      "Cookie": "csrfkey=" + st.csrfkey + (loginCookies ? "; " + loginCookies : ""),
-      "User-Agent": CNB_UA,
-    },
-    body: JSON.stringify(body),
-    signal: ac.signal,
-  });
-  } finally { clearTimeout(timer); }
+    return await fetch(CNB_CHAT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream, application/json, text/plain, */*",
+        "Origin": "https://cnb.cool",
+        "Referer": "https://cnb.cool/",
+        "Csrftoken": st.token,
+        "Cookie": "csrfkey=" + st.csrfkey +
+          (loginCookies ? "; " + loginCookies : ""),
+        "User-Agent": CNB_UA,
+      },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function* cnbIter(upstream: Response) {
@@ -1384,23 +1615,34 @@ async function* cnbIter(upstream: Response) {
         if (!line.startsWith("data:")) continue;
         const d = line.slice(5).trim();
         if (d === "[DONE]") return;
-        try { yield JSON.parse(d); } catch {}
+        try {
+          yield JSON.parse(d);
+        } catch {}
       }
     }
     if (buf.trim().startsWith("data:")) {
       const d = buf.trim().slice(5).trim();
-      if (d !== "[DONE]") { try { yield JSON.parse(d); } catch {} }
+      if (d !== "[DONE]") {
+        try {
+          yield JSON.parse(d);
+        } catch {}
+      }
     }
   } finally {
     // cancel 而非仅 releaseLock：[DONE] 提前 return 时也要把流关掉（闸依赖流结束/取消信号）
-    try { await reader.cancel(); } catch {}
+    try {
+      await reader.cancel();
+    } catch {}
   }
 }
 
 function cnbErr(status: number, msg: string, detail?: string) {
   return new Response(JSON.stringify({ error: msg, detail }), {
     status,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
   });
 }
 
@@ -1411,25 +1653,54 @@ function cnbErr(status: number, msg: string, detail?: string) {
 let cnbGate: Promise<void> = Promise.resolve();
 function cnbFingerprint(body: any): string {
   const msgs: any[] = Array.isArray(body?.messages) ? body.messages : [];
-  const pick = (m: any) => (typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? ""));
-  const src = `${body?.model ?? "?"}|${msgs.length}|${pick(msgs[0]).slice(0, 256)}|${pick(msgs[msgs.length - 1]).slice(0, 256)}`;
+  const pick = (
+    m: any,
+  ) => (typeof m?.content === "string"
+    ? m.content
+    : JSON.stringify(m?.content ?? ""));
+  const src = `${body?.model ?? "?"}|${msgs.length}|${
+    pick(msgs[0]).slice(0, 256)
+  }|${pick(msgs[msgs.length - 1]).slice(0, 256)}`;
   let h = 5381;
   for (let i = 0; i < src.length; i++) h = ((h * 33) ^ src.charCodeAt(i)) >>> 0;
   return h.toString(36);
 }
 function cnbGatedResponse(resp: Response, done: () => void): Response {
-  if (!resp.body) { done(); return resp; }
+  if (!resp.body) {
+    done();
+    return resp;
+  }
   // 逐块透传并刷新空闲计时。释放条件（任一）：流正常结束、出错、消费方取消（cancel 会传导回来）、2 分钟无数据。
   // （消费方读到 [DONE] 提前 return 且不 cancel 时，靠空闲计时兜底，闸不会吊死）
-  let idle: ReturnType<typeof setTimeout> = setTimeout(() => { console.warn("[cnb-gate] idle 2min, releasing"); done(); }, 120_000);
-  const touch = () => { clearTimeout(idle); idle = setTimeout(() => { console.warn("[cnb-gate] idle 2min, releasing"); done(); }, 120_000); };
-  const finish = () => { clearTimeout(idle); done(); };
+  let idle: ReturnType<typeof setTimeout> = setTimeout(() => {
+    console.warn("[cnb-gate] idle 2min, releasing");
+    done();
+  }, 120_000);
+  const touch = () => {
+    clearTimeout(idle);
+    idle = setTimeout(() => {
+      console.warn("[cnb-gate] idle 2min, releasing");
+      done();
+    }, 120_000);
+  };
+  const finish = () => {
+    clearTimeout(idle);
+    done();
+  };
   const t = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) { touch(); controller.enqueue(chunk); },
-    flush() { finish(); },
+    transform(chunk, controller) {
+      touch();
+      controller.enqueue(chunk);
+    },
+    flush() {
+      finish();
+    },
   });
   resp.body.pipeTo(t.writable).then(() => finish(), () => finish());
-  return new Response(t.readable, { status: resp.status, headers: resp.headers });
+  return new Response(t.readable, {
+    status: resp.status,
+    headers: resp.headers,
+  });
 }
 async function cnbCallUpstream(upBody: any): Promise<Response> {
   // 这里**曾经**有一道字节预检：body > 1MiB 就在本地直接回 413，不发出去。
@@ -1449,14 +1720,20 @@ async function cnbCallUpstream(upBody: any): Promise<Response> {
   // 有数据可看（fp 与闸的日志同一个算法，能对上同一次请求）。
   const bodyBytes = new TextEncoder().encode(JSON.stringify(upBody)).length;
   if (bodyBytes > 1048576) {
-    console.warn(`[cnb-gate] large body ${bodyBytes}B (${(bodyBytes / 1048576).toFixed(3)} MiB), sending anyway (fp=${cnbFingerprint(upBody)})`);
+    console.warn(
+      `[cnb-gate] large body ${bodyBytes}B (${
+        (bodyBytes / 1048576).toFixed(3)
+      } MiB), sending anyway (fp=${cnbFingerprint(upBody)})`,
+    );
   }
   const fp = cnbFingerprint(upBody);
   // 串行闸的两条慢日志阈值。cnb 上游单次生成实测 30 秒上下，闸又是串行的，
   // 所以「等 30~50 秒」是**正常**的竞争结果、不是故障。默认值取在正常量级
   // 之上，只有真正卡住（闸被吊、上游挂起）才会记；两个都可用环境变量调。
-  const CNB_GATE_SLOW_WAIT_MS = Number(Deno.env.get("CNB_GATE_SLOW_WAIT_MS") ?? 60_000) || 60_000;
-  const CNB_GATE_SLOW_HOLD_MS = Number(Deno.env.get("CNB_GATE_SLOW_HOLD_MS") ?? 120_000) || 120_000;
+  const CNB_GATE_SLOW_WAIT_MS =
+    Number(Deno.env.get("CNB_GATE_SLOW_WAIT_MS") ?? 60_000) || 60_000;
+  const CNB_GATE_SLOW_HOLD_MS =
+    Number(Deno.env.get("CNB_GATE_SLOW_HOLD_MS") ?? 120_000) || 120_000;
   const prev = cnbGate;
   let release!: () => void;
   cnbGate = new Promise<void>((r) => (release = r));
@@ -1472,12 +1749,17 @@ async function cnbCallUpstream(upBody: any): Promise<Response> {
     // 记账，正常的十几到几十秒不再逐条输出。
     const held = Date.now() - t0;
     if (held > CNB_GATE_SLOW_HOLD_MS) {
-      console.warn(`[cnb-gate] fp=${fp} released after ${held}ms (slow hold; ${CNB_GATE_SLOW_HOLD_MS}ms threshold)`);
+      console.warn(
+        `[cnb-gate] fp=${fp} released after ${held}ms (slow hold; ${CNB_GATE_SLOW_HOLD_MS}ms threshold)`,
+      );
     }
     release();
   };
   // 安全阀：流挂死时 10 分钟强制放行，避免闸被永久占死（正常释放时清除，不留误报日志）
-  safety = setTimeout(() => { console.warn(`[cnb-gate] fp=${fp} safety release after 10min`); done(); }, 10 * 60 * 1000);
+  safety = setTimeout(() => {
+    console.warn(`[cnb-gate] fp=${fp} safety release after 10min`);
+    done();
+  }, 10 * 60 * 1000);
   const queuedAt = Date.now();
   await prev;
   const waited = Date.now() - queuedAt;
@@ -1491,7 +1773,9 @@ async function cnbCallUpstream(upBody: any): Promise<Response> {
   // 判据改成「等得明显超过一次正常生成的量级」：默认 60 秒。真正的异常等待
   // （闸被吊住、上游挂起）会远超这个数，仍然会被记下来。阈值在函数开头声明。
   if (waited > CNB_GATE_SLOW_WAIT_MS) {
-    console.warn(`[cnb-gate] fp=${fp} waited ${waited}ms for previous stream (slow; ${CNB_GATE_SLOW_WAIT_MS}ms threshold)`);
+    console.warn(
+      `[cnb-gate] fp=${fp} waited ${waited}ms for previous stream (slow; ${CNB_GATE_SLOW_WAIT_MS}ms threshold)`,
+    );
   }
   try {
     const resp = await cnbCallUpstreamInner(upBody);
@@ -1504,9 +1788,13 @@ async function cnbCallUpstream(upBody: any): Promise<Response> {
 
 function cnbUpstreamFail(status: number, errBody: string): Response {
   if ((status === 401 || /NOT_LOGIN/i.test(errBody)) && !cnbLoginCookies()) {
-    return cnbErr(status, "cnb requires login",
-      "cnb.cool 上游已要求登录。请登录 cnb.cool 后：F12 → Network → 任一 cnb.cool 请求 → 复制完整 Cookie 请求头，"
-      + "单行粘贴到 ai-proxy/cnb-login.txt（保存即热加载，无需重启）。上游原文: " + errBody.slice(0, 300));
+    return cnbErr(
+      status,
+      "cnb requires login",
+      "cnb.cool 上游已要求登录。请登录 cnb.cool 后：F12 → Network → 任一 cnb.cool 请求 → 复制完整 Cookie 请求头，" +
+        "单行粘贴到 ai-proxy/cnb-login.txt（保存即热加载，无需重启）。上游原文: " +
+        errBody.slice(0, 300),
+    );
   }
   return cnbErr(status, "Upstream error", errBody.slice(0, 500));
 }
@@ -1522,21 +1810,39 @@ async function cnbCallUpstreamInner(upBody: any): Promise<Response> {
       if (resp.status === 200) {
         const inspected = await inspectResponseBody(resp);
         if (inspected.timedOut) {
-          return cnbErr(504, "cnb returned headers but no response body", "response sniff deadline reached");
+          return cnbErr(
+            504,
+            "cnb returned headers but no response body",
+            "response sniff deadline reached",
+          );
         }
         if (inspected.shape === "sse") {
           return replayResponse(resp, inspected, "text/event-stream");
         }
         const text = await readInspectedText(inspected);
-        return cnbErr(502, "cnb returned a non-SSE response", text.slice(0, 500) || "empty response body");
+        return cnbErr(
+          502,
+          "cnb returned a non-SSE response",
+          text.slice(0, 500) || "empty response body",
+        );
       }
       last = resp;
       // 4xx（除 429）是确定性的，重试无意义，直接透传
-      if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) return resp;
-      console.warn(`[cnb] upstream ${resp.status}, retry ${i + 1}/${waits.length}`);
-      try { await resp.text(); } catch {} // 排空响应体再重试
+      if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+        return resp;
+      }
+      console.warn(
+        `[cnb] upstream ${resp.status}, retry ${i + 1}/${waits.length}`,
+      );
+      try {
+        await resp.text();
+      } catch {} // 排空响应体再重试
     } catch (e: any) {
-      console.warn(`[cnb] network error: ${e?.message || e}, retry ${i + 1}/${waits.length}`);
+      console.warn(
+        `[cnb] network error: ${e?.message || e}, retry ${
+          i + 1
+        }/${waits.length}`,
+      );
       // 网络层失败：刷新 CSRF 会话后重试
       cnbState.ts = 0;
     }
@@ -1558,25 +1864,33 @@ async function cnbCallUpstreamInner(upBody: any): Promise<Response> {
 // Responses 请求 → 内部 OpenAI chat 格式（随后走 cnbBuildUpstream 的 XYML 管线）
 function responsesToChat(rb: any) {
   const messages: any[] = [];
-  if (rb.instructions) messages.push({ role: "system", content: String(rb.instructions) });
+  if (rb.instructions) {
+    messages.push({ role: "system", content: String(rb.instructions) });
+  }
 
-  const items = Array.isArray(rb.input)
-    ? rb.input
-    : [{ type: "message", role: "user", content: [{ type: "input_text", text: String(rb.input ?? "") }] }];
+  const items = Array.isArray(rb.input) ? rb.input : [{
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: String(rb.input ?? "") }],
+  }];
 
   for (const item of items) {
     if (!item || typeof item !== "object") continue;
     const t = item.type || "message";
 
     if (t === "message") {
-      const role = item.role === "assistant" ? "assistant"
-        : item.role === "system" || item.role === "developer" ? "system"
+      const role = item.role === "assistant"
+        ? "assistant"
+        : item.role === "system" || item.role === "developer"
+        ? "system"
         : "user";
       let content: any = item.content;
       if (Array.isArray(content)) {
         content = content.map((p: any) => {
           if (p.type === "input_image") {
-            const url = typeof p.image_url === "string" ? p.image_url : p.image_url?.url || "";
+            const url = typeof p.image_url === "string"
+              ? p.image_url
+              : p.image_url?.url || "";
             return { type: "image_url", image_url: { url } };
           }
           // input_text / output_text / text 统一为 text 块
@@ -1595,7 +1909,9 @@ function responsesToChat(rb: any) {
           type: "function",
           function: {
             name: item.name || "unknown",
-            arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments ?? {}),
+            arguments: typeof item.arguments === "string"
+              ? item.arguments
+              : JSON.stringify(item.arguments ?? {}),
           },
         }],
       });
@@ -1603,13 +1919,19 @@ function responsesToChat(rb: any) {
       messages.push({
         role: "tool",
         tool_call_id: item.call_id || "call_unknown",
-        content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+        content: typeof item.output === "string"
+          ? item.output
+          : JSON.stringify(item.output ?? ""),
       });
     }
     // reasoning / item_reference 等其它 item 忽略
   }
 
-  const chat: any = { model: rb.model || "deepseek-v4.1-flash", messages, stream: !!rb.stream };
+  const chat: any = {
+    model: rb.model || "deepseek-v4.1-flash",
+    messages,
+    stream: !!rb.stream,
+  };
   // Responses 的 reasoning.effort 透传到 chat 形态，供 cnbBuildUpstream 读取
   if (rb.reasoning?.effort) chat.reasoning_effort = rb.reasoning.effort;
   if (rb.max_output_tokens) chat.max_tokens = rb.max_output_tokens;
@@ -1634,28 +1956,46 @@ function responsesToChat(rb: any) {
 function responsesUsage(u: any) {
   return {
     input_tokens: u.prompt_tokens || 0,
-    input_tokens_details: { cached_tokens: u.prompt_tokens_details?.cached_tokens || 0 },
+    input_tokens_details: {
+      cached_tokens: u.prompt_tokens_details?.cached_tokens || 0,
+    },
     output_tokens: u.completion_tokens || 0,
-    output_tokens_details: { reasoning_tokens: u.completion_tokens_details?.reasoning_tokens || 0 },
+    output_tokens_details: {
+      reasoning_tokens: u.completion_tokens_details?.reasoning_tokens || 0,
+    },
     total_tokens: u.total_tokens || 0,
   };
 }
 
 function responsesShell(id: string, createdAt: number, model: string, rb: any) {
   return (status: string, output: any[], error: any = null) => ({
-    id, object: "response", created_at: createdAt, status, error,
-    incomplete_details: null, instructions: rb.instructions ?? null,
+    id,
+    object: "response",
+    created_at: createdAt,
+    status,
+    error,
+    incomplete_details: null,
+    instructions: rb.instructions ?? null,
     max_output_tokens: rb.max_output_tokens ?? null,
-    model, output, parallel_tool_calls: rb.parallel_tool_calls ?? true,
-    temperature: rb.temperature ?? 1, tool_choice: rb.tool_choice ?? "auto",
-    tools: rb.tools ?? [], metadata: {}, store: false, usage: null as any,
+    model,
+    output,
+    parallel_tool_calls: rb.parallel_tool_calls ?? true,
+    temperature: rb.temperature ?? 1,
+    tool_choice: rb.tool_choice ?? "auto",
+    tools: rb.tools ?? [],
+    metadata: {},
+    store: false,
+    usage: null as any,
   });
 }
 
 async function handleCnbResponses(request: Request): Promise<Response> {
   let bodyText: string;
-  try { bodyText = await request.text(); }
-  catch (e: any) { return cnbErr(400, "Failed to read body", e.message); }
+  try {
+    bodyText = await request.text();
+  } catch (e: any) {
+    return cnbErr(400, "Failed to read body", e.message);
+  }
 
   const p = safeJsonParse(bodyText);
   if (p.error) return cnbErr(400, "Invalid JSON", p.error.message);
@@ -1668,20 +2008,33 @@ async function handleCnbResponses(request: Request): Promise<Response> {
   if (!wantStream) {
     const chatBody = responsesToChat(rb);
     let built;
-    try { built = cnbBuildUpstream(chatBody); }
-    catch (e: any) { return cnbErr(400, "Bad request", e.message); }
+    try {
+      built = cnbBuildUpstream(chatBody);
+    } catch (e: any) {
+      return cnbErr(400, "Bad request", e.message);
+    }
     const upBody = built.upstream;
 
     let upstreamResp: Response;
-    try { upstreamResp = await cnbCallUpstream(upBody); }
-    catch (e: any) { return cnbErr(502, "Upstream error", e.message); }
+    try {
+      upstreamResp = await cnbCallUpstream(upBody);
+    } catch (e: any) {
+      return cnbErr(502, "Upstream error", e.message);
+    }
     if (upstreamResp.status !== 200) {
       let errBody = "";
-      try { errBody = await upstreamResp.text(); } catch {}
+      try {
+        errBody = await upstreamResp.text();
+      } catch {}
       return cnbUpstreamFail(upstreamResp.status, errBody);
     }
 
-    const shell = responsesShell(respId, Math.floor(Date.now() / 1000), upBody.model, rb);
+    const shell = responsesShell(
+      respId,
+      Math.floor(Date.now() / 1000),
+      upBody.model,
+      rb,
+    );
     const textParts: string[] = [], thinkParts: string[] = [];
     let usage: any = null;
     try {
@@ -1693,29 +2046,49 @@ async function handleCnbResponses(request: Request): Promise<Response> {
         }
         if (chunk.usage) usage = chunk.usage;
       }
-    } catch (e: any) { return cnbErr(502, "Stream read error", e.message); }
+    } catch (e: any) {
+      return cnbErr(502, "Stream read error", e.message);
+    }
 
     const r1 = cnbParseToolCalls(thinkParts.join(""), chatBody.tools);
     const r2 = cnbParseToolCalls(textParts.join(""), chatBody.tools);
     const allCalls = [...r1.calls, ...r2.calls];
 
     const output: any[] = [];
-    if (r1.clean) output.push({ type: "reasoning", id: "rs_" + rand(), summary: [{ type: "summary_text", text: r1.clean }] });
-    if (r2.clean) output.push({
-      type: "message", id: "msg_" + rand(), status: "completed", role: "assistant",
-      content: [{ type: "output_text", text: r2.clean, annotations: [] }],
-    });
+    if (r1.clean) {
+      output.push({
+        type: "reasoning",
+        id: "rs_" + rand(),
+        summary: [{ type: "summary_text", text: r1.clean }],
+      });
+    }
+    if (r2.clean) {
+      output.push({
+        type: "message",
+        id: "msg_" + rand(),
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: r2.clean, annotations: [] }],
+      });
+    }
     for (const c of allCalls) {
       output.push({
-        type: "function_call", id: "fc_" + rand(), call_id: c.id,
-        name: c.function.name, arguments: c.function.arguments, status: "completed",
+        type: "function_call",
+        id: "fc_" + rand(),
+        call_id: c.id,
+        name: c.function.name,
+        arguments: c.function.arguments,
+        status: "completed",
       });
     }
 
     const resp = shell("completed", output);
     if (usage) resp.usage = responsesUsage(usage);
     return new Response(JSON.stringify(resp), {
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
     });
   }
 
@@ -1726,20 +2099,38 @@ async function handleCnbResponses(request: Request): Promise<Response> {
 
   (async () => {
     const writeEvent = (type: string, obj: any) =>
-      writer.write(enc.encode(`event: ${type}\ndata: ${JSON.stringify({ type, ...obj })}\n\n`));
+      writer.write(
+        enc.encode(
+          `event: ${type}\ndata: ${JSON.stringify({ type, ...obj })}\n\n`,
+        ),
+      );
 
-    let shell: any = responsesShell(respId, Math.floor(Date.now() / 1000), rb.model || "unknown", rb);
+    let shell: any = responsesShell(
+      respId,
+      Math.floor(Date.now() / 1000),
+      rb.model || "unknown",
+      rb,
+    );
     let hb: any = null;
 
     try {
       // 首字节立刻出，CF 拿到响应头就不 524
-      await writeEvent("response.created", { response: shell("in_progress", []) });
-      await writeEvent("response.in_progress", { response: shell("in_progress", []) });
+      await writeEvent("response.created", {
+        response: shell("in_progress", []),
+      });
+      await writeEvent("response.in_progress", {
+        response: shell("in_progress", []),
+      });
 
       const chatBody = responsesToChat(rb);
       const built = cnbBuildUpstream(chatBody);
       const upBody = built.upstream;
-      shell = responsesShell(respId, Math.floor(Date.now() / 1000), upBody.model, rb);
+      shell = responsesShell(
+        respId,
+        Math.floor(Date.now() / 1000),
+        upBody.model,
+        rb,
+      );
 
       // 等上游期间每 15 秒一个注释心跳
       hb = setInterval(() => {
@@ -1749,11 +2140,21 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       const upstreamResp = await cnbCallUpstream(upBody);
       if (upstreamResp.status !== 200) {
         let errBody = "";
-        try { errBody = await upstreamResp.text(); } catch {}
-        if ((upstreamResp.status === 401 || /NOT_LOGIN/i.test(errBody)) && !cnbLoginCookies()) {
-          throw new Error("cnb requires login: cnb.cool 已要求登录。F12 → Network → 任一 cnb.cool 请求 → 复制完整 Cookie 请求头，单行粘贴到 ai-proxy/cnb-login.txt（保存即热加载）。上游原文: " + errBody.slice(0, 200));
+        try {
+          errBody = await upstreamResp.text();
+        } catch {}
+        if (
+          (upstreamResp.status === 401 || /NOT_LOGIN/i.test(errBody)) &&
+          !cnbLoginCookies()
+        ) {
+          throw new Error(
+            "cnb requires login: cnb.cool 已要求登录。F12 → Network → 任一 cnb.cool 请求 → 复制完整 Cookie 请求头，单行粘贴到 ai-proxy/cnb-login.txt（保存即热加载）。上游原文: " +
+              errBody.slice(0, 200),
+          );
         }
-        throw new Error(`Upstream ${upstreamResp.status}: ${errBody.slice(0, 300)}`);
+        throw new Error(
+          `Upstream ${upstreamResp.status}: ${errBody.slice(0, 300)}`,
+        );
       }
 
       const rsId = "rs_" + rand();
@@ -1773,10 +2174,23 @@ async function handleCnbResponses(request: Request): Promise<Response> {
             if (out) {
               if (!thinkOpened) {
                 thinkOpened = true;
-                await writeEvent("response.output_item.added", { output_index: 0, item: { type: "reasoning", id: rsId, summary: [] } });
-                await writeEvent("response.reasoning_summary_part.added", { item_id: rsId, output_index: 0, summary_index: 0, part: { type: "summary_text", text: "" } });
+                await writeEvent("response.output_item.added", {
+                  output_index: 0,
+                  item: { type: "reasoning", id: rsId, summary: [] },
+                });
+                await writeEvent("response.reasoning_summary_part.added", {
+                  item_id: rsId,
+                  output_index: 0,
+                  summary_index: 0,
+                  part: { type: "summary_text", text: "" },
+                });
               }
-              await writeEvent("response.reasoning_summary_text.delta", { item_id: rsId, output_index: 0, summary_index: 0, delta: out });
+              await writeEvent("response.reasoning_summary_text.delta", {
+                item_id: rsId,
+                output_index: 0,
+                summary_index: 0,
+                delta: out,
+              });
             }
           }
           if (d.content) {
@@ -1785,10 +2199,29 @@ async function handleCnbResponses(request: Request): Promise<Response> {
               if (!textOpened) {
                 textOpened = true;
                 msgOI = thinkOpened ? 1 : 0;
-                await writeEvent("response.output_item.added", { output_index: msgOI, item: { type: "message", id: msgId, status: "in_progress", role: "assistant", content: [] } });
-                await writeEvent("response.content_part.added", { item_id: msgId, output_index: msgOI, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+                await writeEvent("response.output_item.added", {
+                  output_index: msgOI,
+                  item: {
+                    type: "message",
+                    id: msgId,
+                    status: "in_progress",
+                    role: "assistant",
+                    content: [],
+                  },
+                });
+                await writeEvent("response.content_part.added", {
+                  item_id: msgId,
+                  output_index: msgOI,
+                  content_index: 0,
+                  part: { type: "output_text", text: "", annotations: [] },
+                });
               }
-              await writeEvent("response.output_text.delta", { item_id: msgId, output_index: msgOI, content_index: 0, delta: out });
+              await writeEvent("response.output_text.delta", {
+                item_id: msgId,
+                output_index: msgOI,
+                content_index: 0,
+                delta: out,
+              });
             }
           }
         }
@@ -1803,28 +2236,79 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       let oi = 0;
 
       if (thinkOpened || r1.clean) {
-        const rem = r1.clean.slice(commonPrefixLen(r1.clean, thinkFilter.state.emitted));
-        if (rem) await writeEvent("response.reasoning_summary_text.delta", { item_id: rsId, output_index: 0, summary_index: 0, delta: rem });
+        const rem = r1.clean.slice(
+          commonPrefixLen(r1.clean, thinkFilter.state.emitted),
+        );
+        if (rem) {
+          await writeEvent("response.reasoning_summary_text.delta", {
+            item_id: rsId,
+            output_index: 0,
+            summary_index: 0,
+            delta: rem,
+          });
+        }
         const think = r1.clean;
-        await writeEvent("response.reasoning_summary_text.done", { item_id: rsId, output_index: 0, summary_index: 0, text: think });
-        await writeEvent("response.reasoning_summary_part.done", { item_id: rsId, output_index: 0, summary_index: 0, part: { type: "summary_text", text: think } });
-        const rsItem = { type: "reasoning", id: rsId, summary: think ? [{ type: "summary_text", text: think }] : [] };
-        await writeEvent("response.output_item.done", { output_index: 0, item: rsItem });
+        await writeEvent("response.reasoning_summary_text.done", {
+          item_id: rsId,
+          output_index: 0,
+          summary_index: 0,
+          text: think,
+        });
+        await writeEvent("response.reasoning_summary_part.done", {
+          item_id: rsId,
+          output_index: 0,
+          summary_index: 0,
+          part: { type: "summary_text", text: think },
+        });
+        const rsItem = {
+          type: "reasoning",
+          id: rsId,
+          summary: think ? [{ type: "summary_text", text: think }] : [],
+        };
+        await writeEvent("response.output_item.done", {
+          output_index: 0,
+          item: rsItem,
+        });
         finalOutput.push(rsItem);
         oi = 1;
       }
 
       if (textOpened || r2.clean) {
-        const rem = r2.clean.slice(commonPrefixLen(r2.clean, textFilter.state.emitted));
-        if (rem) await writeEvent("response.output_text.delta", { item_id: msgId, output_index: msgOI, content_index: 0, delta: rem });
+        const rem = r2.clean.slice(
+          commonPrefixLen(r2.clean, textFilter.state.emitted),
+        );
+        if (rem) {
+          await writeEvent("response.output_text.delta", {
+            item_id: msgId,
+            output_index: msgOI,
+            content_index: 0,
+            delta: rem,
+          });
+        }
         const text = r2.clean;
-        await writeEvent("response.output_text.done", { item_id: msgId, output_index: msgOI, content_index: 0, text });
-        await writeEvent("response.content_part.done", { item_id: msgId, output_index: msgOI, content_index: 0, part: { type: "output_text", text, annotations: [] } });
+        await writeEvent("response.output_text.done", {
+          item_id: msgId,
+          output_index: msgOI,
+          content_index: 0,
+          text,
+        });
+        await writeEvent("response.content_part.done", {
+          item_id: msgId,
+          output_index: msgOI,
+          content_index: 0,
+          part: { type: "output_text", text, annotations: [] },
+        });
         const msgItem = {
-          type: "message", id: msgId, status: "completed", role: "assistant",
+          type: "message",
+          id: msgId,
+          status: "completed",
+          role: "assistant",
           content: [{ type: "output_text", text, annotations: [] }],
         };
-        await writeEvent("response.output_item.done", { output_index: msgOI, item: msgItem });
+        await writeEvent("response.output_item.done", {
+          output_index: msgOI,
+          item: msgItem,
+        });
         finalOutput.push(msgItem);
         oi = msgOI + 1;
       }
@@ -1833,17 +2317,35 @@ async function handleCnbResponses(request: Request): Promise<Response> {
         for (const c of allCalls) {
           const fcId = "fc_" + rand();
           const item = {
-            type: "function_call", id: fcId, call_id: c.id,
-            name: c.function.name, arguments: c.function.arguments, status: "completed",
+            type: "function_call",
+            id: fcId,
+            call_id: c.id,
+            name: c.function.name,
+            arguments: c.function.arguments,
+            status: "completed",
           };
-          await writeEvent("response.output_item.added", { output_index: oi, item: { ...item, arguments: "" } });
+          await writeEvent("response.output_item.added", {
+            output_index: oi,
+            item: { ...item, arguments: "" },
+          });
           const args = c.function.arguments || "";
           // 一次性发出全部 arguments（不切片，最大化流式吞吐）
           if (args) {
-            await writeEvent("response.function_call_arguments.delta", { item_id: fcId, output_index: oi, delta: args });
+            await writeEvent("response.function_call_arguments.delta", {
+              item_id: fcId,
+              output_index: oi,
+              delta: args,
+            });
           }
-          await writeEvent("response.function_call_arguments.done", { item_id: fcId, output_index: oi, arguments: args });
-          await writeEvent("response.output_item.done", { output_index: oi, item });
+          await writeEvent("response.function_call_arguments.done", {
+            item_id: fcId,
+            output_index: oi,
+            arguments: args,
+          });
+          await writeEvent("response.output_item.done", {
+            output_index: oi,
+            item,
+          });
           finalOutput.push(item);
           oi++;
         }
@@ -1854,11 +2356,18 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       await writeEvent("response.completed", { response: final });
     } catch (e: any) {
       try {
-        await writeEvent("response.failed", { response: { ...shell("failed", []), error: { code: "upstream_error", message: e.message } } });
+        await writeEvent("response.failed", {
+          response: {
+            ...shell("failed", []),
+            error: { code: "upstream_error", message: e.message },
+          },
+        });
       } catch {}
     } finally {
       if (hb) clearInterval(hb);
-      try { await writer.close(); } catch {}
+      try {
+        await writer.close();
+      } catch {}
     }
   })();
 
@@ -1889,13 +2398,20 @@ async function handleCnbResponses(request: Request): Promise<Response> {
  */
 async function handleCnbMessages(request: Request): Promise<Response> {
   let raw = "";
-  try { raw = await request.text(); } catch (e: any) { return cnbErr(400, "Failed to read body", e.message); }
+  try {
+    raw = await request.text();
+  } catch (e: any) {
+    return cnbErr(400, "Failed to read body", e.message);
+  }
   const parsed = safeJsonParse(raw);
   if (parsed.error) return cnbErr(400, "Invalid JSON", parsed.error.message);
 
   let converted;
-  try { converted = anthropicMessagesToChat(parsed.data || {}); }
-  catch (e: any) { return cnbErr(400, "Bad request", e.message); }
+  try {
+    converted = anthropicMessagesToChat(parsed.data || {});
+  } catch (e: any) {
+    return cnbErr(400, "Bad request", e.message);
+  }
   if (!converted.ok) {
     return cnbErr(400, "Bad request", (converted as any).message);
   }
@@ -1905,7 +2421,14 @@ async function handleCnbMessages(request: Request): Promise<Response> {
   chatUrl.pathname = "/cnb/v1/chat/completions";
   const headers = new Headers();
   headers.set("Content-Type", "application/json");
-  for (const name of ["authorization", "x-api-key", "x-session-id", "x-conversation-id"]) {
+  for (
+    const name of [
+      "authorization",
+      "x-api-key",
+      "x-session-id",
+      "x-conversation-id",
+    ]
+  ) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
@@ -1928,18 +2451,212 @@ async function handleCnbMessages(request: Request): Promise<Response> {
 
   const text = await chatResponse.text().catch(() => "");
   let payload: unknown = null;
-  try { payload = JSON.parse(text); } catch { payload = null; }
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = null;
+  }
   if (!chatResponse.ok) {
     const message = payload && typeof payload === "object" &&
-      (payload as Record<string, any>).error?.message
+        (payload as Record<string, any>).error?.message
       ? String((payload as Record<string, any>).error.message)
       : "cnb upstream request failed";
     return cnbErr(chatResponse.status, "Upstream error", message);
   }
-  return new Response(JSON.stringify(chatResponseToAnthropic(payload, String(converted.body.model))), {
-    status: 200,
-    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+  return new Response(
+    JSON.stringify(
+      chatResponseToAnthropic(payload, String(converted.body.model)),
+    ),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
+    },
+  );
+}
+
+/**
+ * cnb 的会话压缩。Zen 的副本在 src/zen.ts:maybeCompactZen，这里是第二处接线。
+ *
+ * 三个和 Zen 不同的地方，每条都有实测依据：
+ *
+ * ① 分母不是 1M 上下文窗口，而是**请求体字节数**。cnb 上游的拒绝条件是
+ *    `413 [BODY_TOO_LARGE]`——2026-10-06 实测边界：1,048,169 B 通过、
+ *    1,049,193 B 起拒（≈1 MiB）。所以 contextWindow 用
+ *    `CNB_BODY_BUDGET_BYTES / 4` 折算成 compactIfNeeded 认识的 token 数。
+ *    用模型的 context window 会永远不触发——它比 1 MiB 大得多。
+ *
+ * ② 压缩**不设 keepTokens 上限以外的预算**：默认 keepTokens 8000 折成字符
+ *    约 32 KB，加摘要 4096 token（≈16 KB），离 1 MiB 很远，不会二次超限。
+ *
+ * ③ 摘要请求走本文件的 chat 路径（拼一个指向自己的 Request），这样串行闸、
+ *    退避重试、CSRF、工具协议全都自动生效。**不能直接 fetch 上游**——那会让
+ *    摘要请求绕过闸，和模型请求并发打同一个 cookie 会话（曾观测到跨会话
+ *    内容泄漏，AGENTS.md 有记）。
+ */
+const CNB_BODY_BUDGET_BYTES = 900 * 1024; // 1 MiB 留 128 KiB 给 envelope
+let cnbLastCompactNote = "";
+
+function cnbIntSetting(name: string, fallback: number): number {
+  const raw = Number(Deno.env.get(name));
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+function sessionIdOf(request: Request): string {
+  return request.headers.get("x-session-id") ??
+    request.headers.get("x-conversation-id") ??
+    "cnb-default";
+}
+
+/** 摘要写入器：走本代理自己的 cnb chat 路由，带上完整闸与重试。 */
+async function writeCnbSummary(
+  prompt: string,
+  model: string,
+  maxTokens: number,
+): Promise<string> {
+  const summaryBody = {
+    model: model || "deepseek-v4.1-flash",
+    max_tokens: maxTokens,
+    stream: true,
+    messages: [{ role: "user", content: prompt }],
+  };
+  const url = new URL("http://cnb.local/cnb/v1/chat/completions");
+  const req = new Request(url.toString(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      // 摘要必须是独立会话：与被压缩的会话共用 id 会让压缩状态互相覆盖
+      "x-session-id": `cnb-summary:${Date.now()}`,
+    },
+    body: JSON.stringify(summaryBody),
+    signal: AbortSignal.timeout(120_000),
   });
+  const resp = await handleCnb("/cnb/v1/chat/completions", req, url);
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => "");
+    throw new Error(
+      `summary request HTTP ${resp.status}: ${detail.slice(0, 120)}`,
+    );
+  }
+  // 非流式收集（stream:true 时上游回 SSE，这里由 cnb 分支自己聚合）
+  const text = await resp.text();
+  let content = "";
+  try {
+    for (const line of text.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      const payload = line.slice(6).trim();
+      if (payload === "" || payload === "[DONE]") continue;
+      const chunk = JSON.parse(payload);
+      const delta = chunk?.choices?.[0]?.delta;
+      if (delta?.content) content += delta.content;
+    }
+  } catch {
+    content = "";
+  }
+  if (content.trim() === "") {
+    throw new Error("summary response carried no content");
+  }
+  return content;
+}
+
+// 导出给 src/cnb.test.ts：压缩的判据（超预算才动、压缩后必须能过上游的
+// 1 MiB 线、尾部必须保留原文）只能对着它测。摘要写入器可注入，所以单测
+// 不打真上游。
+export async function maybeCompactCnb(
+  body: any,
+  session: string,
+  // 测试缝：单测必须能在不打上游的前提下走完压缩（打一次真摘要要 10 秒以上、
+  // 还要登录 cookie，放进套件会让 deno task test 从 2 秒变成几分钟）。
+  writeSummaryOverride?: (
+    prompt: string,
+    model: string,
+    maxTokens: number,
+  ) => Promise<string>,
+): Promise<void> {
+  const messages = body?.messages;
+  if (!Array.isArray(messages) || messages.length === 0) return;
+  if (Deno.env.get("CNB_COMPACTION") === "off") return;
+
+  // 用**实际编码后的字节数**估，而不是字符数：base64 图片一头就占掉大半个
+  // 预算，字符数会把它算成 1/4（这正是 Zen 那边踩过的：估算跳过 image_url）。
+  let bytes = 0;
+  let json = "";
+  try {
+    json = JSON.stringify(body);
+    bytes = new TextEncoder().encode(json).length;
+  } catch {
+    return;
+  }
+  const budget = cnbIntSetting("CNB_BODY_BUDGET_BYTES", CNB_BODY_BUDGET_BYTES);
+  if (bytes <= budget) return;
+
+  // ★ 摘要请求自身的体积上限。
+  //
+  // 这是本功能最容易失败的地方：compactIfNeeded 会把**被丢弃的那段历史原文**
+  // 全部拼进摘要 prompt。用户那个 1.2 MiB 的会话，head 就有 1 MiB 上下——摘要
+  // 请求一样会被上游 413，压缩永远失败，死锁原样不动。
+  //
+  // 所以在把 messages 交给 compactIfNeeded 之前，先把**头部**（头部=要被总结的
+  // 那段）逐条截到 CNB_SUMMARY_MSG_CHARS，让 prompt 的体积有界。
+  // 关键在于**不能截尾部**：尾部是原样保留给模型的，截了就丢真话。
+  const summaryMsgChars = cnbIntSetting("CNB_COMPACTION_MSG_CHARS", 600);
+  const serialized = messages.map((m: any) =>
+    m && typeof m === "object" ? serializeMessage(m) : ""
+  );
+  const selection = selectTail(
+    serialized,
+    cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000),
+  );
+  const headSplit = selection?.split ?? messages.length;
+  const forSummary = messages.map((m: any, i: number) => {
+    if (i >= headSplit || !m || typeof m !== "object") return m;
+    if (typeof m.content !== "string" || m.content.length <= summaryMsgChars) {
+      return m;
+    }
+    return {
+      ...m,
+      content: m.content.slice(0, summaryMsgChars) +
+        "\n[truncated for summary]",
+    };
+  });
+
+  const result = await compactIfNeeded({
+    messages: forSummary,
+    // ★ 这里**故意**让内部阈值必然通过。内部判据是 `JSON 字符数 / 4`，
+    // 而上游限的是**字节**：中文一字符三字节，于是一个 1.2 MiB 的中文会话
+    // 在内部估算里只有 ~100 K token，永远够不到阈值——压缩静默不触发，
+    // 上游照样 413。字节判据才是权威的，所以闸门由上面的 `bytes <= budget`
+    // 做，这里把 contextWindow 设成刚好低于估算值，让内部检查同意我的判断。
+    body,
+    contextWindow: Math.max(1, Math.floor(json.length / 4) + 4096 - 1),
+    maxOutputTokens: 4096,
+    sessionId: `cnb:${session}`,
+    config: {
+      keepTokens: cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000),
+      buffer: cnbIntSetting("CNB_COMPACTION_BUFFER", 20000),
+      maxSummaryTokens: cnbIntSetting("CNB_COMPACTION_MAX_SUMMARY", 4096),
+      summaryModel: String(Deno.env.get("CNB_COMPACTION_SUMMARY_MODEL") || ""),
+    },
+    writeSummary: writeSummaryOverride ?? writeCnbSummary,
+  });
+
+  if (result.changed) {
+    body.messages = result.messages;
+    const after = new TextEncoder().encode(JSON.stringify(body)).length;
+    cnbLastCompactNote = `compacted ${result.note} session=${session} ` +
+      `bytes ${bytes} -> ${after} cost≈${result.compactTokens}`;
+    return;
+  }
+  // 摘要失败：降级成截断。**仍然要说一句**——静默丢历史比丢历史更糟。
+  if (result.note === "summary-failed") {
+    const truncated = fallbackTruncate(messages, Math.floor(budget / 4));
+    body.messages = truncated.messages;
+    const after = new TextEncoder().encode(JSON.stringify(body)).length;
+    cnbLastCompactNote = `${truncated.note} session=${session} ` +
+      `(summary generation failed) bytes ${bytes} -> ${after}`;
+  }
 }
 
 export async function handleCnb(path: string, request: Request, url: URL) {
@@ -1964,21 +2681,50 @@ export async function handleCnb(path: string, request: Request, url: URL) {
 
   if (path.endsWith("/models") && request.method === "GET") {
     return new Response(JSON.stringify({ object: "list", data: CNB_MODELS }), {
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+      },
     });
   }
 
   if (path.endsWith("/chat/completions") && request.method === "POST") {
     let bodyText: string;
-    try { bodyText = await request.text(); }
-    catch (e: any) { return cnbErr(400, "Failed to read body", e.message); }
+    try {
+      bodyText = await request.text();
+    } catch (e: any) {
+      return cnbErr(400, "Failed to read body", e.message);
+    }
 
     const p = safeJsonParse(bodyText);
     if (p.error) return cnbErr(400, "Invalid JSON", p.error.message);
 
+    // ★ 会话压缩：必须在 cnbBuildUpstream **之前**改写 p.data.messages。
+    //
+    // Zen 那条已经踩过这个坑并记在 AGENTS.md 里：compress 之后再构造 upstream，
+    // 否则改写后的 messages 根本不会进入实际请求。cnb 这边起因是 2026-10-06
+    // 用户的会话涨到 89 轮/576M token，请求体超过上游 1 MiB 硬限（实测：
+    // 1,048,169 B 通过、1,049,193 B 起 413 `[BODY_TOO_LARGE]`），而 harness
+    // 自己的压缩请求同样超限——它得发一次模型调用来写摘要。死锁：
+    //     上下文 1.2 MiB → 压缩它要发请求 → 请求体同样 > 1 MiB → 413 → 压不掉
+    //
+    // 打破它的办法是让摘要请求**远小于** 1 MiB：只送被压缩掉的那段历史
+    // （compactIfNeeded 自己选定的 head），而不是整个 transcript。
+    await maybeCompactCnb(p.data, sessionIdOf(request));
+    if (Array.isArray(p.data?.messages)) {
+      // 压缩失败也要说一句：静默截断会让用户以为历史还在。
+      if (cnbLastCompactNote) {
+        console.warn(`[cnb] ${cnbLastCompactNote}`);
+        cnbLastCompactNote = "";
+      }
+    }
+
     let built;
-    try { built = cnbBuildUpstream(p.data || {}); }
-    catch (e: any) { return cnbErr(400, "Bad request", e.message); }
+    try {
+      built = cnbBuildUpstream(p.data || {});
+    } catch (e: any) {
+      return cnbErr(400, "Bad request", e.message);
+    }
 
     const { upstream: upBody, hasTools } = built;
     const wantStream = !!(p.data && p.data.stream);
@@ -1986,21 +2732,32 @@ export async function handleCnb(path: string, request: Request, url: URL) {
     // 统一走 cnbCallUpstream：串行闸 + 1MiB 预检 + 退避重试 + flash→pro 兜底
     // （替代原先手写的"网络错重试一次/非 200 刷新 csrf 再试一次"）
     let upstreamResp: Response | null = null;
-    try { upstreamResp = await cnbCallUpstream(upBody); }
-    catch (e: any) { return cnbErr(502, "Upstream error", e.message); }
+    try {
+      upstreamResp = await cnbCallUpstream(upBody);
+    } catch (e: any) {
+      return cnbErr(502, "Upstream error", e.message);
+    }
     if (upstreamResp.status !== 200) {
       let errBody = "";
-      try { errBody = await upstreamResp.text(); } catch {}
+      try {
+        errBody = await upstreamResp.text();
+      } catch {}
       return cnbUpstreamFail(upstreamResp.status, errBody);
     }
 
     // ─── 非流式 ───
     if (!wantStream) {
       const textParts: string[] = [], thinkParts: string[] = [];
-      let id: any = null, created = Math.floor(Date.now() / 1000), finish = "stop", usage: any = null;
+      let id: any = null,
+        created = Math.floor(Date.now() / 1000),
+        finish = "stop",
+        usage: any = null;
       try {
         for await (const chunk of cnbIter(upstreamResp)) {
-          if (id == null) { id = chunk.id; created = chunk.created || created; }
+          if (id == null) {
+            id = chunk.id;
+            created = chunk.created || created;
+          }
           for (const ch of chunk.choices || []) {
             const d = ch.delta || {};
             if (d.content) textParts.push(d.content);
@@ -2009,7 +2766,9 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           }
           if (chunk.usage) usage = chunk.usage;
         }
-      } catch (e: any) { return cnbErr(502, "Stream read error", e.message); }
+      } catch (e: any) {
+        return cnbErr(502, "Stream read error", e.message);
+      }
 
       const fullText = textParts.join("");
       const fullThink = thinkParts.join("");
@@ -2043,7 +2802,10 @@ export async function handleCnb(path: string, request: Request, url: URL) {
       };
       if (usage) resp.usage = usage;
       return new Response(JSON.stringify(resp), {
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        },
       });
     }
 
@@ -2058,10 +2820,14 @@ export async function handleCnb(path: string, request: Request, url: URL) {
       let finish = "stop";
       let usage: any = null;
 
-      const write = (obj: any) => writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      const write = (obj: any) =>
+        writer.write(enc.encode(`data: ${JSON.stringify(obj)}\n\n`));
       const emit = (delta: any) =>
         write({
-          id: chatId, object: "chat.completion.chunk", created, model: upBody.model,
+          id: chatId,
+          object: "chat.completion.chunk",
+          created,
+          model: upBody.model,
           choices: [{ index: 0, delta, finish_reason: null }],
         });
 
@@ -2069,12 +2835,17 @@ export async function handleCnb(path: string, request: Request, url: URL) {
         // ─── 无 tools：逐 chunk 直通，每个 delta 立即转发 ───
         if (!hasTools) {
           for await (const chunk of cnbIter(upstreamResp!)) {
-            if (chatId == null) { chatId = chunk.id || "chatcmpl-" + Date.now(); created = chunk.created || created; }
+            if (chatId == null) {
+              chatId = chunk.id || "chatcmpl-" + Date.now();
+              created = chunk.created || created;
+            }
             for (const ch of chunk.choices || []) {
               if (ch.finish_reason) finish = ch.finish_reason;
               const d = ch.delta || {};
               if (d.role) await emit({ role: d.role });
-              if (d.reasoning_content) await emit({ reasoning_content: d.reasoning_content });
+              if (d.reasoning_content) {
+                await emit({ reasoning_content: d.reasoning_content });
+              }
               if (d.content) await emit({ content: d.content });
             }
             if (chunk.usage) usage = chunk.usage;
@@ -2085,7 +2856,10 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           const thinkFilter = createLiveFilter();
 
           for await (const chunk of cnbIter(upstreamResp!)) {
-            if (chatId == null) { chatId = chunk.id || "chatcmpl-" + Date.now(); created = chunk.created || created; }
+            if (chatId == null) {
+              chatId = chunk.id || "chatcmpl-" + Date.now();
+              created = chunk.created || created;
+            }
             for (const ch of chunk.choices || []) {
               const d = ch.delta || {};
               if (ch.finish_reason) finish = ch.finish_reason;
@@ -2106,10 +2880,14 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           const allCalls = [...r1.calls, ...r2.calls];
 
           // 尾段 = 清理后的全文 − 已实时发出的前缀（扣住的标记段 + 标记之后的正文）
-          const thinkRem = r1.clean.slice(commonPrefixLen(r1.clean, thinkFilter.state.emitted));
+          const thinkRem = r1.clean.slice(
+            commonPrefixLen(r1.clean, thinkFilter.state.emitted),
+          );
           if (thinkRem) await emit({ reasoning_content: thinkRem });
 
-          const textRem = r2.clean.slice(commonPrefixLen(r2.clean, textFilter.state.emitted));
+          const textRem = r2.clean.slice(
+            commonPrefixLen(r2.clean, textFilter.state.emitted),
+          );
           if (textRem) await emit({ content: textRem });
 
           if (allCalls.length) {
@@ -2118,7 +2896,10 @@ export async function handleCnb(path: string, request: Request, url: URL) {
             for (let i = 0; i < allCalls.length; i++) {
               const c = allCalls[i];
               await write({
-                id: chatId, object: "chat.completion.chunk", created, model: upBody.model,
+                id: chatId,
+                object: "chat.completion.chunk",
+                created,
+                model: upBody.model,
                 choices: [{
                   index: 0,
                   delta: {
@@ -2137,10 +2918,15 @@ export async function handleCnb(path: string, request: Request, url: URL) {
             for (let i = 0; i < allCalls.length; i++) {
               const args = allCalls[i].function.arguments || "";
               await write({
-                id: chatId, object: "chat.completion.chunk", created, model: upBody.model,
+                id: chatId,
+                object: "chat.completion.chunk",
+                created,
+                model: upBody.model,
                 choices: [{
                   index: 0,
-                  delta: { tool_calls: [{ index: i, function: { arguments: args } }] },
+                  delta: {
+                    tool_calls: [{ index: i, function: { arguments: args } }],
+                  },
                   finish_reason: null,
                 }],
               });
@@ -2149,17 +2935,27 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           }
         }
 
-        const tail: any = { id: chatId, object: "chat.completion.chunk", created, model: upBody.model, choices: [{ index: 0, delta: {}, finish_reason: finish }] };
+        const tail: any = {
+          id: chatId,
+          object: "chat.completion.chunk",
+          created,
+          model: upBody.model,
+          choices: [{ index: 0, delta: {}, finish_reason: finish }],
+        };
         if (usage) tail.usage = usage;
         await write(tail);
         await writer.write(enc.encode("data: [DONE]\n\n"));
       } catch (e: any) {
         try {
-          await write({ error: { message: e.message, type: "upstream_error" } });
+          await write({
+            error: { message: e.message, type: "upstream_error" },
+          });
           await writer.write(enc.encode("data: [DONE]\n\n"));
         } catch {}
       } finally {
-        try { await writer.close(); } catch {}
+        try {
+          await writer.close();
+        } catch {}
       }
     })();
 
@@ -2181,9 +2977,12 @@ export async function handleCnb(path: string, request: Request, url: URL) {
   //
   // 清单必须和上面的分支一致：写过 "messages is NOT served" 之后我就给它加了
   // 路由，那句话于是变成假的——**文案是实现的一部分**，改分支要回来改它。
-  return cnbErr(404, "Not found",
-    "cnb serves: GET /models, POST /chat/completions, POST /responses, "
-    + "POST /messages (Anthropic Messages shape). "
-    + "Check the path for a duplicated /v1 segment — /cnb/v1/v1/messages also "
-    + "matches, so a duplicate is not what breaks it.");
+  return cnbErr(
+    404,
+    "Not found",
+    "cnb serves: GET /models, POST /chat/completions, POST /responses, " +
+      "POST /messages (Anthropic Messages shape). " +
+      "Check the path for a duplicated /v1 segment — /cnb/v1/v1/messages also " +
+      "matches, so a duplicate is not what breaks it.",
+  );
 }
