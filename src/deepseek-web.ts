@@ -19,6 +19,7 @@ import {
   type ToolSchemaLike,
   TranscriptEchoGuard,
 } from "../third_party/dsh-deepseek-web-login/src/protocol.ts";
+import { CachedCredential } from "./credential-source.ts";
 
 // ============================================
 // DeepSeek 网页聊天端集成模块
@@ -30,6 +31,19 @@ const DEEPSEEK_WEB_COOKIE_FILE = "./deepseek-cookies.txt";
 const DEEPSEEK_WEB_AUTH_FILE = "./deepseek-auth.txt";
 const DEEPSEEK_WEB_HEADERS_FILE = "./deepseek-headers.json";
 const DEEPSEEK_WEB_COOLDOWN_FILE = "./deepseek-web-cooldown.json";
+
+// ★ 云上没有工作目录，所以每份凭据都必须有环境变量这一路。
+//
+// 命名与 cnb 的 `CNB_LOGIN_COOKIES` 保持同一套规则（`<渠道>_<东西>`），
+// 让用户在控制台里填的时候不用猜。值的形状与对应文件**逐字相同**：
+// 直接把文件内容整段粘进去即可，包括 Netscape cookies.txt 那种 tab 分列的
+// 形态——`normalizeCnbCookies` 同款的归一化在这里也照做。
+const DEEPSEEK_WEB_COOKIE_ENV = "DEEPSEEK_WEB_COOKIES";
+const DEEPSEEK_WEB_AUTH_ENV = "DEEPSEEK_WEB_AUTH";
+const DEEPSEEK_WEB_HEADERS_ENV = "DEEPSEEK_WEB_HEADERS";
+// 冷却状态是**写**回文件的（`deepseekWebSaveCooldown`）。云上没有可写的
+// 持久盘，所以它只进内存：同一实例内仍然有效，实例重启就丢。
+// 这比"写不进去就当没发生"好——限流期间至少本实例会拦住后续请求。
 const DEEPSEEK_MAX_PROMPT_CHARS = 200_000;
 const DEEPSEEK_MAX_REF_IMAGES = 24;
 const DEEPSEEK_SESSION_REUSE_TURNS = (() => {
@@ -49,62 +63,84 @@ let deepseekWebSessionSlot: DeepSeekSessionSlot | undefined;
 const deepseekWebState: any = {
   chatSessionId: null,
   cookies: "",
-  mtime: null,
   auth: "",
-  authMtime: null,
   headers: {},
-  headersMtime: null,
 };
 
-function deepseekWebLoadCookies(): string {
-  let st: Deno.FileInfo | null = null;
-  try {
-    st = Deno.statSync(DEEPSEEK_WEB_COOKIE_FILE);
-  } catch (e) {
-    console.log("[deepseek-web] stat error:", e);
-    return "";
-  }
-  if (!st?.isFile) {
-    console.log("[deepseek-web] not a file");
-    return "";
-  }
-  const mtime = st.mtime?.getTime() ?? 0;
-  if (deepseekWebState.mtime === mtime) return deepseekWebState.cookies;
-  let raw = "";
-  try {
-    raw = Deno.readTextFileSync(DEEPSEEK_WEB_COOKIE_FILE).trim();
-  } catch {}
-  if (!raw) return "";
-  // 支持 Netscape cookies.txt 格式
-  if (raw.includes("\t")) {
-    raw = raw.split(String.fromCharCode(10)).filter((l) =>
-      l && l.includes("\t")
-    ).map((l) => {
+/**
+ * 归一化 cookie 文本：支持浏览器直接粘的 `k=v; k=v`，也支持 Netscape
+ * `cookies.txt`（tab 分列）。
+ *
+ * 两种形状**同一个来源**会出现：用户在浏览器里 F12 复制得到前者，用导出插件
+ * 得到后者。环境变量这一路会让人更容易粘 tab 分列的那种（整文件全选复制），
+ * 所以这段必须在两条来源上都跑。
+ */
+function normalizeDeepseekCookies(raw: string): string {
+  if (!raw.includes("\t")) return raw;
+  return raw.split(String.fromCharCode(10))
+    .filter((l) => l && l.includes("\t"))
+    .map((l) => {
       const c = l.split("\t");
       return c.length >= 7 ? c[5] + "=" + c[6] : "";
-    }).filter(Boolean).join("; ");
+    })
+    .filter(Boolean)
+    .join("; ");
+}
+
+// 环境变量优先，文件兜底；云端没有工作目录，只靠文件会一律「未登录」。
+// 缓存键是「来源 + mtime」，文件没变时只 stat 不读。
+const deepseekWebCookieSource = new CachedCredential(
+  DEEPSEEK_WEB_COOKIE_ENV,
+  DEEPSEEK_WEB_COOKIE_FILE,
+);
+const deepseekWebAuthSource = new CachedCredential(
+  DEEPSEEK_WEB_AUTH_ENV,
+  DEEPSEEK_WEB_AUTH_FILE,
+);
+const deepseekWebHeadersSource = new CachedCredential(
+  DEEPSEEK_WEB_HEADERS_ENV,
+  DEEPSEEK_WEB_HEADERS_FILE,
+);
+
+function describeSource(source: string, envName: string, file: string) {
+  return source === "env" ? envName : file.replace(/^\.\//, "");
+}
+
+function deepseekWebLoadCookies(): string {
+  const found = deepseekWebCookieSource.load();
+  if (found.changed) {
+    deepseekWebState.chatSessionId = null;
+    deepseekWebState.cookies = normalizeDeepseekCookies(found.value);
+    if (found.value) {
+      console.log(
+        "[deepseek-web] loaded cookies from " +
+          describeSource(
+            found.source,
+            DEEPSEEK_WEB_COOKIE_ENV,
+            DEEPSEEK_WEB_COOKIE_FILE,
+          ),
+      );
+    }
   }
-  deepseekWebState.mtime = mtime;
-  deepseekWebState.cookies = raw.replace(/\r/g, "");
-  console.log("[deepseek-web] loaded cookies from deepseek-cookies.txt");
   return deepseekWebState.cookies;
 }
 
 function deepseekWebLoadAuth(): string {
-  try {
-    const st = Deno.statSync(DEEPSEEK_WEB_AUTH_FILE);
-    if (!st.isFile) return "";
-    const mtime = st.mtime?.getTime() ?? 0;
-    if (deepseekWebState.authMtime !== mtime) {
-      const auth = Deno.readTextFileSync(DEEPSEEK_WEB_AUTH_FILE).trim();
-      if (auth && auth !== deepseekWebState.auth) {
-        deepseekWebState.chatSessionId = null;
-      }
-      deepseekWebState.auth = auth;
-      deepseekWebState.authMtime = mtime;
-      console.log("[deepseek-web] loaded Bearer token from deepseek-auth.txt");
+  const found = deepseekWebAuthSource.load();
+  if (found.changed) {
+    deepseekWebState.chatSessionId = null;
+    deepseekWebState.auth = found.value;
+    if (found.value) {
+      console.log(
+        "[deepseek-web] loaded Bearer token from " +
+          describeSource(
+            found.source,
+            DEEPSEEK_WEB_AUTH_ENV,
+            DEEPSEEK_WEB_AUTH_FILE,
+          ),
+      );
     }
-  } catch {}
+  }
   return deepseekWebState.auth;
 }
 
@@ -269,32 +305,30 @@ function deepseekWebRequestHeaders(
 }
 
 function deepseekWebLoadHeaders(): Record<string, string> {
-  try {
-    const st = Deno.statSync(DEEPSEEK_WEB_HEADERS_FILE);
-    if (!st.isFile) return deepseekWebState.headers || {};
-    const mtime = st.mtime?.getTime() ?? 0;
-    if (deepseekWebState.headersMtime !== mtime) {
-      const parsed = safeJsonParse(
-        Deno.readTextFileSync(DEEPSEEK_WEB_HEADERS_FILE),
-      );
-      const allowed = [
-        "x-hif-dliq",
-        "x-hif-leim",
-        "x-client-platform",
-        "x-client-version",
-        "x-app-version",
-        "accept-language",
-        "user-agent",
-      ];
-      const source = parsed.error ? {} : (parsed.data || {});
-      deepseekWebState.headers = Object.fromEntries(
-        allowed.filter((key) => typeof source[key] === "string").map((
-          key,
-        ) => [key, source[key]]),
-      );
-      deepseekWebState.headersMtime = mtime;
-    }
-  } catch {}
+  const allowed = [
+    "x-hif-dliq",
+    "x-hif-leim",
+    "x-client-platform",
+    "x-client-version",
+    "x-app-version",
+    "accept-language",
+    "user-agent",
+  ];
+  const found = deepseekWebHeadersSource.load();
+  if (!found.changed) return deepseekWebState.headers || {};
+
+  const parsed = found.value ? safeJsonParse(found.value) : { error: true };
+  const source = parsed.error ? {} : ((parsed as any).data || {});
+  deepseekWebState.headers = Object.fromEntries(
+    allowed.filter((key) => typeof source[key] === "string").map((
+      key,
+    ) => [key, source[key]]),
+  );
+  if (found.source === "env") {
+    console.log(
+      `[deepseek-web] loaded browser headers from ${DEEPSEEK_WEB_HEADERS_ENV}`,
+    );
+  }
   return deepseekWebState.headers || {};
 }
 
@@ -304,7 +338,16 @@ async function deepseekSolvePow(
   challenge: DeepSeekPowChallenge,
 ): Promise<number> {
   if (!deepseekWasmExports) {
-    const bytes = await Deno.readFile("./deepseek-sha3.wasm");
+    // ★ 用**相对模块的 URL**，不用 `./deepseek-sha3.wasm`。
+    //
+    // 裸相对路径是按**进程工作目录**解析的，而这个项目的部署形态有三种：
+    // 本地 `deno run -A main.ts`（cwd=仓库，恰好对）、Deno Deploy（没有 cwd，
+    // 但 `new URL(..., import.meta.url)` 能定位到已部署的静态文件）、容器
+    // （cwd 由平台决定，`WORKDIR` 与仓库根未必一致）。只有模块相对 URL 在三种
+    // 形态下都指向同一个文件——`import.meta.url` 是模块自己的位置。
+    const bytes = await Deno.readFile(
+      new URL("../deepseek-sha3.wasm", import.meta.url),
+    );
     const module = await WebAssembly.instantiate(bytes, {});
     deepseekWasmExports = module.instance.exports;
   }
@@ -1164,6 +1207,17 @@ function deepseekWebLoadCooldown(): number {
   return deepseekWebBlockedUntil > Date.now() ? deepseekWebBlockedUntil : 0;
 }
 
+/**
+ * 把冷却状态落盘。
+ *
+ * 云端**写不进去**（容器文件系统临时、Deno Deploy 只读），这里的 `catch` 就是
+ * 那条路径——**不是吞错，而是刻意降级**：内存里的 `deepseekWebBlockedUntil`
+ * 仍然生效，同一实例在冷却期内照旧拦截后续请求。代价只有「实例重启后忘记冷却」
+ * 这一条，而重启后又本来会重新探测一次上游。
+ *
+ * 不给它加环境变量之类的替代持久化：冷却是个**会自愈的短时状态**，为它引入
+ * 外部存储（KV/Redis）不值得——限流结束时它自己就过期了。
+ */
 function deepseekWebSaveCooldown(reason: string): void {
   try {
     Deno.writeTextFileSync(
@@ -1174,7 +1228,7 @@ function deepseekWebSaveCooldown(reason: string): void {
         updatedAt: new Date().toISOString(),
       }),
     );
-  } catch {}
+  } catch { /* 云端只读/临时盘：内存态照常生效，见上面的说明 */ }
 }
 
 function deepseekWebTripCircuit(

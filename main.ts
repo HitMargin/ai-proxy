@@ -17,6 +17,7 @@ import {
   handleCustom,
   isCustomPath,
 } from "./src/custom-handler.ts";
+import { envBackedStore } from "./src/credential-source.ts";
 import { CNB_MODELS, handleCnb } from "./src/cnb.ts";
 import { readJsonBodyLimited } from "./src/deepseek-responses.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
@@ -33,6 +34,7 @@ import {
   isTraeExpired,
   readTraeCredential,
   refreshTraeIfNeeded,
+  type TraeCredential,
 } from "./src/trae-account.ts";
 import {
   fetchTraeCatalog,
@@ -84,6 +86,52 @@ const TRAE_ROOT = (() => {
 // Same resolution as TRAE_ROOT, same reason: the login script writes the
 // credential next to the sources, so picking it up must not require a restart.
 const WORKBUDDY_ROOT = TRAE_ROOT;
+
+// ---------- 凭据来源：环境变量优先，文件兜底 ----------
+//
+// trae 与 workbuddy 的读写是**注入**的，所以在这里分流即可，两个模块内部一行
+// 不用动、它们的单测也继续用假 read。
+//
+// 为什么必须有环境变量这一路：Deno Deploy 与容器平台**没有工作目录**，
+// `TRAE_ROOT` 在那边是空串，`Deno.readTextFile("/trae-auth.json")` 必然失败。
+// 于是这两个渠道在本地好好的、一上云就静默变成「未登录」。
+//
+// 续期结果进内存覆盖层（见 `envBackedStore`），否则环境变量那份过期令牌会被
+// 每个请求重新读到、重新续期一次。
+const traeStore = envBackedStore("TRAE_AUTH_JSON", {
+  read: Deno.readTextFile,
+  write: Deno.writeTextFile,
+});
+const workBuddyStore = envBackedStore("WORKBUDDY_AUTH_JSON", {
+  read: Deno.readTextFile,
+  write: Deno.writeTextFile,
+});
+
+/** 读 TRAE 凭据并在需要时续期；返回**续期后**的那份，续期失败则原样返回。 */
+async function loadFreshTraeCredential(
+  label: string,
+): Promise<TraeCredential | undefined> {
+  const credential = await readTraeCredential(TRAE_ROOT, traeStore.read);
+  if (credential === undefined) return undefined;
+  try {
+    const refreshed = await refreshTraeIfNeeded(
+      TRAE_ROOT,
+      credential,
+      fetch,
+      Date.now(),
+      traeStore.write,
+    );
+    if (refreshed !== undefined) return refreshed;
+  } catch (error) {
+    // 非致命：让上游决定。过期 token 和没有 token 失败方式一样，
+    // 而把一个换成另一个只会掩盖真正的原因。
+    console.warn(
+      "[trae] " + label + " failed:",
+      error instanceof Error ? error.message : error,
+    );
+  }
+  return credential;
+}
 // ---------- 鉴权 ----------
 function checkAuth(request: Request) {
   const authHeader = request.headers.get("authorization");
@@ -377,18 +425,10 @@ async function loadTraeCatalog(force = false): Promise<TraeModel[]> {
   // 在飞请求共享一个 Promise：面板每 10 秒轮询一次，不共享就是每次都打上游。
   if (traeCatalog.loading !== null) return await traeCatalog.loading;
   const pending = (async () => {
-    const credential = await readTraeCredential(TRAE_ROOT);
+    const credential = await loadFreshTraeCredential("token refresh");
     if (credential === undefined) {
       throw new Error(
         "no TRAE credential. run: deno run -A .tmp-trae-login.ts",
-      );
-    }
-    try {
-      await refreshTraeIfNeeded(TRAE_ROOT, credential);
-    } catch (error) {
-      console.warn(
-        "[trae] token refresh failed:",
-        error instanceof Error ? error.message : error,
       );
     }
     const models = await fetchTraeCatalog(credential);
@@ -462,19 +502,9 @@ async function handleTrae(path: string, request: Request): Promise<Response> {
       }, 400);
     }
 
-    const credential = await readTraeCredential(TRAE_ROOT);
+    const credential = await loadFreshTraeCredential("pre-chat refresh");
     if (credential === undefined) {
       return jsonResponse({ error: "no TRAE credential" }, 409);
-    }
-    try {
-      await refreshTraeIfNeeded(TRAE_ROOT, credential);
-    } catch (error) {
-      // 非致命：让上游决定。过期 token 和没有 token 失败方式一样，
-      // 而把一个换成另一个只会掩盖真正的原因。
-      console.warn(
-        "[trae] pre-chat refresh failed:",
-        error instanceof Error ? error.message : error,
-      );
     }
     try {
       return await handleTraeChat(credential, model, body);
@@ -516,22 +546,34 @@ async function loadWorkBuddyCatalog(force = false): Promise<WorkBuddyModel[]> {
   }
   if (workBuddyCatalog.loading !== null) return await workBuddyCatalog.loading;
   const pending = (async () => {
-    const credential = await readWorkBuddyCredential(WORKBUDDY_ROOT);
+    const credential = await readWorkBuddyCredential(
+      WORKBUDDY_ROOT,
+      workBuddyStore.read,
+    );
     workBuddyCatalog.configured = credential !== undefined;
     if (credential === undefined) {
       throw new Error(
         "no WorkBuddy credential. run: deno run -A .tmp-workbuddy-login.ts (opens a browser)",
       );
     }
+    let current = credential;
     try {
-      await refreshWorkBuddyIfNeeded(WORKBUDDY_ROOT, credential);
+      const refreshed = await refreshWorkBuddyIfNeeded(
+        WORKBUDDY_ROOT,
+        credential,
+        fetch,
+        Date.now(),
+        undefined,
+        workBuddyStore.write,
+      );
+      if (refreshed !== undefined) current = refreshed;
     } catch (error) {
       console.warn(
         "[workbuddy] token refresh failed:",
         error instanceof Error ? error.message : error,
       );
     }
-    const models = await fetchWorkBuddyModels(credential);
+    const models = await fetchWorkBuddyModels(current);
     if (models.length === 0) {
       throw new Error(
         workBuddyCatalog.models.length > 0
@@ -629,7 +671,10 @@ async function handleWorkBuddy(
   }
 
   if (path === "/workbuddy/v1/account" && request.method === "GET") {
-    const credential = await readWorkBuddyCredential(WORKBUDDY_ROOT);
+    const credential = await readWorkBuddyCredential(
+      WORKBUDDY_ROOT,
+      workBuddyStore.read,
+    );
     if (credential === undefined) {
       return jsonResponse({
         configured: false,
@@ -702,7 +747,10 @@ async function handleWorkBuddy(
       );
     }
 
-    const credential = await readWorkBuddyCredential(WORKBUDDY_ROOT);
+    const credential = await readWorkBuddyCredential(
+      WORKBUDDY_ROOT,
+      workBuddyStore.read,
+    );
     if (credential === undefined) {
       const missing = workBuddyLocalError(
         409,
@@ -719,6 +767,10 @@ async function handleWorkBuddy(
       const refreshed = await refreshWorkBuddyIfNeeded(
         WORKBUDDY_ROOT,
         current,
+        fetch,
+        Date.now(),
+        undefined,
+        workBuddyStore.write,
       );
       if (refreshed !== undefined) current = refreshed;
     } catch (error) {
@@ -827,7 +879,11 @@ async function handleWorkBuddy(
           try {
             const revived = await refreshWorkBuddyCredential(current);
             current = revived;
-            await writeWorkBuddyCredential(WORKBUDDY_ROOT, revived);
+            await writeWorkBuddyCredential(
+              WORKBUDDY_ROOT,
+              revived,
+              workBuddyStore.write,
+            );
             upstream = await postWorkBuddyChat(
               current,
               payload,
@@ -1410,7 +1466,10 @@ export async function handler(request: Request): Promise<Response> {
       (path === "/trae/v1/account" && request.method === "GET") ||
       (path === "/trae/v1/checkin" && request.method === "POST")
     ) {
-      const credential = await readTraeCredential(TRAE_ROOT);
+      // Refresh a day before expiry, so a long-idle proxy does not answer every
+      // call with 401. A failure here is not fatal: keep the current credential
+      // and let the upstream decide - replacing it with nothing hides the reason.
+      const credential = await loadFreshTraeCredential("token refresh");
       if (credential === undefined) {
         return new Response(
           JSON.stringify({
@@ -1425,17 +1484,6 @@ export async function handler(request: Request): Promise<Response> {
               "Access-Control-Allow-Origin": "*",
             },
           },
-        );
-      }
-      // Refresh a day before expiry, so a long-idle proxy does not answer every
-      // call with 401. A failure here is not fatal: keep the current credential
-      // and let the upstream decide - replacing it with nothing hides the reason.
-      try {
-        await refreshTraeIfNeeded(TRAE_ROOT, credential);
-      } catch (error) {
-        console.warn(
-          "[trae] token refresh failed:",
-          error instanceof Error ? error.message : error,
         );
       }
       if (path === "/trae/v1/account") {
@@ -2035,14 +2083,32 @@ export async function handler(request: Request): Promise<Response> {
 
 // 本地 Deno 直跑入口（Workers 里 Deno 未定义，自动跳过；Workers 入口见 worker.ts）
 if (typeof Deno !== "undefined") {
-  const serveOptions: { port: number; hostname?: string } = {
-    port: Number(Deno.env.get("PORT") ?? 8000),
-  };
-  try {
-    if (!Deno.env.get("DENO_DEPLOYMENT_ID")) {
-      serveOptions.hostname = "127.0.0.1";
+  // 绑哪个地址由「谁在跑」决定，默认是本地那个私密的回环地址：
+  //
+  // - 本地直跑：127.0.0.1。代理里存着好几个账号的令牌，不该顺手对同网段敞开。
+  // - Deno Deploy：平台自己在前面对接，不传 hostname。
+  // - 容器（Render / Docker）：**必须** 0.0.0.0，否则容器外的健康检查与流量都
+  //   连不上，表现是「部署成功但一直 502」。
+  //
+  // ★ 判据**不能**是「PORT 被设置了」：DSH 插件拉起本地代理时总会注入 PORT
+  //   （设置页的「端口」），按 PORT 判会把日常本地代理对整个局域网敞开。
+  //   所以只认显式的 `HOST`，以及 Render 自己注入的 `RENDER`。
+  const env = (name: string): string | undefined => {
+    try {
+      return Deno.env.get(name) || undefined;
+    } catch {
+      return undefined; // 没给 --allow-env 的本地运行
     }
-  } catch {
+  };
+  const serveOptions: { port: number; hostname?: string } = {
+    port: Number(env("PORT") ?? 8000),
+  };
+  const explicitHost = env("HOST");
+  if (explicitHost) {
+    serveOptions.hostname = explicitHost;
+  } else if (env("RENDER")) {
+    serveOptions.hostname = "0.0.0.0";
+  } else if (!env("DENO_DEPLOYMENT_ID")) {
     serveOptions.hostname = "127.0.0.1";
   }
   Deno.serve(serveOptions, handler);

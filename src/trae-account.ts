@@ -502,9 +502,10 @@ export async function refreshTraeIfNeeded(
   credential: TraeCredential,
   fetcher: TraeFetcher = fetch,
   nowMs: number = Date.now(),
+  write: TraeWriteFile = Deno.writeTextFile,
 ): Promise<TraeCredential | undefined> {
   if (!needsTraeRefresh(credential, nowMs)) return undefined;
   const refreshed = await refreshTraeCredential(credential, fetcher, nowMs);
-  await writeTraeCredential(root, refreshed);
+  await writeTraeCredential(root, refreshed, write);
   return refreshed;
 }

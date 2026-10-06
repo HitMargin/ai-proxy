@@ -356,6 +356,9 @@ node dsh-plugin/self-test.mjs   # 插件的自检（不联网、不碰真实配�
 | `AI_PROXY_CUSTOM_PROVIDERS` | 否 | 自定义供应商表（JSON 数组）。**含明文 apiKey**，由 DSH 插件注入，也可自己设 |
 | `AI_PROXY_CUSTOM_FILE` | 否 | 自定义供应商配置文件的改道路径，默认工作目录下的 `custom-providers.json` |
 | `CNB_LOGIN_COOKIES` | 否 | cnb 登录态，**并列于 `cnb-login.txt` 且优先于它**。云端部署（Deno Deploy）用它——那边没有工作目录、读不到文件，不配就一律 `401 cnb requires login` |
+| `DEEPSEEK_WEB_COOKIES` / `DEEPSEEK_WEB_AUTH` / `DEEPSEEK_WEB_HEADERS` | 否 | deepseek-web 三份登录态，分别对应 `deepseek-cookies.txt` / `deepseek-auth.txt` / `deepseek-headers.json`，**优先于文件**，值就是文件内容原样粘贴 |
+| `TRAE_AUTH_JSON` / `WORKBUDDY_AUTH_JSON` | 否 | `trae-auth.json` / `workbuddy-auth.json` 的内容，**优先于文件**。续期后的新令牌只留在内存（不写回文件），进程重启后从这里重新续期 |
+| `HOST` | 否 | 监听地址。默认 `127.0.0.1`（只设 `PORT` 不会改变它——DSH 插件总会注入 `PORT`）；容器部署设 `0.0.0.0`。检测到 Render 注入的 `RENDER` 时自动用 `0.0.0.0` |
 | `COMMANDCODE_ADMIN_KEY` | 否 | CommandCode 管理接口独立密钥；设置后需通过 `X-CommandCode-Admin-Key` 发送 |
 | `COMMANDCODE_API_KEY` | 否 | CommandCode Go 账号 key；账号池为空时作为单账号兜底 |
 | `COMMANDCODE_BASE_URL` | 否 | CommandCode 网关地址，默认 `https://api.commandcode.ai`；非 loopback 必须 HTTPS |
