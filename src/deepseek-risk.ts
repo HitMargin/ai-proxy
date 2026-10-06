@@ -25,7 +25,9 @@ const state: RiskState = {
 const WINDOW_MS = 5 * 60_000;
 
 function prune(now: number): void {
-  state.recentRequests = state.recentRequests.filter((at) => now - at < WINDOW_MS);
+  state.recentRequests = state.recentRequests.filter((at) =>
+    now - at < WINDOW_MS
+  );
 }
 
 export function noteDeepSeekRequest(promptChars: number): void {
@@ -42,7 +44,10 @@ export function noteDeepSeekSuccess(): void {
   state.lastSuccessAt = Date.now();
 }
 
-export function noteDeepSeekRestriction(reason: string, durationMs: number): void {
+export function noteDeepSeekRestriction(
+  reason: string,
+  durationMs: number,
+): void {
   const until = Date.now() + durationMs;
   state.restrictedUntil = Math.max(state.restrictedUntil, until);
   state.restrictionReason = reason;
@@ -85,7 +90,9 @@ export function getDeepSeekRiskSnapshot(): DeepSeekRiskSnapshot {
   }
   if (cooldownRemainingMs > 0) {
     score = Math.max(score, 85);
-    factors.push(`上游限制冷却中：${Math.ceil(cooldownRemainingMs / 60_000)} 分钟`);
+    factors.push(
+      `上游限制冷却中：${Math.ceil(cooldownRemainingMs / 60_000)} 分钟`,
+    );
   }
   if (state.lastSuccessAt > 0 && now - state.lastSuccessAt > 30 * 60_000) {
     score += 5;
@@ -94,7 +101,13 @@ export function getDeepSeekRiskSnapshot(): DeepSeekRiskSnapshot {
   if (factors.length === 0) factors.push("暂无明显异常请求模式");
 
   score = Math.max(0, Math.min(100, Math.round(score)));
-  const riskLevel: DeepSeekRiskLevel = score >= 85 ? "critical" : score >= 60 ? "high" : score >= 30 ? "moderate" : "low";
+  const riskLevel: DeepSeekRiskLevel = score >= 85
+    ? "critical"
+    : score >= 60
+    ? "high"
+    : score >= 30
+    ? "moderate"
+    : "low";
   return {
     riskScore: score,
     riskLevel,
@@ -105,7 +118,8 @@ export function getDeepSeekRiskSnapshot(): DeepSeekRiskSnapshot {
     lastPromptChars: state.lastPromptChars,
     cooldownRemainingMs,
     factors,
-    disclaimer: "这是基于本地请求行为的启发式风险分数，不是 DeepSeek 官方封号概率。",
+    disclaimer:
+      "这是基于本地请求行为的启发式风险分数，不是 DeepSeek 官方封号概率。",
     updatedAt: new Date(now).toISOString(),
   };
 }

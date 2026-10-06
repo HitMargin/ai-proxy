@@ -37,8 +37,15 @@ export async function acquireDeepseekGate(): Promise<() => void> {
   }
   if (consecutiveRequests >= LONG_RUN_THRESHOLD) {
     consecutiveRequests = 0;
-    waitMs = Math.max(waitMs, randomDelay(LONG_RUN_BREAK_MIN_MS, LONG_RUN_BREAK_MAX_MS));
-    console.warn(`[deepseek-gate] long-run protection: pausing ${Math.round(waitMs / 1000)}s`);
+    waitMs = Math.max(
+      waitMs,
+      randomDelay(LONG_RUN_BREAK_MIN_MS, LONG_RUN_BREAK_MAX_MS),
+    );
+    console.warn(
+      `[deepseek-gate] long-run protection: pausing ${
+        Math.round(waitMs / 1000)
+      }s`,
+    );
   }
   if (waitMs > 0) await sleep(waitMs);
 
