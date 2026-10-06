@@ -830,8 +830,13 @@ Deno.test("older images are pulled from history so the body stops growing", () =
   );
 
   const { images, placeholders } = countImages(up);
-  assertEquals(images, 2, "only the newest two images survive");
-  assertEquals(placeholders, 3, "each dropped image leaves a placeholder");
+  // 每张图约 507 KiB，而图片预算是 256 KiB —— 所以只留得下**一张**。
+  // 这条曾经写死 2，是按张数丢的旧实现留下的；改成按字节后它就是错的。
+  assertEquals(images, 1, "only the newest image fits the byte budget");
+  assert(
+    placeholders >= 1,
+    "each dropped image leaves a placeholder, got " + placeholders,
+  );
 });
 
 Deno.test("a transcript that fits is left completely alone", () => {
@@ -857,5 +862,72 @@ Deno.test("the placeholder says what happened instead of silently vanishing", ()
   assert(
     text.includes("较早的图片已从上下文"),
     "the model must be told an image was removed",
+  );
+});
+
+// ─── A/B：图片预算按**字节**记，不是按张数 ───
+//
+// 第一版按"保留最新 2 张"实现，被用户当场打回：他那两张图叫
+// imgbig1_1196x899.png / imgbig2_1246x406.png，**最新两张自己就超 1 MiB** ——
+// "保留最新 2 张"于是精确保留了超限的那两张，丢旧图一点用没有。
+// 413 由字节数决定，不由张数决定，所以预算就得按字节记。
+
+function sizedImage(b64Bytes: number) {
+  return {
+    type: "image_url",
+    image_url: { url: "data:image/png;base64," + "A".repeat(b64Bytes) },
+  };
+}
+function sizedHistory(images: any[]) {
+  const messages: any[] = [{ role: "system", content: "sys" }];
+  for (let i = 0; i < images.length; i++) {
+    messages.push({
+      role: "user",
+      content: [{ type: "text", text: "第 " + i + " 张" }, images[i]],
+    });
+    messages.push({ role: "assistant", content: "看过了" });
+  }
+  messages.push({ role: "user", content: "总结" });
+  return { model: "cnb/deepseek-v4.1-flash", max_tokens: 64, messages };
+}
+
+Deno.test("two large images do not both survive - the older one is dropped", () => {
+  // 这是旧实现的真实漏洞：按张数留 2 张 = 留下两张 400KB 的，必然 413。
+  const up = cnbBuildUpstream(
+    sizedHistory([sizedImage(400 * 1024), sizedImage(400 * 1024)]),
+  ).upstream;
+  const { images } = countImages(up);
+  assertEquals(images, 1, "two 400 KiB images must not both be sent");
+  const bytes = new TextEncoder().encode(JSON.stringify(up)).length;
+  assert(bytes < 1048576, "body must fit, got " + bytes);
+});
+
+Deno.test("many small images survive together - the budget is bytes, not count", () => {
+  // 对照组：按张数丢会把这 20 张砍到 2 张。按字节丢应该留下 10 张以上。
+  const many = Array.from({ length: 20 }, () => sizedImage(20 * 1024));
+  const up = cnbBuildUpstream(sizedHistory(many)).upstream;
+  const { images } = countImages(up);
+  assert(
+    images > 5,
+    "small images within budget must not be discarded by a count rule, kept " +
+      images,
+  );
+  const bytes = new TextEncoder().encode(JSON.stringify(up)).length;
+  assert(bytes < 1048576, "body must fit, got " + bytes);
+});
+
+Deno.test("an image too large to send is refused with the real reason", () => {
+  // 丢无可丢时让上游回 413 是不够的：那句话只说 "Request body too large"，
+  // 看不出是谁占的，harness 还会重试 2 次把同样的字节再传一遍。
+  const thrown = capture(() =>
+    cnbBuildUpstream(sizedHistory([sizedImage(1200 * 1024)]))
+  );
+  assert(
+    /exceeds the upstream/.test(thrown),
+    "must name the real cause: " + thrown,
+  );
+  assert(
+    /Nothing was sent upstream/.test(thrown),
+    "must say nothing was sent: " + thrown,
   );
 });

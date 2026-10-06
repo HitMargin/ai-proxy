@@ -1347,13 +1347,22 @@ export function cnbBuildUpstream(openaiBody: any) {
   const rawMsgs = openaiBody.messages || [];
   if (!rawMsgs.length) throw new Error("messages is required");
 
-  // ★ 只保留最近 N 张图，更早的换成占位文字。
+  // ★ 历史里的图片按**累计字节**保留，超预算的更早图片换成占位文字。
   //
-  // 起因（2026-10-06 用户截图）：读了几张图之后每一轮都 413 [BODY_TOO_LARGE]。
+  // 起因（2026-10-06 用户截图两次）：读了几张图之后每一轮都 413 [BODY_TOO_LARGE]。
   // 根因是**图片在历史里累积**——DSH 把图作为 user 消息的 image_url 块放进
   // messages，而 messages 是整段历史，**每轮请求都要重发全部**。实测：一张
   // 400KB 的图 base64 后约 533KB，第 3 轮就到 1.18 MiB，而上游硬限约 1 MiB
-  // （实测 1,048,169 过 / 1,049,193 拒）。所以 1~2 张图就到顶。
+  // （实测 1,048,169 过 / 1,049,193 拒）。
+  //
+  // **第一版按"张数"丢，被用户当场打回**：用户那两张图叫 `imgbig1_1196x899.png`
+  // / `imgbig2_1246x406.png`，最新两张**自己就超了 1 MiB** —— "保留最新 2 张"
+  // 于是精确地保留了超限的那两张，丢旧图一点用没有。判据错了：
+  // **413 由字节数决定，不由张数决定**，所以预算就得按字节记。
+  //
+  // 现在从最新往回累加，每张图的**编码后字节**记账，累计超过预算就停；
+  // 更早的全部换成占位文字。这样"最新两张都很大"会自动只留一张，
+  // "每张都很小"则能留很多张——预算恒定，与张数无关。
   //
   // 为什么是"替换"而不是"删除整条消息"：模型需要知道**自己当时看过一张图**，
   // 否则历史会出现"我根据一张图得出了结论，但上下文里没有任何图"的断裂，
@@ -1362,23 +1371,38 @@ export function cnbBuildUpstream(openaiBody: any) {
   // 为什么删除要带可见的说明：这**改变了模型看到的历史**。静默截断正是本项目
   // 反复在删的那种缺陷（AGENTS.md 里 "静默零" / "静默回退" 那一类），所以
   // 占位文字同时是给模型看的、也是给将来排查的人看的。
-  const CNB_MAX_HISTORY_IMAGES = (() => {
-    const raw = Number(Deno.env.get("CNB_MAX_HISTORY_IMAGES"));
-    return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+  //
+  // 预算留出余量：上游限的是**整个请求体**（含文本、工具定义、envelope），
+  // 所以图片不能吃掉全部 1 MiB。256 KiB 给图片，其余留给文本——文本太大时
+  // 那由会话压缩（maybeCompactCnb）负责，两个机制各治一种膨胀。
+  const CNB_IMAGE_BUDGET_BYTES = (() => {
+    const raw = Number(Deno.env.get("CNB_IMAGE_BUDGET_BYTES"));
+    return Number.isFinite(raw) && raw > 0 ? raw : 256 * 1024;
   })();
-  // 从最新往回数，标出要保留的那几张；其余位置记下来（键是消息下标）
+  const imageBytes = (block: any): number => {
+    const url = typeof block?.image_url === "string"
+      ? block.image_url
+      : block?.image_url?.url;
+    return typeof url === "string" ? new TextEncoder().encode(url).length : 0;
+  };
+  // 从最新往回累加，标出留在预算内的那几张
   const keptImageSlots = new Set<string>();
   {
-    let seen = 0;
+    let used = 0;
     for (let i = rawMsgs.length - 1; i >= 0; i--) {
       const content = rawMsgs[i]?.content;
       if (!Array.isArray(content)) continue;
       for (let j = content.length - 1; j >= 0; j--) {
         if (content[j]?.type !== "image_url") continue;
-        if (seen < CNB_MAX_HISTORY_IMAGES) {
-          keptImageSlots.add(`${i}:${j}`);
-          seen++;
+        const cost = imageBytes(content[j]);
+        // 第一张无条件留：一张都不发的话，用户"刚发的图"就消失了，
+        // 那是比 413 更糟的结果（他看不到任何图，却没有任何提示）。
+        // 单张就超预算的情况由上游的 413 如实回答，不由我们猜。
+        if (keptImageSlots.size > 0 && used + cost > CNB_IMAGE_BUDGET_BYTES) {
+          continue;
         }
+        keptImageSlots.add(`${i}:${j}`);
+        used += cost;
       }
     }
   }
@@ -1399,12 +1423,48 @@ export function cnbBuildUpstream(openaiBody: any) {
       i++;
     }
   }
+  // 留下那几张图的总字节数：两处都要用（日志、以及下面的"装不下"判定）
+  const keptBytes = [...keptImageSlots].reduce((acc, slot) => {
+    const [mi, pi] = slot.split(":").map(Number);
+    return acc + imageBytes(rawMsgs[mi]?.content?.[pi]);
+  }, 0);
+
   if (droppedImageSlots.size > 0) {
     console.warn(
       `[cnb] dropped ${droppedImageSlots.size} older image(s) from history ` +
-        `(keeping the newest ${CNB_MAX_HISTORY_IMAGES}; upstream body limit is ~1 MiB). ` +
-        `Tune with CNB_MAX_HISTORY_IMAGES.`,
+        `(kept ${keptImageSlots.size} within ${
+          (CNB_IMAGE_BUDGET_BYTES / 1024).toFixed(0)
+        } KiB, ` +
+        `actual ${
+          (keptBytes / 1024).toFixed(0)
+        } KiB; upstream body limit is ~1 MiB). ` +
+        `Tune with CNB_IMAGE_BUDGET_BYTES.`,
     );
+  }
+
+  // ★ 丢完还是装不下：说清是图太大，而不是让上游回一句 413 [BODY_TOO_LARGE]。
+  //
+  // 判据：**留下的那几张图的字节数本身就超了预算**，而它们已经是最新的、
+  // 删无可删（第一张无条件保留——把用户刚发的图悄悄丢掉比报错更糟）。
+  // 也就是说这份请求**注定发不出去**，此时唯一的出路是让用户把图压小。
+  //
+  // 为什么值得单独报错：上游的 413 只说 "Request body too large"，看不出
+  // 是谁占的；harness 还会把它当 TRANSPORT **重试 2 次**，每次都把同样
+  // 几百 KB 再传一遍。用户 2026-10-06 两次截图都是这个形状——报错和原因
+  // 完全对不上，他只能靠猜。
+  if (keptImageSlots.size > 0) {
+    // 阈值取 1 MiB 减去一点余量：低于它就是图片自己把上游的线占满了，
+    // 文本那边已经没有空间可让，交由这里判定更准确。
+    const HARD_LIMIT = 1024 * 1024;
+    if (keptBytes + 64 * 1024 > HARD_LIMIT) {
+      const kb = (keptBytes / 1024).toFixed(0);
+      throw new Error(
+        `cnb: the image(s) still in this request are ~${kb} KiB after removing older ones, ` +
+          `which alone exceeds the upstream's ~1 MiB body limit. ` +
+          `Resize/recompress the image (JPEG quality ~75 is usually enough) and send it again. ` +
+          `Nothing was sent upstream.`,
+      );
+    }
   }
 
   let msgIndex = -1;
