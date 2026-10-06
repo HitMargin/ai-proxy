@@ -770,3 +770,92 @@ Deno.test("a transcript under the budget is left completely alone", async () => 
     "a small transcript must be untouched",
   );
 });
+
+// ─── 历史里的旧图片要移出，否则每轮都会 413 ───
+//
+// 2026-10-06 用户报「图片读取多了他炸了」：读几张图之后每一轮都 413
+// [BODY_TOO_LARGE]。根因是**图片在历史里累积**——DSH 把图作为 user 消息的
+// image_url 块放进 messages，而 messages 是整段历史，每轮都要重发全部。
+// 实测：400KB 的图 base64 后约 533KB，第 3 轮就到 1.18 MiB，而上游硬限约
+// 1 MiB（1,048,169 过 / 1,049,193 拒）。
+
+const BIG_IMG = "data:image/png;base64," + "A".repeat(380 * 1024);
+
+function imageHistory(turns: number) {
+  const messages: any[] = [{ role: "system", content: "sys" }];
+  for (let i = 1; i <= turns; i++) {
+    messages.push({
+      role: "user",
+      content: [{ type: "text", text: "第 " + i + " 张" }, {
+        type: "image_url",
+        image_url: { url: BIG_IMG },
+      }],
+    });
+    messages.push({ role: "assistant", content: "看过了" });
+  }
+  messages.push({ role: "user", content: "总结" });
+  return { model: "cnb/deepseek-v4.1-flash", max_tokens: 64, messages };
+}
+
+function countImages(up: any) {
+  let images = 0;
+  let placeholders = 0;
+  for (const m of up.messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const p of m.content) {
+      if (p.type === "image_url") images++;
+      if (
+        p.type === "text" &&
+        String(p.text ?? "").includes("较早的图片已从上下文")
+      ) placeholders++;
+    }
+  }
+  return { images, placeholders };
+}
+
+Deno.test("older images are pulled from history so the body stops growing", () => {
+  // 判据是**发出的字节数**，不是"有没有调用某个函数"：413 由字节数决定。
+  const body = imageHistory(5);
+  const raw = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(
+    raw > 1048576,
+    "the fixture must actually exceed the upstream limit, got " + raw,
+  );
+
+  const up = cnbBuildUpstream(body).upstream;
+  const sent = new TextEncoder().encode(JSON.stringify(up)).length;
+  assert(
+    sent < 1048576,
+    "the outgoing body must fit under ~1 MiB, got " + sent,
+  );
+
+  const { images, placeholders } = countImages(up);
+  assertEquals(images, 2, "only the newest two images survive");
+  assertEquals(placeholders, 3, "each dropped image leaves a placeholder");
+});
+
+Deno.test("a transcript that fits is left completely alone", () => {
+  // 对照组：没超限就不许动。缺了它，无条件砍图也能让上一条通过。
+  const body = imageHistory(1);
+  const up = cnbBuildUpstream(body).upstream;
+  const { images, placeholders } = countImages(up);
+  assertEquals(images, 1, "a single image must be sent untouched");
+  assertEquals(placeholders, 0, "nothing may be replaced when there is room");
+});
+
+Deno.test("the placeholder says what happened instead of silently vanishing", () => {
+  // 静默截断是本项目反复在删的那类缺陷：模型不知道图没了会怀疑自己的历史，
+  // 排查的人也不知道曾经发生过什么。
+  const up = cnbBuildUpstream(imageHistory(4)).upstream;
+  let text = "";
+  for (const m of up.messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const p of m.content) {
+      if (p.type === "text") text += String(p.text ?? "");
+    }
+  }
+  assert(
+    text.includes("较早的图片已从上下文"),
+    "the model must be told an image was removed",
+  );
+});

@@ -1347,7 +1347,69 @@ export function cnbBuildUpstream(openaiBody: any) {
   const rawMsgs = openaiBody.messages || [];
   if (!rawMsgs.length) throw new Error("messages is required");
 
+  // ★ 只保留最近 N 张图，更早的换成占位文字。
+  //
+  // 起因（2026-10-06 用户截图）：读了几张图之后每一轮都 413 [BODY_TOO_LARGE]。
+  // 根因是**图片在历史里累积**——DSH 把图作为 user 消息的 image_url 块放进
+  // messages，而 messages 是整段历史，**每轮请求都要重发全部**。实测：一张
+  // 400KB 的图 base64 后约 533KB，第 3 轮就到 1.18 MiB，而上游硬限约 1 MiB
+  // （实测 1,048,169 过 / 1,049,193 拒）。所以 1~2 张图就到顶。
+  //
+  // 为什么是"替换"而不是"删除整条消息"：模型需要知道**自己当时看过一张图**，
+  // 否则历史会出现"我根据一张图得出了结论，但上下文里没有任何图"的断裂，
+  // 它可能开始怀疑自己的历史。占位文字保住这个事实，只丢掉字节。
+  //
+  // 为什么删除要带可见的说明：这**改变了模型看到的历史**。静默截断正是本项目
+  // 反复在删的那种缺陷（AGENTS.md 里 "静默零" / "静默回退" 那一类），所以
+  // 占位文字同时是给模型看的、也是给将来排查的人看的。
+  const CNB_MAX_HISTORY_IMAGES = (() => {
+    const raw = Number(Deno.env.get("CNB_MAX_HISTORY_IMAGES"));
+    return Number.isFinite(raw) && raw >= 0 ? raw : 2;
+  })();
+  // 从最新往回数，标出要保留的那几张；其余位置记下来（键是消息下标）
+  const keptImageSlots = new Set<string>();
+  {
+    let seen = 0;
+    for (let i = rawMsgs.length - 1; i >= 0; i--) {
+      const content = rawMsgs[i]?.content;
+      if (!Array.isArray(content)) continue;
+      for (let j = content.length - 1; j >= 0; j--) {
+        if (content[j]?.type !== "image_url") continue;
+        if (seen < CNB_MAX_HISTORY_IMAGES) {
+          keptImageSlots.add(`${i}:${j}`);
+          seen++;
+        }
+      }
+    }
+  }
+  const droppedImageSlots = new Set<string>();
+  {
+    let i = 0;
+    for (const m of rawMsgs) {
+      const content = m?.content;
+      if (Array.isArray(content)) {
+        for (let j = 0; j < content.length; j++) {
+          if (
+            content[j]?.type === "image_url" && !keptImageSlots.has(`${i}:${j}`)
+          ) {
+            droppedImageSlots.add(`${i}:${j}`);
+          }
+        }
+      }
+      i++;
+    }
+  }
+  if (droppedImageSlots.size > 0) {
+    console.warn(
+      `[cnb] dropped ${droppedImageSlots.size} older image(s) from history ` +
+        `(keeping the newest ${CNB_MAX_HISTORY_IMAGES}; upstream body limit is ~1 MiB). ` +
+        `Tune with CNB_MAX_HISTORY_IMAGES.`,
+    );
+  }
+
+  let msgIndex = -1;
   const msgs = rawMsgs.map((m: any) => {
+    msgIndex++;
     const role = (m.role || "").toLowerCase();
 
     // 归一化 content
@@ -1381,14 +1443,32 @@ export function cnbBuildUpstream(openaiBody: any) {
               "is rejected upstream with code 11135. Read the attachment bytes and inline them.",
           );
         }
-        c = parts.map((p: any) =>
-          p.type === "text" ? { type: "text", text: p.text || "" } : {
+        // 带原始下标过滤，这样能拿 `${msgIndex}:${原始下标}` 对上"要不要丢"。
+        // 用 filter 的返回值下标会错位——filter 会丢掉非法块。
+        const keptParts: Array<{ p: any; originalIndex: number }> = [];
+        c.forEach((p: any, originalIndex: number) => {
+          if (p && (p.type === "text" || p.type === "image_url")) {
+            keptParts.push({ p, originalIndex });
+          }
+        });
+        c = keptParts.map(({ p, originalIndex }) => {
+          if (p.type === "text") return { type: "text", text: p.text || "" };
+          if (droppedImageSlots.has(`${msgIndex}:${originalIndex}`)) {
+            // 占位文字要保住"当时确实有一张图"这个事实，同时说清它被移出了
+            // ——模型据此不会怀疑自己的历史，排查的人也能看出发生过什么。
+            return {
+              type: "text",
+              text: "[一张较早的图片已从上下文中移出以控制请求体积；" +
+                "如需重新查看，请重新读取该文件]",
+            };
+          }
+          return {
             type: "image_url",
             image_url: typeof p.image_url === "string"
               ? { url: p.image_url }
               : (p.image_url || { url: "" }),
-          }
-        );
+          };
+        });
         multimodal = true;
       } else {
         c = parts
