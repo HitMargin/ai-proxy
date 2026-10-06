@@ -513,6 +513,43 @@ Deno.test("the published model list names only what the upstream actually runs",
   assert(!ids.includes("deepseek-v4-flash"));
 });
 
+Deno.test("the output cap goes upstream under the spelling the upstream reads", () => {
+  // 回归：这里曾经发 `maxTokens`（驼形），而上游只认 `max_tokens`——于是
+  // 客户端传的上限被静默丢弃、下面那个兜底也从没到达上游，从 70d9de4
+  // (2026-09-24) 起整整两周。
+  //
+  // 判据只能是**键名**：这个套件不打网络，所以"上游认不认"在这里无法直接
+  // 观测，能守住的只有"发出去的形状对不对"。上游那边的实测对照记在
+  // src/cnb.ts 该行的注释里（snake 生效 / camel 忽略）。
+  const up = build();
+  assertEquals(
+    "max_tokens" in up,
+    true,
+    "the cap must be sent as snake_case max_tokens",
+  );
+  assertEquals(
+    "maxTokens" in up,
+    false,
+    "camelCase maxTokens is silently ignored by the upstream - never send it",
+  );
+  // 客户端说了就算
+  const asked = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    max_tokens: 4096,
+    messages: [{ role: "user", content: "hi" }],
+  }).upstream;
+  assertEquals(
+    asked.max_tokens,
+    4096,
+    "a caller-supplied max_tokens must survive verbatim",
+  );
+  // 没说就给兜底，而不是漏发（漏发 = 完全不设限）
+  assert(
+    typeof up.max_tokens === "number" && up.max_tokens > 0,
+    "no caller cap must still produce a positive upstream cap",
+  );
+});
+
 Deno.test("the default model matches the published one", () => {
   // 默认值和表必须一致：默认一个已下架的 id 会让"没指定模型"的请求悄悄走旧名
   const up = cnbBuildUpstream({

@@ -1684,8 +1684,22 @@ export function cnbBuildUpstream(openaiBody: any) {
     model,
     messages: msgs,
     stream: true,
-    // flash 思考 token 波动大（实测最多吃掉一半输出预算），默认给 120000；pro 思考量小维持 60000
-    maxTokens: openaiBody.max_tokens || 120000,
+    // ★ 键名必须是小写 snake 的 `max_tokens`，上游**只认**这一个拼法。
+    //
+    // 这里曾经写的是 `maxTokens`（驼形），于是这一行从加入起（70d9de4，
+    // 2026-09-24）**从未生效过**：客户端传的 max_tokens 一直被静默丢弃，
+    // 下面这个兜底值也从没到达上游——cnb 实际跑在"完全不设上限"上。
+    //
+    // 2026-10-06 直连对照（同一 prompt，只改键名）：
+    //   max_tokens=1            → finish_reason:"length"，正文 1 字符   ✅ 生效
+    //   maxTokens=1             → 照常输出 399 token                    ❌ 被忽略
+    //   max_new_tokens=1        → 399 token                             ❌
+    //   max_completion_tokens=1 → 399 token                             ❌
+    //
+    // 兜底 120000 保留：思考 token **计入** max_tokens（completion =
+    // reasoning + 正文），所以 cap 给小了会被思考吃光、正文一个字不出。
+    // 120000 远大于实测思考量，不会踩到这个形态。
+    max_tokens: openaiBody.max_tokens || 120000,
   };
   if (openaiBody.temperature != null) up.temperature = openaiBody.temperature;
   if (openaiBody.top_p != null) up.top_p = openaiBody.top_p;
