@@ -1,0 +1,101 @@
+# render.yaml —— Render 蓝图（Blueprint）
+#
+# 用法：把仓库连到 Render，它会自动读到这个文件并创建服务。
+# 之后每次 push 到 main 都会自动重新部署。
+#
+# 为什么是容器（而不是 Render 原生运行时）：
+#   Render 的原生运行时只有 Node.js / Python / Ruby / Go / Rust / Elixir —— **没有 Deno**。
+#   本项目是纯 Deno（`Deno.serve` / `Deno.readFile` 读 wasm / `Deno.env`），所以必须用
+#   容器跑 `deno`，这样与 Deno Deploy 同一个运行时，**零改代码**。
+
+services:
+  - type: web
+    name: ai-proxy
+    runtime: docker
+    # Dockerfile 在仓库根目录，所以不写 dockerfilePath（那个字段用于非根路径）。
+
+    # 免费档：0.1 CPU / 512 MB RAM。
+    # ★ **不需要绑卡**——这是选 Render 的全部理由（原话「唉 我没有卡」）。
+    #   代价：闲置 15 分钟会休眠，下次请求有约 1 分钟冷启动。
+    #   （实测记录：Render 官方文档写明未绑卡时超额是「挂起服务到月底」，不是扣费。）
+    plan: free
+
+    # 新加坡离国内最近；其余可选 oregon / ohio / virginia / frankfurt。
+    region: singapore
+
+    # ★★ 必须是 `/`，**不能是 `/health`**。
+    #
+    # main.ts 里的顺序是：先 checkAuth（约 1431 行），再处理 /health（约 1576 行）。
+    # checkAuth 只豁免 `path === "/"` 与 `""`——所以设了 API_KEYS 之后，
+    # 不带 key 的健康探针打 /health 会拿到 **401**，Render 会认为服务没起来、
+    # 部署直接判失败，而服务其实是好的。
+    # `/` 走的是 1444 行那个分支，无条件返回 200 + {"message": "Multi-Provider AI Proxy"}，
+    # 正好适合当存活探针。
+    healthCheckPath: /
+
+    # 推 main 就自动部署。
+    #
+    # ★ 用 `autoDeployTrigger` 而不是 `autoDeploy`：官方 Blueprint 文档写明
+    #   `autoDeployTrigger` 字段**已经取代**了 `autoDeploy`（后者是 deprecated）。
+    #   两者同时出现时前者优先，所以只写新的这一个。
+    #   取值：`commit`（每次提交都部署）/ `checksPass`（CI 过了才部署）/ `off`。
+    autoDeployTrigger: commit
+
+    # ★ 环境变量：**sensitive 的值一律不写 here**（这个文件要进公开仓库）。
+    #   `sync: false` = 「在 Render 控制台里提示我填」，值只存在 Render 那边。
+    #
+    # 顺序按重要性排列，控制台里对照着填即可。
+    envVars:
+      # --- 本代理自己的鉴权 ---
+      # 逗号分隔的可用 key。**强烈建议填**：不填的话 checkAuth 直接 return true，
+      # 等于把这个代理完全公开（里面有你的 cnb / deepseek / trae 账号凭据）。
+      - key: API_KEYS
+        sync: false
+
+      # --- cnb ---
+      # 值填**整串** `CNBSESSION=1791...`，变量名就写 CNB_LOGIN_COOKIES。
+      # ★ 别把 `=` 左边的 CNBSESSION 填到「变量名」栏——那样代理读到的
+      #   CNB_LOGIN_COOKIES 是 undefined，云端又没有 cnb-login.txt 兜底，
+      #   于是静默退回匿名模式（401 cnb requires login），极难察觉。
+      - key: CNB_LOGIN_COOKIES
+        sync: false
+
+      # --- DeepSeek 网页端 ---
+      # 三个值分别**原样粘贴**对应文件的内容：
+      #   DEEPSEEK_WEB_COOKIES ← deepseek-cookies.txt
+      #   DEEPSEEK_WEB_AUTH    ← deepseek-auth.txt
+      #   DEEPSEEK_WEB_HEADERS ← deepseek-headers.json
+      - key: DEEPSEEK_WEB_COOKIES
+        sync: false
+      - key: DEEPSEEK_WEB_AUTH
+        sync: false
+      - key: DEEPSEEK_WEB_HEADERS
+        sync: false
+
+      # --- TRAE / WorkBuddy ---
+      # 值分别是 trae-auth.json / workbuddy-auth.json 的完整内容。
+      # 续期拿到的新令牌只留在内存里（envBackedStore），容器重启后会从这两份
+      # 环境变量重新续一次——所以上游若轮换 refresh_token，需要你手动更新这两项。
+      - key: TRAE_AUTH_JSON
+        sync: false
+      - key: WORKBUDDY_AUTH_JSON
+        sync: false
+
+      # --- 自定义供应商 ---
+      # 面板里加的那些 OpenAI 兼容上游，格式是一个 JSON 数组，**含明文 apiKey**。
+      # 不填也能跑，只是没有自定义供应商。
+      - key: AI_PROXY_CUSTOM_PROVIDERS
+        sync: false
+
+    # ⚠️ 这里**刻意不设**下面两个，改动前请先读理由：
+    #
+    # 1) `HOST`：Dockerfile 里已 `ENV HOST=0.0.0.0`。容器里必须绑 0.0.0.0 才能被
+    #    容器外的 Render 探针连上；不设的话 main.ts 会回落到 127.0.0.1，表现是
+    #    「部署成功但一直 502」。
+    # 2) `PORT`：Render 自己会注入（默认 10000），main.ts 读的就是它。写死反而会
+    #    和平台注入的值打架。
+    #
+    # ⚠️ 另一个**绝不能设**的：`BACKEND_URL`。
+    #    main.ts:1442 一旦发现它非空，就会把**所有**请求纯字节转发到那个地址、
+    #    不再执行本机渠道逻辑。那个变量是给 Cloudflare Worker 那条链路用的
+    #    （薄转发到本机隧道）。在 Render 上设了它 = 这个容器变成空壳。

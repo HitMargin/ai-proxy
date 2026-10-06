@@ -1,0 +1,77 @@
+# .dockerignore —— 构建上下文过滤
+#
+# ★ 第一层防御：任何凭据文件都不进构建上下文。
+#   注意 Docker **不读 .gitignore**，两份文件各管一边，所以这里必须重列一遍。
+#   真正让凭据进不了镜像的是 Dockerfile 里那份**显式 COPY 白名单**
+#   （只拷 main.ts / worker.ts / src / third_party / 清单与 wasm）；
+#   这个文件负责的是不把没用的东西（尤其是 7MB 的 cloudflared.exe）传给构建器。
+
+# --- 凭据：永远不进镜像 ---
+cookies.txt
+deepseek-cookies.txt
+deepseek-auth.txt
+deepseek-headers.json
+deepseek-web-cooldown.json
+trae-auth.json
+workbuddy-auth.json
+commandcode-accounts.json
+session.json
+cnb-login.txt
+custom-providers.json
+custom-providers.local.json
+custom-providers.*.local.json
+.env
+.env.*
+*.pem
+*.key
+
+# --- 本地大文件 / 与本镜像无关的二进制 ---
+# cloudflared.exe 是本地隧道用的 Windows 二进制，镜像里没有任何东西会执行它。
+cloudflared.exe
+
+# --- 版本库与本地工具状态 ---
+.git
+.gitignore
+.dsh-meow/
+.wrangler/
+.cloudflared/
+
+# --- 抓取页面快照 / 临时取证文件 ---
+page.html
+cnb-junk.log
+tmp-*.mjs
+.tmp-*.cjs
+.tmp-*.mjs
+.tmp-*.jsonl
+.tmp-*.json
+.tmp-analyze-deploy.cjs
+
+# --- 备份 ---
+*.bak
+*.bak-*
+*.orig
+*.tmp
+main.ts.bak-*
+
+# --- 本镜像不需要的文档与本地打包产物 ---
+# README/AGENTS 是给人看的；插件 tgz 是另一条部署链路（DSH 插件）的产物。
+# 排除它们纯为缩小上下文，与运行时无关。
+README.md
+AGENTS.md
+LICENSE
+ai-proxy-dsh-bridge-*.tgz
+call-bps.ps1
+restart.ps1
+scripts/
+
+# --- 本地登录/抓取脚本（只在开发机上跑，容器内永不执行）---
+# 它们在本地由 main.ts 的报错文案与插件按路径调用，所以**仓库里要保留**；
+# 但容器里没有任何入口会执行它们，拷进去只会让镜像多带一次性脚本。
+.tmp-*.ts
+
+# --- Windows / 编辑器产物 ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
