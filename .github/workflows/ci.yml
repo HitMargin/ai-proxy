@@ -46,7 +46,15 @@ jobs:
           Write-Host "PowerShell syntax ok"
 
       - name: Check formatting
-        run: deno fmt --check main.ts worker.ts src/core.ts src/deepseek-responses.ts src/zen.ts src/zen.test.ts src/zen-catalog.ts src/zen-catalog.test.ts src/zen-compaction.ts src/zen-compaction.test.ts src/zen-egress.ts src/zen-egress.test.ts src/commandcode src/runtime scripts/probes/commandcode-smoke.ts
+        # Directories, not a hand-written file list.
+        #
+        # The list this replaced named 27 paths and left out every file added
+        # after it was written - which is how src/cnb.ts accumulated 591 lines of
+        # formatting drift and then dumped it into a feature commit, making that
+        # diff unreviewable. A list of paths cannot stay correct as a tree grows;
+        # a directory can. `deno fmt --check` skips files it has no business
+        # formatting (the lockfile, vendored copies) on its own.
+        run: deno fmt --check main.ts worker.ts src scripts
 
       - name: Type-check and build-check
         run: deno task check
