@@ -916,15 +916,71 @@ Deno.test("many small images survive together - the budget is bytes, not count",
   assert(bytes < 1048576, "body must fit, got " + bytes);
 });
 
-Deno.test("an image too large to send is refused with the real reason", () => {
-  // 丢无可丢时让上游回 413 是不够的：那句话只说 "Request body too large"，
-  // 看不出是谁占的，harness 还会重试 2 次把同样的字节再传一遍。
-  const thrown = capture(() =>
-    cnbBuildUpstream(sizedHistory([sizedImage(1200 * 1024)]))
-  );
+Deno.test("an oversized image in history is demoted rather than refused", () => {
+  // 这条替换了原先的 "an image too large to send is refused with the real
+  // reason"。那条的夹具最后一条消息是 "总结"（无图），图其实在**历史**里——
+  // 旧实现一刀切报错才让它通过。语义改成按位置分之后，历史里的超大图应当
+  // 被降级放行（否则会话永久卡死），所以那条断言不再成立，由下面两条取代。
+  const up = cnbBuildUpstream(sizedHistory([sizedImage(1200 * 1024)])).upstream;
+  const { images } = countImages(up);
+  assertEquals(images, 0, "an oversized historical image must not be sent");
+  const bytes = new TextEncoder().encode(JSON.stringify(up)).length;
+  assert(bytes < 1048576, "the request must still be sendable, got " + bytes);
+});
+
+// ─── 超大图：历史里的降级放行，当前轮发的如实报错 ───
+//
+// 第一版一刀切报错，被真实会话打回：用户那个 1210 KiB 的图留在历史里，而
+// "第一张无条件保留"意味着它永远删不掉 → 每轮都被拒绝 → 会话卡死。
+// **B 把"偶尔 413 后重试成功"变成"永久 400"，比原问题更糟。**
+// 现在按位置分：历史里的降级成占位（会话继续），当前轮发的报错（还能改）。
+
+const HUGE = "data:image/png;base64," + "A".repeat(1210 * 1024);
+
+function bigHistory(currentBig: boolean, turns: number) {
+  const messages: any[] = [{ role: "system", content: "sys" }];
+  messages.push({
+    role: "user",
+    content: [{ type: "text", text: "看这张" }, {
+      type: "image_url",
+      image_url: { url: HUGE },
+    }],
+  });
+  messages.push({ role: "assistant", content: "看过了" });
+  for (let i = 0; i < turns; i++) {
+    messages.push({ role: "user", content: "继续 " + i });
+    messages.push({ role: "assistant", content: "好" });
+  }
+  messages.push({
+    role: "user",
+    content: currentBig
+      ? [{ type: "text", text: "再看" }, {
+        type: "image_url",
+        image_url: { url: HUGE },
+      }]
+      : "总结",
+  });
+  return { model: "cnb/deepseek-v4.1-flash", max_tokens: 64, messages };
+}
+
+Deno.test("an oversized image in history is demoted so the session can continue", () => {
+  // 这是用户实际卡住的形状：报错一次可以，永久失败不行。
+  for (const turns of [0, 20]) {
+    const up = cnbBuildUpstream(bigHistory(false, turns)).upstream;
+    const bytes = new TextEncoder().encode(JSON.stringify(up)).length;
+    assert(bytes < 1048576, "the body must be sendable, got " + bytes);
+    const { images } = countImages(up);
+    assertEquals(images, 0, "the oversized historical image must not be sent");
+  }
+});
+
+Deno.test("an oversized image being sent right now is refused, not silently dropped", () => {
+  // 当前轮那张是用户此刻要让模型看的东西，静默丢掉才是真骗人——
+  // 而且他还能压小重发，报错比默默失败有用。
+  const thrown = capture(() => cnbBuildUpstream(bigHistory(true, 0)));
   assert(
-    /exceeds the upstream/.test(thrown),
-    "must name the real cause: " + thrown,
+    /the image you just sent/.test(thrown),
+    "must point at the current message: " + thrown,
   );
   assert(
     /Nothing was sent upstream/.test(thrown),

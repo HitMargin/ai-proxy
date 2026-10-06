@@ -1442,27 +1442,63 @@ export function cnbBuildUpstream(openaiBody: any) {
     );
   }
 
-  // ★ 丢完还是装不下：说清是图太大，而不是让上游回一句 413 [BODY_TOO_LARGE]。
+  // ★ 装不下时**分两种**处理，判据是「这张图是不是用户当下刚发的」。
   //
-  // 判据：**留下的那几张图的字节数本身就超了预算**，而它们已经是最新的、
-  // 删无可删（第一张无条件保留——把用户刚发的图悄悄丢掉比报错更糟）。
-  // 也就是说这份请求**注定发不出去**，此时唯一的出路是让用户把图压小。
+  // 第一版一刀切报错，被真实会话打回：用户那个 1210 KiB 的图留在历史里，
+  // 而"第一张无条件保留"意味着它**永远删不掉** → 每轮请求都被这里拒绝 →
+  // 会话每一轮都失败，用户报「对话卡死了」。**B 把"偶尔 413 后重试成功"
+  // 变成了"永久 400"，比原来的问题更糟。**
   //
-  // 为什么值得单独报错：上游的 413 只说 "Request body too large"，看不出
-  // 是谁占的；harness 还会把它当 TRANSPORT **重试 2 次**，每次都把同样
-  // 几百 KB 再传一遍。用户 2026-10-06 两次截图都是这个形状——报错和原因
-  // 完全对不上，他只能靠猜。
-  if (keptImageSlots.size > 0) {
-    // 阈值取 1 MiB 减去一点余量：低于它就是图片自己把上游的线占满了，
-    // 文本那边已经没有空间可让，交由这里判定更准确。
-    const HARD_LIMIT = 1024 * 1024;
-    if (keptBytes + 64 * 1024 > HARD_LIMIT) {
-      const kb = (keptBytes / 1024).toFixed(0);
+  // 现在按位置分：
+  //   ① **历史里的图**（早于最后一条消息）太大 → 降级成占位文字。
+  //      模型知道"这里曾有张图，我看不到"，会话能继续。代价是它看不到那张图，
+  //      但比永久卡死好——而且那张图本来是它**过去**看过的。
+  //   ② **当前轮刚发的图**（最后一条消息里的）太大 → 如实报错。
+  //      这是用户当下要让模型看的东西，静默丢掉才是真骗人；而且他还能改
+  //      （压一下再发），报错比默默失败更有用。
+  //
+  // 为什么值得单独报错而不是让上游回 413：上游那句只说 "Request body too
+  // large"，看不出是谁占的；harness 还会把它当 TRANSPORT **重试 2 次**，每次
+  // 都把同样几百 KB 再传一遍。用户两次截图都是这个形状，报错和原因对不上。
+  const HARD_LIMIT = 1024 * 1024;
+  const lastIndex = rawMsgs.length - 1;
+  const oversizedKept = [...keptImageSlots].filter((slot) => {
+    const [mi] = slot.split(":").map(Number);
+    return mi === lastIndex;
+  });
+  const oversizedFromHistory = [...keptImageSlots].filter((slot) => {
+    const [mi] = slot.split(":").map(Number);
+    return mi !== lastIndex;
+  });
+  if (keptImageSlots.size > 0 && keptBytes + 64 * 1024 > HARD_LIMIT) {
+    // 先把"历史里的超大图"降级，看降完是否装得下
+    let remaining = keptBytes;
+    let demoted = 0;
+    for (const slot of oversizedFromHistory) {
+      const [mi, pi] = slot.split(":").map(Number);
+      remaining -= imageBytes(rawMsgs[mi]?.content?.[pi]);
+      droppedImageSlots.add(slot);
+      keptImageSlots.delete(slot);
+      demoted++;
+    }
+    if (demoted > 0) {
+      console.warn(
+        `[cnb] demoted ${demoted} oversized historical image(s) to placeholders ` +
+          `so the session can continue (~${
+            (remaining / 1024).toFixed(0)
+          } KiB left; ` +
+          `upstream body limit is ~1 MiB).`,
+      );
+    }
+    // 降完仍装不下 = 当前轮那张图自己就太大，这时报错才有用
+    if (remaining + 64 * 1024 > HARD_LIMIT && oversizedKept.length > 0) {
+      const kb = (remaining / 1024).toFixed(0);
       throw new Error(
-        `cnb: the image(s) still in this request are ~${kb} KiB after removing older ones, ` +
-          `which alone exceeds the upstream's ~1 MiB body limit. ` +
-          `Resize/recompress the image (JPEG quality ~75 is usually enough) and send it again. ` +
-          `Nothing was sent upstream.`,
+        `cnb: the image you just sent is ~${kb} KiB, which alone exceeds the upstream's ` +
+          `~1 MiB body limit. Resize/recompress it (JPEG quality ~75 is usually enough) ` +
+          `and send it again. Nothing was sent upstream. ` +
+          `Note: older oversized images in this session are dropped automatically, ` +
+          `so this only applies to the message you are sending now.`,
       );
     }
   }
