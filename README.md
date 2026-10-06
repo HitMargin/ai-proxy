@@ -889,12 +889,25 @@ deno deploy env add CNB_LOGIN_COOKIES "$(Get-Content cnb-login.txt -Raw)" --org 
 
 ### 2. 工具调用的「文本协议」模拟
 
-cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
+**上游不是「不支持」工具调用，而是「禁止在这个场景用」。** 实测（2026-10-06）同一个问题：
 
-- `cnbBuildToolPrompt` 把所有工具定义拼成系统提示词，要求模型输出 `` 包裹的 JSON；
+| 请求 | 结果 |
+|---|---|
+| 不带 `tools` | 200，正常回答 |
+| 带 `tools`（OpenAI 标准形状） | **403** `{"errcode":403,"errmsg":"[FORBIDDEN]Agent calls are not allowed in this scenario"}` |
+| 带 `tool_choice` | 403 同上 |
+| 带伪造的 `tool_calls` + `tool` 结果历史 | 403 同上 |
+
+注意措辞是 **"not allowed in *this scenario*"** —— 模型有这个能力，是这条路径被禁。上游的商业逻辑很清楚：**纯对话免费，工具调用是收费能力，只在 NPC 场景开放**（NPC 按 token 计费）。这也解释了为什么 `model` 参数在这条路径上被完全忽略（实测 5 个模型名 + `user` 字段 + 3 个仓库前缀路径，全部回落 `deepseek-v4.1-flash`）。
+
+**所以这套协议的本质是「请求里根本没有 `tools` 字段」**，而不是协议翻译：
+
+- `cnbBuildToolPrompt` 把工具定义**从 `tools` 字段里拿出来**、拼成系统提示词，要求模型输出 `` 包裹的 JSON——上游看到的是一个普通对话请求，403 因此从未被触发；
 - 历史里的 assistant `tool_calls` 会转回同样的文本，工具结果转成 `[Tool Result id=...]` 的 user 消息——让模型「看到自己的历史就是正确示范」；
 - `cnbParseToolCalls` 是**极其宽容**的反向解析器：兼容 `XYML` / `QNML` / DeepSeek 原生 `DSML` / `` 等多种变体，能修复被截断的 JSON、按 JSON Schema 强制类型、拆解嵌套 arguments、归一化形近字、检测「一字符一行的退化输出」、参数名反猜工具等；
 - `createLiveFilter` 在**流式输出**时扣住「可能是标记开头」的前缀，保证协议标记不会泄漏到用户可见正文。
+
+> ⚠️ **这是绕过，不是适配，所以它依赖对方的检测盲区。** 现在能过只因为上游看的是「请求里有没有 `tools` 字段」；一旦改成看响应内容或提示词特征就会失效。配合 `/codebuddy` 页面上那句「临时免费，年后再说」，**cnb 只应当作补充渠道**，主力是聚合入口（`api.hitmargin.dpdns.org`）。
 
 ### 3. Responses API
 
@@ -904,7 +917,7 @@ cnb 上游不支持原生 `tool_calls`，所以改用提示词协议：
 
 - `cnbCallUpstream` 按 `[0, 500, 1500, 3500, 8000, 20000]` ms 退避重试；
 - 网络层失败会刷新 CSRF 会话再试；4xx（429 除外）视为确定性错误直接透传；
-- `deepseek-v4-flash` 连续 5xx 时**自动降级到 `deepseek-v4-pro`**；
+- 上游**只支持流式**：`stream:false` 会拿到 `400 code 11101 "Non-stream chat request is currently not supported"`，所以非流式的调用方由代理聚合 SSE 后返回；
 - `cnbCall` 带 **30 秒无响应头超时**——cnb 偶发无限挂起，中止后交给退避重试（只罩到响应头返回，不限流式生成总时长）；
 - **串行闸**：cnb 网页会话按 cookie 归属，多客户端并发共用一个 cookie 会互踩（曾观测到跨会话内容泄漏）。所有 cnb 上游调用同一时刻只放行一个，锁持有到**响应流真正消费完**（流结束/出错/消费方取消/2 分钟无数据/10 分钟硬安全阀任一条件释放），日志以 `[cnb-gate] fp=...` 记录排队与释放（fp 为会话指纹，重叠且 fp 不同即跨会话并发）；
 - **请求体大小不做本地预检，交给上游判**：cnb 对 >1 MiB 的请求体回 `413 [BODY_TOO_LARGE]`（实测：1.000 MiB 通过、1.050 MiB 起拒绝）。这里**曾有一道 `>1MiB 直接本地回 413` 的闸，已拆掉**——它比上游还严，会拦掉上游本来会接受的请求（实测一个 1060926 字节的请求被本地拒死，而那个尺寸上游很可能接受）。现在只写一行 `[cnb-gate] large body … sending anyway` 日志，由上游自己判，用户拿到的是上游原文而不是我们猜的线。
