@@ -4,7 +4,28 @@
 Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + Cloudflare Worker 远端链。
 为 dsh 提供免费模型入口。
 
-## 当前状态（2026-09-30 核实，改动此节请更新日期）
+## 当前状态（2026-10-07 核实，改动此节请更新日期）
+- **自调用必须带本进程会接受的凭据（2026-10-07 修 `f6f9dd1`）**：`v1FetchOwnListing` 发的是
+  `Bearer ${ENV.DEFAULT_BEARER_TOKEN || "public"}`，而 `checkAuth` 只认 `API_KEYS`。本地 `API_KEYS`
+  为空时直接放行，所以**本地永远看不见**；部署一旦设了它（Render 就是），每次自调用都 401 →
+  自建列表空 → 目录报 `deepseek-web has no login state yet`，**与同进程 `/health` 的
+  `credentials.deepseek-web.configured=true` 自相矛盾**。线上对照实验：`Bearer public` → 401、
+  真 key → 200+10 模型、不带 → 401。现由 `internalCredential()` 统一（API_KEYS 第一项 >
+  DEFAULT_BEARER_TOKEN > "public"；deepseek-web 列表 / custom 列表 / probe 兜底三处共用）。
+  **判据：自问自答的请求不能带一个只在无鉴权时才成立的占位值**；**也别改成 loopback 信任**——
+  容器 `HOST=0.0.0.0` 时 handler 拿不到可靠远端地址，在反代/隧道后面本就不成立。
+- **Render 线上部署（2026-10-07 核实，已 live）**：service id `srv-db2qf849v7es739t6j50`、URL
+  **https://ai-proxy-w110.onrender.com**、docker / free / singapore / branch=main /
+  healthCheckPath=`/` / autoDeploy=yes。**只填了 7 个 env**（API_KEYS、CNB_LOGIN_COOKIES、
+  DEEPSEEK_WEB_{COOKIES,AUTH,HEADERS}、TRAE_AUTH_JSON、WORKBUDDY_AUTH_JSON）；`render.yaml`
+  声明的第 8 个 `AI_PROXY_CUSTOM_PROVIDERS` **没填，且容器里没有 custom-providers.json
+  （已 gitignore，不进镜像）**，所以云端 custom 报 `no custom providers are configured`
+  ——那是**如实报告，不是 bug**。用户报「render 是空的」实为「部署存在但渠道有洞」。
+- **「目录空」被翻译成「没登录态」（2026-10-07）**：`v1FetchOwnListing` 在 `!response.ok` 和 catch
+  里都返回 `[]`，而 1112 行把空解释成「deepseek-web has no login state yet」。**空只说明这一次
+  自调用没成**（可能是 401、超时、端口不对），不是「文件缺失」。修完凭据后线上 catalog 立刻从
+  failed 变 `ok listed=10 kept=10`，`/v1/models` 从 138 → **148 行**，真实推理返回「收到」
+  `finish=stop`。判据：一个「空」既可能来自没配置、也可能来自取不到，**上游错误要先分类再翻译**。
 - **cnb 匿名通道已死**：上游要登录才能推理。已实现登录态支持：登录 Cookie 粘到
   `cnb-login.txt`（热加载，剔除 csrfkey，见 README 1.5 节）。用户暂无 cnb 账户，通道 dormant。
   ⚠️ **失败判据会漂，别照记忆判断**：早期是 `401 [NOT_LOGIN]`，**2026-10-05 实测已变成
