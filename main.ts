@@ -356,6 +356,24 @@ function v1ResolveModel(model: string): { key: string; raw: string } | null {
 const catalog = new CatalogRegistry();
 
 /**
+ * A credential this same process will accept on a self-call.
+ *
+ * A self-call is not a client: it has no caller token to forward. This used to
+ * send `Bearer ${ENV.DEFAULT_BEARER_TOKEN || "public"}`, which was silently right
+ * only while `API_KEYS` was unset — with no configured keys `checkAuth` returns
+ * true for *any* request, so the wrong token was never inspected. The moment a
+ * deployment sets `API_KEYS` (Render, Deno Deploy, any hardened box) every
+ * self-call 401s, the listing comes back empty, and the channel is reported as
+ * "has no login state yet" while its own endpoint answers 200 to a real client.
+ * A phantom failure with a one-line fix: present a key the same process accepts.
+ */
+function internalCredential(): string {
+  const first = (ENV.API_KEYS || "").split(",").map((k) => k.trim())
+    .find(Boolean);
+  return first || ENV.DEFAULT_BEARER_TOKEN || "public";
+}
+
+/**
  * A channel's own model listing, for a channel that is not an aggregate member.
  *
  * Asked of the local server rather than the upstream: the channel's handler is
@@ -375,7 +393,7 @@ async function v1FetchOwnListing(prefix: string): Promise<any[]> {
       `http://127.0.0.1:${port}/${prefix}/v1/models`,
       {
         headers: {
-          authorization: `Bearer ${ENV.DEFAULT_BEARER_TOKEN || "public"}`,
+          authorization: `Bearer ${internalCredential()}`,
         },
         signal: AbortSignal.timeout(15_000),
       },
