@@ -916,6 +916,25 @@ try {
   }, zenResolved)) { /* stream shape is covered above */ }
   assert.equal(lastRequestHeaders.get('x-session-id'), 'dsh-session-123');
   assert.match(lastRequestHeaders.get('user-agent') || '', /opencode\//);
+  // Session identity is not a Zen-only affair. The proxy keys per-conversation
+  // state off these headers - cnb stores its compaction summary per session id -
+  // and a channel arriving without one collapsed to a single shared key, so a
+  // summary written for one conversation surfaced in another (the logs showed
+  // every cnb compaction under `session=cnb-default`). Assert it on a channel
+  // whose id does not start with `zen/`, because gating on that prefix is
+  // exactly the bug this guards.
+  for await (const _event of adapter.stream({
+    model: projectResolved.id,
+    messages: [{ role: 'user', content: 'ping' }],
+    sessionId: 'dsh-session-456',
+    maxTokens: 32,
+  }, projectResolved)) { /* stream shape is covered above */ }
+  assert.equal(
+    lastRequestHeaders.get('x-session-id'),
+    'dsh-session-456',
+    'a non-zen channel must carry the session id too, or its state collapses to one shared key',
+  );
+  assert.equal(lastRequestHeaders.get('x-conversation-id'), 'dsh-session-456');
   assert.ok(events.some((event) => event.type === 'block-start' && event.blockType === 'text'));
   assert.ok(events.some((event) => event.type === 'text-delta' && event.text === 'pong'));
   assert.ok(events.some((event) => event.type === 'usage'));

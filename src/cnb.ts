@@ -2694,10 +2694,21 @@ function cnbIntSetting(name: string, fallback: number): number {
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
 }
 
-function sessionIdOf(request: Request): string {
+export function sessionIdOf(request: Request): string {
+  // An absent session id must not collapse to a shared constant. This string
+  // keys the compaction state (src/zen-compaction.ts `states`), so one constant
+  // for every headless caller means they all read and overwrite one summary -
+  // which is how a summary written for one conversation surfaced in another.
+  //
+  // "" means "no identity": zen-compaction only stores state when the session
+  // id is non-empty, so such a request still compacts, just statelessly (it
+  // re-derives the previous summary from the messages themselves).
+  //
+  // Do not mint a unique id per request instead: that map has no eviction, so
+  // unique keys would turn it into an unbounded leak.
   return request.headers.get("x-session-id") ??
     request.headers.get("x-conversation-id") ??
-    "cnb-default";
+    "";
 }
 
 /** 摘要写入器：走本代理自己的 cnb chat 路由，带上完整闸与重试。 */
@@ -2822,7 +2833,12 @@ export async function maybeCompactCnb(
     body,
     contextWindow: Math.max(1, Math.floor(json.length / 4) + 4096 - 1),
     maxOutputTokens: 4096,
-    sessionId: `cnb:${session}`,
+    // Prefix only a real id. An empty one must stay empty: this string is the
+    // key zen-compaction stores state under, and it only stores when the key is
+    // non-empty. `cnb:${session}` with an empty session yields the constant
+    // "cnb:" - stored, and shared by every caller without an id, which is the
+    // very collapse this guards against.
+    sessionId: session === "" ? "" : `cnb:${session}`,
     config: {
       keepTokens: cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000),
       buffer: cnbIntSetting("CNB_COMPACTION_BUFFER", 20000),
@@ -2835,7 +2851,8 @@ export async function maybeCompactCnb(
   if (result.changed) {
     body.messages = result.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
-    cnbLastCompactNote = `compacted ${result.note} session=${session} ` +
+    cnbLastCompactNote = `compacted ${result.note} ` +
+      `session=${session || "(none)"} ` +
       `bytes ${bytes} -> ${after} cost≈${result.compactTokens}`;
     return;
   }
@@ -2844,7 +2861,7 @@ export async function maybeCompactCnb(
     const truncated = fallbackTruncate(messages, Math.floor(budget / 4));
     body.messages = truncated.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
-    cnbLastCompactNote = `${truncated.note} session=${session} ` +
+    cnbLastCompactNote = `${truncated.note} session=${session || "(none)"} ` +
       `(summary generation failed) bytes ${bytes} -> ${after}`;
   }
 }

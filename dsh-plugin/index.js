@@ -2914,13 +2914,18 @@ export class AiProxyAdapter {
       requestHeaders.prompt_cache_key = sessionId;
       requestHeaders.session_id = sessionId;
       requestHeaders['x-session-affinity'] = sessionId;
+      // Session identity for every channel, not just Zen. The proxy keys
+      // per-conversation state off these two headers - cnb stores its
+      // compaction summary per session id - and a channel that arrives without
+      // one falls back to a single shared key. That is how a summary written
+      // for one conversation surfaced in another. They are proxy-facing: this
+      // request goes to the proxy's own channel route, and what reaches the
+      // upstream is decided there.
+      requestHeaders['x-session-id'] = sessionId;
+      requestHeaders['x-conversation-id'] = sessionId;
     }
     const isZenAggregate = modelId.startsWith('zen/') && resolved.basePath === '/v1';
     if (isZenAggregate) {
-      if (sessionId) {
-        requestHeaders['x-session-id'] = sessionId;
-        requestHeaders['x-conversation-id'] = sessionId;
-      }
       requestHeaders['user-agent'] = 'deepseek-harness/0.1.7 (+https://github.com/deepseek-ai/deepseek-harness) opencode/1.18.31';
     }
 

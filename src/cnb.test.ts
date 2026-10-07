@@ -21,7 +21,9 @@ import {
   cnbParseToolCalls,
   handleCnb,
   maybeCompactCnb,
+  sessionIdOf,
 } from "./cnb.ts";
+import { compactionState, resetCompactionStates } from "./zen-compaction.ts";
 
 // LT 是源码里唯一允许出现尖括号的地方。测试正文到处要断言「没有一个裸的尖括号
 // 漏到客户端」，写字面量会把标签配对搞坏——这个文件正是靠这条纪律生成的。
@@ -1009,6 +1011,81 @@ Deno.test("an oversized image in history is demoted so the session can continue"
     const { images } = countImages(up);
     assertEquals(images, 0, "the oversized historical image must not be sent");
   }
+});
+
+// ─── 会话身份：缺 id 时不许塌成一个共用常量 ───
+//
+// 2026-10-07 用户报「摘要跑到别的对话去了」。根因链：DSH 插件只在 modelId
+// 以 `zen/` 开头时才发 x-session-id，cnb 渠道收不到任何会话头 → sessionIdOf
+// 退化成常量 "cnb-default" → 所有 cnb 会话共用一份压缩摘要。面板日志里每一行
+// 都写着 session=cnb-default 就是这个。
+//
+// 判据：**没有身份时宁可没有身份**（""），也不能捏一个所有调用者共享的常量。
+// 空串在 zen-compaction 里等于「不存状态」——压缩照常发生，只是无状态，
+// 会从 messages 里自己找上一次的摘要，不会串味。
+Deno.test("a request without a session header gets no identity, not a shared constant", () => {
+  const bare = new Request("http://cnb.local/cnb/v1/chat/completions", {
+    method: "POST",
+  });
+  assertEquals(
+    sessionIdOf(bare),
+    "",
+    'an absent session id must be "" - a constant like "cnb-default" is shared by every caller',
+  );
+});
+
+Deno.test("a request with a session header keeps it, and x-session-id wins over x-conversation-id", () => {
+  const viaSession = new Request("http://cnb.local/cnb/v1/chat/completions", {
+    method: "POST",
+    headers: { "x-session-id": "sess-abc" },
+  });
+  assertEquals(sessionIdOf(viaSession), "sess-abc");
+
+  const viaConversation = new Request(
+    "http://cnb.local/cnb/v1/chat/completions",
+    { method: "POST", headers: { "x-conversation-id": "conv-xyz" } },
+  );
+  assertEquals(sessionIdOf(viaConversation), "conv-xyz");
+
+  const both = new Request("http://cnb.local/cnb/v1/chat/completions", {
+    method: "POST",
+    headers: { "x-session-id": "sess-abc", "x-conversation-id": "conv-xyz" },
+  });
+  assertEquals(sessionIdOf(both), "sess-abc");
+});
+
+Deno.test("an unidentified session still compacts, and leaves no state behind", async () => {
+  // 空 id 不能把压缩一起关掉——那会让「没带头的调用者」永远压不动、每轮 413。
+  // 它只是不该留下会被下一个会话读到的状态。
+  resetCompactionStates();
+  const messages: any[] = [
+    { role: "system", content: "You are helpful." },
+  ];
+  const filler = "这一段用来把请求体撑过上游的 1 MiB 硬限。".repeat(4000);
+  for (let i = 0; i < 60; i += 1) {
+    messages.push({ role: "user", content: filler + i });
+    messages.push({ role: "assistant", content: "收到" + i });
+  }
+  messages.push({ role: "user", content: "这是最新一轮，压缩后必须原样保留" });
+  const body: any = { model: "deepseek-v4.1-flash", max_tokens: 32, messages };
+  const before = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(before > 1048576, "fixture must exceed the limit, got " + before);
+
+  let asked = false;
+  await maybeCompactCnb(body, "", async () => {
+    asked = true;
+    return "## Objective\n- 无身份会话的压缩验证";
+  });
+  assert(asked, "an unidentified session must still compact");
+  const after = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(after < before, "it must actually shrink: " + before + " -> " + after);
+  // 关键：不留状态。留了就会被下一个「同样没有 id」的会话读到。
+  assertEquals(
+    compactionState("cnb:"),
+    undefined,
+    'the empty-id path must not store under the constant "cnb:"',
+  );
+  assertEquals(compactionState(""), undefined);
 });
 
 Deno.test("an oversized image being sent right now is refused, not silently dropped", () => {
