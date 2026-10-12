@@ -42,12 +42,37 @@ export const CNB_MODELS = [
 
 const cnbState: any = { token: null, csrfkey: null, ts: 0, pending: null };
 
+/**
+ * 抓 CSRF 对（token + csrfkey cookie）。
+ *
+ * ★ 2026-10-12 修两个叠在一起的 bug——它们是 cnb 渠道「配了 cookie 仍然 401」的真因：
+ *
+ *  bug 1 **正则只认十六进制**。原来写 `/csrfkey=([0-9a-fA-F]{32,64})/`，
+ *  而实测服务端发的 csrfkey 是 **9~10 位十进制数字**（如 `1126896796`），
+ *  那个正则永远匹配不上 → `throw new Error("csrfkey not found in Set-Cookie")`。
+ *  （我此前多个探针也照抄了这个假设，于是把「csrfkey 是 32 位 hex」当了
+ *  很久的事实——**又一条「看起来合理的格式」没被实测推翻过的例子**。）
+ *
+ *  bug 2 **抓首页时没带登录 cookie**。于是拿到的是**匿名会话**的 token/key 对，
+ *  再拿去配用户的登录会话——两套会话的 CSRF 对配不上。
+ *
+ * 修法：①正则放宽为「任意非分号非空白字符」，不猜格式；②抓首页时带上
+ * `cnbLoginCookies()`，让 token 与 csrfkey 出自同一个会话。
+ *
+ * 实测（2026-10-12，新鲜会话、**浏览器关闭后**纯 Node 侧）：
+ *   带 cookie 抓 token + 同源 csrfkey → HTTP 200 且真的出字
+ *   不带 csrfkey cookie            → 403 errcode 7
+ * 所以**不需要常驻浏览器**；「必须浏览器在场」是我中途的错误结论。
+ */
 async function cnbFetchCsrf() {
+  // ★ 带登录 cookie 抓：token 与 csrfkey 必须同源（同一个会话）。
+  const loginCookies = cnbLoginCookies();
   const r = await fetch(CNB_HOME, {
     headers: {
       "User-Agent": CNB_UA,
       "Accept":
         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      ...(loginCookies ? { "Cookie": loginCookies } : {}),
     },
   });
   const html = await r.text();
@@ -66,7 +91,8 @@ async function cnbFetchCsrf() {
   }
   let csrfkey: string | null = null;
   for (const c of cookies) {
-    const m = c.match(/csrfkey=([0-9a-fA-F]{32,64})/);
+    // ★ 不猜格式：csrfkey 实测是 9~10 位十进制，不是 hex。取到分号/空白即止。
+    const m = c.match(/csrfkey=([^;\s]+)/);
     if (m) {
       csrfkey = m[1];
       break;
