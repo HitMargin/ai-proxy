@@ -1208,3 +1208,77 @@ Deno.test("DSML markers with mismatched bar counts are normalised (left 1 / righ
     assertEquals(r.calls[0].function.name, "read");
   }
 });
+
+// -- 第四种退化形态：满屏 `</ calls>` 与空壳调用（2026-10-17 用户第四次截图） --
+//
+// 截图两张面孔：
+//   ① `</ calls>` 重复几十次（`/` 与 `calls` 之间**有空格**）
+//   ② `{"name":"read","arguments":}`（arguments 是空值）
+//
+// 两者都**一个调用也解析不出来**，而清理段的原入口条件是
+// `calls.length || degenerated || junkToolSyntax` —— 三者全假，于是整屏原样流给用户。
+// 实测：① 修复前残留 30/30；② 长度 28→28（完全没动）。
+
+Deno.test("a flood of degraded close tags is stripped even with no parsed call", () => {
+  resetJunkState();
+  const flood = "</ calls>\n".repeat(30);
+  const r = cnbParseToolCalls(
+    "Now I have what I need.\n\n" + flood,
+    READ_TOOLS,
+  );
+  assertEquals(r.calls.length, 0, "no call is recoverable from this shape");
+  assertEquals(
+    (String(r.clean).match(/<\/\s*calls>/g) || []).length,
+    0,
+    "every degraded close tag must be gone, got: " + JSON.stringify(r.clean),
+  );
+  assert(
+    String(r.clean).includes("Now I have what I need."),
+    "prose survives",
+  );
+});
+
+Deno.test("degraded close tags are stripped even when a real call is present", () => {
+  resetJunkState();
+  // 这一轮有正常调用 → 走的是另一个分支，历史实现同样会漏掉 `</ calls>`。
+  const text = "prose\n" + "</ calls>\n".repeat(10) +
+    OPEN + "\n" + '{"name":"read","arguments":{"file_path":"D:\\\\x.cs"}}' +
+    "\n" + CLOSE;
+  const r = cnbParseToolCalls(text, READ_TOOLS);
+  assertEquals(r.calls.length, 1);
+  assertEquals(
+    (String(r.clean).match(/<\/\s*calls>/g) || []).length,
+    0,
+    "must be clean too, got: " + JSON.stringify(r.clean),
+  );
+});
+
+Deno.test("an empty-arguments call shell is stripped, not echoed", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls('{"name":"read","arguments":}', READ_TOOLS);
+  assertEquals(r.calls.length, 0, "no params means no usable call");
+  assert(
+    !String(r.clean).includes("arguments"),
+    "the shell must not reach the client, got: " + JSON.stringify(r.clean),
+  );
+});
+
+Deno.test("unrelated JSON is still preserved next to the new detectors", () => {
+  resetJunkState();
+  // 反向保护：新加的两个探测器（残骸标签 / 空壳调用）都必须**窄**到不误伤。
+  const tail = "\n" + OPEN + "\n" +
+    '{"name":"read","arguments":{"file_path":"D:\\\\y.cs"}}' + "\n" + CLOSE;
+  const keep = [
+    '配置如下：{"name":"x","version":1}', // name 不是工具名
+    '端口是 {"port":8080}',
+    "普通正文里的 calls 这个词不该被删",
+  ];
+  for (const text of keep) {
+    const r = cnbParseToolCalls(text + tail, READ_TOOLS);
+    assertEquals(r.calls.length, 1);
+    assert(
+      r.clean.includes(text),
+      "must keep unrelated prose: " + JSON.stringify(r.clean),
+    );
+  }
+});

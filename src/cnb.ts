@@ -997,6 +997,24 @@ function normalizeInvokeConfusion(text: string) {
  */
 function stripBareToolJson(text: string, tools?: any[]): string {
   if (!Array.isArray(tools) || tools.length === 0) return text;
+
+  // ① 先剥「空壳工具调用」：`{"name":"read","arguments":}` / `{"name":"read","arguments":{}}`
+  //
+  // 2026-10-17 用户第四次截图里的第二种形态。它**不是**能救回的调用——模型把
+  // arguments 写成了空值，没有任何参数可用；而 `BARE` 兜底正则要求 `arguments`
+  // 后必须跟 `{` 或 `"`，对 `:}` 不匹配，于是它既不被解析也不被清理，原样留在正文。
+  // 判据：带 `name` 字段、但 `arguments` 为空/缺失 → 剥掉（模型会看到诊断后重发）。
+  const toolNames = new Set<string>();
+  for (const t of tools) {
+    const n = t?.function?.name;
+    if (typeof n === "string" && n !== "") toolNames.add(n);
+  }
+  text = text.replace(
+    /\{\s*"name"\s*:\s*"([^"\\]+)"\s*(?:,\s*"arguments"\s*:\s*(?:\{\s*\}|""|null|)\s*)?\}/g,
+    (m, name: string) => (toolNames.has(name) ? "" : m),
+  );
+
+  // ② 剥「裸 JSON 参数体」：`{"file_path":...,"offset":200,"limit":95}`
   // 汇总所有工具的参数名与必需参数名
   const allParams = new Set<string>();
   const requiredParams = new Set<string>();
@@ -1034,6 +1052,34 @@ function stripBareToolJson(text: string, tools?: any[]): string {
     return ""; // 剥掉
   });
 }
+
+/**
+ * 「正文里存在工具协议残骸标签」的探测器。
+ *
+ * 用途是**决定要不要进清理段**，不是做删改本身（删改由清理段里那几条正则完成）。
+ *
+ * 起因（2026-10-17 用户第四次截图）：模型退化时会连续吐出几十个 `</ calls>`，
+ * 斜杠后**带空格**，一个调用也解析不出来。清理段原来的三个入口条件
+ * （`calls.length` / `degenerated` / `junkToolSyntax`）在这种情形下全为假，
+ * 于是整屏残骸原样流给用户。加这条探测后，只要看见这类标签就会进清理段。
+ *
+ * 为什么可以放得这么宽：这些标签名（tool_calls / calls / invoke / parameter，
+ * 含 DSML/XYML 前缀）只可能出现在工具协议残骸里，正常中文/英文正文不会写成
+ * `<... calls>`；而**宽容匹配是必要的**——模型在斜杠后、标签名前都可能插空格。
+ */
+const TOOL_TAG_REMNANT_RE =
+  /<\s*\/?\s*(?:[｜|]{0,2}\s*(?:DSML|XYML|QNML)\s*[｜|]{0,2})?\s*(?:tool[_ ]?calls?|calls?|invoke|parameter)\b/i;
+
+/**
+ * 「正文里存在**空壳**工具调用」的探测器：`{"name":"read","arguments":}`。
+ *
+ * 与上面的残骸标签探测器同一个用途（决定要不要进清理段）。这类对象
+ * **救不回成调用**（模型没给任何参数），但也不能留在正文里——2026-10-17 第四次截图
+ * 的第二种形态就是它，`BARE` 兜底正则要求 `arguments` 后跟 `{` 或 `"`，
+ * 对 `:}` 不匹配，于是既不解析也不清理。
+ */
+const EMPTY_CALL_SHELL_RE =
+  /\{\s*"name"\s*:\s*"[^"\\]+"\s*,\s*"arguments"\s*:\s*(?:\{\s*\}|""|null|)\s*\}/i;
 
 // 导出给 src/cnb.test.ts：整个垃圾语法路径只有经过这个入口才走得通，
 // 不导出就等于那批用例只能测诊断、测不了"清理后的正文到底是什么样"。
@@ -1335,7 +1381,18 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
   }
 
   let clean = text;
-  if (calls.length || degenerated || junkToolSyntax) {
+  // ★ BUG FIX（2026-10-17，用户第四次截图：满屏 `</ calls>`）：清理段原来只在
+  // `calls.length || degenerated || junkToolSyntax` 时执行，而**「整屏退化闭合标签、
+  // 一个调用都没解析出来」**这种情形三者全假 —— 于是 `</ calls>` ×几十次原样流给
+  // 用户（截图里满屏都是）。实测：`</ calls>`×30 且无调用时，清理后残留 30/30。
+  // 这里补一条独立的探测器：只要正文里存在**工具协议残骸标签**（含斜杠后带空格的
+  // 退化写法），就必须走清理段把它剥掉。
+  const hasToolTagRemnant = TOOL_TAG_REMNANT_RE.test(clean);
+  const hasEmptyCallShell = EMPTY_CALL_SHELL_RE.test(clean);
+  if (
+    calls.length || degenerated || junkToolSyntax || hasToolTagRemnant ||
+    hasEmptyCallShell
+  ) {
     // 从后往前删除各 invoke 片段（按记录的 span，含存在的闭合标签）
     spans.sort((a, b) => b[0] - a[0]);
     for (const [s, e] of spans) clean = clean.slice(0, s) + clean.slice(e);
@@ -1346,6 +1403,28 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     clean = clean.replace(new RegExp(`<\\/?${P}parameter[^>]*>`, "gi"), "");
     clean = clean.replace(/<\/?tool[_ ]call(\s[^>]*)?>/gi, "");
     clean = clean.replace(/<\/?\w*call\w*\b[^>]*>/gi, "");
+    // ★ BUG FIX（2026-10-17，用户第四次截图：满屏 `</ calls>`）：上面那两条都要求
+    // 「`<` 紧跟 `/` 或词字符」，而退化形态是 **`<` `/` 空格 `calls` `>`**——斜杠与
+    // 标签名之间**多了一个空格**，于是全部不命中。实测（真实 cnbParseToolCalls）：
+    //   源文本 `</ calls>` ×30 → 清理后**残留 30 次**（三条正则都不命中）
+    //   同样内容但源为 `</｜｜DSML｜｜ calls>` → 归一化成 `</|XYML|tool_calls>` 后能清掉
+    //   即使同一条消息里有正常调用（清理段被激活）→ `</ calls>` 仍残留 30/30
+    // 第三条尤其说明：**这不是闸门问题，是没有任何一条正则覆盖这个形态**。
+    // 模型退化时会在斜杠后插入空格（截图里满屏都是这种），所以这里统一容忍
+    // 「`<` 后空白 + `/` 后空白」，标签名 `tool_calls`/`calls`/`invoke`/`parameter`
+    // 一并收——它们只可能出现在工具协议残骸里，正文不会这么写。
+    clean = clean.replace(
+      new RegExp(
+        `<\\s*\\/?\\s*${P}\\s*(?:tool[_ ]?calls?|calls?|invoke|parameter)\\b[^>]*>`,
+        "gi",
+      ),
+      "",
+    );
+    // 注：这里**曾经**还有一条「竖线前缀被打散」的更宽正则（匹配 `</ ｜｜ DSML ｜｜ calls>`）。
+    // 逐行删实验证明它是死代码：它要求含 `DSML`，而 `normalizeDsml` 在本函数开头就已把
+    // 所有 DSML 形态转成 `|XYML|…`，于是上面这条必然先接住。删掉后全部用例仍绿
+    // （对它的变异也无法使任何断言变红——因为它从不独立生效）。
+    // 判据留档：新增清理正则前，先确认它匹配的形态**有没有在上游被归一化掉**。
     // DSML 残骸（混合协议时模型的串台闭合标签）
     clean = clean.replace(/<\/?[｜|]{2}DSML[｜|]{2}\s*\w*[^>]*>/gi, "");
     // ★ BUG FIX（2026-10-16，用户第三次截图报「乱码」）：剥掉**裸 JSON 参数体**。
