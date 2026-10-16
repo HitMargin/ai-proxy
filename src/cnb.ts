@@ -431,7 +431,18 @@ function parseToolCallPayload(payload: string): any[] {
 // 旧正则用 `\\s>` 要求 `>` 紧跟 tag 名（只允许空白），导致整块匹配不上、
 // 透传成正文泄漏给客户端。改为 `\\b[^>]*>` 容忍标签名后到 `>` 之间的任意
 // 非-`>` 字符（属性、散文、引号残渣），归一化后由 JUNK 检测器统一清理。
-const DSML_TOK = String.raw`[｜|]{2}DSML[｜|]{2}`;
+// ★ BUG FIX（2026-10-16，用户第二次截图报「乱码」）：竖线数量**不能写死对称**。
+//
+// 旧值 `[｜|]{2}DSML[｜|]{2}` 要求两侧各恰好两根，于是漏掉全部非对称形态。
+// 实测泄漏原文是 **左单右双**（`<｜DSML｜｜parameter>`，session line 7299）——
+// 既不进 createLiveFilter 的缓冲、也不被 normalizeDsml 归一化，标记原样流进正文。
+// 用源码真实正则跑过的对照（七种形态）：左单右双 ✗ / 单竖线 ✗ / ASCII 单 ✗ /
+// 带空格 ✗ —— **只有左右各二与 ASCII 双命中**。所以「宽容」这个说法当时是错的：
+// 它和第三方插件犯的是同一类错（对称量词假设），只是漏的具体形态不同。
+//
+// 现在改成两侧各 1~2 根、且允许竖线与 DSML 之间夹空格。**注意量词必须写成
+// `{1,2}` 而不是 `+`**：`+` 会把正文里相邻的竖线一起吃掉（如 `a||b|DSML|`）。
+const DSML_TOK = String.raw`[｜|]{1,2}\s*DSML\s*[｜|]{1,2}`;
 const DSML_PARAM = new RegExp(
   `<${DSML_TOK}\\s*parameter\\s+name="([^"]+)"([^>]*)>([\\s\\S]*?)</${DSML_TOK}\\s*parameter\\b[^>]*>`,
   "gi",
@@ -971,6 +982,59 @@ function normalizeInvokeConfusion(text: string) {
   return text;
 }
 
+/**
+ * 剥掉正文里「伪装成工具参数的裸 JSON 段」。
+ *
+ * 起因（2026-10-16 用户第三次截图）：模型把工具名写进 `parameter name`、参数写成裸
+ * JSON，标签被清掉后**那几份 JSON 留在正文**，用户看到三行一模一样的
+ * `{"file_path":"...","offset":200,"limit":95}`。
+ *
+ * 为什么不能简单删所有 JSON：正文里合法出现 JSON 很常见（贴配置、读日志）。
+ * 所以判据用**与工具 schema 的参数名重合度**，且要求对象所有键都落在某个工具的
+ * 参数集内、并且至少命中一个必需参数（或两个已知参数）——这样
+ * `{"file_path":...,"offset":...,"limit":...}` 会被删，而
+ * `{"name":"x","version":1}` 这类无关对象不会。
+ */
+function stripBareToolJson(text: string, tools?: any[]): string {
+  if (!Array.isArray(tools) || tools.length === 0) return text;
+  // 汇总所有工具的参数名与必需参数名
+  const allParams = new Set<string>();
+  const requiredParams = new Set<string>();
+  for (const t of tools) {
+    const fn = t?.function;
+    if (!fn?.name) continue;
+    const params = fn.parameters || {};
+    const props = params.properties || {};
+    for (const k of Object.keys(props)) allParams.add(k);
+    for (const r of (Array.isArray(params.required) ? params.required : [])) {
+      requiredParams.add(r);
+    }
+  }
+  if (allParams.size === 0) return text;
+
+  // 匹配顶层 JSON 对象（不含嵌套花括号的简单形态，够覆盖这里的参数体）
+  return text.replace(/\{[^{}]*\}/g, (m) => {
+    let obj: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(m);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return m;
+      }
+      obj = parsed as Record<string, unknown>;
+    } catch {
+      return m; // 不是合法 JSON，原样保留
+    }
+    const keys = Object.keys(obj);
+    if (keys.length === 0) return m;
+    // 所有键都必须是某个工具的参数名，否则与工具无关
+    if (!keys.every((k) => allParams.has(k))) return m;
+    // 并且要够像一次调用：命中任一必需参数，或至少两个已知参数
+    const hitRequired = keys.some((k) => requiredParams.has(k));
+    if (!hitRequired && keys.length < 2) return m;
+    return ""; // 剥掉
+  });
+}
+
 // 导出给 src/cnb.test.ts：整个垃圾语法路径只有经过这个入口才走得通，
 // 不导出就等于那批用例只能测诊断、测不了"清理后的正文到底是什么样"。
 export function cnbParseToolCalls(text: string, tools?: any[]) {
@@ -1219,11 +1283,29 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     // 单一 JUNK 正则是这套逻辑的**唯一清理出口**：它少认一种写法，那种写法的整块
     // 标签就会留在正文里直接发给客户端——用户看到的是一堆裸露伪 XML，而不是一句
     // "写错了"。新增协议形态必须同时扩这里。
+    //
+    // ★ BUG FIX（2026-10-16，用户第三次截图报「乱码」）：下面两条**都只认「有外层
+    // 包裹」的形态**，而实际泄漏是**裸标签** —— `<parameter name="read">{裸 JSON}</parameter>`
+    // （无 tool_calls 包裹、无 XYML 前缀）。实测对照（真实 cnbParseToolCalls）：
+    //   <tool_calls> 包裹     → JUNK 命中 ✓ 已清理
+    //   <function_calls> 包裹 → JUNK 命中 ✓ 已清理
+    //   裸 <parameter>        → JUNK **未命中** ✗ 整块泄漏到正文
+    // 这正是上面注释预警的「少认一种写法」第三次应验。
+    //
+    // 为什么补的这条**剥掉而不是还原成调用**：实测那段泄漏所在的 assistant 消息里
+    // **同时存在一个正常的 tool-call（read，id call_f8vjgd094pc）**，泄漏文本只是
+    // 模型思考过程里的冗余副本。若在此处把它解析成调用，同一个 read 会被执行两次。
+    // 所以裸标签的正确归宿是「清理出口」，与上面两条一致。
     const JUNK = new RegExp(
       // 复数 / 带属性 / 漏闭合的 tool_calls 包裹：开到最近的闭合标签或文末
       "<(?:\\|?(?:XYML|QNML)\\|?)?tool[_ ]?calls?\\b[\\s\\S]*?(?:<\\/[^>]*(?:call|invoke|parameter)[^>]*\\s*>|$)" +
         // function_call(s) 单复数都收：只写复数时，单数那半边的标签会原样漏出去
-        "|<function_calls?\\b[\\s\\S]*?(?:<\\/[^>]*call[^>]*\\s*>|$)",
+        "|<function_calls?\\b[\\s\\S]*?(?:<\\/[^>]*call[^>]*\\s*>|$)" +
+        // ★ 裸 invoke / parameter 开标签（无外层包裹）：真实泄漏的写法之一。
+        // 注意这条**只覆盖「这一轮没有任何正常调用」的情形**——真实那次泄漏所在的消息
+        // 里同时存在正常 `tool-call`，于是走不到这个分支，由下面的 stripBareToolJson
+        // 兜住（两条互补，缺一不可）。
+        "|<(?:[｜|]{1,2}\\s*DSML\\s*[｜|]{1,2}|\\|?(?:XYML|QNML)\\|?)?\\s*(?:invoke|parameter)\\b[\\s\\S]*?(?:<\\/|<(?:[｜|]{1,2}\\s*DSML\\s*[｜|]{1,2}|\\|?(?:XYML|QNML)\\|?)?\\s*(?:invoke|parameter)\\b|$)",
       "gi",
     );
     if (JUNK.test(text)) {
@@ -1266,6 +1348,26 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     clean = clean.replace(/<\/?\w*call\w*\b[^>]*>/gi, "");
     // DSML 残骸（混合协议时模型的串台闭合标签）
     clean = clean.replace(/<\/?[｜|]{2}DSML[｜|]{2}\s*\w*[^>]*>/gi, "");
+    // ★ BUG FIX（2026-10-16，用户第三次截图报「乱码」）：剥掉**裸 JSON 参数体**。
+    //
+    // 实测泄漏原文（session line 7481，provider=ai-proxy-cnb）：
+    //   <parameter name="read">
+    //   {"file_path":"...Settings.cs","offset":200,"limit":95}   ← 工具名在标签上、值是裸 JSON
+    //   </parameter>
+    //   </｜｜DSML｜｜ parameter>
+    //   {"file_path":...}          ← 又重复两次
+    //   {"file_path":...}
+    //
+    // 走到这里时标签已被上面几行清掉，**但那三份 JSON 留在正文里**——用户看到的就是
+    // 这个（截图里三行一模一样的 JSON）。它不落在 `!calls.length` 的 JUNK 闸门内：
+    // 真实那一轮的 assistant 消息里**同时有一个正常的 `tool-call read`**
+    // （id call_f8vjgd094pc），所以 `calls.length === 1`，闸门根本不进。
+    // 我第一版补丁加在 JUNK 分支里，对真实情形零作用——实测对照才看出来。
+    //
+    // 判据用「**与工具 schema 的参数名重合度**」而不是「长得像 JSON」：正文里合法出现的
+    // JSON 片段（配置文件、日志）不能被误删，而这里的对象恰好由 read 的
+    // file_path/offset/limit 组成。重合度门槛取「含至少一个必需参数名或两个已知参数名」。
+    clean = stripBareToolJson(clean, tools);
     clean = clean.trim();
     if (degenerated) {
       clean = clean ? clean + "\n\n" + DEGENERATE_NOTE : DEGENERATE_NOTE;
@@ -1302,10 +1404,21 @@ const TOOL_OPENERS = [
   "<tool_calls", // 单复数都收
   "<function_call",
   "<function_calls", // OpenAI 遗留格式
-  "<｜｜dsml",
-  "<||dsml",
 ];
-const MAX_OPENER_LEN = Math.max(...TOOL_OPENERS.map((s) => s.length));
+
+// ★ DSML 开头单独用正则（2026-10-16）：竖线数量是 1~2 根、还可能夹空格，而
+// TOOL_OPENERS 是**精确子串**匹配，表达不了可变宽度。旧写法只列了
+// `"<｜｜dsml"` / `"<||dsml"` 两种「两根竖线」形态，于是**左单右双**的
+// 实际泄漏形态（`<｜DSML｜｜`）在流式阶段被直接放行、根本进不了缓冲——
+// 这正是它没能被 normalizeDsml 修掉的前置原因：**没被扣住，就没有后续处理**。
+const DSML_OPEN_RE = /<[｜|]{1,2}\s*dsml/i;
+// 尾部可能只是 DSML 开头的一部分（跨 chunk 补全），这些形态要扣住不发出。
+// 允许「<」+ 0~2 根竖线 + 空格 + dsml 的任意前缀（含空）。
+const DSML_TAIL_RE = /<[｜|]{0,2}\s*(?:d(?:s(?:m(?:l)?)?)?)?$/i;
+const MAX_OPENER_LEN = Math.max(
+  ...TOOL_OPENERS.map((s) => s.length),
+  "<｜｜dsml".length,
+);
 
 function createLiveFilter() {
   const state = { emitted: "", full: "" };
@@ -1334,6 +1447,9 @@ function createLiveFilter() {
         const p = low.indexOf(o);
         if (p !== -1 && (idx === -1 || p < idx)) idx = p;
       }
+      // DSML 开头用正则（竖线数量可变，子串匹配表达不了）
+      const dm = DSML_OPEN_RE.exec(low);
+      if (dm && (idx === -1 || dm.index < idx)) idx = dm.index;
       if (idx !== -1) {
         const out = held.slice(0, idx);
         held = held.slice(idx);
@@ -1345,7 +1461,10 @@ function createLiveFilter() {
       let keep = 0;
       for (let k = Math.min(MAX_OPENER_LEN, held.length); k > 0; k--) {
         const tail = low.slice(held.length - k);
-        if (TOOL_OPENERS.some((o) => o.startsWith(tail))) {
+        if (
+          TOOL_OPENERS.some((o) => o.startsWith(tail)) ||
+          DSML_TAIL_RE.test(tail)
+        ) {
           keep = k;
           break;
         }

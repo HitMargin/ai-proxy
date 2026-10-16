@@ -1101,3 +1101,110 @@ Deno.test("an oversized image being sent right now is refused, not silently drop
     "must say nothing was sent: " + thrown,
   );
 });
+
+// -- 裸 JSON 参数体不得泄漏到正文（2026-10-16 用户第三次截图报「乱码」） --
+//
+// 泄漏原文长这样（工具名写在 parameter 标签上、参数写成裸 JSON）：
+//   <parameter name="read">
+//   {"file_path":"...","offset":200,"limit":95}
+//   </parameter>
+//   {"file_path":...}   ← 又重复两次
+//
+// 关键：真实那一轮的 assistant 消息里**同时有一个正常的 tool-call**，所以
+// `calls.length === 1`，走不到 `!calls.length` 的 JUNK 闸门。判据必须落在
+// 「与工具 schema 的参数名重合度」上，不能用「长得像 JSON」——正文里合法 JSON 很多。
+
+const READ_TOOLS = [{
+  function: {
+    name: "read",
+    parameters: {
+      type: "object",
+      properties: {
+        file_path: { type: "string" },
+        offset: { type: "number" },
+        limit: { type: "number" },
+      },
+      required: ["file_path"],
+    },
+  },
+}];
+
+const LEAK_JSON =
+  '{"file_path":"D:\\\\Projects\\\\X\\\\Settings.cs","offset":200,"limit":95}';
+
+Deno.test("a bare JSON parameter body next to a real call is stripped, not leaked", () => {
+  resetJunkState();
+  const text = "A 收到。\n\n" +
+    '<parameter name="read">\n' + LEAK_JSON + "\n</parameter>\n" +
+    "</｜｜DSML｜｜ parameter>\n</parameter>\n\n" +
+    LEAK_JSON + "\n\n\n" + LEAK_JSON + "\n" +
+    OPEN + "\n" +
+    '{"name":"read","arguments":' + LEAK_JSON + "}\n" + CLOSE;
+  const r = cnbParseToolCalls(text, READ_TOOLS);
+  assertEquals(r.calls.length, 1, "the real call survives");
+  assertEquals(r.calls[0].function.name, "read");
+  assert(
+    !r.clean.includes("file_path"),
+    "the bare JSON bodies must not reach the client: " + r.clean,
+  );
+  assert(!r.clean.includes("offset"), "no parameter fragments either");
+  assert(r.clean.includes("A 收到"), "prose is kept");
+});
+
+Deno.test("a bare JSON body with no real call is stripped and diagnosed", () => {
+  resetJunkState();
+  const text = "A 收到。\n\n" +
+    '<parameter name="read">\n' + LEAK_JSON + "\n</parameter>\n\n" + LEAK_JSON;
+  const r = cnbParseToolCalls(text, READ_TOOLS);
+  assertEquals(r.calls.length, 0);
+  assert(
+    !r.clean.includes("file_path"),
+    "must not leak the JSON: " + r.clean,
+  );
+  assert(
+    r.clean.includes("What was wrong:"),
+    "the model must be told what was wrong instead of silently losing text",
+  );
+});
+
+Deno.test("unrelated JSON in prose is never deleted", () => {
+  resetJunkState();
+  // 反向保护：这些对象的键不在任何工具的参数集里（或只有一个非必需键），
+  // 误删就是数据丢失。
+  //
+  // ⚠️ 必须让**清理段真的被激活**，否则这条断言恒真、测不到东西：
+  // 清理段的条件是 `calls.length || degenerated || junkToolSyntax`，而单纯一句话
+  // 三者全为假、`stripBareToolJson` 根本不会被调用（变异验证发现的第一版就是
+  // 这样：去掉重合度门槛后它**依然全绿**）。这里在末尾附一个真调用把闸门打开。
+  const tail = "\n" + OPEN + "\n" +
+    '{"name":"read","arguments":{"file_path":"D:\\\\y.cs"}}' + "\n" + CLOSE;
+  const keep = [
+    '配置如下：{"name":"x","version":1}',
+    '端口是 {"port":8080}',
+    '看看 {"limit":95} 这个', // 单个已知但非必需 —— 保守保留
+  ];
+  for (const text of keep) {
+    const r = cnbParseToolCalls(text + tail, READ_TOOLS);
+    assertEquals(r.calls.length, 1, "the appended real call must parse");
+    assert(
+      r.clean.includes(text),
+      "must keep unrelated JSON verbatim, got: " + JSON.stringify(r.clean),
+    );
+  }
+});
+
+Deno.test("DSML markers with mismatched bar counts are normalised (left 1 / right 2)", () => {
+  // 实测泄漏形态是**左单右双**；旧正则 `[｜|]{2}DSML[｜|]{2}` 要求两侧各恰好两根，
+  // 于是漏过。这条同时守住「不对称」与「带空格」两种。
+  for (const tok of ["｜DSML｜｜", "｜DSML｜", "|DSML|", "｜ DSML ｜"]) {
+    const text = "<" + tok + 'parameter name="file_path">D:\\\\x.cs</' + tok +
+      "parameter>";
+    const r = cnbParseToolCalls(text, READ_TOOLS);
+    assertEquals(
+      r.calls.length,
+      1,
+      "DSML form <" + tok + "> must be recognised, got clean=" + r.clean,
+    );
+    assertEquals(r.calls[0].function.name, "read");
+  }
+});
