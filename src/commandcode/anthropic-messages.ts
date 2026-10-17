@@ -264,10 +264,26 @@ export function anthropicMessagesToChat(input: unknown):
     }
     if (input.tool_choice.type === "auto") body.tool_choice = "auto";
     else if (input.tool_choice.type === "none") body.tool_choice = "none";
-    else {
+    else if (input.tool_choice.type === "any") {
+      // Anthropic 的 "any" = 必须调一个工具；OpenAI 语义里最接近的是 "required"。
+      // 上游若不认 "required" 会忽略——比整轮 400 好（Claude Code 会发这个值）。
+      body.tool_choice = "required";
+    } else if (
+      input.tool_choice.type === "tool" &&
+      typeof input.tool_choice.name === "string"
+    ) {
+      // "指定必须调某个工具"在 OpenAI 通用形状里没有统一表达；用 function 壳
+      // （部分网关认），上游不认就忽略——同样比整轮 400 好。
+      body.tool_choice = {
+        type: "function",
+        function: { name: input.tool_choice.name },
+      };
+    } else {
       return {
         ok: false,
-        message: "CommandCode supports only Anthropic tool_choice auto or none",
+        message: "tool_choice.type must be one of auto/none/any/tool (got " +
+          JSON.stringify(input.tool_choice.type ?? null) +
+          ")",
       };
     }
   }

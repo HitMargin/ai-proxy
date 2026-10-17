@@ -76,13 +76,15 @@ Deno.test("Anthropic Messages request rejects unsupported stateless fields", () 
   // 2026-10-18：stop_sequences/thinking/top_k 不再被拒（Claude Code 每轮都带，
   // 硬拒等于整渠道不可用）。改为映射：stop_sequences → `stop`，top_k 透传，
   // thinking 剥掉。见同文件底部的映射断言。
-  const toolChoice = anthropicMessagesToChat({
+  // 2026-10-18：tool_choice 的 any/tool 也不再拒绝（Claude Code 会发），
+  // 改映射，见下面的映射断言。仍拒绝的只剩"非对象"与"未知的 type"。
+  const badToolChoice = anthropicMessagesToChat({
     model: "deepseek/test",
     max_tokens: 10,
     messages: [{ role: "user", content: "hi" }],
-    tool_choice: { type: "any" },
+    tool_choice: { type: "definitely-not-a-type" },
   });
-  equal(toolChoice.ok, false);
+  equal(badToolChoice.ok, false);
 });
 
 Deno.test("Anthropic stop_sequences/top_k map into the chat body instead of failing", () => {
@@ -144,6 +146,37 @@ Deno.test("Anthropic messages with foreign roles are downgraded, not rejected", 
   assert(
     msgs.some((m) => m.role === "user" && m.content === "hi"),
     "the real user message must survive",
+  );
+});
+
+Deno.test("Anthropic tool_choice any/tool map into the chat body instead of failing", () => {
+  // Claude Code 会发 type:"any"（必须调工具）与 type:"tool"（指定工具）。
+  const anyResult = anthropicMessagesToChat({
+    model: "deepseek/test",
+    max_tokens: 10,
+    messages: [{ role: "user", content: "hi" }],
+    tool_choice: { type: "any" },
+  });
+  equal(anyResult.ok, true);
+  if (!anyResult.ok) return;
+  equal(
+    anyResult.body.tool_choice,
+    "required",
+    '"any" maps to OpenAI "required"',
+  );
+
+  const toolResult = anthropicMessagesToChat({
+    model: "deepseek/test",
+    max_tokens: 10,
+    messages: [{ role: "user", content: "hi" }],
+    tool_choice: { type: "tool", name: "read" },
+  });
+  equal(toolResult.ok, true);
+  if (!toolResult.ok) return;
+  equal(
+    (toolResult.body.tool_choice as Record<string, unknown>).type,
+    "function",
+    '"tool" maps to the function shell',
   );
 });
 
