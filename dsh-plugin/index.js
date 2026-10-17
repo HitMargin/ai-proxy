@@ -2736,7 +2736,13 @@ export class AiProxyAdapter {
   providerRetryPolicy() {
     return Object.freeze({
       mode: 'normal',
-      maxRetries: 2,
+      // 2026-10-17 用户要求：重试上限从 2 提到 1,000,000。
+      // 动机：harness 只按失败码判重试、不看这一轮是否已交付，所以 2 次就是
+      // 「两三次上游抖动足以中断一个长任务」。
+      // 代价（已向用户说明）：对持续失败的上游，回合会以 maxDelayMs 为间隔
+      // 一直重试下去、不会自行结束——界面表现是「模型卡着不回复」而非报错。
+      // 只想扛抖动的话，几十到几百就够；这个数字只有在「宁可不放弃」时才合理。
+      maxRetries: 1000000,
       retryableCodes: Object.freeze(['RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']),
       initialDelayMs: 700,
       maxDelayMs: 8000,
@@ -3333,7 +3339,7 @@ export class AiProxyAdapter {
     // session by hand, which is precisely the stall the notice exists to prevent.
     //
     // The only way to make the turn continue on its own is to fail it so the
-    // harness retries (maxRetries: 2 in providerRetryPolicy), and TRANSPORT is
+    // harness retries (see providerRetryPolicy's maxRetries), and TRANSPORT is
     // the only code it retries.
     //
     // Retrying after output has been delivered is normally forbidden here - the

@@ -1032,6 +1032,21 @@ try {
     'an unclassed upstream failure must stay retryable',
   );
 
+  // The retry budget is deliberately enormous (2026-10-17, user's call): a long
+  // task must survive more than a couple of upstream hiccups. Pinned here so a
+  // silent revert to the old default shows up as a red test rather than as a
+  // turn that dies after two transient failures.
+  const policy = adapter.providerRetryPolicy();
+  assert.equal(policy.mode, 'normal');
+  assert.ok(
+    policy.maxRetries >= 1000,
+    `retry budget must stay large; got ${policy.maxRetries}`,
+  );
+  assert.ok(Number.isFinite(policy.maxRetries), 'a finite budget still ends the turn eventually');
+  // Raising the budget must not raise the wait: the ceiling is what keeps a
+  // persistent outage from turning into an hour-long stall between attempts.
+  assert.ok(policy.maxDelayMs <= 8000, `backoff ceiling must stay bounded; got ${policy.maxDelayMs}`);
+
   // A stream that ends properly but delivers nothing. This finished cleanly before,
   // and a clean finish with no blocks is exactly what the harness turns into
   // "Provider returned an empty response" - so the agent loop read a broken turn as
