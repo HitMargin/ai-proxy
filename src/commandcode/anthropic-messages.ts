@@ -77,11 +77,29 @@ export function anthropicMessagesToChat(input: unknown):
     input.stop_sequences !== undefined || input.thinking !== undefined ||
     input.top_k !== undefined
   ) {
-    return {
-      ok: false,
-      message:
-        "stop_sequences, thinking, and top_k are not supported by this gateway",
-    };
+    // 2026-10-18：这三者过去被硬拒（Claude Code 每轮都带，等于整渠道不可用）。
+    // 实测（2026-10-18 直连 cnb 上游）：stop 数组 / top_k / thinking 对象全部
+    // 200 出字（上游校验极松，未知字段不报错）。所以改为**尽力映射**而不是拒绝：
+    //   - stop_sequences → OpenAI 的 `stop`（语义一致）
+    //   - top_k → 原样透传（上游接受；不支持它的网关会忽略）
+    //   - thinking → 剥掉（Anthropic 的思考开关由渠道自己的 effort 机制表达，
+    //     直接透传一个 Anthropic 形状的对象反而可能被下游误读）
+    // ⚠️ commandcode 上游是否接受 top_k 未实测；这里只对 cnb 路径保证可用，
+    // commandcode 侧如遇问题再按渠道分叉。
+  }
+  let stop: Json | undefined;
+  if (input.stop_sequences !== undefined) {
+    if (!Array.isArray(input.stop_sequences)) {
+      return { ok: false, message: "stop_sequences must be an array" };
+    }
+    stop = input.stop_sequences;
+  }
+  let topK: number | undefined;
+  if (input.top_k !== undefined) {
+    if (!Number.isSafeInteger(Number(input.top_k)) || Number(input.top_k) < 1) {
+      return { ok: false, message: "top_k must be a positive integer" };
+    }
+    topK = Number(input.top_k);
   }
 
   const messages: Json[] = [];
@@ -164,6 +182,8 @@ export function anthropicMessagesToChat(input: unknown):
     body.temperature = input.temperature;
   }
   if (typeof input.top_p === "number") body.top_p = input.top_p;
+  if (stop !== undefined) body.stop = stop;
+  if (topK !== undefined) body.top_k = topK;
   if (input.tools !== undefined) {
     if (!Array.isArray(input.tools)) {
       return { ok: false, message: "tools must be an array" };

@@ -73,13 +73,9 @@ Deno.test("Anthropic Messages request rejects unsupported stateless fields", () 
     messages: [{ role: "user", content: "hi" }],
   });
   equal(missingTokens.ok, false);
-  const unsupported = anthropicMessagesToChat({
-    model: "deepseek/test",
-    max_tokens: 10,
-    messages: [{ role: "user", content: "hi" }],
-    stop_sequences: ["stop"],
-  });
-  equal(unsupported.ok, false);
+  // 2026-10-18：stop_sequences/thinking/top_k 不再被拒（Claude Code 每轮都带，
+  // 硬拒等于整渠道不可用）。改为映射：stop_sequences → `stop`，top_k 透传，
+  // thinking 剥掉。见同文件底部的映射断言。
   const toolChoice = anthropicMessagesToChat({
     model: "deepseek/test",
     max_tokens: 10,
@@ -87,6 +83,25 @@ Deno.test("Anthropic Messages request rejects unsupported stateless fields", () 
     tool_choice: { type: "any" },
   });
   equal(toolChoice.ok, false);
+});
+
+Deno.test("Anthropic stop_sequences/top_k map into the chat body instead of failing", () => {
+  const result = anthropicMessagesToChat({
+    model: "deepseek/test",
+    max_tokens: 10,
+    messages: [{ role: "user", content: "hi" }],
+    stop_sequences: ["stop-a", "stop-b"],
+    top_k: 40,
+    thinking: { type: "enabled", budget_tokens: 2048 },
+  });
+  equal(result.ok, true);
+  if (!result.ok) return;
+  // stop_sequences 映射为 OpenAI 的 `stop`
+  equal(result.body.stop, ["stop-a", "stop-b"]);
+  // top_k 原样透传
+  equal(result.body.top_k, 40);
+  // thinking 被剥掉：不进 wire body（Anthropic 的思考开关由渠道 effort 机制表达）
+  equal("thinking" in result.body, false);
 });
 
 Deno.test("Chat response converts to Anthropic message with usage", () => {
