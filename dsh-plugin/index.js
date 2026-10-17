@@ -575,8 +575,15 @@ export function normalizeModel(provider, row) {
       // means an under-clamped request and an upstream 400 - the same class of
       // failure as the 524288-output row in AGENTS.md, arriving through a field that
       // was never read rather than through a wrong value.
+      //
+      // 2026-10-18：兜底从 1000000 降到 200000。上游真正卡的是**字节数**（
+      // workbuddy 报 [BODY_TOO_LARGE] 1.00MB），而 harness 的自动压缩阈值按
+      // **token** 算：contextWindow × 0.8。把窗口虚报成 100 万，等于让自动压缩
+      // 等到 80 万 token 才动手，而 1MB 大约只装得下 25 万 token —— 等到它想
+      // 压缩时请求体早已超限，压缩自己也被 413 拒绝，于是永远压不动。
+      // 200000 token ≈ 800KB，乘 0.8 后在约 16 万 token（≈640KB）触发，安全。
       ['contextWindow', 'context_window', 'context_length', 'max_input_tokens'],
-      readNumber(upstream, ['context_window', 'context_length'], 1000000),
+      readNumber(upstream, ['context_window', 'context_length'], 200000),
     ),
     maxTokens: readNumber(
       row,
@@ -2949,7 +2956,7 @@ export class AiProxyAdapter {
         provider,
         id,
         name: id,
-        context: { contextWindow: 1000000 },
+        context: { contextWindow: 200000 },
         defaultMaxTokens: DEFAULT_MAX_TOKENS,
         basePath: route.basePath,
         wireModel: route.wireModel,
