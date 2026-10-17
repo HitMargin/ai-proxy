@@ -13,7 +13,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn as nodeSpawn } from 'node:child_process'
+import { spawn as nodeSpawn, spawnSync as nodeSpawnSync } from 'node:child_process'
 
 // The tunnel's command line is only observable at the spawn, and what it guards
 // against is measured: run a named tunnel without `--config`, cloudflared warns
@@ -30,6 +30,145 @@ export function __setSpawnForTest(fn) {
 }
 export function __getSpawnForTest() {
   return spawnOverride
+}
+
+// ---- child lifetime -------------------------------------------------------
+//
+// Why this exists at all: the Host decides whether an app update may proceed by
+// waiting for this process to exit *and* for every teardown to finish.  A deno
+// child we spawned but did not outlive keeps its stdout/stderr pipes open, so the
+// Host still owns those handles after `stop()` returns; the update then fails
+// with `DesktopHostUncleanExitError` and the only workaround is `taskkill /T /F`
+// by hand.  Measured 2026-10-17: `child.kill()` on Windows does terminate deno in
+// ~100ms, so the defect was never "kill does not work" - it was that nobody
+// waited for it, closed the pipes, or had a last resort when the signal was
+// ignored.
+//
+// Three layers, each covering a hole the one below it cannot:
+//   1. `terminateChild` awaits the real `exit` event, so teardown is ordered.
+//   2. After a grace period it escalates to `taskkill /T /F` (Windows) or
+//      SIGKILL, which also reaps grandchildren such as conhost.
+//   3. A synchronous `process.on('exit')` sweep catches the path where the Host
+//      kills us outright: nothing async can run there, so it must be spawnSync.
+const LIVE_CHILDREN = new Set()
+let exitSweepInstalled = false
+let spawnSyncOverride = null
+function spawnSyncCapture(bin, args, options) {
+  return spawnSyncOverride
+    ? spawnSyncOverride(bin, args, options)
+    : nodeSpawnSync(bin, args, options)
+}
+export function __setSpawnSyncForTest(fn) {
+  spawnSyncOverride = fn
+}
+export function __liveChildrenForTest() {
+  return [...LIVE_CHILDREN]
+}
+
+/** Register a child so the exit sweep can find it even if teardown never runs. */
+function trackChild(child) {
+  if (!child || typeof child.pid !== 'number' || child.pid <= 0) return child
+  LIVE_CHILDREN.add(child)
+  child.once('exit', () => LIVE_CHILDREN.delete(child))
+  installExitSweep()
+  return child
+}
+
+function installExitSweep() {
+  if (exitSweepInstalled) return
+  exitSweepInstalled = true
+  process.on('exit', () => {
+    for (const child of LIVE_CHILDREN) {
+      const pid = child.pid
+      if (typeof pid !== 'number' || pid <= 0) continue
+      // Already reaped: `exitCode`/`signalCode` are set once the `exit` event
+      // fired, and `once('exit')` normally removed it from the set already.
+      if (child.exitCode !== null || child.signalCode !== null) continue
+      try {
+        if (process.platform === 'win32') {
+          spawnSyncCapture('taskkill', ['/PID', String(pid), '/T', '/F'], {
+            windowsHide: true,
+            stdio: 'ignore',
+            timeout: 3000,
+          })
+        } else {
+          try { child.kill('SIGKILL') } catch { /* already gone */ }
+        }
+      } catch { /* a failed sweep must never block process exit */ }
+    }
+    LIVE_CHILDREN.clear()
+  })
+}
+
+/** Release the pipes so the Host stops owning them. */
+function closeChildStreams(child) {
+  for (const stream of [child?.stdout, child?.stderr, child?.stdin]) {
+    if (!stream || typeof stream.destroy !== 'function') continue
+    try { stream.destroy() } catch { /* already closed */ }
+  }
+}
+
+// Not `unref`-ed on purpose: this timer backs a promise the caller is awaiting, so
+// letting it stop holding the event loop open would turn a deliberate grace period
+// into "the process exits with an unsettled await" - which is exactly how the
+// self-test caught this.
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Terminate a child and do not resolve until it is really gone.
+ *
+ * Returns `true` when the exit event was observed. The escalation is what makes
+ * this reliable rather than hopeful: a signal a process chooses to ignore would
+ * otherwise leave the Host hanging exactly as before.
+ */
+async function terminateChild(child, { graceMs = 3000, killMs = 1500 } = {}) {
+  if (!child) return true
+  const pid = child.pid
+  if (typeof pid !== 'number' || pid <= 0) {
+    closeChildStreams(child)
+    return true
+  }
+  // `exitCode`/`signalCode` are only non-null after the process is reaped.
+  if (child.exitCode !== null && child.exitCode !== undefined) {
+    closeChildStreams(child)
+    LIVE_CHILDREN.delete(child)
+    return true
+  }
+  if (child.signalCode !== null && child.signalCode !== undefined) {
+    closeChildStreams(child)
+    LIVE_CHILDREN.delete(child)
+    return true
+  }
+  const exited = new Promise((resolve) => {
+    let settled = false
+    const done = () => { if (!settled) { settled = true; resolve(true) } }
+    child.once('exit', done)
+    child.once('error', done)
+    child.once('close', done)
+  })
+  try { child.kill() } catch { /* may already be gone */ }
+  if (await Promise.race([exited, wait(graceMs).then(() => false)])) {
+    closeChildStreams(child)
+    LIVE_CHILDREN.delete(child)
+    return true
+  }
+  // Still here: escalate. `taskkill /T` also reaps conhost and any grandchildren,
+  // which a plain signal to the child cannot reach on Windows.
+  try {
+    if (process.platform === 'win32') {
+      spawnSyncCapture('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+        timeout: 5000,
+      })
+    } else {
+      try { child.kill('SIGKILL') } catch { /* already gone */ }
+    }
+  } catch { /* fall through to the final wait */ }
+  const reaped = await Promise.race([exited, wait(killMs).then(() => false)])
+  closeChildStreams(child)
+  LIVE_CHILDREN.delete(child)
+  return reaped
 }
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
@@ -1264,12 +1403,12 @@ export class ProxyRuntime {
     this.state = 'starting';
     this.record(`starting ${deno} in ${root}`);
     try {
-      this.child = spawn(deno, ['run', '-A', 'main.ts'], {
+      this.child = trackChild(spawn(deno, ['run', '-A', 'main.ts'], {
         cwd: root,
         windowsHide: true,
         env: { ...process.env, ...credentialEnv(this.settings), PORT: String(this.settings.port), DENO_NO_UPDATE_CHECK: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      }));
       this.owned = true;
       this.startedAt = Date.now();
       const onData = (chunk) => this.record(String(chunk).trimEnd());
@@ -1304,17 +1443,38 @@ export class ProxyRuntime {
   }
 
   async stop() {
-    if (!this.owned || !this.child) {
-      this.state = 'stopped';
-      return;
-    }
-    this.state = 'stopping';
+    // Take the reference first: the `exit` handler below sets `this.child` to
+    // null, and reading it after an await would lose the process we must reap.
     const child = this.child;
     this.owned = false;
     this.child = null;
-    try { child.kill(); } catch {}
+    if (!child) {
+      this.state = 'stopped';
+      return;
+    }
+    // ★ The old body was `try { child.kill() } catch {}` and then immediately
+    // `state = 'stopped'`.  That returned while deno was still alive and still
+    // holding the pipes this process handed it, which is exactly what made the
+    // Host report `DesktopHostUncleanExitError` on every app update: the Host
+    // asked for a graceful quit, the plugin's disposer was `void`-ed anyway, and
+    // the child outlived the window in which the Host waits.
+    // Awaiting `terminateChild` is what makes "stopped" mean stopped - it resolves
+    // on the real `exit` event, escalates to `taskkill /T /F` if the signal is
+    // ignored, and always closes the pipes.
+    this.state = 'stopping';
+    try {
+      const exited = await terminateChild(child);
+      this.record(
+        exited
+          ? 'local proxy stopped by DSH plugin'
+          : 'local proxy did not confirm exit after taskkill; continuing teardown',
+      );
+    } catch (error) {
+      this.record(
+        `stopping the local proxy failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     this.state = 'stopped';
-    this.record('local proxy stopped by DSH plugin');
   }
 
   async update(values = {}) {
@@ -1569,11 +1729,11 @@ export class TunnelRuntime {
     this.state = 'starting';
     this.record(`starting tunnel: ${binary} ${args.join(' ')}`);
     try {
-      this.child = spawn(binary, args, {
+      this.child = trackChild(spawn(binary, args, {
         windowsHide: true,
         env: { ...process.env, NO_UPDATE_NOTIFIER: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
-      });
+      }));
     } catch (error) {
       this.state = 'error';
       this.lastError = error instanceof Error ? error.message : String(error);
@@ -4245,13 +4405,33 @@ export function apply(ctx, config = {}) {
   });
   const start = () => {
     void runtime.start();
-    return () => { void runtime.stop(); };
+    // ★ Must be `async` and must await: the Host treats a returned promise as
+    // teardown work it can wait for.  Returning `void` here is what let the deno
+    // child outlive the quit window and produce `DesktopHostUncleanExitError`.
+    //
+    // The tunnel is stopped here as well as in the outer disposer: the Host may
+    // run either one (effect cleanup on reload, the returned disposer on quit), and
+    // a teardown path that only stops the proxy leaves cloudflared holding pipes.
+    return async () => {
+      try { await runtime.stop(); } catch { /* keep going */ }
+      try { await tunnel.stop(); } catch { /* the tunnel is optional */ }
+    };
   };
   if (typeof ctx.effect === 'function') ctx.effect(start, 'ai-proxy bridge: proxy lifecycle');
   else start();
   installHotReload(config);
-  return () => {
-    void runtime.stop();
+  return async () => {
+    // Awaiting both children is the point of this function being `async`: the
+    // Host waits for this promise before deciding the shutdown was clean.  A
+    // `void`-ed stop returns immediately and leaves deno (and cloudflared, when
+    // the tunnel is up) holding the pipes and port 8000.
+    try { await runtime.stop(); } catch { /* teardown must not throw during quit */ }
+    try { await tunnel.stop(); } catch { /* the tunnel is optional */ }
+    // Also reap anything the exit sweep knows about that the two runtimes do not
+    // own - e.g. a child that was already nulled out of `this.child`.
+    for (const child of [...LIVE_CHILDREN]) {
+      try { await terminateChild(child); } catch { /* already gone */ }
+    }
     registration?.dispose?.();
     // A pending usage write is coalesced for 800ms, so a teardown right after
     // a turn would otherwise drop it. Flushing here makes the last call before a

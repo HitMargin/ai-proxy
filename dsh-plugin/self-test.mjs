@@ -2684,6 +2684,101 @@ try {
     const partial = buildPayload([], [{ name: 'half', baseUrl: '', origin: 'env' }]);
     assert.deepEqual(partial.customProviders, [], 'an incomplete row must not be submitted');
   }
+
+  // ── 子进程必须被真正杀掉（2026-10-17「更新装不上」的根因）──
+  //
+  // 用户报告：DSH 每次自更新都失败，报 DesktopHostUncleanExitError，只能用
+  // taskkill /T /F 手动强杀后重试。诊断出的是 Plugin 的 deno 子进程在 host
+  // 退出时仍活着——`stop()` 只 `child.kill()` 然后立刻 `state='stopped'`，
+  // 没等进程真的退出、没关管道、也没有兜底。这里把三段行为钉死。
+  {
+    const { __setSpawnForTest, __setSpawnSyncForTest } = await import('./index.js');
+    // terminateChild / trackChild 没有导出给产品用，但测试需要直接验证它们。
+    // 通过 runtime.stop() 走真实路径更贴近线上，所以下面用假的 child 走 stop()。
+    const runtime = new ProxyRuntime({ mode: 'local', projectRoot: os.tmpdir() });
+    let resolveExit;
+    let killCalls = 0;
+    let destroyed = 0;
+    const fakeChild = {
+      pid: 424242,
+      exitCode: null,
+      signalCode: null,
+      stdout: { on: () => {}, destroy: () => { destroyed++ } },
+      stderr: { on: () => {}, destroy: () => { destroyed++ } },
+      stdin: { on: () => {}, destroy: () => { destroyed++ } },
+      on: () => {},
+      once: (event, handler) => {
+        if (event === 'exit') resolveExit = handler;
+        return fakeChild;
+      },
+      kill: () => {
+        killCalls++;
+        // 模拟真实的成序退出：信号发出后进程稍后才死。
+        setTimeout(() => {
+          fakeChild.exitCode = 0;
+          resolveExit?.(0, null);
+        }, 30);
+      },
+    };
+    runtime.child = fakeChild;
+    runtime.owned = true;
+    const started = Date.now();
+    await runtime.stop();
+    const elapsed = Date.now() - started;
+    assert.equal(killCalls, 1, 'stop() must signal the child exactly once');
+    // ★ 核心断言：stop() 必须等到进程真的退出。旧实现是发完信号立刻返回（<1ms）。
+    assert.ok(
+      elapsed >= 25,
+      `stop() must not resolve before the child exits (returned in ${elapsed}ms)`,
+    );
+    assert.equal(fakeChild.exitCode, 0, 'the child must have exited by the time stop() resolves');
+    // ★ 管道必须被关掉：host 正是卡在这些句柄上。
+    assert.equal(destroyed, 3, 'stop() must destroy stdout, stderr and stdin so the host releases them');
+    assert.equal(runtime.state, 'stopped');
+
+    // ★ 反向保护：信号被忽略时必须升级。旧实现里 child.kill() 无效就永远卡住。
+    let spawnedSync = [];
+    __setSpawnSyncForTest?.((bin, args, opts) => {
+      spawnedSync.push([bin, args]);
+      // taskkill 之后模拟进程消失
+      fakeChild.exitCode = 1;
+      resolveExit?.(1, 'SIGKILL');
+      return { status: 0 };
+    });
+    const stubborn = {
+      pid: 424243,
+      exitCode: null,
+      signalCode: null,
+      stdout: { on: () => {}, destroy: () => {} },
+      stderr: { on: () => {}, destroy: () => {} },
+      stdin: { on: () => {}, destroy: () => {} },
+      on: () => {},
+      once: (event, handler) => {
+        if (event === 'exit') stubbornExit = handler;
+        return stubborn;
+      },
+      // 忽略信号：模拟一个死不掉/不自杀的子进程
+      kill: () => {},
+    };
+    let stubbornExit;
+    const runtime2 = new ProxyRuntime({ mode: 'local', projectRoot: os.tmpdir() });
+    runtime2.child = stubborn;
+    runtime2.owned = true;
+    const t2 = Date.now();
+    await runtime2.stop();
+    const elapsed2 = Date.now() - t2;
+    assert.ok(
+      elapsed2 >= 2500,
+      `stop() must wait out the grace period before escalating (took ${elapsed2}ms)`,
+    );
+    const taskkill = spawnedSync.find(([bin]) => /taskkill/i.test(String(bin)));
+    if (process.platform === 'win32') {
+      assert.ok(taskkill, 'a child that ignores the signal must be escalated to taskkill /T /F');
+      assert.ok(taskkill[1].includes('/T'), 'taskkill must use /T so grandchildren are reaped too');
+      assert.ok(taskkill[1].includes('/F'), 'taskkill must use /F: a polite kill is what already failed');
+    }
+    __setSpawnSyncForTest?.(null);
+  }
   console.log('dsh bridge self-test ok');
 } finally {
   globalThis.fetch = originalFetch;
