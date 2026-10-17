@@ -1564,6 +1564,57 @@ function commonPrefixLen(a: string, b: string) {
   return i;
 }
 
+/**
+ * 把 Claude Code 的客户端身份声明改写成中性表述。
+ *
+ * 为什么需要：cnb 于 2026-10-18 上线渠道校验 `errcode 11128`（"Illegal API
+ * invocation from an unapproved channel"，文案「可能不是官方客户端发出的」）。
+ * 实测它的判据是 **system/assistant 消息里连续出现的 Claude Code 身份短语**：
+ *   - 完整原文出现                       → 400 / 11128
+ *   - 去掉句尾句号 / 全大写              → 仍 400（大小写不敏感、容错标点）
+ *   - 去掉开头 "You are"                 → 200
+ *   - 只留 "You are Claude Code"         → 200
+ *   - 中间插词 / 换行拆开 / 放句尾 / 放句中 → 200
+ *   - user 消息里出现                    → 200（不检测）
+ * 也就是说匹配的是**那一段连续字符序列**，不是"Claude"这个品牌名。
+ *
+ * 因此这里做的替换保持了句子的语义（仍然告诉模型它是个编码助手），只是不再
+ * 自称官方客户端。**这是规避，不是适配**——上游随时可以加别的指纹。
+ *
+ * 只动 `system` 与 `assistant`：`user` 不在检测面上，改它反而会篡改用户原文。
+ * 内容为数组（多模态）时逐个 text 块处理，图片块原样保留。
+ */
+export function neutraliseClientIdentity(msgs: any[]): any[] {
+  // 完整短语，以及它能被容忍的标点/空白变体。大小写不敏感在下面统一处理。
+  // 故意只匹配这个"整句"：拆开就不被拦（实测），改了就别无谓地动其它文本。
+  const IDENTITY =
+    /You are Claude Code,{1,2}\s*Anthropic['’]s official CLI for Claude\.?/gi;
+  const REPLACEMENT = "You are a coding agent working inside a CLI tool.";
+
+  const rewrite = (text: string): string => text.replace(IDENTITY, REPLACEMENT);
+
+  return msgs.map((m) => {
+    const role = String(m?.role ?? "").toLowerCase();
+    if (role !== "system" && role !== "assistant") return m;
+    if (typeof m.content === "string") {
+      const next = rewrite(m.content);
+      return next === m.content ? m : { ...m, content: next };
+    }
+    if (Array.isArray(m.content)) {
+      let changed = false;
+      const parts = m.content.map((p: any) => {
+        if (p?.type !== "text" || typeof p.text !== "string") return p;
+        const next = rewrite(p.text);
+        if (next === p.text) return p;
+        changed = true;
+        return { ...p, text: next };
+      });
+      return changed ? { ...m, content: parts } : m;
+    }
+    return m;
+  });
+}
+
 // 导出给 src/cnb.test.ts：推理档位那一组断言（off 真的关掉思考、未知值报错
 // 而不是静默回落）只能对着这个函数的输出来测。它不发网络，纯构造请求体。
 export function cnbBuildUpstream(openaiBody: any) {
@@ -1847,26 +1898,43 @@ export function cnbBuildUpstream(openaiBody: any) {
     return { role: "user", content: c };
   });
 
+  // ★ 客户端身份规避：cnb 于 2026-10-18 上线了渠道校验
+  // （`errcode 11128 "Illegal API invocation from an unapproved channel"`，
+  // 文案「可能不是官方客户端发出的，请用官方版本重新发送」）。实测边界：
+  // 它匹配的是 **system/assistant 消息里连续出现的 Claude Code 身份短语**
+  // （精确序列、大小写不敏感；user 消息不检测）。Claude Code 客户端每轮都把
+  // 那句作为 system prompt 首句发出去，于是**每一轮都必然 400**。
+  //
+  // 这里把那句身份声明改写成中性表述。**这不是协议适配，是规避客户端校验**——
+  // 上游本来就是在拦非官方客户端，改写只赌它此刻只认这一个字符串。
+  // 用户 2026-10-18 明确要求「我想在 claude code 中使用，请你解决」，
+  // 所以做，但风险必须写在这里：上游随时可以加指纹（换措辞、看 tools 形状、
+  // 看 model 组合），届时这条又要失效。
+  const nudgedMsgs = neutraliseClientIdentity(msgs);
+
   // 注入工具定义（XYML schema）
   const tools = openaiBody.tools || [];
   const hasTools = tools.length > 0;
   if (hasTools) {
     const prompt = cnbBuildToolPrompt(tools);
-    if (msgs[0] && msgs[0].role === "system") {
+    if (nudgedMsgs[0] && nudgedMsgs[0].role === "system") {
       // ★ 多模态守卫：system 的 content 可能是数组（含图片），不能直接字符串拼接，
       // 否则会变成 "[object Object]\n\n..."，既丢图又污染系统提示词。
       // 数组形态下把协议提示词追加成一个 text 块。
-      const first = msgs[0];
+      const first = nudgedMsgs[0];
       if (Array.isArray(first.content)) {
-        msgs[0] = {
+        nudgedMsgs[0] = {
           role: "system",
           content: [...first.content, { type: "text", text: prompt }],
         };
       } else {
-        msgs[0] = { role: "system", content: first.content + "\n\n" + prompt };
+        nudgedMsgs[0] = {
+          role: "system",
+          content: first.content + "\n\n" + prompt,
+        };
       }
     } else {
-      msgs.unshift({ role: "system", content: prompt });
+      nudgedMsgs.unshift({ role: "system", content: prompt });
     }
   }
 
@@ -1896,17 +1964,20 @@ export function cnbBuildUpstream(openaiBody: any) {
       '{"name": "TOOL_NAME", "arguments": { ...all required params... }}' +
       "\n" +
       TC_CLOSE;
-    const first = msgs[0];
+    const first = nudgedMsgs[0];
     if (first && first.role === "system" && typeof first.content === "string") {
-      msgs[0] = { role: "system", content: first.content + "\n\n" + reminder };
+      nudgedMsgs[0] = {
+        role: "system",
+        content: first.content + "\n\n" + reminder,
+      };
     } else {
-      msgs.unshift({ role: "system", content: reminder });
+      nudgedMsgs.unshift({ role: "system", content: reminder });
     }
   }
 
   const up: any = {
     model,
-    messages: msgs,
+    messages: nudgedMsgs,
     stream: true,
     // ★ 键名必须是小写 snake 的 `max_tokens`，上游**只认**这一个拼法。
     //

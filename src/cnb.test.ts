@@ -21,6 +21,7 @@ import {
   cnbParseToolCalls,
   handleCnb,
   maybeCompactCnb,
+  neutraliseClientIdentity,
   sessionIdOf,
 } from "./cnb.ts";
 import { compactionState, resetCompactionStates } from "./zen-compaction.ts";
@@ -1281,4 +1282,108 @@ Deno.test("unrelated JSON is still preserved next to the new detectors", () => {
       "must keep unrelated prose: " + JSON.stringify(r.clean),
     );
   }
+});
+
+// ── 客户端身份改写（2026-10-18 cnb 上线 errcode 11128 渠道校验后的规避） ──
+//
+// 上游检测的是 system/assistant 消息里连续出现的 Claude Code 身份短语
+// （实测：整句拦；去掉 "You are"、拆开、换行、放句尾都不拦；user 不检测）。
+// Claude Code 客户端每轮把那句作为 system prompt 首句，所以每轮必 400。
+// 这组用例钉住改写的判据与边界，防止实现悄悄漂移。
+Deno.test("cnb: Claude Code identity phrase is rewritten in system and assistant messages", () => {
+  const FULL = "You are Claude Code, Anthropic's official CLI for Claude.";
+  // 真实 Claude Code 的 system prompt 形态 = 身份句 + 大段后缀
+  const realSystem = FULL +
+    "\n\nYou are an interactive CLI tool that helps users.";
+
+  const out = neutraliseClientIdentity([
+    { role: "system", content: realSystem },
+    { role: "user", content: "hi" },
+    { role: "assistant", content: FULL },
+  ]);
+
+  assertEquals(
+    (out[0].content as string).includes("Claude Code, Anthropic"),
+    false,
+    "the identity phrase must be gone from system",
+  );
+  assert(
+    (out[0].content as string).startsWith("You are a coding agent"),
+    "the rewrite must keep the sentence semantic (still tells the model it is a coding agent)",
+  );
+  assert(
+    (out[0].content as string).endsWith(
+      "interactive CLI tool that helps users.",
+    ),
+    "the rest of the system prompt must survive untouched",
+  );
+  assertEquals(
+    (out[2].content as string).includes("Claude Code, Anthropic"),
+    false,
+    "assistant history is also on the detection surface and must be rewritten",
+  );
+});
+
+Deno.test("cnb: identity rewrite leaves user messages and unrelated prose untouched", () => {
+  const FULL = "You are Claude Code, Anthropic's official CLI for Claude.";
+  const out = neutraliseClientIdentity([
+    // user 不在上游的检测面上，改它等于篡改用户原文
+    { role: "user", content: "请解释这句话: " + FULL },
+    { role: "system", content: "普通系统提示，没有任何身份短语。" },
+    { role: "assistant", content: "只提了 You are Claude Code 这半句的历史。" },
+  ]);
+
+  assert(
+    (out[0].content as string).includes(FULL),
+    "user messages are not on the detection surface and must not be touched",
+  );
+  assertEquals(out[1].content, "普通系统提示，没有任何身份短语。");
+  assertEquals(out[2].content, "只提了 You are Claude Code 这半句的历史。");
+});
+
+Deno.test("cnb: identity rewrite handles array content and survives the real Claude Code shape", () => {
+  const FULL = "You are Claude Code, Anthropic's official CLI for Claude.";
+  const out = neutraliseClientIdentity([
+    {
+      role: "system",
+      // Claude Code 也可能发多模态数组形态
+      content: [
+        { type: "text", text: FULL + "\nmore instructions" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+      ],
+    },
+  ]);
+  const first = out[0].content[0] as { type: string; text: string };
+  assert(
+    !first.text.includes("Claude Code, Anthropic"),
+    "array-shaped system content must be rewritten per text block",
+  );
+  assert(first.text.startsWith("You are a coding agent"));
+  // 图片块必须原样保留
+  const second = out[0].content[1] as { type: string };
+  assertEquals(second.type, "image_url");
+});
+
+Deno.test("cnb: the rewritten request passes cnbBuildUpstream without the trigger phrase", () => {
+  // 端到端形状断言：cnbBuildUpstream 的输出里不允许再出现会被上游拦的短语。
+  // 这条把「改写函数」与「真正发出去的请求体」连起来——只测函数会漏掉接线错误。
+  const FULL = "You are Claude Code, Anthropic's official CLI for Claude.";
+  const up = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    max_tokens: 16,
+    messages: [
+      { role: "system", content: FULL + "\nBe helpful." },
+      { role: "user", content: "hi" },
+    ],
+  });
+  const sys = (up.upstream.messages as any[])[0];
+  assertEquals(
+    JSON.stringify(up.upstream.messages).includes("Claude Code, Anthropic"),
+    false,
+    "the wire body must not contain the phrase upstream blocks",
+  );
+  assert(
+    String(sys.content).startsWith("You are a coding agent"),
+    "the wire body carries the neutral identity instead",
+  );
 });

@@ -1,374 +1,1715 @@
 # ai-proxy 项目上下文（代理每次请求都会读到，压缩不会丢失）
 
 ## 项目
-Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + Cloudflare Worker 远端链。
-为 dsh 提供免费模型入口。
+
+Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + Cloudflare
+Worker 远端链。 为 dsh 提供免费模型入口。
 
 ## 当前状态（2026-10-07 核实，改动此节请更新日期）
-- **自调用必须带本进程会接受的凭据（2026-10-07 修 `f6f9dd1`）**：`v1FetchOwnListing` 发的是
-  `Bearer ${ENV.DEFAULT_BEARER_TOKEN || "public"}`，而 `checkAuth` 只认 `API_KEYS`。本地 `API_KEYS`
-  为空时直接放行，所以**本地永远看不见**；部署一旦设了它（Render 就是），每次自调用都 401 →
-  自建列表空 → 目录报 `deepseek-web has no login state yet`，**与同进程 `/health` 的
-  `credentials.deepseek-web.configured=true` 自相矛盾**。线上对照实验：`Bearer public` → 401、
-  真 key → 200+10 模型、不带 → 401。现由 `internalCredential()` 统一（API_KEYS 第一项 >
-  DEFAULT_BEARER_TOKEN > "public"；deepseek-web 列表 / custom 列表 / probe 兜底三处共用）。
-  **判据：自问自答的请求不能带一个只在无鉴权时才成立的占位值**；**也别改成 loopback 信任**——
-  容器 `HOST=0.0.0.0` 时 handler 拿不到可靠远端地址，在反代/隧道后面本就不成立。
-- **Render 线上部署（2026-10-07 核实，已 live）**：service id `srv-db2qf849v7es739t6j50`、URL
-  **https://ai-proxy-w110.onrender.com**、docker / free / singapore / branch=main /
-  healthCheckPath=`/` / autoDeploy=yes。**只填了 7 个 env**（API_KEYS、CNB_LOGIN_COOKIES、
+
+- **自调用必须带本进程会接受的凭据（2026-10-07 修
+  `f6f9dd1`）**：`v1FetchOwnListing` 发的是
+  `Bearer ${ENV.DEFAULT_BEARER_TOKEN || "public"}`，而 `checkAuth` 只认
+  `API_KEYS`。本地 `API_KEYS`
+  为空时直接放行，所以**本地永远看不见**；部署一旦设了它（Render
+  就是），每次自调用都 401 → 自建列表空 → 目录报
+  `deepseek-web has no login state yet`，**与同进程 `/health` 的
+  `credentials.deepseek-web.configured=true`
+  自相矛盾**。线上对照实验：`Bearer public` → 401、 真 key → 200+10 模型、不带 →
+  401。现由 `internalCredential()` 统一（API_KEYS 第一项 > DEFAULT_BEARER_TOKEN
+  > "public"；deepseek-web 列表 / custom 列表 / probe 兜底三处共用）。
+  > **判据：自问自答的请求不能带一个只在无鉴权时才成立的占位值**；**也别改成
+  > loopback 信任**—— 容器 `HOST=0.0.0.0` 时 handler
+  > 拿不到可靠远端地址，在反代/隧道后面本就不成立。
+- **Render 线上部署（2026-10-07 核实，已 live）**：service id
+  `srv-db2qf849v7es739t6j50`、URL **https://ai-proxy-w110.onrender.com**、docker
+  / free / singapore / branch=main / healthCheckPath=`/` /
+  autoDeploy=yes。**只填了 7 个 env**（API_KEYS、CNB_LOGIN_COOKIES、
   DEEPSEEK_WEB_{COOKIES,AUTH,HEADERS}、TRAE_AUTH_JSON、WORKBUDDY_AUTH_JSON）；`render.yaml`
-  声明的第 8 个 `AI_PROXY_CUSTOM_PROVIDERS` **没填，且容器里没有 custom-providers.json
-  （已 gitignore，不进镜像）**，所以云端 custom 报 `no custom providers are configured`
-  ——那是**如实报告，不是 bug**。用户报「render 是空的」实为「部署存在但渠道有洞」。
-- **「目录空」被翻译成「没登录态」（2026-10-07）**：`v1FetchOwnListing` 在 `!response.ok` 和 catch
-  里都返回 `[]`，而 1112 行把空解释成「deepseek-web has no login state yet」。**空只说明这一次
-  自调用没成**（可能是 401、超时、端口不对），不是「文件缺失」。修完凭据后线上 catalog 立刻从
-  failed 变 `ok listed=10 kept=10`，`/v1/models` 从 138 → **148 行**，真实推理返回「收到」
+  声明的第 8 个 `AI_PROXY_CUSTOM_PROVIDERS` **没填，且容器里没有
+  custom-providers.json （已 gitignore，不进镜像）**，所以云端 custom 报
+  `no custom providers are configured` ——那是**如实报告，不是
+  bug**。用户报「render 是空的」实为「部署存在但渠道有洞」。
+- **「目录空」被翻译成「没登录态」（2026-10-07）**：`v1FetchOwnListing` 在
+  `!response.ok` 和 catch 里都返回 `[]`，而 1112 行把空解释成「deepseek-web has
+  no login state yet」。**空只说明这一次 自调用没成**（可能是
+  401、超时、端口不对），不是「文件缺失」。修完凭据后线上 catalog 立刻从 failed
+  变 `ok listed=10 kept=10`，`/v1/models` 从 138 → **148
+  行**，真实推理返回「收到」
   `finish=stop`。判据：一个「空」既可能来自没配置、也可能来自取不到，**上游错误要先分类再翻译**。
 - **cnb 匿名通道已死**：上游要登录才能推理。已实现登录态支持：登录 Cookie 粘到
-  `cnb-login.txt`（热加载，剔除 csrfkey，见 README 1.5 节）。用户暂无 cnb 账户，通道 dormant。
-  ⚠️ **失败判据会漂，别照记忆判断**：早期是 `401 [NOT_LOGIN]`，**2026-10-05 实测已变成
-  `HTTP 403` + `errcode 7 "User has no permission."`**（匿名打 `POST cnb.cool/ai/chat/completions`）。
+  `cnb-login.txt`（热加载，剔除 csrfkey，见 README 1.5 节）。用户暂无 cnb
+  账户，通道 dormant。 ⚠️ **失败判据会漂，别照记忆判断**：早期是
+  `401 [NOT_LOGIN]`，**2026-10-05 实测已变成 `HTTP 403` +
+  `errcode 7 "User has no permission."`**（匿名打
+  `POST cnb.cool/ai/chat/completions`）。
   所以判定「登录态到底有没有用」只能看**带凭据的请求能不能出字**，不能认状态码或错误文案。
   一键脚本 `.tmp-cnb-login.ts` 就是按这条判据写的（见下面那条）。
-- **DeepSeek 网页端**：`/deepseek-web/v1` 已支持自动登录凭证、PoW WASM、THINK/RESPONSE SSE 解析、OpenAI SSE、工具调用、图片 data URL 上传到 `ref_file_ids`、Chat Completions、Responses API 和 `off/low/high/max` 思考档位；由于 DSH OpenAI 兼容列表不读取自定义 reasoning 元数据，额外暴露 `deepseek-reasoner-off/low/high/max` 模型变体；同一账号请求串行，随机间隔 2～4 秒，连续 15 次长休，429/403 会暂停自动重试。默认同一账号复用 chat_session 20 轮，`DEEPSEEK_SESSION_REUSE_TURNS=0` 可关闭复用。图片首次使用前需重新运行登录捕获脚本生成 `deepseek-headers.json`。
-- **Zen 兼容层**：`src/zen.ts` 为 `/zen/v1` 补齐 OpenCode UA、DSH session 派生的 `x-opencode-*`、`bash/glob/grep/read` 工具 quartet、Muse Spark Responses/Anthropic Messages 转换和 FreeTier/Region 错误分类；可用 `ZEN_BASE_URL`/`ZEN_BEARER_TOKEN` 覆盖上游。实测非流式请求会触发 `FreeTierError`，`stream:true` 可正常出流，因此 DSH 路径必须保持流式；模型列表可返回 11 个 `-free` 模型。单会话免费额度有限，连续探针会触发 `FreeUsageLimitError`。
-- **Zen 会话压缩**：`src/zen-compaction.ts` 移植 opencode 官方 `session/compaction.ts`（经 YuJunZhiXue/Cline-proxy `internal/app/compact.go` 中转）。超限时从尾部按 token 预算保留原文（超预算那条按 prefix/suffix 拆开而非整条丢弃），更早的历史交给模型生成锚定摘要，重组为 `[system] + [Conversation Summary] + 尾部原文`；同一 session 下次压缩走 `Update the anchored summary` 增量更新而非重写。token 估算沿用官方 `字符数/4` 近似。`ZEN_COMPACTION=off` 关闭；`ZEN_COMPACTION_KEEP_TOKENS`/`BUFFER`/`MAX_SUMMARY`/`SUMMARY_MODEL` 可调。**压缩必须发生在 `upstreamBodyForChat` 之前**，否则改写后的 messages 不会进入实际请求；摘要请求复用本代理的 Zen 路由以带上指纹。摘要生成失败降级为 `fallbackTruncate` 截断，不会把会话直接打失败。
-- **Zen 截断检测（2026-10-01 核实）**：此前 `src/zen.ts` **完全没接入** `stream-normalizer`，reader 一报 `done` 就发 `[DONE]` + `finish_reason: stop`，所以 Zen 额度中途掐断、传输失败和「模型自己停止」三者**完全无法区分**——agent loop 判定回合正常结束、标记目标完成、起下一个目标，故障不留痕迹（用户实测 489 轮会话反复停在半句）。现改为**由各 wire 自己的终止帧判定完成**：`[DONE]`（chat）/ `response.completed|failed|incomplete`（responses）/ `message_stop`（messages）；缺终止帧即 `stream_cut`，先补一帧 `{"error":{"code":"stream_cut"}}` 再收尾，插件会把它变成可见错误。`restoreChatStream` 过去在 `map.size === 0` 时**纯透传**，现已始终包装（逐帧原样透传）。读取抛错经 `classifyStreamFailure` 分类，客户端取消走 `StreamAbort` **静默结束**，不算上游故障。**这条曾留下的已知代价已在 2026-10-04 消除**：插件过去把流内 `error` 帧统一映射成 `code: 'SERVER'`，而 `SERVER` 在 `retryableCodes` 里 → 截断会被重放最多 2 次。现在插件**读 `payload.error.code`**：`stream_cut` 按「本轮已投递没有」分级（已投递 → `stream_cut` 不可重试，未投递 → `TRANSPORT` 可重试），其它码原样透传，无码则回落 `SERVER`（保持 cnb / deepseek-web 那两条尚未命名失败类别的路径仍可重试）。判据必须留在插件这一层：只有它知道这一轮有没有把东西送到客户端。配套两条判据见下面「流内 error 帧的 code 不能丢」与「错误轮不许再声称 finish_reason」。
-- **插件流截断检测（2026-10-01 核实）**：`dsh-plugin/index.js` 的 `readSse` 是插件路径**独有**的手写 SSE 读取器（配置里手写的模型走 DSH 内置 OpenAI 客户端，不经过它），过去**从不检查 `[DONE]` 是否到达**；流提前断开时 `for await` 正常退出、`finish` 保持 `undefined`，`finishKind(undefined)` 落到 `return 'stop'`——**被掐断的流和正常结束的流完全一样**，agent loop 判定回合说完、标记目标完成、起下一个（用户实测：所有供应商的插件注入模型都有概率「要干活却直接停止」，配置里手写的模型没有）。现跟踪 `sawDone` + `delivered`：缺终止帧即报失败，**已输出内容的用非重试码 `stream_cut`**（重放会重复执行并二次付费，违反「已输出后不重放」原则），**未输出任何内容的用 `TRANSPORT`**（这是重试真正有意义的唯一情形）。已到达的部分照常 `block-end` 收尾，文字不随失败一起丢掉；统计记 `ok:false/truncated:true`，所以截断终于在用量面板里可见。`finishKind` 现在只在流带终止标记后才会走到。
-- **Zen UA 版本可被客户端降级（已修）**：`src/zen.ts` 的 `combinedUserAgent` 过去在客户端 UA 已含 `opencode/` 时**原样转发**，于是发 `opencode/1.1.55` 的客户端把网关钉死在旧版本上，Zen 直接回 `426 UpgradeRequired`（实测：探针带旧 UA 得 426，不带 UA 得 429）。现先剥掉所有 `opencode/<version>` token 再盖上当前的 `opencode/1.18.31`，其余客户端 UA 保留（指纹需要）。顺带结论：Zen 的 UA 在两条路径上行为**一致**，`isZenAggregate`（仅 `basePath === '/v1'` 时才带 OpenCode UA）**不是**用户所述差异的原因。
-- **Zen 能力元数据（2026-10-01 核实）**：Zen 的 `GET /models` 只回 `{id,object,created,owned_by}`，没有 ctx/输出上限/模态/推理档位。`src/zen-catalog.ts` 改从 models.dev 读——其 `opencode` 条目的 `api` 就是 `https://opencode.ai/zen/v1`。**阶梯逐模型不同**：`space-bunny-free` 五档、`deepseek-v4-flash-free` 三档、`muse-spark-*` minimal~xhigh 五档、`longcat`/`ling` 仅开关、`mimo`/`nemotron` 不可调。**任何一条阶梯都不含 `off`**，所以不得凭空补「关闭」档，也不得自己编统一阶梯。三点约束：目录约 5 MB，**不进请求路径**——`handleModels` 只排后台刷新（TTL 12h、失败降级上一份快照、`ZEN_CATALOG=off` 可关）；目录没覆盖的模型原样返回不补猜测值（`jev-1.13-free` 属此类，用 `ZEN_MODEL_LIMITS` 显式指定）；**只在目录确认该模型发布了这个档位时才转发 effort**，未知档位记日志而非透传（透传要么编造能力、要么给本来能通的请求换 400）。`toggle` 型模型（longcat/ling）**不发布 ladder**，因为 OpenAI 形状的请求无法表达开关，发布就是死控件；`chatToClaude`（union-alpha）也刻意不映射 effort，Anthropic 用 `budget_tokens` 而目录没有该字段，映射就得凭空发明预算。**同时修掉两个既有错误**：`ZEN_MODEL_LIMITS` 原是空对象，11 个模型共用 `{context:1M,output:64k}` 兜底，而压缩正拿它做分母——真实 output 从 32k 到 524k，旧值对目录覆盖的 10 个模型全错（mimo 高估 2 倍、space-bunny 低估 8.2 倍）；`chatToResponses`/`chatToClaude` 从零重建请求体，会把客户端传来的 `reasoning_effort` 静默丢弃。
-- **推理阶梯形状（2026-10-01 修 bug）**：`dsh-plugin/index.js` 的 `pickEfforts` 过去只认 `typeof value === 'string'`，而 `reasoning_efforts` 有**两种形状**：CommandCode 发裸字符串（`["off","high","max"]`），Zen 的 models 端点发**对象**（`[{id,name}]`，即 `/v1/models` 文档里 `reasoning_efforts` 的形状）。只挑字符串 → Zen 目录里的阶梯全部变成空数组 → **harness 直接拒绝整个 provider**（`INVALID_MODEL_REASONING`，报错 `'ai-proxy' 加载失败: adapter returned invalid reasoning metadata … zen/deepseek-v4-flash-free`）。**不是跳档问题**（`low/high/max` 的 gap 完全合法），也不是能力问题，纯粹是形状没对上。现在两种都认，去重后按 `EFFORT_ORDER` 排序，**顺序表里没有的 id 追加保留而不丢弃**——阶梯以上游说的为准，不以上游「应该」有的为准。**`EFFORT_ORDER` 补了 `minimal`**（排在 `off` 与 `low` 之间），否则 muse spark 的 `minimal/low/medium/high/xhigh` 会丢掉头一档。
-- **harness 的 reasoning 校验规则（从 app.asar 读出，2026-10-01）**：`reasoning === undefined` → 通过；**`reasoning.efforts.length === 0` → 直接抛 INVALID_MODEL_REASONING**；每个 effort 的 `id`/`name` 必须是非空字符串、`description` 若有必须是字符串、**`id` 不得重复**；`defaultEffort` 若给出必须在 `efforts` 里。同批校验还有 `defaultMaxTokens`（必须是正安全整数）、`systemPromptUpdate`、`toolUpdate`。**所以 adapter 永远不能返回空的 `reasoning`**——要么省略该字段，要么给出至少一档。
-- **插件消息转换丢工具（2026-10-01 修，最关键的一条）**：`toOpenAiMessages` 过去写的是 `const role = message.role === 'assistant' ? 'assistant' : 'user'`，于是**工具结果被当成用户消息发出、`tool_call_id` 丢失**，assistant 消息也被压成纯文本（`tool_calls` 整个字段没保留）。上游看到的是 `user:帮我改` → `assistant:读一下文件:`（无 tool_calls）→ `user:<工具返回的文件内容>`——模型完全不知道自己调过工具，只当作收到一条新消息，回答完就收工。**这就是「插件注入的模型会突然停止、配置里手写的不会」的确切原因**：同一个上游，配置路径走 harness 自带客户端，序列化 `tool_calls`/`tool` 是对的，只有插件那条手写路径错。harness 侧的消息形状：`role` 取 `user|assistant|tool|system`；工具结果带 `toolCallId`/`isError`；assistant 的 `content` 是块数组，块为 `{type:'text'|'reasoning'|'tool-call', id, name, arguments}`。**reasoning 块发不出去就丢弃**——回放需要上游自己的签名格式，过期签名会 400。空结果**也要保留 `tool_call_id`**，丢了就是协议错误（悬空的 tool call）而不是干净的 transcript。另注：截断检测本身**不是**这个症状的成因（实测 224 次调用 `truncated=0`，每次 `[DONE]` 都到），但那个修复仍然必要——它让「流真被掐断」这种情况以后可见。
-- **Zen 出口代理池**：`src/zen-egress.ts` 处理 `ZEN_PROXIES`（逗号/空格分隔的 http/https/socks5/socks5h URL）+ `ZEN_PROXY_STRATEGY`（round_robin/random/fill）+ `ZEN_PROXY_COOLDOWN_MS`。Zen 按出口地址计量匿名额度，单 IP 会先耗尽；轮换出口可分摊。429/5xx 或传输失败会把该出口标记冷却并线性探测下一个。凭据在 `describe()` 里被 `***` 遮蔽，面板不会拿到密码。**TLS 指纹伪装（utls `HelloChrome_120`）未移植**：Deno 不暴露 ClientHello 定制 API，Go 的 utls 无法在 Deno 侧等价实现；Cline-proxy 用它绕过 CF 风控，我们只有 HTTP 层指纹。Zen 的 500 是否由 TLS 指纹导致尚未证实。
-- **Cline 上游结论**：`api.cline.bot/api/v1` 列模型免认证（464 个，与 OpenRouter 清单 `shared=464` 完全重合，且缺 name/pricing/architecture），但推理一律 401——`Bearer public`、无头、OpenCode UA 三种形式都试过，含 Cline-proxy README 标为「不消耗额度」的 `deepseek/deepseek-v4-flash`、`poolside/laguna-s-2.1:free`、`stepfun/step-3.7-flash`。那个项目的「免费」实际来自 Zen，Cline 只是加了账号门槛的 OpenRouter 转发层。
-- **CommandCode Go**：`/commandcode/v1` 已移植 `dsh-cmdgo-provider` 0.9.1 的模型筛选、CLI 私有网关协议、OpenAI Chat/Responses/Anthropic Messages 转换、显式会话头作用域内稳定的 `x-session-id`（无会话头时每请求随机隔离）、工具调用双射/自愈、损坏 tool arguments 的截断保护、多账号轮询冷却、单账号 in-flight/最小间隔限制、OAuth、额度和缓存统计；`COMMANDCODE_API_KEY` 可作单账号兜底，OAuth key 存入已忽略的 `commandcode-accounts.json`。公开模型目录实测 51 个 Go 模型（31 个图像模型）；尚未用真实 CommandCode 凭据验证推理，需有 key 后实测。
-- **可用通道**：`/v1` 聚合入口的 kilo 系模型（**2026-10-05 复核**：`kilo/stepfun/step-3.7-flash:free` 实测正常出流；同一天 `kilo/deepseek/deepseek-v4-flash-0731:free` 已下架，上游回 `model_not_found`）。**这里不写死具体 id**——免费档每周下架，写死的 id 会变成误导；要确认当下有什么，跑 `GET /v1/models` 筛 `:free`。
-- **不可用/受限**：Zen 的模型列表可读，但真实推理可能被上游按出口或客户端策略拒绝；ss2a 自营模型 502；ss2a 免费档间歇 403/502。
-- **DSH 配置**：活动 Web profile 的模型注册文件是 `C:\Users\22282\.dsh\profiles\web\cordis.patch.yml`；其中 `deepseek-web` 已注册 1,048,576 context、16,384/32,768 maxTokens、text/image 输入和 off/low/high/max 思考档位。HTTP `/models` 不能替代这份 DSH 配置。
-- **业务错误/冷却**：DeepSeek HTTP 200 `biz_code`、SSE `error/toast`、`content/msg` 错误正文、muted/mute_until、非 SSE completion 错误会被识别；限流期返回 429 + Retry-After，`deepseek-web-cooldown.json` 持久化冷却状态，进程重启不丢失；Responses 流错误转换为 `response.failed`。
-- **请求指纹**：DeepSeek 的 PoW、建会话、删除会话、图片上传和 completion 共用 `deepseek-headers.json` 的浏览器头集合；不再发送重复版本头或 `X-Deepseek-Harness`。
-- **健康状态**：`GET /health` 返回最近一次标准 Provider 探测汇总；`GET /commandcode/v1/panel` 返回 CommandCode 模型/账号/额度快照，供 DSH 设置页读取；`src/runtime/health.ts` 将 200/429/5xx/鉴权失败/网络失败区分为 available/degraded/unavailable/unknown，unknown 不会清空模型列表。
-- **渠道清单失败可见（2026-10-01 核实）**：`main.ts` 的 `v1FetchMemberModels` 过去在成员拉取失败时**静默 return**（`if (parsed.error || !parsed.data) return;`），整个渠道从 `/v1/models` 消失——无报错、无日志、`/health` 查不到，界面只表现为「渠道变少了」。实测 kilo 的 17 个模型整条消失（`/kilo/v1/models` 同时完全正常，是聚合那一次失败），叠加 `cnb` 被屏蔽后面板只剩 zen + commandcode。现由 `src/runtime/health.ts` 的 `CatalogRegistry` 记录每种结果：**请求抛错 / 上游返回不可用列表 / 上游正常但被 provider 过滤器清空**（第三种最隐蔽——kilo 的 `isFree` 字段改名会让渠道静默变空而非报错）。失败写 `console.warn`，并进 `GET /health` 的 `catalog` + `catalogIssues`（后者只在非空时出现），插件带到面板渠道区标为「列表拉取失败」。**与 probe 注册表是两回事**：probe 回答「能不能跑一轮」且只在有人要求时跑，catalog 回答「这个渠道现在在不在选择器里」。注意 `CatalogRegistry.get()` 必须返回拷贝（同 `HealthRegistry.get`），否则调用方改到的是内部记录——这条是单测 `the registry hands out copies…` 抓出来的。
-- **逐模型状态**：`/health` 除 provider 级计数外还带 `models[provider][未加前缀的 model id]` 的逐模型判定（`src/core.ts` 的 `getModelHealth`）。插件 `healthIndex()` 把样本拼回 `kilo/…` 完整 ID 后写到每个模型行，面板显示 可用/限流/不可用/未探测 + 延迟。**join 时必须无条件加 provider 前缀**：kilo 的 `kilo-auto/free` 自身含 `/`，用 `includes('/')` 判断「已加前缀」会漏拼。`/health` 在根路径，插件用 `requestAt('/', '/health')` 而非 `request('/health')`（后者会拼成 `/commandcode/v1/health`）。未探测的模型不带 `state` 字段，不计入 `modelHealth`，避免被当作故障。探测只在拉模型列表时触发（`?health=true` 强制重探），插件不自行发起推理探测。
-- **真实 smoke**：`scripts/probes/commandcode-smoke.ts` 是显式 `--confirm-live` 才会发请求的手动探针；只走本地代理，不读取上游 key/OAuth/session 文件，输出元数据不输出正文。
-- **DSH 桥接**：`dsh-plugin/` 是覆盖整个 ai-proxy 项目的可选 Node Host + 浏览器设置分区，支持自动启动/监控 `projectRoot` 中的原始 Deno 项目或连接已有本地/远程代理；注册 `ai-proxy` Provider，聚合 `/v1` 以及 TokenHarbor 等渠道，通过同源 `/api/ai-proxy/*` 提供面板、设置和启停，不保存上游凭据；面板运行时长每秒刷新、快照每 10 秒拉取；`node dsh-plugin/self-test.mjs` 使用 fake fetch 验证多渠道发现、元数据归一、生命周期路由和 SSE 转换。 **插件热重载（2026-10-01 加）**：`apply()` 里 `installHotReload(config)` 用 `fs.watch` 同时盯**安装目录**和**仓库**（`<projectRoot>/dsh-plugin`，即面板「项目目录」下），250ms 防抖；触发时先把仓库侧文件同步到安装侧，再做 **cache-busted `import(pathToFileURL(self).href + '?hot=' + Date.now())`** 并把新模块的 `AiProxyAdapter.prototype.stream` / `.resolveModel` 换进模块级 `HOT` holder——**DSH 持有的是 adapter 实例**，`prepareCall` 里的 `this.stream` 早已绑定，所以不换 prototype 的话重新 import 对运行中的会话毫无作用（实测：不带 cache buster 的重新 import 拿到的仍是旧值 `1`，带上才是 `2`）。旧模块实例不动，进行中的流继续跑旧代码。`stats.mjs` 只按 URL 缓存，所以重复 import **不会**新建 StatsStore。仓库路径也可由 `AI_PROXY_PLUGIN_REPO` 覆盖。**但它只换 `stream`/`resolveModel` 两个方法**，改 `listModels`/`listProjectModels`/`normalizeModel`/`publishedEfforts` 这类随宿主启动定格的函数仍要重启宿主——见下面那条实测。
-- **插件图片支持（2026-10-01 修；先前的「结构性限制」结论是错的）**：`ImageBlock` 是 `{type:'image', attachment: ImageAttachmentRef}`，插件过去读的是 `part.source.{type,media_type,data}`，而 `part.source` 在 asar 里**出现 0 次**——那个分支**永远匹配不上**，所以图片从未真正发出去过。**字节从 `ctx.get('attachments').imageHostPath(ref)` 拿**（`ref.attachmentId` → 磁盘路径 → base64），这条 cordis 服务不在 `LlmAdapter` 的 7 个公开方法里，**只盯着 adapter 契约会漏掉它**——我犯过这个错。内置 `DeepSeekAdapter` 的 `dependencies.resolveImageAccess()` 是另一条路，仅对它可用。参照实现：`dsh-our-free-model` 的 `src/messages.js`（`imageDataUrl` + `toChatMessages`）与 `index.js` 的 `imageResolver`。**三个必须照抄的要点**：①`ctx.get('attachments')` **每次调用时读**（在 `apply()` 里读一次会永远拿到 undefined，因为服务比插件晚加载——`our-free-model` 的注释明确记着这个坑，而且「日志里什么都不说」）；②`offloaded === true` 的块不内联；③8 MB 上限 + 48 条缓存 + 读失败写 warn。`role:'tool'` 在 OpenAI 线上**只带文本**，所以工具返回的图片要**附在其后的 user 消息**里，否则 `read_image` 的结果静默丢失。另外**按 `inputModalities` 门控**——对不支持视觉的模型发 `image_url` 是整个回合 400，不是丢一张图。
-- **思考字段各家不同名（2026-10-01 修）**：`stream()` 过去只读 `delta.reasoning_content`（DeepSeek 拼法），**kilo/OpenRouter 发的是 `delta.reasoning`**，还有网关用 `thinking`。只认一家 → **思考内容被整个丢掉**：既没显示成思考、也没混进正文，而是消失（用户报「开了推理却看不到思考过程」）。实测 space-bunny-alpha：`reasoning` 有 126 字符，`reasoning_content` 一次都没出现。现在 `reasoningTextOf(delta)` 依次试 `reasoning_content` / `reasoning` / `thinking`，**每帧只取一个**（网关同时给两个是描述同一段思考，不是拼接），并兼容数组形状。**注意 usage 里的 `reasoning_tokens` 仍是 0**——那是 kilo 自己报的（它把思考折进 `completion_tokens`，实测 44 token ≈ 180 字符），不是插件读不到；所以用量面板算解码速度时思考时间仍算进去，无法在插件侧修正。
-- **输出上限不等于请求大小（2026-10-02 修）**：`max_tokens` 直接取模型的**输出天花板**（`defaultMaxTokens`），而 kilo 顶层不发布 `max_output_tokens`，值取自 `top_provider.max_completion_tokens: 524288`，窗口 1,000,000——**天花板本身就给输入只剩 475,712**，对话用掉 475,845 后网关直接 400：`467563 text + 8282 tool + 524288 output = 1000133`。现在 `clampOutputBudget(body, contextWindow)` 按 `chars/4` 估算输入并把 `max_tokens` 压到 `window - 输入 - 2048`（下限 1024），压过就写运行日志（**不静默**，否则答案变短会被误当成换了个模型）。估算跳过 `image_url`/`url`，否则 base64 会把输入撑爆。**注意边界**：输入本身超窗时压输出救不了（实测 1,067,500 输入 → 仍 400），那是 DSH 压缩该管的。**同一个错还有第二层**：`requestAt` 对非 2xx 一律 `throw new Error`，被当成通用传输失败，而 `TRANSPORT` 在 `retryableCodes` 里 → **超预算请求被重放直到额度烧光**。现在按状态给码：400 且匹配 `CONTEXT_OVERFLOW` → `CONTEXT_WINDOW_EXCEEDED`（harness 认识的码，不在重试集里，还能触发它的溢出恢复）、429 → `RATE_LIMIT`、≥500 → `SERVER`、其余 4xx → `CONFIG_DISABLED`，并带上 `error.status`。
-- **缓存 token 被整个丢掉（2026-10-02 修）**：harness 的 `TokenUsage` 是 `{ inputTokens, outputTokens, totalTokens?, cacheReadTokens?, cacheWriteTokens?, reasoningTokens? }`，而 `mapUsage` 只填了前两个和 reasoning——**`cacheReadTokens` / `cacheWriteTokens` 从来没被发过**，所以任何渠道的 prompt cache 记账在作曲栏一律显示 **0%**（用户新开会话实测：未缓存输入 674,973、缓存读取 0）。数字其实一直在，只是没人读：kilo 的 `prompt_tokens_details.cached_tokens`（实测 880 输入里 149 命中 = 16.9%），Anthropic 风格则叫 `cache_read_input_tokens` / `cache_creation_input_tokens`，两种都认。**为 0 时字段整个省略而不是填 0**——网关没报缓存是「没说话」，填 0 是「断言没有缓存」。这条和思考字段是同一个病根：只按一种形状读，没读到的字段既不报错也不显示，界面因此显示 0 而不是「未知」。
-- **kilo 的 `opencode.variants`：键是标签，`reasoning.effort` 才是 wire 值（2026-10-02 修，推翻上一条的判据）**：形状是 `{instant:{reasoning:{enabled:false,effort:"none"}}, thinking:{reasoning:{enabled:true,effort:"high"}}}`——**键是 kilo 给这档起的名字，`effort` 才是发到线上的值**。上一轮只确认「字段在这里」，就把 `Object.keys(variants)` 当阶梯发布：那个「18/18 完全一致」的对拍**比的是自己的读取器，不可能失败**。真判据是**上游认不认这个值**：kilo 的校验器对 `reasoning_effort` 只收 `max|xhigh|high|medium|low|minimal|none`，喂 `instant`/`thinking` 直接 400 `Invalid option`（实测 ~400ms）。`instant→none`、`thinking→high`，于是 16 个带 variants 的模型里**有 10 个的默认档（无 `high` 时就是 `efforts[0]`）是上游拒收的，每轮调用都 400**；`kilo/liquid/lfm-2.5-2.6b:free` 只发布一个 `thinking`，等于整模型不可用。现在 **`id` 取 `variants[k].reasoning.effort`（发出去的），`name` 取变体键（picker/面板显示的）**，`EFFORT_ORDER` 补 `none`（`off` 的同义词）。判据：**阶梯里每个 id 都要能通过上游自己的校验器，而不是能通过自己的读取器。**
-- **没有发布阶梯就不发阶梯（2026-10-02 修）**：`pickEfforts` 过去在「上游什么都没说」时返回兜底表 `off/low/high/max`，**11 个模型（kilo 2、zen 7、cnb 2）因此拿到一张编造的表**，三种渠道坏法各不相同：kilo 的校验器里**根本没有 `off`**（选中即 400）；zen 的 `zenRequestedEffort` 只转发目录里真有档位，这四个**全是死控件**（记一条 warn 就丢弃）——`zen.ts` 故意不给 toggle-only 模型发布阶梯就是为了不造死控件，插件又加了回去；cnb 的 `src/cnb.ts` 把 `["low","medium","high","max"]` 以外的值**一律当 `high`**，选「off」反而开思考。现在**上游没发布 → `reasoning` 整个省略**（harness 接受 `reasoning === undefined`，只是不显示 Effort 行；**空数组才是它拒绝的形状**）。
-- **上游发布的 `default_reasoning_effort` 必须照用（2026-10-02 修）**：deepseek-web 的 `/models` 每个模型都带它（`deepseek-chat` 是 `off`、`deepseek-reasoner` 是 `high`、`-off/-low/-high/-max` 各钉一档），插件**从不读**，一律 `efforts.includes('high') ? 'high' : efforts[0]`——一个「默认不思考」的快速模型被默认打开了思考，`-off` 变体也就没意义了。现在 `normalizeModel` 读出来（蛇形/驼形都认），`resolveModel` 优先用它。
-- **harness 的真实校验规则（2026-10-02 从 app.asar 读出，可当 oracle）**：`normalizeModelInfo` 逐项判 adapter 的 `resolveModel` 结果——`provider` 必须等于请求的 provider、**`id` 必须与传入的 `model` 字符串完全相同**、`name` 非空、`context.contextWindow` 必须是正整数、`defaultMaxTokens` 必须是正安全整数、`reasoning === undefined` 通过、**`efforts` 为空数组直接抛 `INVALID_MODEL_REASONING`**、每个 effort 的 `id`/`name` 必须非空字符串且 **`id` 不得重复**、`defaultEffort` 若给出必须落在 `efforts` 里。`listModels` 另外要求 id 非空且**不重复**（重复 → `INVALID_CATALOG`）。`buildModelCatalog` 逐个调 `resolveModelInfo` 且**没有逐项兜底**，所以**一个模型不合格 → 整个 provider 组消失**。判据：**把这几条抄成脚本对全部真实模型跑一遍**——这是唯一能同时抓到「形状不对」与「形状对但值不被上游接受」的检查。
-- **热重载只换 `stream` 与 `resolveModel`（2026-10-02 实测；我因此把用户的会话打崩过一次）**：`installHotReload` 只把新模块的 `AiProxyAdapter.prototype.stream`/`.resolveModel` 填进 `HOT`，**`listModels`/`listProjectModels`/`normalizeModel`/`publishedEfforts` 都停留在宿主启动时那一版**（实例是那次构造的，harness 直接调 `adapter.resolveModel(...)` 走的也仍是旧原型）。所以「只改 helper 的返回形状、忘了改调用方」这种半成品编辑**会立刻生效并炸**：调用方还写着 `efforts.map(id => ({id, name:id}))`，收到新 `pickEfforts` 返回的对象后把对象当成了 id/name，harness 报 `adapter returned invalid or duplicate reasoning effort metadata`，**整个 provider 挂掉**。两条推论：①改 `normalizeModel` 这类模块级函数，**仓库改完还要重启宿主才完全生效**；②**改 helper 返回形状必须同时改调用方并立刻跑自检**——我跳过了这一步，代价是用户当场报错。
-- **kilo 的推理阶梯在 `opencode.variants` 里（2026-10-02 修）**：`pickEfforts` 只认 `reasoning_efforts` / `reasoningEfforts` 两种形状，**kilo 用的是第三个字段** `opencode.variants`——每个变体一项，各自带 `reasoning:{enabled,effort}`。所以 `space-bunny-alpha` 明明发布了 `low/medium/high/xhigh/max` 五档，插件却看不到任何阶梯，掉进兜底表发出 `off/low/high/max`：**凭空多一个上游没有的 `off`，同时漏掉 `medium` 和 `xhigh`**（kilo 18 个模型里 16 个带这个字段）。**`enabled:false` 不是「这一档不存在」，恰恰是「这一档表示关闭思考」**——kilo 把它命名成 `instant` 或 `none`，和 `thinking` 是同一枚硬币的两面；按「关掉就是没有」过滤，会把半个目录里唯一的不思考选项删掉。**教训：字段名认全了，值的语义还要读对。**（**这条当时的判据是错的，见下面那条**：那个「18/18 与 `Object.keys(opencode.variants)` 完全一致」的对拍比的是自己的读取器，永远不可能失败。）
-- **渠道凭据（2026-10-02 改）**：`anthropic` 和 `gemini` **已从 `src/core.ts` 整体删除**（provider + `toAnthropic`/`toGemini` 两个 adapter 180 行 + 请求路径两段分支 90 行）——两者都需要 per-user key，空渠道在选择器里是死控件；Zen 的 Anthropic Messages 转换是 `zen.ts` 里独立的 `chatToClaude`，**不经过被删的 adapter**，删前已确认。`openrouter` 加入 `V1_AGGREGATE_MEMBERS`，但**没 key 时不列模型**：`hasChannelCredential()` 在拉列表前就判定，报「needs an API key」而不是笼统的「fetch failed」——401 和上游挂了需要不同的修法。面板写 key 到 `settings.json`，插件 spawn deno 时经 `credentialEnv()` 注入 `DEFAULT_BEARER_TOKEN`；**空值不导出**，否则会覆盖进程自己继承的真值。`/health` 的 `credentials` 字段回答每个渠道有没有凭据，插件只回 `openRouterKeySet` 布尔值，**密钥不回传**（回传到会渲染的页面等于会进截图）。**commandcode 不需要 key 输入框**——三条路：`COMMANDCODE_API_KEY` / 本地 OAuth / `commandcode-accounts.json`，且它当前就在跑。**deepseek-web 也不是 key 渠道**：它读 `deepseek-cookies.txt` + `deepseek-auth.txt` + `deepseek-headers.json` 三个登录态文件，所以面板给的是**一键配置**（`deepseekWebStatus()` 先查缺哪个，`/deepseek-web/setup` 再以 `stdio:'inherit'` 拉起 `.tmp-extract-deepseek-cookies.ts`——它要开浏览器等扫码，**不能 await**，且 `windowsHide:false` 否则 QR 流程看起来像坏了），完成后自动取消隐藏该渠道。
-- **渠道开关必须从「代理提供哪些渠道」推出，不能从名单推（2026-10-02 修）**：`allChannels` 曾经算成「在 roster 里的 ∪ 被隐藏的」——于是**一个已开启但一个模型都不产的渠道**（openrouter 没 key、deepseek-web 没登录态）**两边都不在，开关当场消失**，而唯一的办法是手改 `settings.json`。开一次就回不去。现在基线是写死的 `KNOWN_CHANNELS`（与 `src/core.ts` 的 provider 前缀一一对应），再并上 roster 和 hidden。**判据：任何一个渠道，不管它今天答不答话，都必须还有开关。**
-- **`self-test.mjs` 必须隔离 `DSH_HOME`（2026-10-02 修）**：设置存在 `~/.dsh/ai-proxy-dsh-bridge/settings.json`，测试直接读的是**用户真实那个文件**——所以套件的结果取决于用户上次在面板里存了什么。实际已经因此翻车：手写的 `hiddenChannels` 让「被屏蔽渠道必须不触达上游」那条断言变红，而这跟被测代码毫无关系。测试开头把 `DSH_HOME` 指到 `os.tmpdir()` 下的进程专属目录并在 `exit` 时清理，且**必须在 `import('./index.js')` 之前设置**（模块首次读设置就已经发生）。**更一般的教训：用 HTTP 路由测插件时会写用户的真实配置**——我拿 `/settings` 试 `hiddenChannels: ['cnb']` 时就真的写进去了，还顺手把 deepseek-web 打开了。
-- **每个带 key 的渠道一个变量（2026-10-02 修）**：所有 bearer 渠道曾共用 `DEFAULT_BEARER_TOKEN`——**一个渠道的 key 会静默变成另一个的 key**，失败表现是远端一个 401，日志里什么都没有。现在 provider 的 `auth` 带 `envToken`（`OPENROUTER_API_KEY` / `TOKENHARBOR_API_KEY`），`cloneHeadersForUpstream` 按 `userToken || defaultToken || env[envToken] || DEFAULT_BEARER_TOKEN` 取，插件的 `KEYED_CHANNELS` 与之一一对应、面板按它渲染字段。**tokenharbor 的 0 是被伪装的 401**：上游无 key 回 401，而它自己的 `filterModels` 只留 `:free` 后缀，**401 的响应体因此变成空数组**——和「渠道正常但没有免费模型」长得一模一样，面板在把一个被掩盖的故障当事实报。所以没有 key 时它和 openrouter 一样被扣住。
-- **测试必须自备夹具，不能依赖检出目录的内容（2026-10-02）**：deepseek-web 的门控读的是**项目目录**里的三个登录态文件，于是套件在仓库里绿、在安装目录里红（那边没有那些文件），**同一个 commit 在两个地方结果相反**。判据：**同一个提交必须在仓库、安装目录、以及任意 cwd 下都通过**——这是唯一能抓到「测试依赖了工作目录」的方法。现在夹具自己造那三个文件，并把它当作 projectRoot 传进去。
-- **列表端点不记日志（2026-10-02）**：`handleDeepseekWeb` 开头一句无条件 `console.log("[deepseek-web] handle:", path, method)`——**deepseek-web 之前不在任何列表路径上，面板从不打它，所以看不出来**；把它加进 `EXTRA_MODEL_ROUTES` 之后，面板每 10 秒的轮询就变成一行，**刷掉的是真正该看的**（实测把 `[zen] models.dev catalog refreshed` 和 toggle-only 那条挤在了中间）。现在 `if (!path.endsWith("/models"))` 才记。**教训：新增一个「会被周期性访问」的渠道时，要先查它有没有请求级日志**——kilo/zen/commandcode/cnb 都没有，只有 deepseek-web 有这个习惯，所以之前一直不显眼。
-- **面板要显示的字段只能放在 `/panel` 快照里（2026-10-02）**：`runtime.snapshot()` **每个 `apply()` 只建一次**，被一个比窗口重载活得更久的实例持有——所以放进那里的字段**在宿主重启前一直是旧的**。`channelKeySet` 就这样丢的：同一时刻 `allChannels` / `keyedChannels` / `deepseekWeb` 全是新的（它们在按请求现算的 `/panel` 快照里），只有它是旧的，于是面板把「已设置」显示成「未设置」还把「清除」按钮藏了。`hiddenChannels` / `channelKeySet` 现在都在 `/panel` 快照里。**但挪位置不等于能热更新**：`apiHandler` 是 `apply()` 时绑定的闭包，热重载换不到它，改这里**仍然要重启宿主**——这一点单独记，因为很容易以为「挪对了位置」就等于「不用重启了」。测试里断言这些字段在 `/panel` 上、且不在 `/settings` 上。
-- **面板要显示的字段，放的地方必须真的被送到面板（2026-10-02）**：给 commandcode 加「一键登录」时踩了两层。①`src/commandcode/handler.ts` 的 `/panel` **逐字段重建响应**（不是透传），`statusSnapshot()` 有的字段它没列——`login` 就这样没进 `/panel`，**面板拿到的是没有它的形状**。②插件 `POST /login` 的回传和 `/panel` 里的 `login` **是两个形状**：前者 `{authUrl, callbackUrl, status:{...}}`（`status` 是对象），后者 `{status:'idle'}`（`status` 是字符串）。两边都进同一个 `status === 'waiting'` 判断 → **取决于哪份先到，含义不同**。现在插件只回内层对象。**判据：一个字段要经过两跳（代理 → 插件 → 面板），每一跳都要单独验证它还在，而且形状不能变。**
-- **本地状态不能一直压着服务端（2026-10-02 修）**：一键登录的第一版写的是 `const loginView = commandLogin ?? data?.login`——点完按钮 `commandLogin` 变成 `waiting` 之后**再也没更新过**，于是它永远盖着 `/panel` 的真值。实测用户授权**成功了**（`{"status":"success"}`，新 key 已写、端口已关、账号在册），面板还在显示「等待浏览器回调…」；「取消」调了路由但没清本地状态，所以**看起来完全没反应**。现在记下点击瞬间服务端的说法（`baseline`），**只在这个说法没变时**才用本地那份；一旦服务端动了就以它为准，取消则直接清空。**判据：任何 `local ?? server` 的写法都要问「本地这份什么时候作废」——没写这一条，它就是个永久遮罩。**
-- **「已完成」不等于「文件都在」（2026-10-02 修）**：deepseek-web 的「一键配置」在已配置时**直接 return**，是个死按钮（实测点下去 `alreadyConfigured:true`、文件时间戳纹丝不动）。但它该能重跑——cookie 和 bearer token 都会过期——于是加了 `.bak` 备份。**第一版判据是错的**：`deepseekWebStatus().configured` 只答「三个文件都在吗」，而抓取脚本**先写 token 和 headers、最后写 cookie**（`.tmp-extract-deepseek-cookies.ts` 的 204/205/246 行），中途挂掉会留下**三份都在**的半套文件，面板照样说 ready。现在判据是 **`退出码 === 0 && 三份都在`**——脚本每条失败路径都 `Deno.exit(1)`，退出码才说明这轮跑完了。两条同类教训：①**存在性检查不能代替有效性检查**（缓存 token、思考字段都是这个）；②**把方法当回调传会丢 `this`**（`backUpDeepseekState(root, runtime.record)` 传的是裸引用，调用时 `this` 是 undefined，直接把整个路由打成 502）——helpers 改成返回值，由调用方自己记日志。
-- **测试要造出能骗过 `resolveProjectRoot` 的目录（2026-10-02）**：它要求候选目录里**同时有 `main.ts` 和 `deno.jsonc`**，否则静默回退到插件所在仓库。我第一版测试只造了登录态文件，结果**点了「重新配置」真的在用户机器上弹出了 DeepSeek 登录浏览器**（进程已自行退出，三个文件时间戳未变，`.bak` 与原文件逐字节一致，已清理）。**判据：凡是会按路径找文件的被测代码，测试必须先确认那个路径真的会被选中**，否则测的是回退分支而不是被测行为。
-- **两个来源必须对两个界面都可见，只对代理可见等于没用（2026-10-05 修）**：加了文件来源之后我只改了代理侧，插件仍只读 `settings.json`。结果是**手写文件配的供应商代理能用、面板显示为空、选择器里也看不到**——而两边代码各自都对。这正是本项目那条「面板有、选择器没有」的同型故障，只是这次裂缝在「代理有、面板没有」。修法：插件也读同一个文件（路径必须与代理一致——`resolveProjectRoot` 下的工作目录，因为代理由插件以 projectRoot 为 cwd 启动），并把合并结果分成两份：**`providers`（两个来源的并集）给面板与列表门控看，`settingsProviders`（只有 settings 那份）才注入环境变量**。后者是必须的——文件那份由代理自己读，再注入一遍就等于同一份配置送两次，而且环境的副本会在用户改动文件后继续生效，方向正好反了。面板上文件来源的条目**只读**（虚线边框、`origin:'file'` 标记、没有删除按钮）：文件拥有它，从这个卡片删只会删掉一个 settings.json 里根本不存在的条目，下次读它又回来了。保存时也过滤掉 file 行，否则会在 settings.json 里写第二份，同一个供应商在两处各存一份且可能不一致。**两条断言各被杀掉的变异**：把文件那份从 `providers` 里去掉 → 「a vendor configured in the file must be visible to the panel」红；把注入改成 `providers` → 「credentialEnv must not carry file-backed vendors either」红。**后者第一版是恒真的**（我漏了传 `projectRoot`，于是 `resolveProjectRoot` 回退到插件仓库、那里没有配置文件），补上目录才杀掉——「断言必须能答出改坏哪一处它会红」又一次直接抓到问题。
-- **自定义供应商有两个入口，缺一个就等于没有这个功能（2026-10-05 修）**：第一版只有环境变量 `AI_PROXY_CUSTOM_PROVIDERS` 一个来源，**而唯一写它的是 DSH 插件**。于是代理脱离插件运行时（直接 `deno run -A main.ts`、cloudflared 隧道、自建客户端），自定义供应商有实现却没有入口——`/custom/v1/*` 回 404「no custom providers are configured」，而内置渠道全不受影响。这条是用户指出来的：「代理启动也要支持自定义填入供应商啊」。现在有**两个并列来源**：环境变量（插件注入，运行时生成）与工作目录下的 `custom-providers.json`（手写，`AI_PROXY_CUSTOM_FILE` 可改道）。**同名冲突时环境赢**，被盖掉的记进 `shadowed` 并打日志；文件读到但解析不出东西时 `fileError` **单独上报**——「没配」与「配坏了」是两种状态，混为一谈会让写错格式的人看到「去配一个」（他已经配了）。404 的响应体里同时给出两条配法和一份可复制的最小示例。文件按 mtime 缓存（读发生在**每次请求**上，而改动极少），所以**保存即生效、不用重启**。**凭据文件纪律**：`custom-providers.json` 进 `.gitignore`（与 `cnb-login.txt` 同类，含明文 key），可提交的样例是 `custom-providers.example.json`，它靠一条否定规则 `!custom-providers.example.json` 从通配里豁免——我第一版写的 `custom-providers.*.json` 把样例也一起忽略了，正是我自己要求可提交的那个文件。
-- **cloudflared 隧道已进面板（2026-10-05 加）**：设置页可以直接开关 cloudflared 并把公网地址显示出来，填了 Worker 名字还会自动回写 `BACKEND_URL`。`TunnelRuntime`（`dsh-plugin/index.js`）是 `ProxyRuntime` 的**兄弟**而不是子类，因为两者生命周期不同：代理在每次保存设置时都被 stop/start，而隧道是「要不要对外可达」的选择，跟着保存一起重启会在每次无关保存后换一个新域名。它**不读 `runtime.snapshot()`**——那个快照每个 `apply()` 只建一次、被活过窗口重载的实例持有，放那里的字段在宿主重启前一直是旧的（`channelKeySet` 就是这么丢的）；隧道信息在**按请求现算的 `/panel` 快照**里，所以地址能在隧道还没起完时就出现。三个路由：`POST /tunnel/start`（先落盘 `tunnelEnabled:true` 再起进程，顺序反了的话宿主重启会让开关静默回退）、`/tunnel/stop`、`/tunnel/sync-worker`（**单独一条**——隧道可能好着而 `BACKEND_URL` 是旧的，为了修后者去重起 cloudflared 会白白换掉域名）。地址解析走 stderr 正则，与 `restart.ps1` 同一套判据；**给出的地址是带 `/v1` 的聚合**，不是裸 hostname（同「对外显示的地址必须是聚合」那条）。`tunnelEnabled` **不由保存按钮发送**：它归 start/stop 路由所有，否则另一个标签页里的旧快照会把你刚开的隧道关掉。
-- **`spawn('cloudflared')` 在 Windows 上 EFTYPE：现象稳定，根因未定（2026-10-05 实测；含一次自我纠正)**：第一版 `resolveBinary()` 把裸名 `cloudflared` 放在候选表第一位并**直接 return**（注释还写着「PATH 由 spawn 解析」），于是绝对路径分支从没被走过，`spawn` 报 `EFTYPE`。现在绝对路径在前（Windows 三个安装位置，Unix 三个），裸名只作最后兜底；self-test 断言「检测到的路径必须是绝对路径且以 `.exe` 结尾」，已用变异验证可证伪。
-  **我第一版把根因写成「没有 `shell: true` 时 Node 不做 PATHEXT 展开」——那条是错的**，已用对照实验证伪。把同一个 `cloudflared.exe` 复制到干净目录、只用该目录作 PATH 逐项测试：
+- **cnb 渠道校验拦截 Claude Code（2026-10-18，已规避）**：上游新增
+  `errcode 11128 "Illegal API invocation from an unapproved channel"`（文案「可能不是官方客户端
+  发出的」）。实测边界：检测的是 **system/assistant 消息里连续出现的 Claude Code
+  身份短语**
+  `You are Claude Code, Anthropic's official CLI for Claude.`——大小写不敏感、容忍句尾标点，但
+  **去掉 "You are"、只留半句、中间插词、换行拆开、放句尾/句中全部不拦** ⇒
+  匹配的是那段连续 字符序列而非 "Claude" 这个品牌名；`user` 消息不在检测面上；与
+  tools/路径/headers 无关。 Claude Code 每轮把该句作为 system prompt
+  首句，因此**每轮必 400**。已加 `neutraliseClientIdentity()`（`src/cnb.ts`）把
+  system/assistant 里的该句替换为语义等价的 中性表述，`user`
+  不动（改它等于篡改用户原文），数组形态逐 text 块处理。 **⚠️
+  定性：这是规避客户端校验，不是协议适配**——上游在拦非官方客户端，改写只赌它此刻只认
+  这一个字符串；**上游随时可以加别的指纹**（换措辞、看 tools
+  形状、看组合特征），届时这条会 再失效，届时重新实测边界再改判据，别照抄本段。
+- **DeepSeek 网页端**：`/deepseek-web/v1` 已支持自动登录凭证、PoW
+  WASM、THINK/RESPONSE SSE 解析、OpenAI SSE、工具调用、图片 data URL 上传到
+  `ref_file_ids`、Chat Completions、Responses API 和 `off/low/high/max`
+  思考档位；由于 DSH OpenAI 兼容列表不读取自定义 reasoning 元数据，额外暴露
+  `deepseek-reasoner-off/low/high/max` 模型变体；同一账号请求串行，随机间隔 2～4
+  秒，连续 15 次长休，429/403 会暂停自动重试。默认同一账号复用 chat_session 20
+  轮，`DEEPSEEK_SESSION_REUSE_TURNS=0`
+  可关闭复用。图片首次使用前需重新运行登录捕获脚本生成 `deepseek-headers.json`。
+- **Zen 兼容层**：`src/zen.ts` 为 `/zen/v1` 补齐 OpenCode UA、DSH session 派生的
+  `x-opencode-*`、`bash/glob/grep/read` 工具 quartet、Muse Spark
+  Responses/Anthropic Messages 转换和 FreeTier/Region 错误分类；可用
+  `ZEN_BASE_URL`/`ZEN_BEARER_TOKEN` 覆盖上游。实测非流式请求会触发
+  `FreeTierError`，`stream:true` 可正常出流，因此 DSH
+  路径必须保持流式；模型列表可返回 11 个 `-free`
+  模型。单会话免费额度有限，连续探针会触发 `FreeUsageLimitError`。
+- **Zen 会话压缩**：`src/zen-compaction.ts` 移植 opencode 官方
+  `session/compaction.ts`（经 YuJunZhiXue/Cline-proxy `internal/app/compact.go`
+  中转）。超限时从尾部按 token 预算保留原文（超预算那条按 prefix/suffix
+  拆开而非整条丢弃），更早的历史交给模型生成锚定摘要，重组为
+  `[system] + [Conversation Summary] + 尾部原文`；同一 session 下次压缩走
+  `Update the anchored summary` 增量更新而非重写。token 估算沿用官方 `字符数/4`
+  近似。`ZEN_COMPACTION=off`
+  关闭；`ZEN_COMPACTION_KEEP_TOKENS`/`BUFFER`/`MAX_SUMMARY`/`SUMMARY_MODEL`
+  可调。**压缩必须发生在 `upstreamBodyForChat` 之前**，否则改写后的 messages
+  不会进入实际请求；摘要请求复用本代理的 Zen 路由以带上指纹。摘要生成失败降级为
+  `fallbackTruncate` 截断，不会把会话直接打失败。
+- **Zen 截断检测（2026-10-01 核实）**：此前 `src/zen.ts` **完全没接入**
+  `stream-normalizer`，reader 一报 `done` 就发 `[DONE]` +
+  `finish_reason: stop`，所以 Zen
+  额度中途掐断、传输失败和「模型自己停止」三者**完全无法区分**——agent loop
+  判定回合正常结束、标记目标完成、起下一个目标，故障不留痕迹（用户实测 489
+  轮会话反复停在半句）。现改为**由各 wire
+  自己的终止帧判定完成**：`[DONE]`（chat）/
+  `response.completed|failed|incomplete`（responses）/
+  `message_stop`（messages）；缺终止帧即 `stream_cut`，先补一帧
+  `{"error":{"code":"stream_cut"}}`
+  再收尾，插件会把它变成可见错误。`restoreChatStream` 过去在 `map.size === 0`
+  时**纯透传**，现已始终包装（逐帧原样透传）。读取抛错经 `classifyStreamFailure`
+  分类，客户端取消走 `StreamAbort`
+  **静默结束**，不算上游故障。**这条曾留下的已知代价已在 2026-10-04
+  消除**：插件过去把流内 `error` 帧统一映射成 `code: 'SERVER'`，而 `SERVER` 在
+  `retryableCodes` 里 → 截断会被重放最多 2 次。现在插件**读
+  `payload.error.code`**：`stream_cut` 按「本轮已投递没有」分级（已投递 →
+  `stream_cut` 不可重试，未投递 → `TRANSPORT`
+  可重试），其它码原样透传，无码则回落 `SERVER`（保持 cnb / deepseek-web
+  那两条尚未命名失败类别的路径仍可重试）。判据必须留在插件这一层：只有它知道这一轮有没有把东西送到客户端。配套两条判据见下面「流内
+  error 帧的 code 不能丢」与「错误轮不许再声称 finish_reason」。
+- **插件流截断检测（2026-10-01 核实）**：`dsh-plugin/index.js` 的 `readSse`
+  是插件路径**独有**的手写 SSE 读取器（配置里手写的模型走 DSH 内置 OpenAI
+  客户端，不经过它），过去**从不检查 `[DONE]` 是否到达**；流提前断开时
+  `for await` 正常退出、`finish` 保持 `undefined`，`finishKind(undefined)` 落到
+  `return 'stop'`——**被掐断的流和正常结束的流完全一样**，agent loop
+  判定回合说完、标记目标完成、起下一个（用户实测：所有供应商的插件注入模型都有概率「要干活却直接停止」，配置里手写的模型没有）。现跟踪
+  `sawDone` + `delivered`：缺终止帧即报失败，**已输出内容的用非重试码
+  `stream_cut`**（重放会重复执行并二次付费，违反「已输出后不重放」原则），**未输出任何内容的用
+  `TRANSPORT`**（这是重试真正有意义的唯一情形）。已到达的部分照常 `block-end`
+  收尾，文字不随失败一起丢掉；统计记
+  `ok:false/truncated:true`，所以截断终于在用量面板里可见。`finishKind`
+  现在只在流带终止标记后才会走到。
+- **Zen UA 版本可被客户端降级（已修）**：`src/zen.ts` 的 `combinedUserAgent`
+  过去在客户端 UA 已含 `opencode/` 时**原样转发**，于是发 `opencode/1.1.55`
+  的客户端把网关钉死在旧版本上，Zen 直接回 `426 UpgradeRequired`（实测：探针带旧
+  UA 得 426，不带 UA 得 429）。现先剥掉所有 `opencode/<version>` token
+  再盖上当前的 `opencode/1.18.31`，其余客户端 UA 保留（指纹需要）。顺带结论：Zen
+  的 UA 在两条路径上行为**一致**，`isZenAggregate`（仅 `basePath === '/v1'`
+  时才带 OpenCode UA）**不是**用户所述差异的原因。
+- **Zen 能力元数据（2026-10-01 核实）**：Zen 的 `GET /models` 只回
+  `{id,object,created,owned_by}`，没有
+  ctx/输出上限/模态/推理档位。`src/zen-catalog.ts` 改从 models.dev 读——其
+  `opencode` 条目的 `api` 就是
+  `https://opencode.ai/zen/v1`。**阶梯逐模型不同**：`space-bunny-free`
+  五档、`deepseek-v4-flash-free` 三档、`muse-spark-*` minimal~xhigh
+  五档、`longcat`/`ling` 仅开关、`mimo`/`nemotron` 不可调。**任何一条阶梯都不含
+  `off`**，所以不得凭空补「关闭」档，也不得自己编统一阶梯。三点约束：目录约 5
+  MB，**不进请求路径**——`handleModels` 只排后台刷新（TTL
+  12h、失败降级上一份快照、`ZEN_CATALOG=off`
+  可关）；目录没覆盖的模型原样返回不补猜测值（`jev-1.13-free` 属此类，用
+  `ZEN_MODEL_LIMITS` 显式指定）；**只在目录确认该模型发布了这个档位时才转发
+  effort**，未知档位记日志而非透传（透传要么编造能力、要么给本来能通的请求换
+  400）。`toggle` 型模型（longcat/ling）**不发布 ladder**，因为 OpenAI
+  形状的请求无法表达开关，发布就是死控件；`chatToClaude`（union-alpha）也刻意不映射
+  effort，Anthropic 用 `budget_tokens`
+  而目录没有该字段，映射就得凭空发明预算。**同时修掉两个既有错误**：`ZEN_MODEL_LIMITS`
+  原是空对象，11 个模型共用 `{context:1M,output:64k}`
+  兜底，而压缩正拿它做分母——真实 output 从 32k 到 524k，旧值对目录覆盖的 10
+  个模型全错（mimo 高估 2 倍、space-bunny 低估 8.2
+  倍）；`chatToResponses`/`chatToClaude` 从零重建请求体，会把客户端传来的
+  `reasoning_effort` 静默丢弃。
+- **推理阶梯形状（2026-10-01 修 bug）**：`dsh-plugin/index.js` 的 `pickEfforts`
+  过去只认 `typeof value === 'string'`，而 `reasoning_efforts`
+  有**两种形状**：CommandCode 发裸字符串（`["off","high","max"]`），Zen 的
+  models 端点发**对象**（`[{id,name}]`，即 `/v1/models` 文档里
+  `reasoning_efforts` 的形状）。只挑字符串 → Zen 目录里的阶梯全部变成空数组 →
+  **harness 直接拒绝整个 provider**（`INVALID_MODEL_REASONING`，报错
+  `'ai-proxy' 加载失败: adapter returned invalid reasoning metadata … zen/deepseek-v4-flash-free`）。**不是跳档问题**（`low/high/max`
+  的 gap 完全合法），也不是能力问题，纯粹是形状没对上。现在两种都认，去重后按
+  `EFFORT_ORDER` 排序，**顺序表里没有的 id
+  追加保留而不丢弃**——阶梯以上游说的为准，不以上游「应该」有的为准。**`EFFORT_ORDER`
+  补了 `minimal`**（排在 `off` 与 `low` 之间），否则 muse spark 的
+  `minimal/low/medium/high/xhigh` 会丢掉头一档。
+- **harness 的 reasoning 校验规则（从 app.asar
+  读出，2026-10-01）**：`reasoning === undefined` →
+  通过；**`reasoning.efforts.length === 0` → 直接抛
+  INVALID_MODEL_REASONING**；每个 effort 的 `id`/`name`
+  必须是非空字符串、`description` 若有必须是字符串、**`id`
+  不得重复**；`defaultEffort` 若给出必须在 `efforts` 里。同批校验还有
+  `defaultMaxTokens`（必须是正安全整数）、`systemPromptUpdate`、`toolUpdate`。**所以
+  adapter 永远不能返回空的 `reasoning`**——要么省略该字段，要么给出至少一档。
+- **插件消息转换丢工具（2026-10-01 修，最关键的一条）**：`toOpenAiMessages`
+  过去写的是
+  `const role = message.role === 'assistant' ? 'assistant' : 'user'`，于是**工具结果被当成用户消息发出、`tool_call_id`
+  丢失**，assistant 消息也被压成纯文本（`tool_calls`
+  整个字段没保留）。上游看到的是 `user:帮我改` → `assistant:读一下文件:`（无
+  tool_calls）→
+  `user:<工具返回的文件内容>`——模型完全不知道自己调过工具，只当作收到一条新消息，回答完就收工。**这就是「插件注入的模型会突然停止、配置里手写的不会」的确切原因**：同一个上游，配置路径走
+  harness 自带客户端，序列化 `tool_calls`/`tool`
+  是对的，只有插件那条手写路径错。harness 侧的消息形状：`role` 取
+  `user|assistant|tool|system`；工具结果带 `toolCallId`/`isError`；assistant 的
+  `content` 是块数组，块为
+  `{type:'text'|'reasoning'|'tool-call', id, name, arguments}`。**reasoning
+  块发不出去就丢弃**——回放需要上游自己的签名格式，过期签名会
+  400。空结果**也要保留 `tool_call_id`**，丢了就是协议错误（悬空的 tool
+  call）而不是干净的 transcript。另注：截断检测本身**不是**这个症状的成因（实测
+  224 次调用 `truncated=0`，每次 `[DONE]`
+  都到），但那个修复仍然必要——它让「流真被掐断」这种情况以后可见。
+- **Zen 出口代理池**：`src/zen-egress.ts` 处理 `ZEN_PROXIES`（逗号/空格分隔的
+  http/https/socks5/socks5h URL）+
+  `ZEN_PROXY_STRATEGY`（round_robin/random/fill）+ `ZEN_PROXY_COOLDOWN_MS`。Zen
+  按出口地址计量匿名额度，单 IP 会先耗尽；轮换出口可分摊。429/5xx
+  或传输失败会把该出口标记冷却并线性探测下一个。凭据在 `describe()` 里被 `***`
+  遮蔽，面板不会拿到密码。**TLS 指纹伪装（utls `HelloChrome_120`）未移植**：Deno
+  不暴露 ClientHello 定制 API，Go 的 utls 无法在 Deno 侧等价实现；Cline-proxy
+  用它绕过 CF 风控，我们只有 HTTP 层指纹。Zen 的 500 是否由 TLS
+  指纹导致尚未证实。
+- **Cline 上游结论**：`api.cline.bot/api/v1` 列模型免认证（464 个，与 OpenRouter
+  清单 `shared=464` 完全重合，且缺 name/pricing/architecture），但推理一律
+  401——`Bearer public`、无头、OpenCode UA 三种形式都试过，含 Cline-proxy README
+  标为「不消耗额度」的
+  `deepseek/deepseek-v4-flash`、`poolside/laguna-s-2.1:free`、`stepfun/step-3.7-flash`。那个项目的「免费」实际来自
+  Zen，Cline 只是加了账号门槛的 OpenRouter 转发层。
+- **CommandCode Go**：`/commandcode/v1` 已移植 `dsh-cmdgo-provider` 0.9.1
+  的模型筛选、CLI 私有网关协议、OpenAI Chat/Responses/Anthropic Messages
+  转换、显式会话头作用域内稳定的
+  `x-session-id`（无会话头时每请求随机隔离）、工具调用双射/自愈、损坏 tool
+  arguments 的截断保护、多账号轮询冷却、单账号
+  in-flight/最小间隔限制、OAuth、额度和缓存统计；`COMMANDCODE_API_KEY`
+  可作单账号兜底，OAuth key 存入已忽略的
+  `commandcode-accounts.json`。公开模型目录实测 51 个 Go 模型（31
+  个图像模型）；尚未用真实 CommandCode 凭据验证推理，需有 key 后实测。
+- **可用通道**：`/v1` 聚合入口的 kilo 系模型（**2026-10-05
+  复核**：`kilo/stepfun/step-3.7-flash:free` 实测正常出流；同一天
+  `kilo/deepseek/deepseek-v4-flash-0731:free` 已下架，上游回
+  `model_not_found`）。**这里不写死具体 id**——免费档每周下架，写死的 id
+  会变成误导；要确认当下有什么，跑 `GET /v1/models` 筛 `:free`。
+- **不可用/受限**：Zen
+  的模型列表可读，但真实推理可能被上游按出口或客户端策略拒绝；ss2a 自营模型
+  502；ss2a 免费档间歇 403/502。
+- **DSH 配置**：活动 Web profile 的模型注册文件是
+  `C:\Users\22282\.dsh\profiles\web\cordis.patch.yml`；其中 `deepseek-web`
+  已注册 1,048,576 context、16,384/32,768 maxTokens、text/image 输入和
+  off/low/high/max 思考档位。HTTP `/models` 不能替代这份 DSH 配置。
+- **业务错误/冷却**：DeepSeek HTTP 200 `biz_code`、SSE
+  `error/toast`、`content/msg` 错误正文、muted/mute_until、非 SSE completion
+  错误会被识别；限流期返回 429 + Retry-After，`deepseek-web-cooldown.json`
+  持久化冷却状态，进程重启不丢失；Responses 流错误转换为 `response.failed`。
+- **请求指纹**：DeepSeek 的 PoW、建会话、删除会话、图片上传和 completion 共用
+  `deepseek-headers.json` 的浏览器头集合；不再发送重复版本头或
+  `X-Deepseek-Harness`。
+- **健康状态**：`GET /health` 返回最近一次标准 Provider
+  探测汇总；`GET /commandcode/v1/panel` 返回 CommandCode 模型/账号/额度快照，供
+  DSH 设置页读取；`src/runtime/health.ts` 将 200/429/5xx/鉴权失败/网络失败区分为
+  available/degraded/unavailable/unknown，unknown 不会清空模型列表。
+- **渠道清单失败可见（2026-10-01 核实）**：`main.ts` 的 `v1FetchMemberModels`
+  过去在成员拉取失败时**静默
+  return**（`if (parsed.error || !parsed.data) return;`），整个渠道从
+  `/v1/models` 消失——无报错、无日志、`/health`
+  查不到，界面只表现为「渠道变少了」。实测 kilo 的 17
+  个模型整条消失（`/kilo/v1/models` 同时完全正常，是聚合那一次失败），叠加 `cnb`
+  被屏蔽后面板只剩 zen + commandcode。现由 `src/runtime/health.ts` 的
+  `CatalogRegistry` 记录每种结果：**请求抛错 / 上游返回不可用列表 / 上游正常但被
+  provider 过滤器清空**（第三种最隐蔽——kilo 的 `isFree`
+  字段改名会让渠道静默变空而非报错）。失败写 `console.warn`，并进 `GET /health`
+  的 `catalog` +
+  `catalogIssues`（后者只在非空时出现），插件带到面板渠道区标为「列表拉取失败」。**与
+  probe 注册表是两回事**：probe 回答「能不能跑一轮」且只在有人要求时跑，catalog
+  回答「这个渠道现在在不在选择器里」。注意 `CatalogRegistry.get()`
+  必须返回拷贝（同
+  `HealthRegistry.get`），否则调用方改到的是内部记录——这条是单测
+  `the registry hands out copies…` 抓出来的。
+- **逐模型状态**：`/health` 除 provider 级计数外还带
+  `models[provider][未加前缀的 model id]` 的逐模型判定（`src/core.ts` 的
+  `getModelHealth`）。插件 `healthIndex()` 把样本拼回 `kilo/…` 完整 ID
+  后写到每个模型行，面板显示 可用/限流/不可用/未探测 + 延迟。**join
+  时必须无条件加 provider 前缀**：kilo 的 `kilo-auto/free` 自身含 `/`，用
+  `includes('/')` 判断「已加前缀」会漏拼。`/health` 在根路径，插件用
+  `requestAt('/', '/health')` 而非 `request('/health')`（后者会拼成
+  `/commandcode/v1/health`）。未探测的模型不带 `state` 字段，不计入
+  `modelHealth`，避免被当作故障。探测只在拉模型列表时触发（`?health=true`
+  强制重探），插件不自行发起推理探测。
+- **真实 smoke**：`scripts/probes/commandcode-smoke.ts` 是显式 `--confirm-live`
+  才会发请求的手动探针；只走本地代理，不读取上游 key/OAuth/session
+  文件，输出元数据不输出正文。
+- **DSH 桥接**：`dsh-plugin/` 是覆盖整个 ai-proxy 项目的可选 Node Host +
+  浏览器设置分区，支持自动启动/监控 `projectRoot` 中的原始 Deno
+  项目或连接已有本地/远程代理；注册 `ai-proxy` Provider，聚合 `/v1` 以及
+  TokenHarbor 等渠道，通过同源 `/api/ai-proxy/*`
+  提供面板、设置和启停，不保存上游凭据；面板运行时长每秒刷新、快照每 10
+  秒拉取；`node dsh-plugin/self-test.mjs` 使用 fake fetch
+  验证多渠道发现、元数据归一、生命周期路由和 SSE 转换。 **插件热重载（2026-10-01
+  加）**：`apply()` 里 `installHotReload(config)` 用 `fs.watch`
+  同时盯**安装目录**和**仓库**（`<projectRoot>/dsh-plugin`，即面板「项目目录」下），250ms
+  防抖；触发时先把仓库侧文件同步到安装侧，再做 **cache-busted
+  `import(pathToFileURL(self).href + '?hot=' + Date.now())`** 并把新模块的
+  `AiProxyAdapter.prototype.stream` / `.resolveModel` 换进模块级 `HOT`
+  holder——**DSH 持有的是 adapter 实例**，`prepareCall` 里的 `this.stream`
+  早已绑定，所以不换 prototype 的话重新 import
+  对运行中的会话毫无作用（实测：不带 cache buster 的重新 import 拿到的仍是旧值
+  `1`，带上才是 `2`）。旧模块实例不动，进行中的流继续跑旧代码。`stats.mjs` 只按
+  URL 缓存，所以重复 import **不会**新建 StatsStore。仓库路径也可由
+  `AI_PROXY_PLUGIN_REPO` 覆盖。**但它只换 `stream`/`resolveModel` 两个方法**，改
+  `listModels`/`listProjectModels`/`normalizeModel`/`publishedEfforts`
+  这类随宿主启动定格的函数仍要重启宿主——见下面那条实测。
+- **插件图片支持（2026-10-01
+  修；先前的「结构性限制」结论是错的）**：`ImageBlock` 是
+  `{type:'image', attachment: ImageAttachmentRef}`，插件过去读的是
+  `part.source.{type,media_type,data}`，而 `part.source` 在 asar 里**出现 0
+  次**——那个分支**永远匹配不上**，所以图片从未真正发出去过。**字节从
+  `ctx.get('attachments').imageHostPath(ref)` 拿**（`ref.attachmentId` →
+  磁盘路径 → base64），这条 cordis 服务不在 `LlmAdapter` 的 7
+  个公开方法里，**只盯着 adapter 契约会漏掉它**——我犯过这个错。内置
+  `DeepSeekAdapter` 的 `dependencies.resolveImageAccess()`
+  是另一条路，仅对它可用。参照实现：`dsh-our-free-model` 的
+  `src/messages.js`（`imageDataUrl` + `toChatMessages`）与 `index.js` 的
+  `imageResolver`。**三个必须照抄的要点**：①`ctx.get('attachments')`
+  **每次调用时读**（在 `apply()` 里读一次会永远拿到
+  undefined，因为服务比插件晚加载——`our-free-model`
+  的注释明确记着这个坑，而且「日志里什么都不说」）；②`offloaded === true`
+  的块不内联；③8 MB 上限 + 48 条缓存 + 读失败写 warn。`role:'tool'` 在 OpenAI
+  线上**只带文本**，所以工具返回的图片要**附在其后的 user 消息**里，否则
+  `read_image` 的结果静默丢失。另外**按 `inputModalities`
+  门控**——对不支持视觉的模型发 `image_url` 是整个回合 400，不是丢一张图。
+- **思考字段各家不同名（2026-10-01 修）**：`stream()` 过去只读
+  `delta.reasoning_content`（DeepSeek 拼法），**kilo/OpenRouter 发的是
+  `delta.reasoning`**，还有网关用 `thinking`。只认一家 →
+  **思考内容被整个丢掉**：既没显示成思考、也没混进正文，而是消失（用户报「开了推理却看不到思考过程」）。实测
+  space-bunny-alpha：`reasoning` 有 126 字符，`reasoning_content`
+  一次都没出现。现在 `reasoningTextOf(delta)` 依次试 `reasoning_content` /
+  `reasoning` /
+  `thinking`，**每帧只取一个**（网关同时给两个是描述同一段思考，不是拼接），并兼容数组形状。**注意
+  usage 里的 `reasoning_tokens` 仍是 0**——那是 kilo 自己报的（它把思考折进
+  `completion_tokens`，实测 44 token ≈ 180
+  字符），不是插件读不到；所以用量面板算解码速度时思考时间仍算进去，无法在插件侧修正。
+- **输出上限不等于请求大小（2026-10-02 修）**：`max_tokens`
+  直接取模型的**输出天花板**（`defaultMaxTokens`），而 kilo 顶层不发布
+  `max_output_tokens`，值取自 `top_provider.max_completion_tokens: 524288`，窗口
+  1,000,000——**天花板本身就给输入只剩 475,712**，对话用掉 475,845 后网关直接
+  400：`467563 text + 8282 tool + 524288 output = 1000133`。现在
+  `clampOutputBudget(body, contextWindow)` 按 `chars/4` 估算输入并把
+  `max_tokens` 压到 `window - 输入 - 2048`（下限
+  1024），压过就写运行日志（**不静默**，否则答案变短会被误当成换了个模型）。估算跳过
+  `image_url`/`url`，否则 base64
+  会把输入撑爆。**注意边界**：输入本身超窗时压输出救不了（实测 1,067,500 输入 →
+  仍 400），那是 DSH 压缩该管的。**同一个错还有第二层**：`requestAt` 对非 2xx
+  一律 `throw new Error`，被当成通用传输失败，而 `TRANSPORT` 在 `retryableCodes`
+  里 → **超预算请求被重放直到额度烧光**。现在按状态给码：400 且匹配
+  `CONTEXT_OVERFLOW` → `CONTEXT_WINDOW_EXCEEDED`（harness
+  认识的码，不在重试集里，还能触发它的溢出恢复）、429 → `RATE_LIMIT`、≥500 →
+  `SERVER`、其余 4xx → `CONFIG_DISABLED`，并带上 `error.status`。
+- **缓存 token 被整个丢掉（2026-10-02 修）**：harness 的 `TokenUsage` 是
+  `{ inputTokens, outputTokens, totalTokens?, cacheReadTokens?, cacheWriteTokens?, reasoningTokens? }`，而
+  `mapUsage` 只填了前两个和 reasoning——**`cacheReadTokens` / `cacheWriteTokens`
+  从来没被发过**，所以任何渠道的 prompt cache 记账在作曲栏一律显示
+  **0%**（用户新开会话实测：未缓存输入 674,973、缓存读取
+  0）。数字其实一直在，只是没人读：kilo 的
+  `prompt_tokens_details.cached_tokens`（实测 880 输入里 149 命中 =
+  16.9%），Anthropic 风格则叫 `cache_read_input_tokens` /
+  `cache_creation_input_tokens`，两种都认。**为 0 时字段整个省略而不是填
+  0**——网关没报缓存是「没说话」，填 0
+  是「断言没有缓存」。这条和思考字段是同一个病根：只按一种形状读，没读到的字段既不报错也不显示，界面因此显示
+  0 而不是「未知」。
+- **kilo 的 `opencode.variants`：键是标签，`reasoning.effort` 才是 wire
+  值（2026-10-02 修，推翻上一条的判据）**：形状是
+  `{instant:{reasoning:{enabled:false,effort:"none"}}, thinking:{reasoning:{enabled:true,effort:"high"}}}`——**键是
+  kilo 给这档起的名字，`effort`
+  才是发到线上的值**。上一轮只确认「字段在这里」，就把 `Object.keys(variants)`
+  当阶梯发布：那个「18/18
+  完全一致」的对拍**比的是自己的读取器，不可能失败**。真判据是**上游认不认这个值**：kilo
+  的校验器对 `reasoning_effort` 只收
+  `max|xhigh|high|medium|low|minimal|none`，喂 `instant`/`thinking` 直接 400
+  `Invalid option`（实测 ~400ms）。`instant→none`、`thinking→high`，于是 16 个带
+  variants 的模型里**有 10 个的默认档（无 `high` 时就是
+  `efforts[0]`）是上游拒收的，每轮调用都 400**；`kilo/liquid/lfm-2.5-2.6b:free`
+  只发布一个 `thinking`，等于整模型不可用。现在 **`id` 取
+  `variants[k].reasoning.effort`（发出去的），`name`
+  取变体键（picker/面板显示的）**，`EFFORT_ORDER` 补 `none`（`off`
+  的同义词）。判据：**阶梯里每个 id
+  都要能通过上游自己的校验器，而不是能通过自己的读取器。**
+- **没有发布阶梯就不发阶梯（2026-10-02 修）**：`pickEfforts`
+  过去在「上游什么都没说」时返回兜底表 `off/low/high/max`，**11 个模型（kilo
+  2、zen 7、cnb 2）因此拿到一张编造的表**，三种渠道坏法各不相同：kilo
+  的校验器里**根本没有 `off`**（选中即 400）；zen 的 `zenRequestedEffort`
+  只转发目录里真有档位，这四个**全是死控件**（记一条 warn 就丢弃）——`zen.ts`
+  故意不给 toggle-only 模型发布阶梯就是为了不造死控件，插件又加了回去；cnb 的
+  `src/cnb.ts` 把 `["low","medium","high","max"]` 以外的值**一律当
+  `high`**，选「off」反而开思考。现在**上游没发布 → `reasoning`
+  整个省略**（harness 接受 `reasoning === undefined`，只是不显示 Effort
+  行；**空数组才是它拒绝的形状**）。
+- **上游发布的 `default_reasoning_effort` 必须照用（2026-10-02
+  修）**：deepseek-web 的 `/models` 每个模型都带它（`deepseek-chat` 是
+  `off`、`deepseek-reasoner` 是 `high`、`-off/-low/-high/-max`
+  各钉一档），插件**从不读**，一律
+  `efforts.includes('high') ? 'high' : efforts[0]`——一个「默认不思考」的快速模型被默认打开了思考，`-off`
+  变体也就没意义了。现在 `normalizeModel`
+  读出来（蛇形/驼形都认），`resolveModel` 优先用它。
+- **harness 的真实校验规则（2026-10-02 从 app.asar 读出，可当
+  oracle）**：`normalizeModelInfo` 逐项判 adapter 的 `resolveModel`
+  结果——`provider` 必须等于请求的 provider、**`id` 必须与传入的 `model`
+  字符串完全相同**、`name` 非空、`context.contextWindow`
+  必须是正整数、`defaultMaxTokens` 必须是正安全整数、`reasoning === undefined`
+  通过、**`efforts` 为空数组直接抛 `INVALID_MODEL_REASONING`**、每个 effort 的
+  `id`/`name` 必须非空字符串且 **`id` 不得重复**、`defaultEffort` 若给出必须落在
+  `efforts` 里。`listModels` 另外要求 id 非空且**不重复**（重复 →
+  `INVALID_CATALOG`）。`buildModelCatalog` 逐个调 `resolveModelInfo`
+  且**没有逐项兜底**，所以**一个模型不合格 → 整个 provider
+  组消失**。判据：**把这几条抄成脚本对全部真实模型跑一遍**——这是唯一能同时抓到「形状不对」与「形状对但值不被上游接受」的检查。
+- **热重载只换 `stream` 与 `resolveModel`（2026-10-02
+  实测；我因此把用户的会话打崩过一次）**：`installHotReload` 只把新模块的
+  `AiProxyAdapter.prototype.stream`/`.resolveModel` 填进
+  `HOT`，**`listModels`/`listProjectModels`/`normalizeModel`/`publishedEfforts`
+  都停留在宿主启动时那一版**（实例是那次构造的，harness 直接调
+  `adapter.resolveModel(...)` 走的也仍是旧原型）。所以「只改 helper
+  的返回形状、忘了改调用方」这种半成品编辑**会立刻生效并炸**：调用方还写着
+  `efforts.map(id => ({id, name:id}))`，收到新 `pickEfforts`
+  返回的对象后把对象当成了 id/name，harness 报
+  `adapter returned invalid or duplicate reasoning effort metadata`，**整个
+  provider 挂掉**。两条推论：①改 `normalizeModel`
+  这类模块级函数，**仓库改完还要重启宿主才完全生效**；②**改 helper
+  返回形状必须同时改调用方并立刻跑自检**——我跳过了这一步，代价是用户当场报错。
+- **kilo 的推理阶梯在 `opencode.variants` 里（2026-10-02 修）**：`pickEfforts`
+  只认 `reasoning_efforts` / `reasoningEfforts` 两种形状，**kilo
+  用的是第三个字段** `opencode.variants`——每个变体一项，各自带
+  `reasoning:{enabled,effort}`。所以 `space-bunny-alpha` 明明发布了
+  `low/medium/high/xhigh/max` 五档，插件却看不到任何阶梯，掉进兜底表发出
+  `off/low/high/max`：**凭空多一个上游没有的 `off`，同时漏掉 `medium` 和
+  `xhigh`**（kilo 18 个模型里 16 个带这个字段）。**`enabled:false`
+  不是「这一档不存在」，恰恰是「这一档表示关闭思考」**——kilo 把它命名成
+  `instant` 或 `none`，和 `thinking`
+  是同一枚硬币的两面；按「关掉就是没有」过滤，会把半个目录里唯一的不思考选项删掉。**教训：字段名认全了，值的语义还要读对。**（**这条当时的判据是错的，见下面那条**：那个「18/18
+  与 `Object.keys(opencode.variants)`
+  完全一致」的对拍比的是自己的读取器，永远不可能失败。）
+- **渠道凭据（2026-10-02 改）**：`anthropic` 和 `gemini` **已从 `src/core.ts`
+  整体删除**（provider + `toAnthropic`/`toGemini` 两个 adapter 180 行 +
+  请求路径两段分支 90 行）——两者都需要 per-user
+  key，空渠道在选择器里是死控件；Zen 的 Anthropic Messages 转换是 `zen.ts`
+  里独立的 `chatToClaude`，**不经过被删的 adapter**，删前已确认。`openrouter`
+  加入 `V1_AGGREGATE_MEMBERS`，但**没 key 时不列模型**：`hasChannelCredential()`
+  在拉列表前就判定，报「needs an API key」而不是笼统的「fetch failed」——401
+  和上游挂了需要不同的修法。面板写 key 到 `settings.json`，插件 spawn deno 时经
+  `credentialEnv()` 注入
+  `DEFAULT_BEARER_TOKEN`；**空值不导出**，否则会覆盖进程自己继承的真值。`/health`
+  的 `credentials` 字段回答每个渠道有没有凭据，插件只回 `openRouterKeySet`
+  布尔值，**密钥不回传**（回传到会渲染的页面等于会进截图）。**commandcode 不需要
+  key 输入框**——三条路：`COMMANDCODE_API_KEY` / 本地 OAuth /
+  `commandcode-accounts.json`，且它当前就在跑。**deepseek-web 也不是 key
+  渠道**：它读 `deepseek-cookies.txt` + `deepseek-auth.txt` +
+  `deepseek-headers.json`
+  三个登录态文件，所以面板给的是**一键配置**（`deepseekWebStatus()`
+  先查缺哪个，`/deepseek-web/setup` 再以 `stdio:'inherit'` 拉起
+  `.tmp-extract-deepseek-cookies.ts`——它要开浏览器等扫码，**不能 await**，且
+  `windowsHide:false` 否则 QR 流程看起来像坏了），完成后自动取消隐藏该渠道。
+- **渠道开关必须从「代理提供哪些渠道」推出，不能从名单推（2026-10-02
+  修）**：`allChannels` 曾经算成「在 roster 里的 ∪
+  被隐藏的」——于是**一个已开启但一个模型都不产的渠道**（openrouter 没
+  key、deepseek-web 没登录态）**两边都不在，开关当场消失**，而唯一的办法是手改
+  `settings.json`。开一次就回不去。现在基线是写死的 `KNOWN_CHANNELS`（与
+  `src/core.ts` 的 provider 前缀一一对应），再并上 roster 和
+  hidden。**判据：任何一个渠道，不管它今天答不答话，都必须还有开关。**
+- **`self-test.mjs` 必须隔离 `DSH_HOME`（2026-10-02 修）**：设置存在
+  `~/.dsh/ai-proxy-dsh-bridge/settings.json`，测试直接读的是**用户真实那个文件**——所以套件的结果取决于用户上次在面板里存了什么。实际已经因此翻车：手写的
+  `hiddenChannels`
+  让「被屏蔽渠道必须不触达上游」那条断言变红，而这跟被测代码毫无关系。测试开头把
+  `DSH_HOME` 指到 `os.tmpdir()` 下的进程专属目录并在 `exit` 时清理，且**必须在
+  `import('./index.js')`
+  之前设置**（模块首次读设置就已经发生）。**更一般的教训：用 HTTP
+  路由测插件时会写用户的真实配置**——我拿 `/settings` 试
+  `hiddenChannels: ['cnb']` 时就真的写进去了，还顺手把 deepseek-web 打开了。
+- **每个带 key 的渠道一个变量（2026-10-02 修）**：所有 bearer 渠道曾共用
+  `DEFAULT_BEARER_TOKEN`——**一个渠道的 key 会静默变成另一个的
+  key**，失败表现是远端一个 401，日志里什么都没有。现在 provider 的 `auth` 带
+  `envToken`（`OPENROUTER_API_KEY` /
+  `TOKENHARBOR_API_KEY`），`cloneHeadersForUpstream` 按
+  `userToken || defaultToken || env[envToken] || DEFAULT_BEARER_TOKEN`
+  取，插件的 `KEYED_CHANNELS` 与之一一对应、面板按它渲染字段。**tokenharbor 的 0
+  是被伪装的 401**：上游无 key 回 401，而它自己的 `filterModels` 只留 `:free`
+  后缀，**401
+  的响应体因此变成空数组**——和「渠道正常但没有免费模型」长得一模一样，面板在把一个被掩盖的故障当事实报。所以没有
+  key 时它和 openrouter 一样被扣住。
+- **测试必须自备夹具，不能依赖检出目录的内容（2026-10-02）**：deepseek-web
+  的门控读的是**项目目录**里的三个登录态文件，于是套件在仓库里绿、在安装目录里红（那边没有那些文件），**同一个
+  commit 在两个地方结果相反**。判据：**同一个提交必须在仓库、安装目录、以及任意
+  cwd
+  下都通过**——这是唯一能抓到「测试依赖了工作目录」的方法。现在夹具自己造那三个文件，并把它当作
+  projectRoot 传进去。
+- **列表端点不记日志（2026-10-02）**：`handleDeepseekWeb` 开头一句无条件
+  `console.log("[deepseek-web] handle:", path, method)`——**deepseek-web
+  之前不在任何列表路径上，面板从不打它，所以看不出来**；把它加进
+  `EXTRA_MODEL_ROUTES` 之后，面板每 10
+  秒的轮询就变成一行，**刷掉的是真正该看的**（实测把
+  `[zen] models.dev catalog refreshed` 和 toggle-only 那条挤在了中间）。现在
+  `if (!path.endsWith("/models"))`
+  才记。**教训：新增一个「会被周期性访问」的渠道时，要先查它有没有请求级日志**——kilo/zen/commandcode/cnb
+  都没有，只有 deepseek-web 有这个习惯，所以之前一直不显眼。
+- **面板要显示的字段只能放在 `/panel`
+  快照里（2026-10-02）**：`runtime.snapshot()` **每个 `apply()`
+  只建一次**，被一个比窗口重载活得更久的实例持有——所以放进那里的字段**在宿主重启前一直是旧的**。`channelKeySet`
+  就这样丢的：同一时刻 `allChannels` / `keyedChannels` / `deepseekWeb`
+  全是新的（它们在按请求现算的 `/panel`
+  快照里），只有它是旧的，于是面板把「已设置」显示成「未设置」还把「清除」按钮藏了。`hiddenChannels`
+  / `channelKeySet` 现在都在 `/panel`
+  快照里。**但挪位置不等于能热更新**：`apiHandler` 是 `apply()`
+  时绑定的闭包，热重载换不到它，改这里**仍然要重启宿主**——这一点单独记，因为很容易以为「挪对了位置」就等于「不用重启了」。测试里断言这些字段在
+  `/panel` 上、且不在 `/settings` 上。
+- **面板要显示的字段，放的地方必须真的被送到面板（2026-10-02）**：给 commandcode
+  加「一键登录」时踩了两层。①`src/commandcode/handler.ts` 的 `/panel`
+  **逐字段重建响应**（不是透传），`statusSnapshot()` 有的字段它没列——`login`
+  就这样没进 `/panel`，**面板拿到的是没有它的形状**。②插件 `POST /login`
+  的回传和 `/panel` 里的 `login` **是两个形状**：前者
+  `{authUrl, callbackUrl, status:{...}}`（`status` 是对象），后者
+  `{status:'idle'}`（`status` 是字符串）。两边都进同一个 `status === 'waiting'`
+  判断 →
+  **取决于哪份先到，含义不同**。现在插件只回内层对象。**判据：一个字段要经过两跳（代理
+  → 插件 → 面板），每一跳都要单独验证它还在，而且形状不能变。**
+- **本地状态不能一直压着服务端（2026-10-02 修）**：一键登录的第一版写的是
+  `const loginView = commandLogin ?? data?.login`——点完按钮 `commandLogin` 变成
+  `waiting` 之后**再也没更新过**，于是它永远盖着 `/panel`
+  的真值。实测用户授权**成功了**（`{"status":"success"}`，新 key
+  已写、端口已关、账号在册），面板还在显示「等待浏览器回调…」；「取消」调了路由但没清本地状态，所以**看起来完全没反应**。现在记下点击瞬间服务端的说法（`baseline`），**只在这个说法没变时**才用本地那份；一旦服务端动了就以它为准，取消则直接清空。**判据：任何
+  `local ?? server`
+  的写法都要问「本地这份什么时候作废」——没写这一条，它就是个永久遮罩。**
+- **「已完成」不等于「文件都在」（2026-10-02 修）**：deepseek-web
+  的「一键配置」在已配置时**直接 return**，是个死按钮（实测点下去
+  `alreadyConfigured:true`、文件时间戳纹丝不动）。但它该能重跑——cookie 和 bearer
+  token 都会过期——于是加了 `.bak`
+  备份。**第一版判据是错的**：`deepseekWebStatus().configured`
+  只答「三个文件都在吗」，而抓取脚本**先写 token 和 headers、最后写
+  cookie**（`.tmp-extract-deepseek-cookies.ts` 的 204/205/246
+  行），中途挂掉会留下**三份都在**的半套文件，面板照样说 ready。现在判据是
+  **`退出码 === 0 && 三份都在`**——脚本每条失败路径都
+  `Deno.exit(1)`，退出码才说明这轮跑完了。两条同类教训：①**存在性检查不能代替有效性检查**（缓存
+  token、思考字段都是这个）；②**把方法当回调传会丢
+  `this`**（`backUpDeepseekState(root, runtime.record)` 传的是裸引用，调用时
+  `this` 是 undefined，直接把整个路由打成 502）——helpers
+  改成返回值，由调用方自己记日志。
+- **测试要造出能骗过 `resolveProjectRoot`
+  的目录（2026-10-02）**：它要求候选目录里**同时有 `main.ts` 和
+  `deno.jsonc`**，否则静默回退到插件所在仓库。我第一版测试只造了登录态文件，结果**点了「重新配置」真的在用户机器上弹出了
+  DeepSeek 登录浏览器**（进程已自行退出，三个文件时间戳未变，`.bak`
+  与原文件逐字节一致，已清理）。**判据：凡是会按路径找文件的被测代码，测试必须先确认那个路径真的会被选中**，否则测的是回退分支而不是被测行为。
+- **两个来源必须对两个界面都可见，只对代理可见等于没用（2026-10-05
+  修）**：加了文件来源之后我只改了代理侧，插件仍只读
+  `settings.json`。结果是**手写文件配的供应商代理能用、面板显示为空、选择器里也看不到**——而两边代码各自都对。这正是本项目那条「面板有、选择器没有」的同型故障，只是这次裂缝在「代理有、面板没有」。修法：插件也读同一个文件（路径必须与代理一致——`resolveProjectRoot`
+  下的工作目录，因为代理由插件以 projectRoot 为 cwd
+  启动），并把合并结果分成两份：**`providers`（两个来源的并集）给面板与列表门控看，`settingsProviders`（只有
+  settings
+  那份）才注入环境变量**。后者是必须的——文件那份由代理自己读，再注入一遍就等于同一份配置送两次，而且环境的副本会在用户改动文件后继续生效，方向正好反了。面板上文件来源的条目**只读**（虚线边框、`origin:'file'`
+  标记、没有删除按钮）：文件拥有它，从这个卡片删只会删掉一个 settings.json
+  里根本不存在的条目，下次读它又回来了。保存时也过滤掉 file 行，否则会在
+  settings.json
+  里写第二份，同一个供应商在两处各存一份且可能不一致。**两条断言各被杀掉的变异**：把文件那份从
+  `providers` 里去掉 → 「a vendor configured in the file must be visible to the
+  panel」红；把注入改成 `providers` → 「credentialEnv must not carry file-backed
+  vendors either」红。**后者第一版是恒真的**（我漏了传 `projectRoot`，于是
+  `resolveProjectRoot`
+  回退到插件仓库、那里没有配置文件），补上目录才杀掉——「断言必须能答出改坏哪一处它会红」又一次直接抓到问题。
+- **自定义供应商有两个入口，缺一个就等于没有这个功能（2026-10-05
+  修）**：第一版只有环境变量 `AI_PROXY_CUSTOM_PROVIDERS`
+  一个来源，**而唯一写它的是 DSH 插件**。于是代理脱离插件运行时（直接
+  `deno run -A main.ts`、cloudflared
+  隧道、自建客户端），自定义供应商有实现却没有入口——`/custom/v1/*` 回 404「no
+  custom providers are
+  configured」，而内置渠道全不受影响。这条是用户指出来的：「代理启动也要支持自定义填入供应商啊」。现在有**两个并列来源**：环境变量（插件注入，运行时生成）与工作目录下的
+  `custom-providers.json`（手写，`AI_PROXY_CUSTOM_FILE`
+  可改道）。**同名冲突时环境赢**，被盖掉的记进 `shadowed`
+  并打日志；文件读到但解析不出东西时 `fileError`
+  **单独上报**——「没配」与「配坏了」是两种状态，混为一谈会让写错格式的人看到「去配一个」（他已经配了）。404
+  的响应体里同时给出两条配法和一份可复制的最小示例。文件按 mtime
+  缓存（读发生在**每次请求**上，而改动极少），所以**保存即生效、不用重启**。**凭据文件纪律**：`custom-providers.json`
+  进 `.gitignore`（与 `cnb-login.txt` 同类，含明文 key），可提交的样例是
+  `custom-providers.example.json`，它靠一条否定规则
+  `!custom-providers.example.json` 从通配里豁免——我第一版写的
+  `custom-providers.*.json` 把样例也一起忽略了，正是我自己要求可提交的那个文件。
+- **cloudflared 隧道已进面板（2026-10-05 加）**：设置页可以直接开关 cloudflared
+  并把公网地址显示出来，填了 Worker 名字还会自动回写
+  `BACKEND_URL`。`TunnelRuntime`（`dsh-plugin/index.js`）是 `ProxyRuntime`
+  的**兄弟**而不是子类，因为两者生命周期不同：代理在每次保存设置时都被
+  stop/start，而隧道是「要不要对外可达」的选择，跟着保存一起重启会在每次无关保存后换一个新域名。它**不读
+  `runtime.snapshot()`**——那个快照每个 `apply()`
+  只建一次、被活过窗口重载的实例持有，放那里的字段在宿主重启前一直是旧的（`channelKeySet`
+  就是这么丢的）；隧道信息在**按请求现算的 `/panel`
+  快照**里，所以地址能在隧道还没起完时就出现。三个路由：`POST /tunnel/start`（先落盘
+  `tunnelEnabled:true`
+  再起进程，顺序反了的话宿主重启会让开关静默回退）、`/tunnel/stop`、`/tunnel/sync-worker`（**单独一条**——隧道可能好着而
+  `BACKEND_URL` 是旧的，为了修后者去重起 cloudflared
+  会白白换掉域名）。地址解析走 stderr 正则，与 `restart.ps1`
+  同一套判据；**给出的地址是带 `/v1` 的聚合**，不是裸
+  hostname（同「对外显示的地址必须是聚合」那条）。`tunnelEnabled`
+  **不由保存按钮发送**：它归 start/stop
+  路由所有，否则另一个标签页里的旧快照会把你刚开的隧道关掉。
+- **`spawn('cloudflared')` 在 Windows 上 EFTYPE：现象稳定，根因未定（2026-10-05
+  实测；含一次自我纠正)**：第一版 `resolveBinary()` 把裸名 `cloudflared`
+  放在候选表第一位并**直接 return**（注释还写着「PATH 由 spawn
+  解析」），于是绝对路径分支从没被走过，`spawn` 报
+  `EFTYPE`。现在绝对路径在前（Windows 三个安装位置，Unix
+  三个），裸名只作最后兜底；self-test 断言「检测到的路径必须是绝对路径且以
+  `.exe` 结尾」，已用变异验证可证伪。 **我第一版把根因写成「没有 `shell: true`
+  时 Node 不做 PATHEXT 展开」——那条是错的**，已用对照实验证伪。把同一个
+  `cloudflared.exe` 复制到干净目录、只用该目录作 PATH 逐项测试：
 
-  | 调用方式 | 结果 |
-  |---|---|
-  | 裸名 `cloudflared`（其目录在 PATH 上） | ❌ `EFTYPE` |
+  | 调用方式                                         | 结果                                         |
+  | ------------------------------------------------ | -------------------------------------------- |
+  | 裸名 `cloudflared`（其目录在 PATH 上）           | ❌ `EFTYPE`                                  |
   | **同样的字节改名为 `cf2`**（同一目录、同样方式） | ✅ 正常，打印 `cloudflared version 2026.9.0` |
-  | 裸名 `deno`（它自己的目录在 PATH 上） | ✅ 正常 |
-  | **绝对路径** `...\cloudflared.exe` | ✅ 正常 |
+  | 裸名 `deno`（它自己的目录在 PATH 上）            | ✅ 正常                                      |
+  | **绝对路径** `...\cloudflared.exe`               | ✅ 正常                                      |
 
-  逐个排除掉的候选解释：**不是 PATHEXT**（改个名就活）、**不是 PATH 里有没有它**（在也失败、加进干净 PATH 也失败）、**不是那个二进制本身**（复制同一份改名就能跑）、**不是 `(x86)` 括号、不是尾反斜杠**（都单独试过）。剩下的事实是：**用 `cloudflared` 这个字面名字走 PATH 搜索会失败，换任何别的名字或给绝对路径都成功**。到这一步我没有可信解释，**所以不给一个听起来合理的因果**。
-  **判据（比这条 bug 本身更重要）**：`cloudflared --version` 在 pwsh 里能用，**推不出** Node `spawn` 能用——这条推论当时是对的；但正因为它对，我就没去怀疑自己**随手编的那个机制**。**凡是「我想到一个合理机制」就写进文档的，必须先做一次能证伪它的对照实验**；我隔了几轮才补做，代价是一条错因果在 AGENTS.md 里留了整场会话。应对方式（绝对路径优先）在两种解释下都正确，所以代码不用改——**结论不变不等于归因正确**。
-- **`wrangler secret put` 会把不存在的 Worker 建出来并返回 0（2026-10-05 实测；测试中真的建出了一个游离 Worker）**：名字打错时它不报错、打印 `Success! Uploaded secret BACKEND_URL`、**并在账号里创建一个新 Worker**——用户真正的 Worker 还指着旧地址，而面板显示成功。判据：**退出码 0 只说明「这条命令没出错」，不说明「你的目标被改到了」**。现在写入前先 `wrangler secret list --name <name>` 验存在（不存在时它 `exit 1` 并打印 `Worker "..." not found`），不存在就**拒绝写入**并说明原因。注意 `secret list` 对**已存在**的 Worker 一定 exit 0，所以这条检查只在「名字是错的」时才触发——我用一个刚被自己创建出来的 Worker 测过一次，得到假绿，删掉它之后才拿到真实的 `exit 1`。**凭据回写失败绝不抛异常**：隧道本身是好的，不能因为 wrangler 的问题把它一起打死，所以 `worker.state` 单独上报（`ok`/`error`/`skipped`）。不填 Worker 名字则整个跳过——往一个猜来的 Worker 写 secret 比不写更糟。
-- **自定义供应商：一个静态前缀 + 运行时的名字表（2026-10-05 加）**：面板里让用户增加任意 OpenAI 兼容上游。**provider 前缀表是启动定格的**（`channelPrefixes`/`V1_AGGREGATE_MEMBERS`/`core.ts` 的 `providers`，插件的 `CHANNEL_GROUPS` 更只在 `apply()` 时注册），所以「一家一个前缀」= 每加一个供应商重启一次 DSH Host，与「面板填一下就生效」直接冲突。做法：所有自定义上游共用 `custom` 这一个静态前缀，供应商名作第二段——`custom/<供应商名>/<上游模型 id>`；**名字取第一段**才能让上游 id 自带斜杠（`deepseek-ai/deepseek-v4.1-flash`、`z-ai/glm-5.3`），按最后一段切会在一半模型上切错。代价是**所有自定义供应商共享一个选择器分组**（换来零重启）。**不复用通用 passthrough 分支**有两条理由：那条路从 `provider.auth` 读静态凭据（这里按请求里的名字变），而且它**会把入站请求的 authorization 转发给上游**——对用户自己填的第三方上游那是把本代理的入站凭据送出去。`core.ts` 里的 custom 条目故意用不可路由的 baseUrl（`http://custom-disabled.invalid`）：handler 分支一旦没命中就立刻失败，而不是悄悄打到一个真主机上。**接线必须同改**：`V1_AGGREGATE_MEMBERS`（否则选择器看不到）、`channelPrefixes`（否则探针 400）、`core.ts` 的 providers、插件 `KNOWN_CHANNELS`/`CHANNEL_GROUPS`/`CHANNEL_ROUTES`/`PROBE_CHANNELS`——最后两处被 self-test 的 cross-file 断言盯着，只改一边就红。**凭据只进 `AI_PROXY_CUSTOM_PROVIDERS` 这个环境变量**，面板只回 `keySet` 布尔值。
-- **`v1FetchOwnListing` 读的是没登记的 `ENV.PORT`（2026-10-05 修）**：它写 `ENV.PORT || 8000`，而 `src/core.ts` 的 `ENV` 里**根本没有 PORT 这个键**，所以它恒等于 8000。恰好在默认部署上是对的，于是这个 bug 一直没暴露；一旦代理跑在别的端口，每一次「问自己」的自调用都会打到那个端口上**别的进程**，拿到的是**旧代理的回答**——看起来像真的（有行、有 id），只是属于另一个进程。现在按 `Deno.serve` 同一个读法取 `Number(Deno.env.get("PORT") ?? 8000)`。**判据：自调用（问自己）的地址必须来自本进程实际绑定的端口，不能来自一个可能未登记的配置键**；这类 bug 的伪装性在于「有数据回来」，所以只在非默认端口上才现形。
-- **流内 error 帧的 code 不能丢，丢了它就是死数据（2026-10-04 修；我上一轮的实错）**：我在 trae 的断流帧里写了 `code: "stream_cut"`，注释还写「由调用方决定重不重试」——但插件 `dsh-plugin/index.js` 的 `payload.error` 分支**硬编码 `code: 'SERVER'`**，全文不读 `payload.error.code`，所以那行是**死数据**；而 `SERVER` 在 `retryableCodes` 里 → 已投递一半的断流仍会被重放最多 2 次（重放 = 已发射的工具调用再执行一遍 + 二次计费）。更糟的是**这条 error 帧反而废掉了插件自己的正确判据**：代理在 error 帧之外又补了 `[DONE]`，插件在第一帧就 `return`，所以它靠 `!sawDone` 分级的那套逻辑根本没机会跑。**如果代理什么都不发、直接断连接，插件现有逻辑给出的答案是完全正确的。** 现在插件读 `payload.error.code`：`stream_cut` 按「本轮已投递没有」分级（已投递 → `stream_cut` 不可重试；未投递 → `TRANSPORT` 可重试），其它码原样透传，无码回落 `SERVER`（保住 cnb / deepseek-web 那两条尚未命名失败类别的路径仍可重试）。**判据：代理发出去的任何分级信号，必须先确认下游真的读它**——写完 grep 一下消费者，grep 不到就是死数据；而且「提前终止读取」会掩盖下游本来能给出的正确答案。**这一处改完，zen / workbuddy / commandcode / trae 四家原有的 stream_cut 一并生效。**
-- **错误轮不许再声称 finish_reason（2026-10-04 修；同一个病换了个入口）**：修完断流路径，我留了 catch 分支原样——它先发 `{error:{message}}`，**紧跟着发一帧 `finish_reason:"stop"`**，再补 `[DONE]`。整条 SSE 聚合起来读到的就是「模型说完了」，等于把刚治好的病从断流入口搬到错误入口。实测 TRAE 4008 配额耗尽时上游给出的正是这三帧（真代理真凭据，`/v1` 与 `/trae/v1` 两条路由一致）。插件之所以没被咬到，只因它在第一帧 error 就 return；**哪天帧顺序一变就成了真**。现有测试只断言 message 含业务码、没断言不许出现非 null 的 finish_reason，所以把 `:920` 的 `stop` 改成 `null` 重跑仍 36/36 绿。**判据：修「某条失败路径不许撒谎」时，要同时审它的兄弟路径——同一个出口的不同分支往往共享同一个错误。** 断言要写成「不存在非 null 的 finish_reason」（增量帧自带 `null`，所以判空得用 `!= null` 而非 `!== undefined`）。
-- **两份探测名单必须同改（2026-10-04 修，实测复现）**：`main.ts` 的 `channelPrefixes`（`/health/probe` 的路由表，未知名回 `400 unknown channel`）与插件的 `PROBE_CHANNELS`（面板按需探测的白名单）**回答同一个问题，却各写一份**，于是 workbuddy 和 trae 加进来时两处都漏了 —— zlkpro 那次靠纪律加对了（AGENTS.md 上面的「五处必须同时加」），这两个就漂了。漂移的失败方向是**贵的**：`client.js` 的探测按钮不是从 `PROBE_CHANNELS` 渲染的，它取实时快照的渠道计数表，所以 workbuddy/trae 的按钮照常显示；点下去 `runProbe([channel])` → `cleanProbeRequest` 把名字滤掉 → `channels.length === 0` → **回落成「全部渠道」**。实测 `{channels:["workbuddy"],limit:1}` 与 `{channels:["trae"],limit:1}` 都返回 7 个渠道（kilo,zen,cnb,commandcode,deepseek-web,tokenharbor,zlkpro），而 `POST 8000/health/probe?provider=trae` 直接 400。两个后果同时成立：①点一个渠道真的打满 7 个上游（tokenharbor 无 key，纯浪费）；②workbuddy/trae **永远探测不到**，面板上一直停在「未探测」，而代理侧其实探得了（`provider=workbuddy` 实测 200 `workbuddy/hy4-preview available 3207ms`）。**现在 `self-test.mjs` 直接读 `main.ts` 的 `channelPrefixes` 与 `PROBE_CHANNELS` 做 `deepEqual`**，两份名单漂了就红；`PROBE_CHANNELS` 因此改成 `export`。解析按行做并先剔掉注释行，所以被注释掉的渠道不计数、带引号的键（`"deepseek-web"`）照收。**判据：跨文件名单要么单一事实源，要么 CI 断言，靠纪律同步的一定会漂。**
-- **探测和目录都必须覆盖「不在聚合里的渠道」（2026-10-02 修）**：`/health/probe` 的模型列表取自 `v1FetchMemberModels()`（= `V1_AGGREGATE_MEMBERS`），而 **deepseek-web 不是成员**——只在 `channelPrefixes` 里。于是它 `rows = []` → `probed: 0`，**一个能用的渠道探测不出任何东西**（同模型列表那次一样的「静默零」）。现在 `v1FetchOwnListing(prefix)` 兜底。更深一层：`testModelThroughProxy` **固定打 `${origin}/v1/chat/completions` 并传带前缀的 `channel/model`**，而渠道自己的口要**裸 id**——实测 deepseek-web 收到 `deepseek-web/deepseek-chat` 直接 400、`latencyMs: 0`。现在按 `basePath` 决定去不去前缀。**注意：聚合是能派发到非成员渠道的**（成员表只管列模型，不管派发），所以「能否派发」和「是否在列表里」是两件事，别混。
-- **harness 的模型目录每个 Host generation 只建一次，且不会重建（2026-10-02）**：插件 `apply()` 一加载，宿主就建目录——**而那时代理还没起来**（实测宿主 12:44:14、代理 12:44:17 才 Listening）。建在空代理上的目录会被保留，`settings/document-updated` 之类的刷新也不会重读列表。插件的发现回调因此自己重试（最多 4 次，退避 2/4/6 秒）——**这是唯一能救的地方，宿主自己不会重试**。**同类问题：代理自己的聚合名单有 `DEGRADED_TTL: 15s` 的降级重试，harness 目录没有，两边都得各自扛。**
-- **`/restart` 可能不重启（2026-10-02 实测）**：面板点重启后代理进程 pid 和启动时间**纹丝不动**，日志只有 `proxy already available at http://127.0.0.1:8000/commandcode/v1`，`deno exited ... SIGTERM` 那行没有出现。**判据：改了 `src/` 之后不要信 `/restart` 的返回值，要比对 deno 进程的启动时间和源文件 mtime**——我因此对着旧代码测了半小时。手动 `Stop-Process` 再 `/start` 才真的换掉。未修。
-- **面板的模型列表和 harness 的模型目录是两条路（2026-10-02 实测）**：面板读 `projectAdapter.listProjectModels()`（含 `EXTRA_MODEL_ROUTES` 里的渠道，93 个），**harness 的目录读 `ctx.llm.listModels()` → 注册的 adapter → 代理的聚合 `/v1/models`**（85 个）。插件注册的 `registerModelDiscovery` **并没有喂到 `listModels`**。所以 deepseek-web 一度「面板 10 个、选择器 0 个」——两个界面自相矛盾而两边代码都对。修法是把它加进 `V1_AGGREGATE_MEMBERS`（取本地静态列表 `v1FetchOwnListing('deepseek-web')`，不走上游），聚合 85 → 95。**派发是另一套映射，所以加成员不会破坏路由**（实测 `/v1` 早就能派发 `deepseek-web/*`，只是不列它们）。**判据：任何一个「某个界面有、另一个界面没有」的问题，先确认两边读的是不是同一个函数，别默认它们一致。**
-- **harness 的模型目录是 `groups.filter(g => g.models.length > 0)`（2026-10-02 从 asar 读出）**：`buildModelCatalog(ctx)` 逐 provider 调 `listModels()`，再 `Promise.all(models.map(m => resolveModelInfo(...)))`——**没有逐项兜底**，所以**任何一个模型解析抛错，整组变成 `failure` 并被过滤掉**，症状是「某个 provider 整个消失」而不是「少一个模型」。另外 `ModelCatalogDirectory.load()` 每个 Host generation 只调一次 `ctx.remote.session.modelCatalog()`，**不会重读**；`invalidate()` 才重新拉。**所以改完插件必须重启宿主才验证，而且要等代理先起来。**
-- **对外显示的地址必须是聚合，不是某个渠道（2026-10-02 修）**：`runtime.baseUrl()` 过去返回 `serviceUrl('/commandcode/v1')`，面板设置卡右上角就把它当「代理地址」显示成 `http://127.0.0.1:8000/commandcode/v1`——**照抄进客户端会把所有请求发给一个渠道**，而 `ai-proxy` provider 注册的是 `/v1` 聚合。现在返回 `/v1`。同一处还有个相关的坑：`originUrl()` 在 external 模式的**兜底值**也带着 `/commandcode/v1`，于是「模式切成 external 但地址留空」会得到 origin `.../commandcode/v1`，所有请求变成 `/commandcode/v1/v1/...`（什么也不答）。**判据：一个「照抄就能用」的地址，必须是那个东西的真实入口。**
-- **「完整结束但什么都没吐」不是正常结束（2026-10-02 修）**：`[DONE]` 到了、`finish_reason` 也没说停，插件就**干净地报 `stop`**——可**一个 block 都没开**。harness 收到一个没有任何块的干净回合，显示的是 **`Provider returned an empty response`**，而 agent loop 把它当成模型选择不说话，于是故障不留痕迹。现在和截断那条同规则：**没交付任何东西 → 报 `TRANSPORT`（可重试）**，同时写一条运行日志。**判据：`finish` 的语义是「这一轮说完了」，不是「这一轮发生了什么」——什么都不发生也是一件事，得说出来。** 测试用 `streamMode = 'done-empty'`（带 `finish_reason` 和 `[DONE]` 但零 block），并已验证**去掉守卫该用例会红**（`'stop' !== 'error'`）。
-- **插件的失败从来只进统计、不进日志（2026-10-02 修）**：截断和空流两条路径都只调 `recordUsage`，`runtime.record` 一句不写——所以面板日志一片空白，用户看到 harness 报错而日志里什么都查不到（**我因此对着空气猜了很久**）。现在两条路径都记一行。**判据：一个只在统计里出现的失败，等于没有日志的失败。**
-- **适配器契约是 7 个方法，少一个就在运行时炸（2026-10-02 修）**：`LlmAdapter` 的完整契约是 `providerInfo` / `providerRetryPolicy` / **`imageRequestPricing`** / `listModels` / `resolveModel` / `prepareCall` / `stream`。我们的类是**从零写的、没继承 base**，base 里 `imageRequestPricing(_provider, _model) {}` 的**默认实现（返回 `undefined`）因此拿不到**。宿主的 token meter 在**压缩时**调 `this.adapters.get(provider)?.adapter.imageRequestPricing(provider, model)`——**那个 `?.` 只防「渠道没注册」，不防「方法不存在」**，于是抛 `imageRequestPricing is not a function`，**需要压缩的会话压不了**。现在补上并返回 `undefined`（**本代理不知道上游怎么计视觉 token，就不能编一个数**——base 的默认就是这个意思）。**判据：写一个不继承基类的适配器时，要把契约的每个成员逐个实现，哪怕只是返回 `undefined`。** 测试里断言 `typeof adapter.imageRequestPricing === 'function'` 且返回 `undefined`。
-- **目录闸门：`resolveModel` 会把一次建目录放大成「每模型一次全量列表」（2026-10-02 修）**：宿主 `buildModelCatalog` 调 `listModels()` 一次、再对**每个模型**调 `resolveModel()`（并发），而我们的 `resolveModel` 里又调 `listProjectModels()` —— 实测 93 个模型的建目录过程向代理发了 **186 次 `/v1/models`**，而且**每次都是完整聚合列表**（不是便宜的单次查询）。这是抄 `dsh-codearts-auth` 的 `src/remote-catalog-gate.ts` 时发现的，他们把同一件事抽象成了 `RemoteCatalogGate`。现在 `CatalogGate` 三条语义：①**在飞请求共享一个 Promise**（`inFlight` 先赋值再 await）；②**成功的列表在一个短窗口内复用**（面板要活列表，所以**不是永久缓存**，`force`/面板轮询可绕过）；③**失败开冷却**并**保留上一份 rows**（面板显示「上次已知目录」优于空白）。窗口 5s。改完实测 **186 → 0 次**。
-- **闸门必须一渠道一个，不能共用（2026-10-02 修；我引入又抓住的 bug）**：第一版给每个渠道复用了同一个 `catalogGate`，结果 **tokenharbor 的行被拿来回答 deepseek-web 的请求**，目录从 93 行变成 **188 行，其中 105 行是 `deepseek-web/deepseek-web/…`（前缀套了两遍）**。根因是**缓存的键是「这批行来自哪里」**，共用即失去判别力。现在 `routeGate(prefix)` 按渠道各持一个。**判据：任何缓存的键必须包含「它是谁的」，否则第一个进来的渠道会污染所有后来者。**
-- **空列表是「没答上来」，不是「这里什么都没有」（2026-10-02）**：`listModels` 里把 `normalized.length === 0` 翻译成 `undefined`（= 没答上来），于是失败保留上一份 rows、无 rows 时开冷却。**若照抄成「空 = 空目录」缓存起来，一次坏读就会让所有渠道消失 5 秒**——这正是本项目反复在删的「静默零」形态。
-- **断言必须真的可证伪：我的两条新断言一开始是「永远通过」的（2026-10-02）**。①我为「加载器抛错不能卡死闸门」写的测试，把 `inFlight` 的清空改成无条件赋值后**照样绿**——独立复现才看出：闸门内部 `catch` 把任何抛出都变成**已 resolve 的 `undefined`**，async IIFE 又在外层赋值生效前就 settle，所以那条 identity 检查**今天并不承载行为**，只是防御性的。②模拟一个真卡死的闸门（在 `finally` 里不置空）后套件确实变红，**但红的是「窗口过期后重新拉」那条，不是我为它写的那条**——**一条测试红不红，取决于它断言的是不是那个真正起作用的性质**。写完断言必须问：**把实现改坏哪一处，它才会红？** 答不上来的断言等于没写。
-- **provider id 是全局唯一的，分组名必须加命名空间（2026-10-03 实测；我炸了用户桌面端两次）**：用户问「能不能给模型列表分个类」，我按渠道注册了 7 个 provider，id 直接用渠道名（`commandcode`/`deepseek-web`/`kilo`…）。**结果宿主报 `an adapter for provider "commandcode" is already registered`，我插件的整个条目 `1 entry did not activate ai-proxy (ai-proxy-dsh-bridge)`，llm-pi-ai 也跟着起不来。**根因：**用户自己的 `cordis.patch.yml` 里 `llm-pi-ai` 的 `providers:` 已经注册了同名 provider**——实测那 7 个 key 是 `free`/`local-aggregation`/`commandcode`/`pollinations`/`opencode`/`deepseek-web`/`nvidia`，其中 **`commandcode` 与 `deepseek-web` 和我的分组 id 逐字相同**。`LlmRegistry.prepareRoutes` 的判据是 `this.adapters.has(provider) && !owned.has(provider)` → 抛 `DUPLICATE_ADAPTER`，**谁先注册谁留下，后一个整个条目挂掉**。现在分组 id 一律带 `ai-proxy-` 前缀（`ai-proxy-commandcode`…），**标题仍由 `providerInfo().name` 给友好名**，所以选择器里显示的还是「CommandCode」。**判据：provider id 是全局命名空间，不是你的私有字段——注册前先看这个名字会不会被别人的配置占用，拿不准就加自己的前缀。**
+  逐个排除掉的候选解释：**不是 PATHEXT**（改个名就活）、**不是 PATH
+  里有没有它**（在也失败、加进干净 PATH
+  也失败）、**不是那个二进制本身**（复制同一份改名就能跑）、**不是 `(x86)`
+  括号、不是尾反斜杠**（都单独试过）。剩下的事实是：**用 `cloudflared`
+  这个字面名字走 PATH
+  搜索会失败，换任何别的名字或给绝对路径都成功**。到这一步我没有可信解释，**所以不给一个听起来合理的因果**。
+  **判据（比这条 bug 本身更重要）**：`cloudflared --version` 在 pwsh
+  里能用，**推不出** Node `spawn`
+  能用——这条推论当时是对的；但正因为它对，我就没去怀疑自己**随手编的那个机制**。**凡是「我想到一个合理机制」就写进文档的，必须先做一次能证伪它的对照实验**；我隔了几轮才补做，代价是一条错因果在
+  AGENTS.md
+  里留了整场会话。应对方式（绝对路径优先）在两种解释下都正确，所以代码不用改——**结论不变不等于归因正确**。
+- **`wrangler secret put` 会把不存在的 Worker 建出来并返回 0（2026-10-05
+  实测；测试中真的建出了一个游离 Worker）**：名字打错时它不报错、打印
+  `Success! Uploaded secret BACKEND_URL`、**并在账号里创建一个新
+  Worker**——用户真正的 Worker 还指着旧地址，而面板显示成功。判据：**退出码 0
+  只说明「这条命令没出错」，不说明「你的目标被改到了」**。现在写入前先
+  `wrangler secret list --name <name>` 验存在（不存在时它 `exit 1` 并打印
+  `Worker "..." not found`），不存在就**拒绝写入**并说明原因。注意 `secret list`
+  对**已存在**的 Worker 一定 exit
+  0，所以这条检查只在「名字是错的」时才触发——我用一个刚被自己创建出来的 Worker
+  测过一次，得到假绿，删掉它之后才拿到真实的
+  `exit 1`。**凭据回写失败绝不抛异常**：隧道本身是好的，不能因为 wrangler
+  的问题把它一起打死，所以 `worker.state`
+  单独上报（`ok`/`error`/`skipped`）。不填 Worker 名字则整个跳过——往一个猜来的
+  Worker 写 secret 比不写更糟。
+- **自定义供应商：一个静态前缀 + 运行时的名字表（2026-10-05
+  加）**：面板里让用户增加任意 OpenAI 兼容上游。**provider
+  前缀表是启动定格的**（`channelPrefixes`/`V1_AGGREGATE_MEMBERS`/`core.ts` 的
+  `providers`，插件的 `CHANNEL_GROUPS` 更只在 `apply()`
+  时注册），所以「一家一个前缀」= 每加一个供应商重启一次 DSH
+  Host，与「面板填一下就生效」直接冲突。做法：所有自定义上游共用 `custom`
+  这一个静态前缀，供应商名作第二段——`custom/<供应商名>/<上游模型 id>`；**名字取第一段**才能让上游
+  id
+  自带斜杠（`deepseek-ai/deepseek-v4.1-flash`、`z-ai/glm-5.3`），按最后一段切会在一半模型上切错。代价是**所有自定义供应商共享一个选择器分组**（换来零重启）。**不复用通用
+  passthrough 分支**有两条理由：那条路从 `provider.auth`
+  读静态凭据（这里按请求里的名字变），而且它**会把入站请求的 authorization
+  转发给上游**——对用户自己填的第三方上游那是把本代理的入站凭据送出去。`core.ts`
+  里的 custom 条目故意用不可路由的
+  baseUrl（`http://custom-disabled.invalid`）：handler
+  分支一旦没命中就立刻失败，而不是悄悄打到一个真主机上。**接线必须同改**：`V1_AGGREGATE_MEMBERS`（否则选择器看不到）、`channelPrefixes`（否则探针
+  400）、`core.ts` 的 providers、插件
+  `KNOWN_CHANNELS`/`CHANNEL_GROUPS`/`CHANNEL_ROUTES`/`PROBE_CHANNELS`——最后两处被
+  self-test 的 cross-file 断言盯着，只改一边就红。**凭据只进
+  `AI_PROXY_CUSTOM_PROVIDERS` 这个环境变量**，面板只回 `keySet` 布尔值。
+- **`v1FetchOwnListing` 读的是没登记的 `ENV.PORT`（2026-10-05 修）**：它写
+  `ENV.PORT || 8000`，而 `src/core.ts` 的 `ENV` 里**根本没有 PORT
+  这个键**，所以它恒等于 8000。恰好在默认部署上是对的，于是这个 bug
+  一直没暴露；一旦代理跑在别的端口，每一次「问自己」的自调用都会打到那个端口上**别的进程**，拿到的是**旧代理的回答**——看起来像真的（有行、有
+  id），只是属于另一个进程。现在按 `Deno.serve` 同一个读法取
+  `Number(Deno.env.get("PORT") ?? 8000)`。**判据：自调用（问自己）的地址必须来自本进程实际绑定的端口，不能来自一个可能未登记的配置键**；这类
+  bug 的伪装性在于「有数据回来」，所以只在非默认端口上才现形。
+- **流内 error 帧的 code 不能丢，丢了它就是死数据（2026-10-04
+  修；我上一轮的实错）**：我在 trae 的断流帧里写了
+  `code: "stream_cut"`，注释还写「由调用方决定重不重试」——但插件
+  `dsh-plugin/index.js` 的 `payload.error` 分支**硬编码
+  `code: 'SERVER'`**，全文不读 `payload.error.code`，所以那行是**死数据**；而
+  `SERVER` 在 `retryableCodes` 里 → 已投递一半的断流仍会被重放最多 2 次（重放 =
+  已发射的工具调用再执行一遍 + 二次计费）。更糟的是**这条 error
+  帧反而废掉了插件自己的正确判据**：代理在 error 帧之外又补了
+  `[DONE]`，插件在第一帧就 `return`，所以它靠 `!sawDone`
+  分级的那套逻辑根本没机会跑。**如果代理什么都不发、直接断连接，插件现有逻辑给出的答案是完全正确的。**
+  现在插件读 `payload.error.code`：`stream_cut` 按「本轮已投递没有」分级（已投递
+  → `stream_cut` 不可重试；未投递 → `TRANSPORT`
+  可重试），其它码原样透传，无码回落 `SERVER`（保住 cnb / deepseek-web
+  那两条尚未命名失败类别的路径仍可重试）。**判据：代理发出去的任何分级信号，必须先确认下游真的读它**——写完
+  grep 一下消费者，grep
+  不到就是死数据；而且「提前终止读取」会掩盖下游本来能给出的正确答案。**这一处改完，zen
+  / workbuddy / commandcode / trae 四家原有的 stream_cut 一并生效。**
+- **错误轮不许再声称 finish_reason（2026-10-04
+  修；同一个病换了个入口）**：修完断流路径，我留了 catch 分支原样——它先发
+  `{error:{message}}`，**紧跟着发一帧 `finish_reason:"stop"`**，再补
+  `[DONE]`。整条 SSE
+  聚合起来读到的就是「模型说完了」，等于把刚治好的病从断流入口搬到错误入口。实测
+  TRAE 4008 配额耗尽时上游给出的正是这三帧（真代理真凭据，`/v1` 与 `/trae/v1`
+  两条路由一致）。插件之所以没被咬到，只因它在第一帧 error 就
+  return；**哪天帧顺序一变就成了真**。现有测试只断言 message
+  含业务码、没断言不许出现非 null 的 finish_reason，所以把 `:920` 的 `stop` 改成
+  `null` 重跑仍 36/36
+  绿。**判据：修「某条失败路径不许撒谎」时，要同时审它的兄弟路径——同一个出口的不同分支往往共享同一个错误。**
+  断言要写成「不存在非 null 的 finish_reason」（增量帧自带 `null`，所以判空得用
+  `!= null` 而非 `!== undefined`）。
+- **两份探测名单必须同改（2026-10-04 修，实测复现）**：`main.ts` 的
+  `channelPrefixes`（`/health/probe` 的路由表，未知名回
+  `400 unknown channel`）与插件的
+  `PROBE_CHANNELS`（面板按需探测的白名单）**回答同一个问题，却各写一份**，于是
+  workbuddy 和 trae 加进来时两处都漏了 —— zlkpro 那次靠纪律加对了（AGENTS.md
+  上面的「五处必须同时加」），这两个就漂了。漂移的失败方向是**贵的**：`client.js`
+  的探测按钮不是从 `PROBE_CHANNELS` 渲染的，它取实时快照的渠道计数表，所以
+  workbuddy/trae 的按钮照常显示；点下去 `runProbe([channel])` →
+  `cleanProbeRequest` 把名字滤掉 → `channels.length === 0` →
+  **回落成「全部渠道」**。实测 `{channels:["workbuddy"],limit:1}` 与
+  `{channels:["trae"],limit:1}` 都返回 7
+  个渠道（kilo,zen,cnb,commandcode,deepseek-web,tokenharbor,zlkpro），而
+  `POST 8000/health/probe?provider=trae` 直接
+  400。两个后果同时成立：①点一个渠道真的打满 7 个上游（tokenharbor 无
+  key，纯浪费）；②workbuddy/trae
+  **永远探测不到**，面板上一直停在「未探测」，而代理侧其实探得了（`provider=workbuddy`
+  实测 200 `workbuddy/hy4-preview available 3207ms`）。**现在 `self-test.mjs`
+  直接读 `main.ts` 的 `channelPrefixes` 与 `PROBE_CHANNELS` 做
+  `deepEqual`**，两份名单漂了就红；`PROBE_CHANNELS` 因此改成
+  `export`。解析按行做并先剔掉注释行，所以被注释掉的渠道不计数、带引号的键（`"deepseek-web"`）照收。**判据：跨文件名单要么单一事实源，要么
+  CI 断言，靠纪律同步的一定会漂。**
+- **探测和目录都必须覆盖「不在聚合里的渠道」（2026-10-02 修）**：`/health/probe`
+  的模型列表取自 `v1FetchMemberModels()`（= `V1_AGGREGATE_MEMBERS`），而
+  **deepseek-web 不是成员**——只在 `channelPrefixes` 里。于是它 `rows = []` →
+  `probed: 0`，**一个能用的渠道探测不出任何东西**（同模型列表那次一样的「静默零」）。现在
+  `v1FetchOwnListing(prefix)` 兜底。更深一层：`testModelThroughProxy` **固定打
+  `${origin}/v1/chat/completions` 并传带前缀的
+  `channel/model`**，而渠道自己的口要**裸 id**——实测 deepseek-web 收到
+  `deepseek-web/deepseek-chat` 直接 400、`latencyMs: 0`。现在按 `basePath`
+  决定去不去前缀。**注意：聚合是能派发到非成员渠道的**（成员表只管列模型，不管派发），所以「能否派发」和「是否在列表里」是两件事，别混。
+- **harness 的模型目录每个 Host generation
+  只建一次，且不会重建（2026-10-02）**：插件 `apply()`
+  一加载，宿主就建目录——**而那时代理还没起来**（实测宿主 12:44:14、代理 12:44:17
+  才 Listening）。建在空代理上的目录会被保留，`settings/document-updated`
+  之类的刷新也不会重读列表。插件的发现回调因此自己重试（最多 4 次，退避 2/4/6
+  秒）——**这是唯一能救的地方，宿主自己不会重试**。**同类问题：代理自己的聚合名单有
+  `DEGRADED_TTL: 15s` 的降级重试，harness 目录没有，两边都得各自扛。**
+- **`/restart` 可能不重启（2026-10-02 实测）**：面板点重启后代理进程 pid
+  和启动时间**纹丝不动**，日志只有
+  `proxy already available at http://127.0.0.1:8000/commandcode/v1`，`deno exited ... SIGTERM`
+  那行没有出现。**判据：改了 `src/` 之后不要信 `/restart` 的返回值，要比对 deno
+  进程的启动时间和源文件 mtime**——我因此对着旧代码测了半小时。手动
+  `Stop-Process` 再 `/start` 才真的换掉。未修。
+- **面板的模型列表和 harness 的模型目录是两条路（2026-10-02 实测）**：面板读
+  `projectAdapter.listProjectModels()`（含 `EXTRA_MODEL_ROUTES` 里的渠道，93
+  个），**harness 的目录读 `ctx.llm.listModels()` → 注册的 adapter → 代理的聚合
+  `/v1/models`**（85 个）。插件注册的 `registerModelDiscovery` **并没有喂到
+  `listModels`**。所以 deepseek-web 一度「面板 10 个、选择器 0
+  个」——两个界面自相矛盾而两边代码都对。修法是把它加进
+  `V1_AGGREGATE_MEMBERS`（取本地静态列表
+  `v1FetchOwnListing('deepseek-web')`，不走上游），聚合 85 →
+  95。**派发是另一套映射，所以加成员不会破坏路由**（实测 `/v1` 早就能派发
+  `deepseek-web/*`，只是不列它们）。**判据：任何一个「某个界面有、另一个界面没有」的问题，先确认两边读的是不是同一个函数，别默认它们一致。**
+- **harness 的模型目录是 `groups.filter(g => g.models.length > 0)`（2026-10-02
+  从 asar 读出）**：`buildModelCatalog(ctx)` 逐 provider 调 `listModels()`，再
+  `Promise.all(models.map(m => resolveModelInfo(...)))`——**没有逐项兜底**，所以**任何一个模型解析抛错，整组变成
+  `failure` 并被过滤掉**，症状是「某个 provider
+  整个消失」而不是「少一个模型」。另外 `ModelCatalogDirectory.load()` 每个 Host
+  generation 只调一次
+  `ctx.remote.session.modelCatalog()`，**不会重读**；`invalidate()`
+  才重新拉。**所以改完插件必须重启宿主才验证，而且要等代理先起来。**
+- **对外显示的地址必须是聚合，不是某个渠道（2026-10-02
+  修）**：`runtime.baseUrl()` 过去返回
+  `serviceUrl('/commandcode/v1')`，面板设置卡右上角就把它当「代理地址」显示成
+  `http://127.0.0.1:8000/commandcode/v1`——**照抄进客户端会把所有请求发给一个渠道**，而
+  `ai-proxy` provider 注册的是 `/v1` 聚合。现在返回
+  `/v1`。同一处还有个相关的坑：`originUrl()` 在 external 模式的**兜底值**也带着
+  `/commandcode/v1`，于是「模式切成 external 但地址留空」会得到 origin
+  `.../commandcode/v1`，所有请求变成
+  `/commandcode/v1/v1/...`（什么也不答）。**判据：一个「照抄就能用」的地址，必须是那个东西的真实入口。**
+- **「完整结束但什么都没吐」不是正常结束（2026-10-02 修）**：`[DONE]`
+  到了、`finish_reason` 也没说停，插件就**干净地报 `stop`**——可**一个 block
+  都没开**。harness 收到一个没有任何块的干净回合，显示的是
+  **`Provider returned an empty response`**，而 agent loop
+  把它当成模型选择不说话，于是故障不留痕迹。现在和截断那条同规则：**没交付任何东西
+  → 报 `TRANSPORT`（可重试）**，同时写一条运行日志。**判据：`finish`
+  的语义是「这一轮说完了」，不是「这一轮发生了什么」——什么都不发生也是一件事，得说出来。**
+  测试用 `streamMode = 'done-empty'`（带 `finish_reason` 和 `[DONE]` 但零
+  block），并已验证**去掉守卫该用例会红**（`'stop' !== 'error'`）。
+- **插件的失败从来只进统计、不进日志（2026-10-02
+  修）**：截断和空流两条路径都只调 `recordUsage`，`runtime.record`
+  一句不写——所以面板日志一片空白，用户看到 harness
+  报错而日志里什么都查不到（**我因此对着空气猜了很久**）。现在两条路径都记一行。**判据：一个只在统计里出现的失败，等于没有日志的失败。**
+- **适配器契约是 7 个方法，少一个就在运行时炸（2026-10-02 修）**：`LlmAdapter`
+  的完整契约是 `providerInfo` / `providerRetryPolicy` /
+  **`imageRequestPricing`** / `listModels` / `resolveModel` / `prepareCall` /
+  `stream`。我们的类是**从零写的、没继承 base**，base 里
+  `imageRequestPricing(_provider, _model) {}` 的**默认实现（返回
+  `undefined`）因此拿不到**。宿主的 token meter 在**压缩时**调
+  `this.adapters.get(provider)?.adapter.imageRequestPricing(provider, model)`——**那个
+  `?.` 只防「渠道没注册」，不防「方法不存在」**，于是抛
+  `imageRequestPricing is not a function`，**需要压缩的会话压不了**。现在补上并返回
+  `undefined`（**本代理不知道上游怎么计视觉 token，就不能编一个数**——base
+  的默认就是这个意思）。**判据：写一个不继承基类的适配器时，要把契约的每个成员逐个实现，哪怕只是返回
+  `undefined`。** 测试里断言 `typeof adapter.imageRequestPricing === 'function'`
+  且返回 `undefined`。
+- **目录闸门：`resolveModel`
+  会把一次建目录放大成「每模型一次全量列表」（2026-10-02 修）**：宿主
+  `buildModelCatalog` 调 `listModels()` 一次、再对**每个模型**调
+  `resolveModel()`（并发），而我们的 `resolveModel` 里又调 `listProjectModels()`
+  —— 实测 93 个模型的建目录过程向代理发了 **186 次
+  `/v1/models`**，而且**每次都是完整聚合列表**（不是便宜的单次查询）。这是抄
+  `dsh-codearts-auth` 的 `src/remote-catalog-gate.ts`
+  时发现的，他们把同一件事抽象成了 `RemoteCatalogGate`。现在 `CatalogGate`
+  三条语义：①**在飞请求共享一个 Promise**（`inFlight` 先赋值再
+  await）；②**成功的列表在一个短窗口内复用**（面板要活列表，所以**不是永久缓存**，`force`/面板轮询可绕过）；③**失败开冷却**并**保留上一份
+  rows**（面板显示「上次已知目录」优于空白）。窗口 5s。改完实测 **186 → 0 次**。
+- **闸门必须一渠道一个，不能共用（2026-10-02 修；我引入又抓住的
+  bug）**：第一版给每个渠道复用了同一个 `catalogGate`，结果 **tokenharbor
+  的行被拿来回答 deepseek-web 的请求**，目录从 93 行变成 **188 行，其中 105 行是
+  `deepseek-web/deepseek-web/…`（前缀套了两遍）**。根因是**缓存的键是「这批行来自哪里」**，共用即失去判别力。现在
+  `routeGate(prefix)`
+  按渠道各持一个。**判据：任何缓存的键必须包含「它是谁的」，否则第一个进来的渠道会污染所有后来者。**
+- **空列表是「没答上来」，不是「这里什么都没有」（2026-10-02）**：`listModels`
+  里把 `normalized.length === 0` 翻译成 `undefined`（=
+  没答上来），于是失败保留上一份 rows、无 rows 时开冷却。**若照抄成「空 =
+  空目录」缓存起来，一次坏读就会让所有渠道消失 5
+  秒**——这正是本项目反复在删的「静默零」形态。
+- **断言必须真的可证伪：我的两条新断言一开始是「永远通过」的（2026-10-02）**。①我为「加载器抛错不能卡死闸门」写的测试，把
+  `inFlight` 的清空改成无条件赋值后**照样绿**——独立复现才看出：闸门内部 `catch`
+  把任何抛出都变成**已 resolve 的 `undefined`**，async IIFE 又在外层赋值生效前就
+  settle，所以那条 identity
+  检查**今天并不承载行为**，只是防御性的。②模拟一个真卡死的闸门（在 `finally`
+  里不置空）后套件确实变红，**但红的是「窗口过期后重新拉」那条，不是我为它写的那条**——**一条测试红不红，取决于它断言的是不是那个真正起作用的性质**。写完断言必须问：**把实现改坏哪一处，它才会红？**
+  答不上来的断言等于没写。
+- **provider id 是全局唯一的，分组名必须加命名空间（2026-10-03
+  实测；我炸了用户桌面端两次）**：用户问「能不能给模型列表分个类」，我按渠道注册了
+  7 个 provider，id
+  直接用渠道名（`commandcode`/`deepseek-web`/`kilo`…）。**结果宿主报
+  `an adapter for provider "commandcode" is already registered`，我插件的整个条目
+  `1 entry did not activate ai-proxy (ai-proxy-dsh-bridge)`，llm-pi-ai
+  也跟着起不来。**根因：**用户自己的 `cordis.patch.yml` 里 `llm-pi-ai` 的
+  `providers:` 已经注册了同名 provider**——实测那 7 个 key 是
+  `free`/`local-aggregation`/`commandcode`/`pollinations`/`opencode`/`deepseek-web`/`nvidia`，其中
+  **`commandcode` 与 `deepseek-web` 和我的分组 id
+  逐字相同**。`LlmRegistry.prepareRoutes` 的判据是
+  `this.adapters.has(provider) && !owned.has(provider)` → 抛
+  `DUPLICATE_ADAPTER`，**谁先注册谁留下，后一个整个条目挂掉**。现在分组 id
+  一律带 `ai-proxy-` 前缀（`ai-proxy-commandcode`…），**标题仍由
+  `providerInfo().name`
+  给友好名**，所以选择器里显示的还是「CommandCode」。**判据：provider id
+  是全局命名空间，不是你的私有字段——注册前先看这个名字会不会被别人的配置占用，拿不准就加自己的前缀。**
 
-- **「换个名字」解决不了分组，但「加前缀」能（2026-10-03）**：用户问「你就不能给模型的 id 换个名字吗」。读 asar 确认**不行**：`buildModelCatalog` 是 `providers.map(p => listModels(p.id) → {kind:'group', group:{id:p.id, name:p.name}})`，**分组只有 provider 这一层，模型 id 只出现在组内的 `models` 数组里，宿主从它身上读不出任何分组信息**；组合 `groups.filter(g => g.models.length > 0)`。所以改模型 id / 改模型 name 都动不了分组。**但用户的直觉指对了方向**：问题确实出在「名字」上，只是出在 **provider id** 而不是 model id。**判据：用户说「换个名字」时，先确认要换的是哪一层的名字——这个项目里有两层，改错一层等于没改。**
+- **「换个名字」解决不了分组，但「加前缀」能（2026-10-03）**：用户问「你就不能给模型的
+  id 换个名字吗」。读 asar 确认**不行**：`buildModelCatalog` 是
+  `providers.map(p => listModels(p.id) → {kind:'group', group:{id:p.id, name:p.name}})`，**分组只有
+  provider 这一层，模型 id 只出现在组内的 `models`
+  数组里，宿主从它身上读不出任何分组信息**；组合
+  `groups.filter(g => g.models.length > 0)`。所以改模型 id / 改模型 name
+  都动不了分组。**但用户的直觉指对了方向**：问题确实出在「名字」上，只是出在
+  **provider id** 而不是 model
+  id。**判据：用户说「换个名字」时，先确认要换的是哪一层的名字——这个项目里有两层，改错一层等于没改。**
 
-- **自检里「分组不能是空的」这条不变量差点变成假绿（2026-10-03）**：我加了「聚合有哪个渠道，那个渠道的分组就不能为空」，**结果基线就是红的**。读夹具才发现两个坑：①**假 fetch 的 `/models` 正体在中途被后面的测试换成了 2 行（`kilo/a`/`kilo/b`）**，而 `ai-proxy` 的闸门缓存着**换之前**那份 16 行 payload → **拿缓存的聚合去比新读的分组，两边根本不是同一份上游**；②`deepseek-web`/`trae`/`tokenharbor` 的行走 `EXTRA_MODEL_ROUTES`，**只在 `listProjectModels` 里出现，`listModels` 对它们答空**。现在两边都 `force: true`，且分组侧读的是 `listProjectModels`（面板真正用的那个函数）。**判据：缓存会精确地破坏「两边读同一个上游」这类断言——凡是要对比两次读取，先问它们会不会命中不同的缓存代。**
+- **自检里「分组不能是空的」这条不变量差点变成假绿（2026-10-03）**：我加了「聚合有哪个渠道，那个渠道的分组就不能为空」，**结果基线就是红的**。读夹具才发现两个坑：①**假
+  fetch 的 `/models` 正体在中途被后面的测试换成了 2
+  行（`kilo/a`/`kilo/b`）**，而 `ai-proxy` 的闸门缓存着**换之前**那份 16 行
+  payload →
+  **拿缓存的聚合去比新读的分组，两边根本不是同一份上游**；②`deepseek-web`/`trae`/`tokenharbor`
+  的行走 `EXTRA_MODEL_ROUTES`，**只在 `listProjectModels` 里出现，`listModels`
+  对它们答空**。现在两边都 `force: true`，且分组侧读的是
+  `listProjectModels`（面板真正用的那个函数）。**判据：缓存会精确地破坏「两边读同一个上游」这类断言——凡是要对比两次读取，先问它们会不会命中不同的缓存代。**
 
-- **「分组返回空」曾是静默通过的（2026-10-03）**：自检里 `if (rows.length === 0) continue;` 让**一个什么都不返回的分组照样绿**——这正是本项目反复在删的「静默零」。补上不变量后，`M10 channelFor answers the provider id` 这个突变**当场从假绿转红**。**判据：跳过空输入的断言，等于宣布「空是合法的」，而空恰恰是最常见的故障形态。**
+- **「分组返回空」曾是静默通过的（2026-10-03）**：自检里
+  `if (rows.length === 0) continue;`
+  让**一个什么都不返回的分组照样绿**——这正是本项目反复在删的「静默零」。补上不变量后，`M10 channelFor answers the provider id`
+  这个突变**当场从假绿转红**。**判据：跳过空输入的断言，等于宣布「空是合法的」，而空恰恰是最常见的故障形态。**
 
-- **catch 里的 send 会二次抛出，把「客户端取消」变成进程级事故（2026-10-03 修；用户贴日志我才看到）**：`src/trae.ts` 的流式 handler 用 `const send = (payload) => controller.enqueue(encoder.encode(payload))`，**正常收尾和 catch 收尾都要写帧**。客户端提前断开（关标签页 / 取消请求）之后 `controller.enqueue` 抛 `TypeError: The stream controller cannot close or enqueue`：`try` 里那次抛出被 `catch` 接住，**`catch` 里再 `send` 一次，这次抛出就没有任何东西接了**，变成 `Uncaught (in promise)` 把代理进程带走（用户日志原文）。现在 `createFrameWriter(sink, encoder)` 记住「已经关了」，之后每次写都是空操作；`finally` 里在 `controller.close()` **之前**先 `writer.close()`。**判据：任何写流的函数，只要它可能从一个 catch 里被调用，就必须自己吞掉「流已关」——收尾代码不能是唯一没设防的写入点。**
+- **catch 里的 send 会二次抛出，把「客户端取消」变成进程级事故（2026-10-03
+  修；用户贴日志我才看到）**：`src/trae.ts` 的流式 handler 用
+  `const send = (payload) => controller.enqueue(encoder.encode(payload))`，**正常收尾和
+  catch 收尾都要写帧**。客户端提前断开（关标签页 / 取消请求）之后
+  `controller.enqueue` 抛
+  `TypeError: The stream controller cannot close or enqueue`：`try` 里那次抛出被
+  `catch` 接住，**`catch` 里再 `send` 一次，这次抛出就没有任何东西接了**，变成
+  `Uncaught (in promise)` 把代理进程带走（用户日志原文）。现在
+  `createFrameWriter(sink, encoder)`
+  记住「已经关了」，之后每次写都是空操作；`finally` 里在 `controller.close()`
+  **之前**先 `writer.close()`。**判据：任何写流的函数，只要它可能从一个 catch
+  里被调用，就必须自己吞掉「流已关」——收尾代码不能是唯一没设防的写入点。**
 
-- **「没配 key」和「挂了」是两种状态，混为一谈会让名册永久降级（2026-10-03 修）**：`main.ts` 的聚合把「任一成员不在或为空」判成 degraded，于是把重拉窗口从 5 分钟压到 15 秒。但**没配 key 的渠道根本不会被写进 members**（`!hasChannelCredential` 时直接 return），所以 `openrouter`（用户没配 key）让名册**永远**停在 degraded：**20 倍的上游请求频率，外加每次启动一条 `roster is incomplete` 警告**——为一个用户自己选的状态。现在 `isRosterDegraded(keys, members, isDormant)` 把休眠成员排除在外，`isDormant` 即 `!hasChannelCredential(key, providers[key])`。**判据：「缺失」分主动和被动两种，降级判定只能数被动那种——否则用户不买的东西会一直拖垮别人的性能预算。**
+- **「没配 key」和「挂了」是两种状态，混为一谈会让名册永久降级（2026-10-03
+  修）**：`main.ts` 的聚合把「任一成员不在或为空」判成
+  degraded，于是把重拉窗口从 5 分钟压到 15 秒。但**没配 key 的渠道根本不会被写进
+  members**（`!hasChannelCredential` 时直接 return），所以
+  `openrouter`（用户没配 key）让名册**永远**停在 degraded：**20
+  倍的上游请求频率，外加每次启动一条 `roster is incomplete`
+  警告**——为一个用户自己选的状态。现在
+  `isRosterDegraded(keys, members, isDormant)` 把休眠成员排除在外，`isDormant`
+  即
+  `!hasChannelCredential(key, providers[key])`。**判据：「缺失」分主动和被动两种，降级判定只能数被动那种——否则用户不买的东西会一直拖垮别人的性能预算。**
 
-- **TRAE 登录捕获已就绪（2026-10-02 未提交，`.tmp-trae-login.ts`）**：照 `.tmp-extract-deepseek-cookies.ts` 的模式写的**一次性取证脚本**——拉浏览器 → 18 参数授权页 → 本地 `127.0.0.1:18080/authorize` 收 `refreshToken` → `ExchangeToken` 换 `Cloud-IDE-JWT` → 写 `trae-auth.json`（已 gitignore）→ **顺带跑三个只读探针**（`batch_get_detail_param` 目录+倍率 / `ide_user_ent_usage` 积分余额 / `checkin_credits/status` 签到状态，**零额度消耗**）。**它的作用是回答移植决策需要的全部事实**，不是绕过实测。
-- **`device_id` 是 hex32 不是 16 位数字（2026-10-02 写脚本时才发现）**：我第一版按早期注释写成「16 位纯数字」，读他们 [`trae.ts:1301`](file:///C:/Users/22282/AppData/Local/Temp/dsh-codearts-auth/src/trae.ts) 才看到**那是 CodeBuddy 的签到格式**——TRAE 是 `openssl rand -hex 16`（16 字节 → 32 hex），且该值随登录 URL 的 `device_id`/`x_device_id` 下发、也写进凭据用于签到的 `X-Device-Id`。**判据同「字段名认全了值语义还要读对」：同一篇文档里不同章节的早期注释会互相矛盾，必须追到实现。** `machine_id` 同样是 hex32 且**登录后绝不重新生成**（服务端按它标识设备）。
-- **别为「同一个渠道」去找浏览器凭证（2026-10-02 走过的弯路）**：用户问「看 Edge 的账户登录凭证」时我去读了 Edge 的 `Login Data`/`Cookies`——**那是保存的密码与站点列表，不是会话凭证**，而且那次 Cookies 表**是空的**。正确答案是**登录流程本身产出凭证**（OAuth 回调直接回传 token），这正是 deepseek-web 已在做的事。**判据：先问「这个凭据的持有者是不是我」，再去翻磁盘。**
-- **TRAE 实测可用（2026-10-02，本机账号实测推翻多条二手结论）**：真实登录后逐模型实发对话，**7 个模型全部出文本 `ok` + `finish=stop`**——`deepseek-v4.1-flash`(x0.15)、`glm-5.3-flash`(x0.06)、`qwen3.8-flash`(x0.08)、`DeepSeek-V4-Flash-Official`(x0.2)、`Doubao-Seed-Code`(x0.12→x0.06)、`glm-5.3`(x0.78)、`qwen3.8-max`(x1.5)。**①「请求体加密」不成立**——`ideVersion 0.1.52` 那套头就能正常推理，上游真实模型名是 `ali-deepseek-v4.1-flash`（`extra_info` 事件里回传）。**②「40 个模型」是错的**：合并 54 条 → 过滤后仅 **20 条可用**，其余 34 条全是 `is_invisible_to_user` 官方隐藏（含 `deepseek-v4-flash`、`glm-5.1`、`glm-5-turbo`、`sagitta`、`glm-4.7`）。**③ 倍率全部是实测值不是文档快照**：`glm-5.3-flash` x0.06、`glm-5.2` x0.78、`deepseek-v4.1-flash` x0.15（**不是 9-20 文档里的 0.13**）、`qwen3.8-max` x1.5、`kimi-k3` x1.83。**判据：`is_invisible_to_user === true` 的条目要在建目录阶段就滤掉**——它们会出现在 `/v3/config` 里但用户侧调不通。
-- **SOLO 的正文字段叫 `response`，不是 `content`（2026-10-02 抓包）**：`event:output` 的真实形状是 `{"response":"正文增量","reasoning_content":"思考增量","tool_calls":null,"multimodal_contents":null,"phase":null}`——**没有 `delta` 这一层**，也没有 `content`。我按 OpenAI 习惯连试 `delta.content` / `content` **都恒为 undefined**，但流是通的（帧数、`finish=stop` 都在），差点误判成「模型没说话」。**另外事件名不止四种**：还有 `metadata`（带 session_id）、`timing_cost`（带 `provider_model_name`）、`extra_info`（带 `input_token`/真实 model 名），而 `token_usage` 在这几次实测里**一次都没出现**，token 数只在 `extra_info` 里。**判据：读不到字段时先 dump 原始帧，别猜字段名——「流通了但正文读不到」是最容易被当成上游故障的本地 bug。**
-- **SOLO 请求体有两处和 OpenAI 不同，都是 400（2026-10-02 实测）**：①`messages[].content` **必须是数组** `[{"type":"text","text":"…"}]`，传字符串直接 `HTTP 400 code 4001 cannot unmarshal string into Go struct field … of type []*LLMRawMessageContent`；②请求体要带 `function`（通道）且**通道必须按模型路由**。**判据：400 的报错里 Go 结构体类型就是协议说明书**——`cannot unmarshal X into … of type Y` 直接告诉你该字段的形状，比翻文档快。
-- **TRAE 签到必须自己退避，业务码 9074 是按 device_id 的全网高峰限流（2026-10-02 实测两次）**：`claim_trae_daily_checkin` 首次调用即撞 `9074 当前参与用户太多`，退避 5/10/15s 重试三次**仍被拒**（走 HTTP 路由实测：4 次退避共 31.4s，`throttled:4`）。**这不是账号问题**，也**不能靠换 device_id 绕过**——参考实现派生新设备号是**登录时**的行为，对已落盘凭据换号等于让凭据与设备指纹失配。**判据：只有 9074 值得重试**，其它业务码重试无意义（`9004 device id required` 重试一万次也一样）。**claim 响应不含积分数**（完整响应只有 `code`/`message`），真实数值必须在成功后**补查 status**；且 claim 对「今天已领」**幂等**——重复领取同样回 `code 0`，与真成功无法区分，所以**必须先查 status** 用 `checked_in` 判是否已领。⚠️ 本账号只回 `did_checked_in` 不回 `checked_in`，两个都要读。
-- **业务失败回 200 而不是 5xx，领取类端点尤其不能反（2026-10-02）**：`/trae/v1/checkin` 在 `ok:false` + `code:9074` 时**仍回 HTTP 200**——传输成功了、业务没成功，理由在 body 里。回 5xx 会让任何按状态重试的调用方**重放领取**；插件的 `requestAt` 正是非 2xx 即抛（且 `SERVER` 在可重试集里）。**这与「输出上限」那条是同一条纪律：已经发出去的状态变更，重放要么重复执行要么二次付费。**
-- **`isRecord(response.json)` 是恒真的形状陷阱（2026-10-02，插件侧真 bug）**：`response.json` 是**函数**，对函数做 `isRecord` 永远为真，于是 `isRecord(x) ? await x : fallback` 的**类型守卫实际不起作用**——该走 fallback 的形状全部被放行。实测症状：`GET /api/ai-proxy/trae/status` 恒回 `{}`，面板显示「未登录」，而 self-test 里 `traeAccountCalls` 计数**是对的**（请求确实到了代理）。**判据：先 `await` 再判形状**；「请求发出去了」和「响应解析对了」是**两件事**，只断言前者会漏掉后者。
-- **`deno task test` 只开 `--allow-env`（2026-10-02）**：`deno.jsonc` 的 test 任务没有任何文件权限。给新模块的测试碰磁盘，就得**给 CI 加权限**——那是错的取舍，因为那会让**整套测试**拿到文件系统读写，而模块之外的代码也跟着受益。正确做法是**把文件读写注入**（`TraeReadFile`/`TraeWriteFile` 带 `Deno.readTextFile` 默认值），测试用内存 Map 假件。**判据：新测试需要 CI 没开的权限时，先问「能不能不碰这个资源」。**
-- **`finish_reason` 要以「我们发出去了什么」为准，不能照抄上游（2026-10-02 抓包发现的真 bug）**：实测**发起了工具调用的那一轮，上游仍然回 `finish_reason:"stop"`**。照抄就等于告诉下游「模型说完了」——agent loop 于是跳过工具执行、拿空工具结果继续，症状是「模型好像没在用工具」而两边都不报错。第一版改法按「看见了工具调用」算 `tool_calls`，**我自己的测试当场把它抓出来是反过来撒谎**：一个 `name:""` 的调用会被扣住不发射（`name:""` 会污染会话、下一轮回放被 400），按「看见了」算就会报 `tool_calls` 而客户端一个调用都收不到。**所以判据是「真的发射了」。****判据：协议的终止原因描述的是「这一轮发生了什么」，上游说什么不算数——它可能自相矛盾。**
-- **收集器跳过的东西，必须有人断言它发出去了（2026-10-02）**：测试里的 `collect()` 遇到 `data: [DONE]` 就 `continue`，**于是全套测试从来没断言过终止帧真的发出来了**——而那正是 harness 判 `stream_cut` 的唯一依据。少发 `[DONE]` 是个照样绿的缺陷。现在收集器顺手断言它到了。**与「插件消息转换丢工具」同型：字段被读到了不等于它被用上了，跳过更不等于没人管。**
-- **`token_usage` 不是「从不出现」，是「纯文本轮次不出现」（2026-10-02，修正我自己的记述）**：早前几轮纯文本对话里它一次都没到，我据此记成「至今没出现过」。这次带工具的那一轮它出现了：`{prompt_tokens:169, completion_tokens:40, total_tokens:209, cache_read_input_tokens:64, reasoning_tokens:27}`——**缓存与思考 token 都有值**。**判据：把「N 次没看到」写成「不存在」之前，先确认那 N 次都走了同一条代码路径。**
-- **`publishedEfforts` 漏认 `/v1/models` 自己文档化的形状（2026-10-02 插件侧真 bug，TRAE 全 20 行中招）**：它只读 `reasoningEfforts` / `reasoning_efforts` / `opencode.variants` 三个字段名，**而 `/v1/models` 文档写的正是 `reasoning: {efforts: [{id,name}], defaultEffort}`**——代理侧发得完全正确，插件**从来没看过这个字段**。症状：面板上 TRAE 20 行全部没有 Effort 控件，**代理返回里 `reasoning` 明明在，没有任何一处报错**。**这是「kilo 的 `opencode.variants`」那条的第三层：字段在、没报错、就是没人读。所以补的是插件的读取器，不是让 TRAE 去凑一个插件认得的字段名。**已用真实数据验证：修复后 15 个带阶梯的 TRAE 模型**全部**通过 harness 规则（`id` 是 wire 值 `low/high/xhigh`、`name` 是上游标签 `light/high/extra_high`），**但要重启 DSH Host 才生效**（模块级函数不在热重载范围）。
-- **「渠道必须还有开关」那条断言其实不能证伪（2026-10-02 发现，未修）**：`self-test.mjs` 里 `for (const channel of [...]) assert.ok(panel.allChannels.includes(channel))` 那个循环，**断言的全是被夹具列出了模型的渠道**——而 `allChannels` 是 `KNOWN_CHANNELS ∪ roster ∪ hidden`，**roster 独立地就能满足它**。实测把 `trae` 或 `openrouter` 从 `KNOWN_CHANNELS` 删掉，套件照样绿。要有可证伪的版本得断言一个「既没行、也没被隐藏」的渠道，但 `BLOCKED_CHANNELS` 是**模块级状态**，造这个前提需要一次自己持有注册的新 `apply()`。**记在代码注释和 AGENTS.md 里，没有伪造一条不会红的断言。****判据：`allChannels` 这种三路并集，任何一条来源都能单独解释结果时，那条断言就不是在测基线。**
-- **TRAE 推理链路已接通（2026-10-02 实测，提交含 `src/trae.ts`）**：`/trae/v1/models` + `/trae/v1/chat/completions` 已实跑通，**6 个模型逐个出文本 `ok` + `finish=stop` + `[DONE]`**（`deepseek-v4.1-flash`/`glm-5.3-flash`/`qwen3.8-flash`/`DeepSeek-V4-Flash-Official`/`glm-5.3`/`Doubao-Seed-Code`），聚合 `/v1` 侧 95 → **115 个模型**（`trae/*` 20 个），带前缀 `trae/glm-5.3-flash` 派发同样出文本。**判据：通道是承重的**——故意把 `glm-5.1` 发到 `solo_work_lite` 得到流内 `4001 param is invalid`，而正确通道正常；这条实测让「目录携带通道」从设计偏好变成硬需求。
-- **目录必须携带通道，前缀式路由表达不了（2026-10-02 实现时的结构性决定）**：模型**只在列出它的通道里可调用**，所以 `trae/<model>` 剥前缀后**不能**用固定 `function` 派发——路由表本身就得携带通道。`TraeModel` 因此带 `function`，目录是 `Map<id, TraeModel>` 而不是字符串数组。**推不到通道就宁可拒绝**（502），不猜默认值。
-- **两条合并规则的测试夹具顺序就是那条规则本身（2026-10-02，我自己的测试一开始是「永远绿」的）**：「空档位不得覆盖有档位」只在**空档位后到**时才可能触发；我第一版把它放前面，于是「后覆盖前」本来就会保留真档位，删掉规则 1 断言照样绿。同理 `support_thinking:false` 那条夹具**必须在同一个通道**——我第一版分处两个通道，通道优先级（规则 2）独立地就选中了另一条，于是删掉守卫照样绿。**判据：写合并/择优规则的测试时，先问「去掉这条规则，哪种顺序会红」；一个测试里两条规则同时能解释结果，就等于没测任何一条。**
-- **有一段守卫是「给人看的意图」而不是承载行为的分支（2026-10-02，如实记录）**：`normalizeTools` 里 `typeof params === "string"` 那行**删掉测试照样绿**——下面 `typeof !== "object"` 已经覆盖了字符串。13 个突变里只有它不红。留着显式守卫并在注释里注明，而不是删掉那行再让注释去解释一个隐式行为。**判据：断言不红有三种原因——夹具写错、两条规则混叠、代码冗余。三种都要指认是哪一种，不能笼统归为「测试不够强」。**
-- **造好夹具后必须逐个突变验证「补丁真的落进去了」（2026-10-02 踩到的坑）**：第一轮 13 个突变里 3 个没变红，逐个查下去发现其中两个是**我的 PowerShell 字符串手术被换行搞坏了**（补丁根本没落盘），看起来像我自己的测试是空的。判据：非红先看 `Select-String` 确认改动在文件里，再看断言；**先证明变异有效，再讨论测试强度**。剩下的一个才是真冗余（见上一条）。
-- **`readJsonBodyLimited` 回的是信封不是请求体（2026-10-02 接路由时踩的）**：它返回 `{ok:true,value}` / `{ok:false,message,status}`，我当成 body 直接取 `.model`，于是**每个请求都报 `model is required` 400**——而这个错误信息完全不像根因。判据：信封形状的 helper 要先看它的类型定义再取字段。
-- **给 TRAE 开的 `/trae/v1/models` 也会被面板每 10 秒轮询（2026-10-02）**：`EXTRA_MODEL_ROUTES` 里的渠道都会走面板自己的列表请求，所以 `self-test.mjs` 里「模型列表请求总数」那条断言**从 1 变成 2**（deepseek-web + TRAE）。这个数字是承重的——它当初正是抓出 deepseek-web 每轮都拉列表的工具，所以改成**写死期望值并注明为什么是这个数**，而不是写成「有几个算几个」。
-- ~~**TRAE 的 token_usage 至今没出现过**~~ **← 这条已被上面「`token_usage` 不是从不出现」推翻**：当时的实测全是纯文本轮次，带工具那一轮它照常到达。**`mapTraeUsage` 的缺省行为（字段整个省略而不是填 0）仍然正确**，理由也与 token_usage 无关——填 0 是「断言没有消耗」，与「上游没报」不是一回事（同「缓存 token 被整个丢掉」那条纪律）。**保留这条的教训是：结论错了要就地划掉并指向推翻它的那条，不要静默删除——静默删除会让下一个人重新踩一遍。**
-- **TRAE 反代原理：唯一「进出两个方向都要翻译」的 provider（2026-10-02 clone 研究）**：端点 `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`，鉴权是 **`Cloud-IDE-JWT <token>`**（不是 `Bearer`）+ 十余个 `X-*` 身份头（`X-Cloudide-Token`/`X-Ide-Token`/`X-Uid`/`X-Machine-Id`/`X-Device-Id`/`X-Ide-Version`…）。**进去**：`DSH 原生块 → OpenAI wire（`serializeTraeMessages`）→ SOLO（`transformToSOLOBody`）—— `tools[].function.parameters` 对象要**序列化成 JSON 字符串**（OpenAI 标准是对象）、`tool_calls[].function` → `function_call`、`tool_choice` 对象 → 字符串且 `"none"` 要**连 `tools` 一起删**、`model` → `config_name` + `model` 同值、**新增 `function`（通道）**。**出来**：SOLO 自定义事件 `output`/`token_usage`/`done`/`error` → OpenAI chunk。**顺序有硬依赖**：`tools` 必须在转换**之前**放进源对象，否则 `parameters` 保持对象形态被拒，**且错误信息不会指向那里**。
-- **TRAE 最隐蔽的坑与本项目的 `toOpenAiMessages` 同型（2026-10-02）**：`serializeTraeMessages` 曾被漏掉（文件顶部 `import` 了 `resolveToolPairing` 却从未使用），后果是**每一轮多步对话都坏掉**而症状极隐蔽——①**工具调用对模型不可见**；②**工具结果丢失**，模型于是反复请求同一个工具或凭空编造；③`reasoning` 块被当正文喂回污染上下文。**判据同「插件消息转换丢工具」那条：凡是手写协议转换的工具链，工具往返要单独验一遍。**
-- **TRAE 的两个不显然设计（2026-10-02）**：①**通道必须按模型路由**——模型只在列出它的通道里可调用（`glm-5.1` 在 `solo_agent_remote` 正常、在 `solo_work_lite` 回流内 `4001`；`glm-5-turbo`/`sagitta` 相反），旧实现把 `function` 写死就导致 agent 专有模型一用即报错。②**目录合并不能用「后覆盖前」**——原注释假设「后面的条目配置更全」，**该假设与真实数据相反**：上游把空档位条目排在**最后**，实测 **13 个模型丢掉 `reasoning_effort_config`**；现在「**空档位不得覆盖有档位**」，且**档位必须与 `function` 同源**（发档位的通道必须正是声明支持它的通道）。
-- **二手结论必须回到原文，且原文内部会自相矛盾（2026-10-02，连犯两次）**：`deepseek-harness-codearts` 的 `AGENTS.md` 481 KB，同一个「`deepseek-v4-flash` 打不通」散在**三处且时效不同**：模型目录章说它是 `display_config.is_custom_model === true`（**且 09-20 复测时已下架**，同批 5 个里 3 个下架、2 个转为合法模型，custom 条目数为 0）；真实客户端抓包章说它是**请求体加密**（措辞是「仅换版本头解不开」——那是**排除法的结论**，作者明写「排除性证据：消息序列化/tools.parameters/多轮 tool_calls/max_tokens 全部通过」，剩下的唯一假设，不是已证实）；e2e 探针至今仍断言它不在可用目录里。**我先把它读成「整个渠道不可用」，纠正一版后仍然照抄了因果。判据：我引用的那条，能不能指到原文里另一处讲同一件事的段落？指不到，就说明我可能在转述一个已被推翻的中间结论。** 这与本项目已有的「归因错了会去调一个根本无关的旋钮」是同一条纪律，**读别人的文档同样适用**。
-- **TRAE 的 e2e 探针是可复用模板（2026-10-02）**：`tests/e2e/trae-reasoning-probe.e2e.spec.ts` 用**双闸门**（`DSH_TRAE_E2E=1` **且** `DSH_TRAE_REASONING_E2E_CONFIRM=yes`，只设前者整体 skip）保护会烧额度的真实对话用例，且**明确警告不要断言「正文非空」**——实测同一档位重复调用会随机地有时回「好的」、有时只回思考不吐正文，**判据必须是 `finish.reason`**（档位被拒时是 `max-tokens` 截断或报错）。**这与本项目「`maxTokens: 1` 会饿死输出、产生模仿被测 bug 的假故障」是同一条。**
-- **`dsh-codearts-auth` 值得对照的地方（2026-10-02 clone 到 %TEMP% 研究，本机未装）**：`src/` 135 文件 64270 行、`tests/` 254 文件 70560 行（**测试比源码多**），`AGENTS.md` 481 KB——把推理过程写进文档。三处印证了本项目当天的结论：①`qoder-adapter.ts:557`/`zcode-adapter.ts:433` 各自独立记下「**不声明 `reasoning`，选择器就不出现**」（我们是阶梯编造了，他们是压根没声明，同一个字段的两种失败）；②三个 adapter 各自写「**`defaultEffort` 必须在 `efforts` 内**，否则 DSH 抛 `UNSUPPORTED_REASONING_EFFORT` 整轮起不来」，且 TRAE 有专门用例记着「**实测上游确实会下发 `default_level='max'` 而 options 里没有 max**」；③`zcode-adapter.ts:426`/`qoder-adapter.ts:571`「未知模型不编造 context」「未声明按不支持」。**但它没有统一的全模型契约检查**——本项目那个逐模型断言 provider/id/不重复/defaultEffort 的循环覆盖面更宽。
-- **两个 profile 的安装方式不同：web 是 Junction（指向仓库，改完自动生效），desktop 是实体副本（改完必须手动 `Copy-Item` 过去，用户日常用的是 desktop）。**漏了这一步就会出现「代码改了但行为没变」，而且两边自检都通过、看不出差别——同步后要在安装目录里再跑一次 `node self-test.mjs` 验证。
-- **渠道屏蔽**：`DEFAULT_HIDDEN_CHANNELS = [openrouter, deepseek-web, cnb]`（anthropic/gemini 已从代理侧删除），**这份名单现在由面板的「渠道显示」开关拥有**，见上面「渠道凭据」那节——`applyHiddenChannels()` 替换 Set 内容而非 push，一次读到的名单不会半途变。调用被屏蔽的渠道返回 `CONFIG_DISABLED`，理由按渠道各不相同（`BLOCK_REASON`，面板手动关的走通用「已在面板关闭」而不是谎称缺 key）。`deepseek-web` 是**按用户要求关闭**，它本身可用（实测 HTTP 200 + 真实文本）；`cnb` 是上游 `401 [NOT_LOGIN]`；其余三个缺 per-user key。判断用 `isBlockedModelId()` 读**首个路径段**，不用子串匹配：子串会误伤 `kilo/openrouter/free`（Kilo 自托管的免费路由模型，实测存在），而只测开头又会让 `tokenharbor/openrouter/…` 这种前缀伪装绕过屏蔽。**屏蔽判断必须用调用方的 `resolved.id` 而非 `resolved.wireModel`**——路由已剥掉渠道前缀，用 wireModel 测前缀必然放行。
-- **模型元数据归一**：`/v1/models` 返回 OpenAI 蛇形（`context_window`/`max_output_tokens`/`input_modalities`），插件的 `normalizeModel()` 同时接受蛇形与驼峰；曾因只读驼峰导致 CommandCode 54 个模型中 33 个图像模型被降级成 text。reasoning effort 按上游实际发布档位生成，不再全模型硬编码四档。
-- **用量统计**：`dsh-plugin/stats.mjs`（纯 JS + `node:test`，非 Deno）在插件侧记录每次调用。**持久化在 `~/.dsh/ai-proxy-dsh-bridge/stats.json`**（`$DSH_HOME` 优先），经 `StatsStore`：800ms 合并写入、临时文件 + rename 落盘、损坏文件先复制 `.corrupt-<ts>` 再重置、`dispose()` 补 flush、版本不符整份丢弃（防止语义已变的日桶被逐字段合并）。选文件而非 harness 存储服务的原因同 `dsh-our-free-model`：设置缝隙在两条 kernel 线形状不同、存储域可能未挂载、且用量是高基数遥测不该塞进配置文档。`GET /api/ai-proxy/usage` 返回 `{summary, models, heatmap, trend}`，模型行带 `name`（从目录缓存补全，Zen 只给 ID）。速度口径沿用 `dsh-our-free-model` 的 `src/store.js`：解码窗口 <250ms 或速率 >250 tok/s 不计入（`MIN_DECODE_MS`/`MAX_CREDIBLE_TPS`），**推理 token 不计入解码窗口**，失败调用的耗时不算首帧延迟，速度按累计 token÷累计窗口而非各次速率均值。采样环 400 条，日桶保留 120 天。**该文件必须保持纯 JavaScript**——它是 Node 加载的 `.mjs`，写成 TS 语法会直接 `SyntaxError`；**且不要用 `write` 整体覆盖它**，会连带删掉全部测试。
-- **max_output_tokens**：CommandCode 目前对所有模型返回同一个 `COMMANDCODE_MAX_TOKENS` 全局值（`src/commandcode/handler.ts` 的 `modelToOpenAi`），实测 54 个模型 distinct 值只有 64000；这是代理真实行为，插件不伪造，需要按模型真实上限须在代理侧另开一轮。
-- **源码结构**：`main.ts` 为入口/路由；`src/core.ts` 为通用核心；`src/cnb.ts`、`src/deepseek-web.ts`、`src/commandcode/` 为上游适配模块；`src/runtime/stream-normalizer.ts` 提供响应体形状嗅探、流回放和 abort/截断分类；`src/runtime/health.ts` 提供健康状态聚合；`dsh-plugin/` 为可选 DSH 桥接；`third_party/dsh-deepseek-web-login` 与 `third_party/dsh-cmdgo-provider` 分别保留 Apache-2.0 / MIT 派生代码的许可与说明。
-- git 已于今日 init（身份 HitMargin），`.gitignore` 已排除 cookies.txt / cnb-login.txt / deepseek-auth.txt / deepseek-cookies.txt / commandcode-accounts.json / *.bak 等。
-- **未决事项**：session journal/启动补删仍未完成。CommandCode `pause_turn` 目前仅支持尚未产生客户端输出时的有限同会话续写，输出开始后仍明确拒绝重放。TLS 指纹伪装（utls）仍未移植，受 Deno 限制；若要追 Zen 的 500 根因需先确认是否真与 TLS 有关。
+- **TRAE 登录捕获已就绪（2026-10-02 未提交，`.tmp-trae-login.ts`）**：照
+  `.tmp-extract-deepseek-cookies.ts` 的模式写的**一次性取证脚本**——拉浏览器 → 18
+  参数授权页 → 本地 `127.0.0.1:18080/authorize` 收 `refreshToken` →
+  `ExchangeToken` 换 `Cloud-IDE-JWT` → 写 `trae-auth.json`（已 gitignore）→
+  **顺带跑三个只读探针**（`batch_get_detail_param` 目录+倍率 /
+  `ide_user_ent_usage` 积分余额 / `checkin_credits/status`
+  签到状态，**零额度消耗**）。**它的作用是回答移植决策需要的全部事实**，不是绕过实测。
+- **`device_id` 是 hex32 不是 16 位数字（2026-10-02
+  写脚本时才发现）**：我第一版按早期注释写成「16 位纯数字」，读他们
+  [`trae.ts:1301`](file:///C:/Users/22282/AppData/Local/Temp/dsh-codearts-auth/src/trae.ts)
+  才看到**那是 CodeBuddy 的签到格式**——TRAE 是 `openssl rand -hex 16`（16 字节 →
+  32 hex），且该值随登录 URL 的 `device_id`/`x_device_id`
+  下发、也写进凭据用于签到的
+  `X-Device-Id`。**判据同「字段名认全了值语义还要读对」：同一篇文档里不同章节的早期注释会互相矛盾，必须追到实现。**
+  `machine_id` 同样是 hex32 且**登录后绝不重新生成**（服务端按它标识设备）。
+- **别为「同一个渠道」去找浏览器凭证（2026-10-02 走过的弯路）**：用户问「看 Edge
+  的账户登录凭证」时我去读了 Edge 的
+  `Login Data`/`Cookies`——**那是保存的密码与站点列表，不是会话凭证**，而且那次
+  Cookies 表**是空的**。正确答案是**登录流程本身产出凭证**（OAuth 回调直接回传
+  token），这正是 deepseek-web
+  已在做的事。**判据：先问「这个凭据的持有者是不是我」，再去翻磁盘。**
+- **TRAE
+  实测可用（2026-10-02，本机账号实测推翻多条二手结论）**：真实登录后逐模型实发对话，**7
+  个模型全部出文本 `ok` +
+  `finish=stop`**——`deepseek-v4.1-flash`(x0.15)、`glm-5.3-flash`(x0.06)、`qwen3.8-flash`(x0.08)、`DeepSeek-V4-Flash-Official`(x0.2)、`Doubao-Seed-Code`(x0.12→x0.06)、`glm-5.3`(x0.78)、`qwen3.8-max`(x1.5)。**①「请求体加密」不成立**——`ideVersion 0.1.52`
+  那套头就能正常推理，上游真实模型名是 `ali-deepseek-v4.1-flash`（`extra_info`
+  事件里回传）。**②「40 个模型」是错的**：合并 54 条 → 过滤后仅 **20
+  条可用**，其余 34 条全是 `is_invisible_to_user` 官方隐藏（含
+  `deepseek-v4-flash`、`glm-5.1`、`glm-5-turbo`、`sagitta`、`glm-4.7`）。**③
+  倍率全部是实测值不是文档快照**：`glm-5.3-flash` x0.06、`glm-5.2`
+  x0.78、`deepseek-v4.1-flash` x0.15（**不是 9-20 文档里的
+  0.13**）、`qwen3.8-max` x1.5、`kimi-k3`
+  x1.83。**判据：`is_invisible_to_user === true`
+  的条目要在建目录阶段就滤掉**——它们会出现在 `/v3/config` 里但用户侧调不通。
+- **SOLO 的正文字段叫 `response`，不是 `content`（2026-10-02
+  抓包）**：`event:output` 的真实形状是
+  `{"response":"正文增量","reasoning_content":"思考增量","tool_calls":null,"multimodal_contents":null,"phase":null}`——**没有
+  `delta` 这一层**，也没有 `content`。我按 OpenAI 习惯连试 `delta.content` /
+  `content` **都恒为 undefined**，但流是通的（帧数、`finish=stop`
+  都在），差点误判成「模型没说话」。**另外事件名不止四种**：还有 `metadata`（带
+  session_id）、`timing_cost`（带 `provider_model_name`）、`extra_info`（带
+  `input_token`/真实 model 名），而 `token_usage`
+  在这几次实测里**一次都没出现**，token 数只在 `extra_info`
+  里。**判据：读不到字段时先 dump
+  原始帧，别猜字段名——「流通了但正文读不到」是最容易被当成上游故障的本地 bug。**
+- **SOLO 请求体有两处和 OpenAI 不同，都是 400（2026-10-02
+  实测）**：①`messages[].content` **必须是数组**
+  `[{"type":"text","text":"…"}]`，传字符串直接
+  `HTTP 400 code 4001 cannot unmarshal string into Go struct field … of type []*LLMRawMessageContent`；②请求体要带
+  `function`（通道）且**通道必须按模型路由**。**判据：400 的报错里 Go
+  结构体类型就是协议说明书**——`cannot unmarshal X into … of type Y`
+  直接告诉你该字段的形状，比翻文档快。
+- **TRAE 签到必须自己退避，业务码 9074 是按 device_id 的全网高峰限流（2026-10-02
+  实测两次）**：`claim_trae_daily_checkin` 首次调用即撞
+  `9074 当前参与用户太多`，退避 5/10/15s 重试三次**仍被拒**（走 HTTP 路由实测：4
+  次退避共 31.4s，`throttled:4`）。**这不是账号问题**，也**不能靠换 device_id
+  绕过**——参考实现派生新设备号是**登录时**的行为，对已落盘凭据换号等于让凭据与设备指纹失配。**判据：只有
+  9074 值得重试**，其它业务码重试无意义（`9004 device id required`
+  重试一万次也一样）。**claim 响应不含积分数**（完整响应只有
+  `code`/`message`），真实数值必须在成功后**补查 status**；且 claim
+  对「今天已领」**幂等**——重复领取同样回
+  `code 0`，与真成功无法区分，所以**必须先查 status** 用 `checked_in`
+  判是否已领。⚠️ 本账号只回 `did_checked_in` 不回 `checked_in`，两个都要读。
+- **业务失败回 200 而不是
+  5xx，领取类端点尤其不能反（2026-10-02）**：`/trae/v1/checkin` 在 `ok:false` +
+  `code:9074` 时**仍回 HTTP 200**——传输成功了、业务没成功，理由在 body 里。回
+  5xx 会让任何按状态重试的调用方**重放领取**；插件的 `requestAt` 正是非 2xx
+  即抛（且 `SERVER`
+  在可重试集里）。**这与「输出上限」那条是同一条纪律：已经发出去的状态变更，重放要么重复执行要么二次付费。**
+- **`isRecord(response.json)` 是恒真的形状陷阱（2026-10-02，插件侧真
+  bug）**：`response.json` 是**函数**，对函数做 `isRecord` 永远为真，于是
+  `isRecord(x) ? await x : fallback` 的**类型守卫实际不起作用**——该走 fallback
+  的形状全部被放行。实测症状：`GET /api/ai-proxy/trae/status` 恒回
+  `{}`，面板显示「未登录」，而 self-test 里 `traeAccountCalls`
+  计数**是对的**（请求确实到了代理）。**判据：先 `await`
+  再判形状**；「请求发出去了」和「响应解析对了」是**两件事**，只断言前者会漏掉后者。
+- **`deno task test` 只开 `--allow-env`（2026-10-02）**：`deno.jsonc` 的 test
+  任务没有任何文件权限。给新模块的测试碰磁盘，就得**给 CI
+  加权限**——那是错的取舍，因为那会让**整套测试**拿到文件系统读写，而模块之外的代码也跟着受益。正确做法是**把文件读写注入**（`TraeReadFile`/`TraeWriteFile`
+  带 `Deno.readTextFile` 默认值），测试用内存 Map 假件。**判据：新测试需要 CI
+  没开的权限时，先问「能不能不碰这个资源」。**
+- **`finish_reason` 要以「我们发出去了什么」为准，不能照抄上游（2026-10-02
+  抓包发现的真 bug）**：实测**发起了工具调用的那一轮，上游仍然回
+  `finish_reason:"stop"`**。照抄就等于告诉下游「模型说完了」——agent loop
+  于是跳过工具执行、拿空工具结果继续，症状是「模型好像没在用工具」而两边都不报错。第一版改法按「看见了工具调用」算
+  `tool_calls`，**我自己的测试当场把它抓出来是反过来撒谎**：一个 `name:""`
+  的调用会被扣住不发射（`name:""` 会污染会话、下一轮回放被
+  400），按「看见了」算就会报 `tool_calls`
+  而客户端一个调用都收不到。**所以判据是「真的发射了」。****判据：协议的终止原因描述的是「这一轮发生了什么」，上游说什么不算数——它可能自相矛盾。**
+- **收集器跳过的东西，必须有人断言它发出去了（2026-10-02）**：测试里的
+  `collect()` 遇到 `data: [DONE]` 就
+  `continue`，**于是全套测试从来没断言过终止帧真的发出来了**——而那正是 harness
+  判 `stream_cut` 的唯一依据。少发 `[DONE]`
+  是个照样绿的缺陷。现在收集器顺手断言它到了。**与「插件消息转换丢工具」同型：字段被读到了不等于它被用上了，跳过更不等于没人管。**
+- **`token_usage`
+  不是「从不出现」，是「纯文本轮次不出现」（2026-10-02，修正我自己的记述）**：早前几轮纯文本对话里它一次都没到，我据此记成「至今没出现过」。这次带工具的那一轮它出现了：`{prompt_tokens:169, completion_tokens:40, total_tokens:209, cache_read_input_tokens:64, reasoning_tokens:27}`——**缓存与思考
+  token 都有值**。**判据：把「N 次没看到」写成「不存在」之前，先确认那 N
+  次都走了同一条代码路径。**
+- **`publishedEfforts` 漏认 `/v1/models` 自己文档化的形状（2026-10-02 插件侧真
+  bug，TRAE 全 20 行中招）**：它只读 `reasoningEfforts` / `reasoning_efforts` /
+  `opencode.variants` 三个字段名，**而 `/v1/models` 文档写的正是
+  `reasoning: {efforts: [{id,name}], defaultEffort}`**——代理侧发得完全正确，插件**从来没看过这个字段**。症状：面板上
+  TRAE 20 行全部没有 Effort 控件，**代理返回里 `reasoning`
+  明明在，没有任何一处报错**。**这是「kilo 的
+  `opencode.variants`」那条的第三层：字段在、没报错、就是没人读。所以补的是插件的读取器，不是让
+  TRAE 去凑一个插件认得的字段名。**已用真实数据验证：修复后 15 个带阶梯的 TRAE
+  模型**全部**通过 harness 规则（`id` 是 wire 值 `low/high/xhigh`、`name`
+  是上游标签 `light/high/extra_high`），**但要重启 DSH Host
+  才生效**（模块级函数不在热重载范围）。
+- **「渠道必须还有开关」那条断言其实不能证伪（2026-10-02
+  发现，未修）**：`self-test.mjs` 里
+  `for (const channel of [...]) assert.ok(panel.allChannels.includes(channel))`
+  那个循环，**断言的全是被夹具列出了模型的渠道**——而 `allChannels` 是
+  `KNOWN_CHANNELS ∪ roster ∪ hidden`，**roster 独立地就能满足它**。实测把 `trae`
+  或 `openrouter` 从 `KNOWN_CHANNELS`
+  删掉，套件照样绿。要有可证伪的版本得断言一个「既没行、也没被隐藏」的渠道，但
+  `BLOCKED_CHANNELS` 是**模块级状态**，造这个前提需要一次自己持有注册的新
+  `apply()`。**记在代码注释和 AGENTS.md
+  里，没有伪造一条不会红的断言。****判据：`allChannels`
+  这种三路并集，任何一条来源都能单独解释结果时，那条断言就不是在测基线。**
+- **TRAE 推理链路已接通（2026-10-02 实测，提交含
+  `src/trae.ts`）**：`/trae/v1/models` + `/trae/v1/chat/completions`
+  已实跑通，**6 个模型逐个出文本 `ok` + `finish=stop` +
+  `[DONE]`**（`deepseek-v4.1-flash`/`glm-5.3-flash`/`qwen3.8-flash`/`DeepSeek-V4-Flash-Official`/`glm-5.3`/`Doubao-Seed-Code`），聚合
+  `/v1` 侧 95 → **115 个模型**（`trae/*` 20 个），带前缀 `trae/glm-5.3-flash`
+  派发同样出文本。**判据：通道是承重的**——故意把 `glm-5.1` 发到 `solo_work_lite`
+  得到流内
+  `4001 param is invalid`，而正确通道正常；这条实测让「目录携带通道」从设计偏好变成硬需求。
+- **目录必须携带通道，前缀式路由表达不了（2026-10-02
+  实现时的结构性决定）**：模型**只在列出它的通道里可调用**，所以 `trae/<model>`
+  剥前缀后**不能**用固定 `function` 派发——路由表本身就得携带通道。`TraeModel`
+  因此带 `function`，目录是 `Map<id, TraeModel>`
+  而不是字符串数组。**推不到通道就宁可拒绝**（502），不猜默认值。
+- **两条合并规则的测试夹具顺序就是那条规则本身（2026-10-02，我自己的测试一开始是「永远绿」的）**：「空档位不得覆盖有档位」只在**空档位后到**时才可能触发；我第一版把它放前面，于是「后覆盖前」本来就会保留真档位，删掉规则
+  1 断言照样绿。同理 `support_thinking:false`
+  那条夹具**必须在同一个通道**——我第一版分处两个通道，通道优先级（规则
+  2）独立地就选中了另一条，于是删掉守卫照样绿。**判据：写合并/择优规则的测试时，先问「去掉这条规则，哪种顺序会红」；一个测试里两条规则同时能解释结果，就等于没测任何一条。**
+- **有一段守卫是「给人看的意图」而不是承载行为的分支（2026-10-02，如实记录）**：`normalizeTools`
+  里 `typeof params === "string"` 那行**删掉测试照样绿**——下面
+  `typeof !== "object"` 已经覆盖了字符串。13
+  个突变里只有它不红。留着显式守卫并在注释里注明，而不是删掉那行再让注释去解释一个隐式行为。**判据：断言不红有三种原因——夹具写错、两条规则混叠、代码冗余。三种都要指认是哪一种，不能笼统归为「测试不够强」。**
+- **造好夹具后必须逐个突变验证「补丁真的落进去了」（2026-10-02
+  踩到的坑）**：第一轮 13 个突变里 3 个没变红，逐个查下去发现其中两个是**我的
+  PowerShell
+  字符串手术被换行搞坏了**（补丁根本没落盘），看起来像我自己的测试是空的。判据：非红先看
+  `Select-String`
+  确认改动在文件里，再看断言；**先证明变异有效，再讨论测试强度**。剩下的一个才是真冗余（见上一条）。
+- **`readJsonBodyLimited` 回的是信封不是请求体（2026-10-02
+  接路由时踩的）**：它返回 `{ok:true,value}` /
+  `{ok:false,message,status}`，我当成 body 直接取 `.model`，于是**每个请求都报
+  `model is required` 400**——而这个错误信息完全不像根因。判据：信封形状的 helper
+  要先看它的类型定义再取字段。
+- **给 TRAE 开的 `/trae/v1/models` 也会被面板每 10
+  秒轮询（2026-10-02）**：`EXTRA_MODEL_ROUTES`
+  里的渠道都会走面板自己的列表请求，所以 `self-test.mjs`
+  里「模型列表请求总数」那条断言**从 1 变成 2**（deepseek-web +
+  TRAE）。这个数字是承重的——它当初正是抓出 deepseek-web
+  每轮都拉列表的工具，所以改成**写死期望值并注明为什么是这个数**，而不是写成「有几个算几个」。
+- ~~**TRAE 的 token_usage 至今没出现过**~~ **← 这条已被上面「`token_usage`
+  不是从不出现」推翻**：当时的实测全是纯文本轮次，带工具那一轮它照常到达。**`mapTraeUsage`
+  的缺省行为（字段整个省略而不是填 0）仍然正确**，理由也与 token_usage 无关——填
+  0 是「断言没有消耗」，与「上游没报」不是一回事（同「缓存 token
+  被整个丢掉」那条纪律）。**保留这条的教训是：结论错了要就地划掉并指向推翻它的那条，不要静默删除——静默删除会让下一个人重新踩一遍。**
+- **TRAE 反代原理：唯一「进出两个方向都要翻译」的 provider（2026-10-02 clone
+  研究）**：端点
+  `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`，鉴权是
+  **`Cloud-IDE-JWT <token>`**（不是 `Bearer`）+ 十余个 `X-*`
+  身份头（`X-Cloudide-Token`/`X-Ide-Token`/`X-Uid`/`X-Machine-Id`/`X-Device-Id`/`X-Ide-Version`…）。**进去**：`DSH 原生块 → OpenAI wire（`serializeTraeMessages`）→ SOLO（`transformToSOLOBody`）——`tools[].function.parameters`对象要**序列化成 JSON 字符串**（OpenAI 标准是对象）、`tool_calls[].function`→`function_call`、`tool_choice`对象 → 字符串且`"none"`要**连`tools`一起删**、`model`→`config_name`+`model`同值、**新增`function`（通道）**。**出来**：SOLO 自定义事件`output`/`token_usage`/`done`/`error`→ OpenAI chunk。**顺序有硬依赖**：`tools`必须在转换**之前**放进源对象，否则`parameters`
+  保持对象形态被拒，**且错误信息不会指向那里**。
+- **TRAE 最隐蔽的坑与本项目的 `toOpenAiMessages`
+  同型（2026-10-02）**：`serializeTraeMessages` 曾被漏掉（文件顶部 `import` 了
+  `resolveToolPairing`
+  却从未使用），后果是**每一轮多步对话都坏掉**而症状极隐蔽——①**工具调用对模型不可见**；②**工具结果丢失**，模型于是反复请求同一个工具或凭空编造；③`reasoning`
+  块被当正文喂回污染上下文。**判据同「插件消息转换丢工具」那条：凡是手写协议转换的工具链，工具往返要单独验一遍。**
+- **TRAE
+  的两个不显然设计（2026-10-02）**：①**通道必须按模型路由**——模型只在列出它的通道里可调用（`glm-5.1`
+  在 `solo_agent_remote` 正常、在 `solo_work_lite` 回流内
+  `4001`；`glm-5-turbo`/`sagitta` 相反），旧实现把 `function` 写死就导致 agent
+  专有模型一用即报错。②**目录合并不能用「后覆盖前」**——原注释假设「后面的条目配置更全」，**该假设与真实数据相反**：上游把空档位条目排在**最后**，实测
+  **13 个模型丢掉
+  `reasoning_effort_config`**；现在「**空档位不得覆盖有档位**」，且**档位必须与
+  `function` 同源**（发档位的通道必须正是声明支持它的通道）。
+- **二手结论必须回到原文，且原文内部会自相矛盾（2026-10-02，连犯两次）**：`deepseek-harness-codearts`
+  的 `AGENTS.md` 481 KB，同一个「`deepseek-v4-flash`
+  打不通」散在**三处且时效不同**：模型目录章说它是
+  `display_config.is_custom_model === true`（**且 09-20 复测时已下架**，同批 5
+  个里 3 个下架、2 个转为合法模型，custom 条目数为
+  0）；真实客户端抓包章说它是**请求体加密**（措辞是「仅换版本头解不开」——那是**排除法的结论**，作者明写「排除性证据：消息序列化/tools.parameters/多轮
+  tool_calls/max_tokens 全部通过」，剩下的唯一假设，不是已证实）；e2e
+  探针至今仍断言它不在可用目录里。**我先把它读成「整个渠道不可用」，纠正一版后仍然照抄了因果。判据：我引用的那条，能不能指到原文里另一处讲同一件事的段落？指不到，就说明我可能在转述一个已被推翻的中间结论。**
+  这与本项目已有的「归因错了会去调一个根本无关的旋钮」是同一条纪律，**读别人的文档同样适用**。
+- **TRAE 的 e2e
+  探针是可复用模板（2026-10-02）**：`tests/e2e/trae-reasoning-probe.e2e.spec.ts`
+  用**双闸门**（`DSH_TRAE_E2E=1` **且**
+  `DSH_TRAE_REASONING_E2E_CONFIRM=yes`，只设前者整体
+  skip）保护会烧额度的真实对话用例，且**明确警告不要断言「正文非空」**——实测同一档位重复调用会随机地有时回「好的」、有时只回思考不吐正文，**判据必须是
+  `finish.reason`**（档位被拒时是 `max-tokens`
+  截断或报错）。**这与本项目「`maxTokens: 1` 会饿死输出、产生模仿被测 bug
+  的假故障」是同一条。**
+- **`dsh-codearts-auth` 值得对照的地方（2026-10-02 clone 到 %TEMP%
+  研究，本机未装）**：`src/` 135 文件 64270 行、`tests/` 254 文件 70560
+  行（**测试比源码多**），`AGENTS.md` 481
+  KB——把推理过程写进文档。三处印证了本项目当天的结论：①`qoder-adapter.ts:557`/`zcode-adapter.ts:433`
+  各自独立记下「**不声明
+  `reasoning`，选择器就不出现**」（我们是阶梯编造了，他们是压根没声明，同一个字段的两种失败）；②三个
+  adapter 各自写「**`defaultEffort` 必须在 `efforts` 内**，否则 DSH 抛
+  `UNSUPPORTED_REASONING_EFFORT` 整轮起不来」，且 TRAE
+  有专门用例记着「**实测上游确实会下发 `default_level='max'` 而 options 里没有
+  max**」；③`zcode-adapter.ts:426`/`qoder-adapter.ts:571`「未知模型不编造
+  context」「未声明按不支持」。**但它没有统一的全模型契约检查**——本项目那个逐模型断言
+  provider/id/不重复/defaultEffort 的循环覆盖面更宽。
+- **两个 profile 的安装方式不同：web 是
+  Junction（指向仓库，改完自动生效），desktop 是实体副本（改完必须手动
+  `Copy-Item` 过去，用户日常用的是
+  desktop）。**漏了这一步就会出现「代码改了但行为没变」，而且两边自检都通过、看不出差别——同步后要在安装目录里再跑一次
+  `node self-test.mjs` 验证。
+- **渠道屏蔽**：`DEFAULT_HIDDEN_CHANNELS = [openrouter, deepseek-web, cnb]`（anthropic/gemini
+  已从代理侧删除），**这份名单现在由面板的「渠道显示」开关拥有**，见上面「渠道凭据」那节——`applyHiddenChannels()`
+  替换 Set 内容而非 push，一次读到的名单不会半途变。调用被屏蔽的渠道返回
+  `CONFIG_DISABLED`，理由按渠道各不相同（`BLOCK_REASON`，面板手动关的走通用「已在面板关闭」而不是谎称缺
+  key）。`deepseek-web` 是**按用户要求关闭**，它本身可用（实测 HTTP 200 +
+  真实文本）；`cnb` 是上游 `401 [NOT_LOGIN]`；其余三个缺 per-user key。判断用
+  `isBlockedModelId()` 读**首个路径段**，不用子串匹配：子串会误伤
+  `kilo/openrouter/free`（Kilo
+  自托管的免费路由模型，实测存在），而只测开头又会让 `tokenharbor/openrouter/…`
+  这种前缀伪装绕过屏蔽。**屏蔽判断必须用调用方的 `resolved.id` 而非
+  `resolved.wireModel`**——路由已剥掉渠道前缀，用 wireModel 测前缀必然放行。
+- **模型元数据归一**：`/v1/models` 返回 OpenAI
+  蛇形（`context_window`/`max_output_tokens`/`input_modalities`），插件的
+  `normalizeModel()` 同时接受蛇形与驼峰；曾因只读驼峰导致 CommandCode 54
+  个模型中 33 个图像模型被降级成 text。reasoning effort
+  按上游实际发布档位生成，不再全模型硬编码四档。
+- **用量统计**：`dsh-plugin/stats.mjs`（纯 JS + `node:test`，非
+  Deno）在插件侧记录每次调用。**持久化在
+  `~/.dsh/ai-proxy-dsh-bridge/stats.json`**（`$DSH_HOME` 优先），经
+  `StatsStore`：800ms 合并写入、临时文件 + rename 落盘、损坏文件先复制
+  `.corrupt-<ts>` 再重置、`dispose()` 补
+  flush、版本不符整份丢弃（防止语义已变的日桶被逐字段合并）。选文件而非 harness
+  存储服务的原因同 `dsh-our-free-model`：设置缝隙在两条 kernel
+  线形状不同、存储域可能未挂载、且用量是高基数遥测不该塞进配置文档。`GET /api/ai-proxy/usage`
+  返回 `{summary, models, heatmap, trend}`，模型行带 `name`（从目录缓存补全，Zen
+  只给 ID）。速度口径沿用 `dsh-our-free-model` 的 `src/store.js`：解码窗口
+  <250ms 或速率 >250 tok/s 不计入（`MIN_DECODE_MS`/`MAX_CREDIBLE_TPS`），**推理
+  token 不计入解码窗口**，失败调用的耗时不算首帧延迟，速度按累计
+  token÷累计窗口而非各次速率均值。采样环 400 条，日桶保留 120
+  天。**该文件必须保持纯 JavaScript**——它是 Node 加载的 `.mjs`，写成 TS
+  语法会直接 `SyntaxError`；**且不要用 `write`
+  整体覆盖它**，会连带删掉全部测试。
+- **max_output_tokens**：CommandCode 目前对所有模型返回同一个
+  `COMMANDCODE_MAX_TOKENS` 全局值（`src/commandcode/handler.ts` 的
+  `modelToOpenAi`），实测 54 个模型 distinct 值只有
+  64000；这是代理真实行为，插件不伪造，需要按模型真实上限须在代理侧另开一轮。
+- **源码结构**：`main.ts` 为入口/路由；`src/core.ts`
+  为通用核心；`src/cnb.ts`、`src/deepseek-web.ts`、`src/commandcode/`
+  为上游适配模块；`src/runtime/stream-normalizer.ts`
+  提供响应体形状嗅探、流回放和 abort/截断分类；`src/runtime/health.ts`
+  提供健康状态聚合；`dsh-plugin/` 为可选 DSH
+  桥接；`third_party/dsh-deepseek-web-login` 与 `third_party/dsh-cmdgo-provider`
+  分别保留 Apache-2.0 / MIT 派生代码的许可与说明。
+- git 已于今日 init（身份 HitMargin），`.gitignore` 已排除 cookies.txt /
+  cnb-login.txt / deepseek-auth.txt / deepseek-cookies.txt /
+  commandcode-accounts.json / *.bak 等。
+- **未决事项**：session journal/启动补删仍未完成。CommandCode `pause_turn`
+  目前仅支持尚未产生客户端输出时的有限同会话续写，输出开始后仍明确拒绝重放。TLS
+  指纹伪装（utls）仍未移植，受 Deno 限制；若要追 Zen 的 500 根因需先确认是否真与
+  TLS 有关。
 
-- **WorkBuddy 中国版（2026-10-03 新增渠道，`/workbuddy/v1`）**：移植自 `dsh-codearts-auth`（MIT）的 `buddy.ts`/`buddy-oauth.ts`/`buddy-adapter.ts`/`product.ts`，但**主机是中国版 `www.workbuddy.cn`**，不是参考实现里的国际版 `www.workbuddy.ai`。三条不能照抄的地方：① 国际版按模型族分档的 UA 表只服务国际版，中国版客户端产物里那张表是空的，所以只有单一 UA `WorkBuddy/5.6.2 WorkBuddy/5.6.2 CLI/5.6.2`（版本号取中国版文档站 Changelog 最新发布版，**不是**参考实现的 5.5.2，那是国际版桌面端）；② 静态兜底模型表**刻意留空**（拿国际版别名或按展示名猜 id = 把用户送进「选得到、调不通」的模型）；③ `X-Product` 聊天请求发归属名 `WorkBuddy`、目录请求发部署类型 `SaaS`，参考实现两处含义不同，两个常量必须分开命名。
-- **WorkBuddy 的请求体与 SSE 都是标准 OpenAI 形态**：本模块一个字节的帧转换都不做，`upstreamResponse.body` 直接透传。只做三件上游必须看到的事：凭据（401 后静默续期重试）、目录解析、流内 11140 窄判定。
-- **同名产品可以各有一个区域主机**：`www.workbuddy.cn` / `www.workbuddy.ai` / `copilot.tencent.com` 路径与响应结构完全相同、platform 同为 `workbuddy-ai`，实测三者的路由集一模一样。所以「参考实现里 WorkBuddy = 国际版」**推不出**「中国版 = copilot.tencent.com」——参考实现里那是它自己的映射。主机只能靠登录后打 `/v3/config` 判定（看哪个返回非空 `data.models`）。
-- **平台常量不能靠探测得**：`platform` 是纯回显字段，`POST /v2/plugin/auth/state?platform=totally-bogus-xyz` 返回 200 并把编造串原样回显在 `authUrl` 里。所以它只能来自客户端产物（登录 bundle 里的枚举 `Z.WORKBUDDYAI='workbuddy-ai'`）。
-- **`prompt_cache_key` 是费用量级差**：不带它 `prompt_tokens=8027, prompt_cache_hit_tokens=0, credit=0.34`，带上之后命中 7808、`credit=0.02`（约 17 倍）。代理从请求头 `x-session-id` / `x-conversation-id` 取，都没有才随机生成。
-- **登录轮询的两个超时**：`STATE_REQUEST_TIMEOUT_MS=10_000`（不能用通用 5s，实测 www.workbuddy.* 建连稳定 5860–7525ms）；聊天流 `AbortSignal.timeout(600_000)`（60s 会在长思考时把流掐断）。
-- **`/v2/plugin/auth/token` 只返回 `expiresIn`/`refreshExpiresIn` 相对秒数**，没有 `expiresAt`（e2e 实证 2026-09-11）。不换算的话 `expires_at` 恒为空串、面板显示「有效期未知」；相对秒数的基准取 JWT `iat`，否则用当前时间。
-- **JWT 解码必须用 `atob` 不能用 `Buffer`**：Buffer 是 Node 全局，Deno 不提供。JWT 兜底只在真登录/过期判定触发，正是最不该到运行期才炸、且测试容易漏的路径。
-- **解析不出过期时间 ⇒ 不判过期**：否则 `expires_at` 归一化失败的账号会被永久锁死在「请重新登录」。
-- **X-Domain 用 `||` 不用 `??`**：`readStringField` 对缺失字段返回**空串**不是 undefined，`??` 会把空值发出去。两处方向不同且都是故意的——聊天请求用**产品常量覆盖**凭据快照（凭据 domain 是登录时的历史快照，迁区后会过期，而 baseURL 来自 product endpoint，X-Domain 必须与目的地一致）；登录取 account 时用 `token.domain || product.apiDomain`（登录期服务端下发的值是权威的）。
-- **五个归属头一个都不能少**：`X-Product`/`X-Product-Code`/`X-IDE-Name`/`X-IDE-Type`/`X-IDE-Version`，后台「使用端」一栏靠它们归因，缺任一头显示 `-`。
-- **scope 字段实测是多行文本**，换行会破坏 YAML/JSON 往返，面板上表现为「有效期/昵称字段丢失」——所以写盘前必须 `stripControlChars`。
-- **目录必须取两个端点的并集**：`/console/enterprises/personal/models` 与 `/v3/config` 的 id 集合不同，促销 `modelIds` 只挂一侧。先到先得会让整批限时免费模型（如 `hy4-preview-f`）从选择器里消失，而服务端照常按它计费。同名 id 以企业端点为准（scoped 赢），另一侧独有的追加在后。
-- **倍率归一化的两个正则形状相反**：模型 credits 是 `'x0.29'`（前缀 x），促销 `discountedCredits` 是 `'0.50x'`（后缀 x）。共用正则会让**每一个**促销价静默失败 → 界面显示原价、后台按促销计费。
-- **促销 `factor: 0` 是「免费」不是「已结束」**：hy4-preview 夜间的 `{discountedCredits:'0x',factor:0}` 真的免费。但**无时间窗口**的 factor 0 促销仍按历史占位跳过。
-- **`schedule` 挂在 promotion 层，`discountedCredits`/`factor` 挂在 discount 层**——写成 `discount.schedule` 会让所有定时促销恒等于「无窗口」。且必须判定**本地时段窗口**：实测存在夜间 23:00–7:50 的 0.50x 促销，只看 `enabled` 会把夜间折扣显示一整天，用户按没折扣的预期被计费。
-- **promotion modelIds 引用但不在兜底表里的 id 要留下**（`agentReferenced`）：白名单式重建目录会把它整批丢掉。
-- **isAutoSelectAlias 只认字面量 `auto`/`default`**，不做前缀匹配——`default-model`/`fast-model` 被 craft 引用且是官方入口，前缀匹配会误杀。
-- **11140 是账号级拦截，且与真认证失败共用 HTTP 403**：不能靠状态码区分（403 同时覆盖真认证失败/额度/权限/安全策略），也不能走 `parseRateLimitError`（默认 1 小时，会和限流混淆，而 11140 冷却是 30 分钟且服务端不给解禁时间）。实测同一请求体发 7 个账号：2 个 200、4 个 403+11140、1 个 429 ⇒ **换号**而不是让用户改内容。
-- **流内 11140 的判据必须窄**：只有「**没有 `choices` 字段**」且正文命中 `/"code"s*:s*11140/` 的帧才算——模型正文里真的会讨论「安全审核」/出现 11140 字样，而合法内容帧一定带 `choices`。过去该帧被**静默丢弃**（帧分类器只认 `error`/`choices`/`usage`），表现为「干净地停了，没有任何失败」。判断复用同一份 `isContentRejection`，不做第二份拷贝——两份漂移正是 trae 那个 bug 的成因。
-- **deepseek 系必须同时带 `thinking:{type:'enabled'}` 和 `reasoning_effort`**，缺任一上游都按不思考应答（三点对比实测：裸请求 `reasoning_content` 恒 0；单给 `reasoning_effort:'high'` 才有思考；单给 `thinking:{type:'enabled'}` 仍为 0）。且该行为与 endpoint/UA 无关。
-- **只在目录确认该模型发布了这个档位时才发 `reasoning_effort`**：非 deepseek 模型选了未声明档位不兜底（发上去是 400）。
-- **Deno 的 `Deno.Command` 选项键叫 `windowsRawArguments`**，Node 的 `spawn` 才叫 `windowsVerbatimArguments`——同一语义的键名两边不同，照抄参考实现直接编译不过。
-- **登录 URL 只追加不重建**：`decorateLoginUrl` 在 `appendSessionParams` 为真时追加 `version=pluginVersion` 与 `loginSessionId=crypto.randomUUID()`；URL 非法原样返回。中国版是否也需要这两个参数尚未验证（plan 附录 B）。
-- **WorkBuddy 路由存在 ≠ 账号有资格签到**：`/v2/billing/meter/daily-checkin` 与 `/checkin-activity-status` 在 workbuddy.cn / workbuddy.ai / copilot.tencent.com 上都返回 401（**不是 404**），但中国版文档从未提及该活动，参考项目只是观察到国际版客户端 bundle 里没有这些字面量。所以 v1 不做签到按钮，状态记「待实测」。
-- **路由存在性探测需要一条对照路径**：`GET /totally/unknown/route/xyz` → 404 `{"error_msg":"404 Route Not Found"}`，而真实但未鉴权的路由 → 401（openresty HTML）。只看 404 会把「需要凭据」误判成「路由不存在」。
-- **业务 OK ≠ 有数据**：`/v3/config` 对编造的 bearer 照样回 200 且 `models:null`，判据是「非空数组」。
-- **凭据类渠道在 `isRosterDegraded` 里必须单独判**：`auth:{type:'none'}` 的渠道凭据在文件里，共享的 `hasChannelCredential` 会一直说「有凭据」，于是从首次启动起名单就被判 degraded —— 20 倍重取 + 每次启动告警，而该渠道在用户跑登录脚本前根本不会应答。
-- **插件面板的渠道开关与渠道列表是两种东西**：workbuddy 在 `KNOWN_CHANNELS` 里（开关可见、可管用），但 `EXTRA_MODEL_ROUTES` 的 `requiresCredential` 在 `workbuddy-auth.json` 存在之前不让它进模型列表（没有它的目录，代理答 502，面板只会渲染一个空渠道而不是那句「去跑登录脚本」）。只读文件是否存在、**不读不解析**：令牌归代理管，半写状态不该有第二个读者给出第二个判断。同 `requiresDeepseekLogin`。
-- **WorkBuddy 的 429 是抖动不是封禁，退避一次即可，不必落盘冷却**：实测并发 1/2/3/4/5/6/8 分别是 0/0/1/0/2/**0**/**0** 个被拒——并发 6、8 反而全过，并发 3、5 各挂 1~2 个，说明限流桶按「最近 N 秒请求数」抖动触发，与瞬时并发数无单调关系。所以 `postWorkBuddyChatWithThrottleRetry()` 只退避重发**一次**（上限 `WORKBUDDY_THROTTLE_BACKOFF_MS=1_500`，上游 `Retry-After: 30` 也只等 1.5s——等满会把用户挂在原地），第二次仍 429 才 `tripWorkBuddyCircuit()` 开 20 秒闸门并回 429 + `Retry-After` 头。**闸门刻意不落盘**（`deepseekWebSaveCooldown` 是落盘的，这里不同）：抖动不是封禁，落盘会让重启后第一轮对话白白撞一次假闸门。`Math.min(上游时长, 20_000)` 钳制 + `Math.max(旧窗口, 新窗口)` 是两条独立约束：上游要 2 小时也不能真等 2 小时，而更短的新窗口不能覆盖更长的旧窗口。
-- **限流不会伪装成死模型，所以探测判据不会被污染**：150 次死模型压测（default-1.1 / glm-4.6 / glm-5.0 / hy4-preview-x / kimi-k2-thinking）全部 `http=400 code=11102`，masked=0；14003 只出现在活模型上（hy3-c 5/30、hy3-b 7/30）。原因是死模型在**路由解析那一步**就被拒，走不到限流层。⇒ `classifyModelProbe()` 的「11102/11103 ⇒ dead，其余 ⇒ live」不会把活模型判死，探测并发 6 安全。反过来说，若哪天上游改成先限流再解析路由，这个前提就失效了，需要重新实测。
-- **`isWorkBuddyThrottled()` 不能只搜 `rate_limit` 字样**：上游模型正文里真的会讨论「限流」，正文命中不等于本次请求被限流。判据收紧为 `status === 429` 或 `"code": 14003`。
-- **每个请求必须只发一发上游，发请求的整段编排要和「发一次」这个纯函数待在同一处**：main.ts 曾先裸发一次 `postWorkBuddyChat()` 再把同一个 payload 交给重试包装，于是每个请求都打两发，第一发的 `body` 既没读也没取消 —— 双倍计费，且在真正该重试时已经用掉一次配额。更糟的是它**端到端永远测不出**：12 并发的真实 e2e 全部 200、一个 429 都没撞到，双发在功能上完全不可见，只有断言「`calls === 1`」能抓到。所以 `sendWorkBuddyChat()`（闸门 → 发一次 → 退避重试 → 记窗口，四步一体）整体搬进 `workbuddy.ts`，调用方只传一个 `send` 回调。派发层的契约有三条会被变异测试盯住：健康路径恰好 1 发、被闸门挡住 0 发、**显式 `retryOnce:false` 既不重试也不记窗口**（第三条曾被漏掉：`attempts === 2` 这个条件在关掉重试后恒不成立，判据一放松就会给一次没重试的 429 记上窗口）。
+- **WorkBuddy 中国版（2026-10-03 新增渠道，`/workbuddy/v1`）**：移植自
+  `dsh-codearts-auth`（MIT）的
+  `buddy.ts`/`buddy-oauth.ts`/`buddy-adapter.ts`/`product.ts`，但**主机是中国版
+  `www.workbuddy.cn`**，不是参考实现里的国际版
+  `www.workbuddy.ai`。三条不能照抄的地方：① 国际版按模型族分档的 UA
+  表只服务国际版，中国版客户端产物里那张表是空的，所以只有单一 UA
+  `WorkBuddy/5.6.2 WorkBuddy/5.6.2 CLI/5.6.2`（版本号取中国版文档站 Changelog
+  最新发布版，**不是**参考实现的 5.5.2，那是国际版桌面端）；②
+  静态兜底模型表**刻意留空**（拿国际版别名或按展示名猜 id =
+  把用户送进「选得到、调不通」的模型）；③ `X-Product` 聊天请求发归属名
+  `WorkBuddy`、目录请求发部署类型
+  `SaaS`，参考实现两处含义不同，两个常量必须分开命名。
+- **WorkBuddy 的请求体与 SSE 都是标准 OpenAI
+  形态**：本模块一个字节的帧转换都不做，`upstreamResponse.body`
+  直接透传。只做三件上游必须看到的事：凭据（401 后静默续期重试）、目录解析、流内
+  11140 窄判定。
+- **同名产品可以各有一个区域主机**：`www.workbuddy.cn` / `www.workbuddy.ai` /
+  `copilot.tencent.com` 路径与响应结构完全相同、platform 同为
+  `workbuddy-ai`，实测三者的路由集一模一样。所以「参考实现里 WorkBuddy =
+  国际版」**推不出**「中国版 =
+  copilot.tencent.com」——参考实现里那是它自己的映射。主机只能靠登录后打
+  `/v3/config` 判定（看哪个返回非空 `data.models`）。
+- **平台常量不能靠探测得**：`platform`
+  是纯回显字段，`POST /v2/plugin/auth/state?platform=totally-bogus-xyz` 返回 200
+  并把编造串原样回显在 `authUrl` 里。所以它只能来自客户端产物（登录 bundle
+  里的枚举 `Z.WORKBUDDYAI='workbuddy-ai'`）。
+- **`prompt_cache_key` 是费用量级差**：不带它
+  `prompt_tokens=8027, prompt_cache_hit_tokens=0, credit=0.34`，带上之后命中
+  7808、`credit=0.02`（约 17 倍）。代理从请求头 `x-session-id` /
+  `x-conversation-id` 取，都没有才随机生成。
+- **登录轮询的两个超时**：`STATE_REQUEST_TIMEOUT_MS=10_000`（不能用通用 5s，实测
+  www.workbuddy.* 建连稳定 5860–7525ms）；聊天流
+  `AbortSignal.timeout(600_000)`（60s 会在长思考时把流掐断）。
+- **`/v2/plugin/auth/token` 只返回 `expiresIn`/`refreshExpiresIn`
+  相对秒数**，没有 `expiresAt`（e2e 实证 2026-09-11）。不换算的话 `expires_at`
+  恒为空串、面板显示「有效期未知」；相对秒数的基准取 JWT `iat`，否则用当前时间。
+- **JWT 解码必须用 `atob` 不能用 `Buffer`**：Buffer 是 Node 全局，Deno
+  不提供。JWT
+  兜底只在真登录/过期判定触发，正是最不该到运行期才炸、且测试容易漏的路径。
+- **解析不出过期时间 ⇒ 不判过期**：否则 `expires_at`
+  归一化失败的账号会被永久锁死在「请重新登录」。
+- **X-Domain 用 `||` 不用 `??`**：`readStringField` 对缺失字段返回**空串**不是
+  undefined，`??`
+  会把空值发出去。两处方向不同且都是故意的——聊天请求用**产品常量覆盖**凭据快照（凭据
+  domain 是登录时的历史快照，迁区后会过期，而 baseURL 来自 product
+  endpoint，X-Domain 必须与目的地一致）；登录取 account 时用
+  `token.domain || product.apiDomain`（登录期服务端下发的值是权威的）。
+- **五个归属头一个都不能少**：`X-Product`/`X-Product-Code`/`X-IDE-Name`/`X-IDE-Type`/`X-IDE-Version`，后台「使用端」一栏靠它们归因，缺任一头显示
+  `-`。
+- **scope 字段实测是多行文本**，换行会破坏 YAML/JSON
+  往返，面板上表现为「有效期/昵称字段丢失」——所以写盘前必须
+  `stripControlChars`。
+- **目录必须取两个端点的并集**：`/console/enterprises/personal/models` 与
+  `/v3/config` 的 id 集合不同，促销 `modelIds`
+  只挂一侧。先到先得会让整批限时免费模型（如
+  `hy4-preview-f`）从选择器里消失，而服务端照常按它计费。同名 id
+  以企业端点为准（scoped 赢），另一侧独有的追加在后。
+- **倍率归一化的两个正则形状相反**：模型 credits 是 `'x0.29'`（前缀 x），促销
+  `discountedCredits` 是 `'0.50x'`（后缀
+  x）。共用正则会让**每一个**促销价静默失败 → 界面显示原价、后台按促销计费。
+- **促销 `factor: 0` 是「免费」不是「已结束」**：hy4-preview 夜间的
+  `{discountedCredits:'0x',factor:0}` 真的免费。但**无时间窗口**的 factor 0
+  促销仍按历史占位跳过。
+- **`schedule` 挂在 promotion 层，`discountedCredits`/`factor` 挂在 discount
+  层**——写成 `discount.schedule`
+  会让所有定时促销恒等于「无窗口」。且必须判定**本地时段窗口**：实测存在夜间
+  23:00–7:50 的 0.50x 促销，只看 `enabled`
+  会把夜间折扣显示一整天，用户按没折扣的预期被计费。
+- **promotion modelIds 引用但不在兜底表里的 id
+  要留下**（`agentReferenced`）：白名单式重建目录会把它整批丢掉。
+- **isAutoSelectAlias 只认字面量
+  `auto`/`default`**，不做前缀匹配——`default-model`/`fast-model` 被 craft
+  引用且是官方入口，前缀匹配会误杀。
+- **11140 是账号级拦截，且与真认证失败共用 HTTP 403**：不能靠状态码区分（403
+  同时覆盖真认证失败/额度/权限/安全策略），也不能走 `parseRateLimitError`（默认
+  1 小时，会和限流混淆，而 11140 冷却是 30
+  分钟且服务端不给解禁时间）。实测同一请求体发 7 个账号：2 个 200、4 个
+  403+11140、1 个 429 ⇒ **换号**而不是让用户改内容。
+- **流内 11140 的判据必须窄**：只有「**没有 `choices` 字段**」且正文命中
+  `/"code"s*:s*11140/` 的帧才算——模型正文里真的会讨论「安全审核」/出现 11140
+  字样，而合法内容帧一定带 `choices`。过去该帧被**静默丢弃**（帧分类器只认
+  `error`/`choices`/`usage`），表现为「干净地停了，没有任何失败」。判断复用同一份
+  `isContentRejection`，不做第二份拷贝——两份漂移正是 trae 那个 bug 的成因。
+- **deepseek 系必须同时带 `thinking:{type:'enabled'}` 和
+  `reasoning_effort`**，缺任一上游都按不思考应答（三点对比实测：裸请求
+  `reasoning_content` 恒 0；单给 `reasoning_effort:'high'` 才有思考；单给
+  `thinking:{type:'enabled'}` 仍为 0）。且该行为与 endpoint/UA 无关。
+- **只在目录确认该模型发布了这个档位时才发 `reasoning_effort`**：非 deepseek
+  模型选了未声明档位不兜底（发上去是 400）。
+- **Deno 的 `Deno.Command` 选项键叫 `windowsRawArguments`**，Node 的 `spawn`
+  才叫
+  `windowsVerbatimArguments`——同一语义的键名两边不同，照抄参考实现直接编译不过。
+- **登录 URL 只追加不重建**：`decorateLoginUrl` 在 `appendSessionParams`
+  为真时追加 `version=pluginVersion` 与
+  `loginSessionId=crypto.randomUUID()`；URL
+  非法原样返回。中国版是否也需要这两个参数尚未验证（plan 附录 B）。
+- **WorkBuddy 路由存在 ≠ 账号有资格签到**：`/v2/billing/meter/daily-checkin` 与
+  `/checkin-activity-status` 在 workbuddy.cn / workbuddy.ai /
+  copilot.tencent.com 上都返回 401（**不是
+  404**），但中国版文档从未提及该活动，参考项目只是观察到国际版客户端 bundle
+  里没有这些字面量。所以 v1 不做签到按钮，状态记「待实测」。
+- **路由存在性探测需要一条对照路径**：`GET /totally/unknown/route/xyz` → 404
+  `{"error_msg":"404 Route Not Found"}`，而真实但未鉴权的路由 → 401（openresty
+  HTML）。只看 404 会把「需要凭据」误判成「路由不存在」。
+- **业务 OK ≠ 有数据**：`/v3/config` 对编造的 bearer 照样回 200 且
+  `models:null`，判据是「非空数组」。
+- **凭据类渠道在 `isRosterDegraded` 里必须单独判**：`auth:{type:'none'}`
+  的渠道凭据在文件里，共享的 `hasChannelCredential`
+  会一直说「有凭据」，于是从首次启动起名单就被判 degraded —— 20 倍重取 +
+  每次启动告警，而该渠道在用户跑登录脚本前根本不会应答。
+- **插件面板的渠道开关与渠道列表是两种东西**：workbuddy 在 `KNOWN_CHANNELS`
+  里（开关可见、可管用），但 `EXTRA_MODEL_ROUTES` 的 `requiresCredential` 在
+  `workbuddy-auth.json` 存在之前不让它进模型列表（没有它的目录，代理答
+  502，面板只会渲染一个空渠道而不是那句「去跑登录脚本」）。只读文件是否存在、**不读不解析**：令牌归代理管，半写状态不该有第二个读者给出第二个判断。同
+  `requiresDeepseekLogin`。
+- **WorkBuddy 的 429 是抖动不是封禁，退避一次即可，不必落盘冷却**：实测并发
+  1/2/3/4/5/6/8 分别是 0/0/1/0/2/**0**/**0** 个被拒——并发 6、8 反而全过，并发
+  3、5 各挂 1~2 个，说明限流桶按「最近 N
+  秒请求数」抖动触发，与瞬时并发数无单调关系。所以
+  `postWorkBuddyChatWithThrottleRetry()` 只退避重发**一次**（上限
+  `WORKBUDDY_THROTTLE_BACKOFF_MS=1_500`，上游 `Retry-After: 30` 也只等
+  1.5s——等满会把用户挂在原地），第二次仍 429 才 `tripWorkBuddyCircuit()` 开 20
+  秒闸门并回 429 + `Retry-After`
+  头。**闸门刻意不落盘**（`deepseekWebSaveCooldown`
+  是落盘的，这里不同）：抖动不是封禁，落盘会让重启后第一轮对话白白撞一次假闸门。`Math.min(上游时长, 20_000)`
+  钳制 + `Math.max(旧窗口, 新窗口)` 是两条独立约束：上游要 2 小时也不能真等 2
+  小时，而更短的新窗口不能覆盖更长的旧窗口。
+- **限流不会伪装成死模型，所以探测判据不会被污染**：150
+  次死模型压测（default-1.1 / glm-4.6 / glm-5.0 / hy4-preview-x /
+  kimi-k2-thinking）全部 `http=400 code=11102`，masked=0；14003
+  只出现在活模型上（hy3-c 5/30、hy3-b
+  7/30）。原因是死模型在**路由解析那一步**就被拒，走不到限流层。⇒
+  `classifyModelProbe()` 的「11102/11103 ⇒ dead，其余 ⇒
+  live」不会把活模型判死，探测并发 6
+  安全。反过来说，若哪天上游改成先限流再解析路由，这个前提就失效了，需要重新实测。
+- **`isWorkBuddyThrottled()` 不能只搜 `rate_limit`
+  字样**：上游模型正文里真的会讨论「限流」，正文命中不等于本次请求被限流。判据收紧为
+  `status === 429` 或 `"code": 14003`。
+- **每个请求必须只发一发上游，发请求的整段编排要和「发一次」这个纯函数待在同一处**：main.ts
+  曾先裸发一次 `postWorkBuddyChat()` 再把同一个 payload
+  交给重试包装，于是每个请求都打两发，第一发的 `body` 既没读也没取消 ——
+  双倍计费，且在真正该重试时已经用掉一次配额。更糟的是它**端到端永远测不出**：12
+  并发的真实 e2e 全部 200、一个 429
+  都没撞到，双发在功能上完全不可见，只有断言「`calls === 1`」能抓到。所以
+  `sendWorkBuddyChat()`（闸门 → 发一次 → 退避重试 → 记窗口，四步一体）整体搬进
+  `workbuddy.ts`，调用方只传一个 `send`
+  回调。派发层的契约有三条会被变异测试盯住：健康路径恰好 1 发、被闸门挡住 0
+  发、**显式 `retryOnce:false`
+  既不重试也不记窗口**（第三条曾被漏掉：`attempts === 2`
+  这个条件在关掉重试后恒不成立，判据一放松就会给一次没重试的 429 记上窗口）。
 
-- **工具调用必须原样透传，且「只发一次」之外还要盯住「合并」**：WorkBuddy 的请求体与响应都是标准 OpenAI 形状，所以 `buildChatBody()` 只做增删不做翻译（实测 top_p / response_format 两种形态 / presence_penalty / frequency_penalty / seed / n / logprobs / parallel_tool_calls / user 全部 200，唯一被拒的是 `stream:false`）。它曾**完全没有 tools / tool_choice 字段**，于是 DSH 的每一次 agent 工具调用都被无声丢掉：请求照发、模型照答，agent 循环停在第一轮 —— 而 40+ 用例与 34 模型真发全都没抓到，因为没有任何一个用例断言请求体里有 tools，且默认 e2e 请求不带工具。判据用「非空数组」而非「字段在不在」，空数组等于「没给工具」。
-- **工具分片按 index 合并，name 覆盖而 arguments 累加**：实测 hy3-c 帧序列是 `[{id,name:"get_weather",arguments:""}]` → `[{function:{name:"",arguments:"{\"city\": \"Paris"}}]` → `[{function:{name:"",arguments:"\"}"}]`（glm-5.3 / kimi-k2.6 / minimax-m3 同形，每轮恰好一个非空 name）。所以 `name` 必须用「非空才覆盖」而不是「累加」：若某上游每帧重发 name，累加会拼出 `get_weatherget_weather`；反过来若不判空，后续空 name 帧会把首帧的名字抹掉。`arguments` 才是分片累加。两条判据各有一个变异体守护（`+=` 与去掉 `fn.name !== ""`）。
-- **`stream:false` 的调用方必须拿到聚合后的 `chat.completion`，不能拿到 SSE**：上游拒绝非流式（`http=400 code=11101 "Non-stream chat request is currently not supported"`），而代理曾从不看 `body.stream`、直接把流透传，于是非流式调用方收到 `http=200` + `Content-Type: text/event-stream` + `: heartbeat` 开头 —— **看起来成功，实则不可解析**。`aggregateWorkBuddySse()` 逐帧拼 content / reasoning_content / tool_calls / finish_reason / usage 后组装标准形状；usage 缺失时保持 undefined，**不编造 token 数**（否则按猜测计费）。有两处上游形状陷阱：有工具调用却报 `stop` 时改判 `tool_calls`（否则客户端以为可以直接继续说话而不去执行工具）；`isContentRejectionFrame` 命中即记 `rejectionPayload` 并**停止读流**，非流式路径再回 403 + `type:"content_rejection"`（流式没有「半条流」要续，所以两者处理不同）。
+- **工具调用必须原样透传，且「只发一次」之外还要盯住「合并」**：WorkBuddy
+  的请求体与响应都是标准 OpenAI 形状，所以 `buildChatBody()`
+  只做增删不做翻译（实测 top_p / response_format 两种形态 / presence_penalty /
+  frequency_penalty / seed / n / logprobs / parallel_tool_calls / user 全部
+  200，唯一被拒的是 `stream:false`）。它曾**完全没有 tools / tool_choice
+  字段**，于是 DSH 的每一次 agent
+  工具调用都被无声丢掉：请求照发、模型照答，agent 循环停在第一轮 —— 而 40+
+  用例与 34 模型真发全都没抓到，因为没有任何一个用例断言请求体里有 tools，且默认
+  e2e
+  请求不带工具。判据用「非空数组」而非「字段在不在」，空数组等于「没给工具」。
+- **工具分片按 index 合并，name 覆盖而 arguments 累加**：实测 hy3-c 帧序列是
+  `[{id,name:"get_weather",arguments:""}]` →
+  `[{function:{name:"",arguments:"{\"city\": \"Paris"}}]` →
+  `[{function:{name:"",arguments:"\"}"}]`（glm-5.3 / kimi-k2.6 / minimax-m3
+  同形，每轮恰好一个非空 name）。所以 `name`
+  必须用「非空才覆盖」而不是「累加」：若某上游每帧重发 name，累加会拼出
+  `get_weatherget_weather`；反过来若不判空，后续空 name
+  帧会把首帧的名字抹掉。`arguments`
+  才是分片累加。两条判据各有一个变异体守护（`+=` 与去掉 `fn.name !== ""`）。
+- **`stream:false` 的调用方必须拿到聚合后的 `chat.completion`，不能拿到
+  SSE**：上游拒绝非流式（`http=400 code=11101 "Non-stream chat request is currently not supported"`），而代理曾从不看
+  `body.stream`、直接把流透传，于是非流式调用方收到 `http=200` +
+  `Content-Type: text/event-stream` + `: heartbeat` 开头 ——
+  **看起来成功，实则不可解析**。`aggregateWorkBuddySse()` 逐帧拼 content /
+  reasoning_content / tool_calls / finish_reason / usage 后组装标准形状；usage
+  缺失时保持 undefined，**不编造 token
+  数**（否则按猜测计费）。有两处上游形状陷阱：有工具调用却报 `stop` 时改判
+  `tool_calls`（否则客户端以为可以直接继续说话而不去执行工具）；`isContentRejectionFrame`
+  命中即记 `rejectionPayload` 并**停止读流**，非流式路径再回 403 +
+  `type:"content_rejection"`（流式没有「半条流」要续，所以两者处理不同）。
 
-- **两个来源给同一实体，能力字段要逐字段取并集，计费字段要留在 primary（2026-10-03 修）**：两个目录端点对**同一 id** 下发的 `reasoning` **形状不同** —— `/console/enterprises/personal/models` 给 `{effort,summary}`（18 个），`/v3/config` 给 `{canDisableThinking,defaultEffort,supportedEfforts,summary}`（14 个）。`mergeRemoteModels()` 曾整块取 primary，于是 `/v3/config` 真实下发的阶梯在选择器里**整块消失**：实测 5 个模型中招（hy3 low/high、glm-5.2 high/xhigh、kimi-k3-1 low/high/xhigh、deepseek-v4-flash high/xhigh、deepseek-v4-pro high/xhigh），代理只发布 9 个阶梯而上游有 14 个；两边默认值另有 20 处实测不一致。现在能力字段（`reasoningEfforts`/`contextWindow`/`maxOutputTokens`/`supportsImages`/`defaultReasoningEffort`）逐个 `model.X ?? other.X`，**计费三件套（`creditsRate`/`discountedCreditsRate`/`agentReferenced`）仍严格以 primary 为准** —— 混搭会算出既不属 primary 也不属 extra 的第三种价格。**判据：两边都可能「只给部分字段」时，合并就逐字段取并集；每条规则要有自己的用例**（「primary 没声明」与「两边都声明」必须分开测，否则「只取 primary」和「正确并集」会一起通过 —— 这是 N2/N5 两个变异体存活后补的）。
-- **`canDisableThinking` 不足以反推出官方关闭档，所以刻意不消费它（2026-10-03）**：曾短暂按 `canDisableThinking === true` 造 `[defaultEffort ?? "high"]` 单档阶梯，随即否掉 —— 单档阶梯是**死控件**（用户点了没反应），且实测 `none`/`minimal`/`off` 上游对**所有**模型都接受，`canDisableThinking` 并不能推出哪些值真的关掉了思考。解析层只取 `defaultEffort`，缺省时回落到薄形状端点唯一的 `effort`，**回落不猜值**（拿不到保持 undefined，让请求体不发这个字段）。
+- **两个来源给同一实体，能力字段要逐字段取并集，计费字段要留在
+  primary（2026-10-03 修）**：两个目录端点对**同一 id** 下发的 `reasoning`
+  **形状不同** —— `/console/enterprises/personal/models` 给
+  `{effort,summary}`（18 个），`/v3/config` 给
+  `{canDisableThinking,defaultEffort,supportedEfforts,summary}`（14
+  个）。`mergeRemoteModels()` 曾整块取 primary，于是 `/v3/config`
+  真实下发的阶梯在选择器里**整块消失**：实测 5 个模型中招（hy3 low/high、glm-5.2
+  high/xhigh、kimi-k3-1 low/high/xhigh、deepseek-v4-flash
+  high/xhigh、deepseek-v4-pro high/xhigh），代理只发布 9 个阶梯而上游有 14
+  个；两边默认值另有 20
+  处实测不一致。现在能力字段（`reasoningEfforts`/`contextWindow`/`maxOutputTokens`/`supportsImages`/`defaultReasoningEffort`）逐个
+  `model.X ?? other.X`，**计费三件套（`creditsRate`/`discountedCreditsRate`/`agentReferenced`）仍严格以
+  primary 为准** —— 混搭会算出既不属 primary 也不属 extra
+  的第三种价格。**判据：两边都可能「只给部分字段」时，合并就逐字段取并集；每条规则要有自己的用例**（「primary
+  没声明」与「两边都声明」必须分开测，否则「只取
+  primary」和「正确并集」会一起通过 —— 这是 N2/N5 两个变异体存活后补的）。
+- **`canDisableThinking`
+  不足以反推出官方关闭档，所以刻意不消费它（2026-10-03）**：曾短暂按
+  `canDisableThinking === true` 造 `[defaultEffort ?? "high"]`
+  单档阶梯，随即否掉 —— 单档阶梯是**死控件**（用户点了没反应），且实测
+  `none`/`minimal`/`off` 上游对**所有**模型都接受，`canDisableThinking`
+  并不能推出哪些值真的关掉了思考。解析层只取
+  `defaultEffort`，缺省时回落到薄形状端点唯一的
+  `effort`，**回落不猜值**（拿不到保持 undefined，让请求体不发这个字段）。
 
-- **`reasoning_effort` 是真开关，但**不分档**；裸请求是否思考**因模型而异**，所以两处都不能凭直觉（2026-10-03 实测，推翻两条旧结论）**：
-  - **不分档**：5~8 轮交替取 `usage.completion_tokens_details.reasoning_tokens` 中位数 —— space-bunny bare 64 / high 53.5 / off 64.5，区间**完全重叠**；hy3-c low 332 vs high 313；space-bunny low 45 vs max 58。⇒ 阶梯表达的是「开着 / 关掉」，**不是思考强度**。⚠️ 第一版 A/B 用 `max_tokens=300` 把 reasoning 与 content 一起压到同一档，结论不可用；必须 3000 + 长提示 + 中位数 + 交替。
-  - **裸请求因模型而异**：会思考 —— space-bunny 62、hy3-c 359、glm-5.3 1761、kimi-k3-1 371；**恒为 0** —— deepseek-v4-pro、minimax-m3、glm-5v-turbo、glm-5.1、deepseek-v4.1-flash、deepseek-v3-2-volc。（推翻 AGENTS.md 旧条目「裸请求 → reasoning_content 恒为 0」。）
-  - **无脑补默认档是有害的**，所以回退必须窄：实测 minimax-m2.7 裸请求思考 **840** token，补上目录的 `effort:"medium"` 后变 **0**；反向例 glm-5.3 裸请求中位数 ~818 vs effort=high ~38.5（约 20 倍）。现在调用方**显式选了 `none` 就原样下发**，没选时**只对 deepseek 系**按「声明的默认档 → 有 `high` 就 `high` → 阶梯第一档」补一个。
-- **上游接受**任意字符串** effort，所以 `includes()` 校验防的不是 400 而是静默丢弃（2026-10-03）**：`reasoning_effort:"totally-bogus"` → `http=200`；只有传数字才 `http=400 code:11101 "json: cannot unmarshal number into Go struct field Request.reasoning_effort of type string"`。旧代码用 `efforts.includes(options.reasoningEffort)` 过滤，于是调用方选 **`none`**（**唯一的关闭档**，必然不在只列「开着」的 `supportedEfforts` 里）时被静默丢掉：请求照发、思考照开，而实测正是收到 `none` 才把推理从 ~1200 压到 ~0（`minimal` 也能关，`off` **不能**，仍思考 1500）。**判据：`Go 结构体类型` 就是协议说明书；「未知值会被拒」不能自证，要喂一个上游没公布过的值。**
+- **`reasoning_effort`
+  是真开关，但**不分档**；裸请求是否思考**因模型而异**，所以两处都不能凭直觉（2026-10-03
+  实测，推翻两条旧结论）**：
+  - **不分档**：5~8 轮交替取 `usage.completion_tokens_details.reasoning_tokens`
+    中位数 —— space-bunny bare 64 / high 53.5 / off
+    64.5，区间**完全重叠**；hy3-c low 332 vs high 313；space-bunny low 45 vs max
+    58。⇒ 阶梯表达的是「开着 / 关掉」，**不是思考强度**。⚠️ 第一版 A/B 用
+    `max_tokens=300` 把 reasoning 与 content 一起压到同一档，结论不可用；必须
+    3000 + 长提示 + 中位数 + 交替。
+  - **裸请求因模型而异**：会思考 —— space-bunny 62、hy3-c 359、glm-5.3
+    1761、kimi-k3-1 371；**恒为 0** ——
+    deepseek-v4-pro、minimax-m3、glm-5v-turbo、glm-5.1、deepseek-v4.1-flash、deepseek-v3-2-volc。（推翻
+    AGENTS.md 旧条目「裸请求 → reasoning_content 恒为 0」。）
+  - **无脑补默认档是有害的**，所以回退必须窄：实测 minimax-m2.7 裸请求思考
+    **840** token，补上目录的 `effort:"medium"` 后变 **0**；反向例 glm-5.3
+    裸请求中位数 ~818 vs effort=high ~38.5（约 20 倍）。现在调用方**显式选了
+    `none` 就原样下发**，没选时**只对 deepseek 系**按「声明的默认档 → 有 `high`
+    就 `high` → 阶梯第一档」补一个。
+- **上游接受**任意字符串** effort，所以 `includes()` 校验防的不是 400
+  而是静默丢弃（2026-10-03）**：`reasoning_effort:"totally-bogus"` →
+  `http=200`；只有传数字才
+  `http=400 code:11101 "json: cannot unmarshal number into Go struct field Request.reasoning_effort of type string"`。旧代码用
+  `efforts.includes(options.reasoningEffort)` 过滤，于是调用方选
+  **`none`**（**唯一的关闭档**，必然不在只列「开着」的 `supportedEfforts`
+  里）时被静默丢掉：请求照发、思考照开，而实测正是收到 `none` 才把推理从 ~1200
+  压到 ~0（`minimal` 也能关，`off` **不能**，仍思考
+  1500）。**判据：`Go 结构体类型`
+  就是协议说明书；「未知值会被拒」不能自证，要喂一个上游没公布过的值。**
 
-11. **单次 11102 不能定罪，`deepseek-v3-1` 是一条正在灰度下线的活路由**（真实对话 6/12 成功，内容正确、usage 真实计费 `prompt 11 / completion 24`；对照 `glm-4.6`、`deepseek-v3-1-volc` 都是 0/6）。探测侧表现为 11102 概率 p≈0.73，外加约 40% 的请求**无限挂起**（60 秒也不回）。换探测形状没用：A `messages:[]` LIVE=0/8，B 真消息 2/8，C `max_tokens:1` 2/8 且 HANG=0，D `max_tokens:0` 3/8，E 空内容 4/8 —— 而真死的 `deepseek-v3-1-volc` 在 5 种形状下全 0。判据：`dead` 需连续两次一致；第二次给 `live` ⇒ 抖动且保留；第二次挂起 ⇒ 记进进程内抖动集合并短路，之后不再对该 id 发探测请求（否则每次刷新白等一个超时，且列表在两次刷新间来回跳）；导出 `resetWorkBuddyProbeFlakiness()` 让修好的路由能回来。⚠️ 抖动集合是**进程内全局状态**，测它的用例必须各用独立 model id。
+11. **单次 11102 不能定罪，`deepseek-v3-1`
+    是一条正在灰度下线的活路由**（真实对话 6/12 成功，内容正确、usage 真实计费
+    `prompt 11 / completion 24`；对照 `glm-4.6`、`deepseek-v3-1-volc` 都是
+    0/6）。探测侧表现为 11102 概率 p≈0.73，外加约 40% 的请求**无限挂起**（60
+    秒也不回）。换探测形状没用：A `messages:[]` LIVE=0/8，B 真消息 2/8，C
+    `max_tokens:1` 2/8 且 HANG=0，D `max_tokens:0` 3/8，E 空内容 4/8 —— 而真死的
+    `deepseek-v3-1-volc` 在 5 种形状下全 0。判据：`dead`
+    需连续两次一致；第二次给 `live` ⇒ 抖动且保留；第二次挂起 ⇒
+    记进进程内抖动集合并短路，之后不再对该 id
+    发探测请求（否则每次刷新白等一个超时，且列表在两次刷新间来回跳）；导出
+    `resetWorkBuddyProbeFlakiness()` 让修好的路由能回来。⚠️
+    抖动集合是**进程内全局状态**，测它的用例必须各用独立 model id。
 
-12. **`status >= 500` 早退在读报文前就掐死了结论**：实测 `hunyuan-chat` / `hunyuan-2.0-instruct` / `hunyuan-2.0-thinking` 串行 12/12 稳定 `http=500 code=10000`，`classifyModelProbe` 判 live（路由已通，是上游供应商故障），但整轮扫描里三个全是 unknown。现在只有 401 早退（令牌问题），5xx 必须先读报文再判：`502` + HTML 解析不出才是 unknown。
+12. **`status >= 500` 早退在读报文前就掐死了结论**：实测 `hunyuan-chat` /
+    `hunyuan-2.0-instruct` / `hunyuan-2.0-thinking` 串行 12/12 稳定
+    `http=500 code=10000`，`classifyModelProbe` 判
+    live（路由已通，是上游供应商故障），但整轮扫描里三个全是 unknown。现在只有
+    401 早退（令牌问题），5xx 必须先读报文再判：`502` + HTML 解析不出才是
+    unknown。
 
-13. **探测超时有实测的 2.6 倍余量，压到 3 秒**（`WORKBUDDY_PROBE_TIMEOUT_MS=3_000`，二次确认 2_000）：两轮全量 94 个采样的非挂起延迟 p50=702ms、p95=1031ms、max=1138ms，**顶满超时的次数=0**。原来 10 秒的代价实测得到：一次挂起把整轮从 5.2 秒拖成 14 秒。
+13. **探测超时有实测的 2.6 倍余量，压到 3
+    秒**（`WORKBUDDY_PROBE_TIMEOUT_MS=3_000`，二次确认 2_000）：两轮全量 94
+    个采样的非挂起延迟
+    p50=702ms、p95=1031ms、max=1138ms，**顶满超时的次数=0**。原来 10
+    秒的代价实测得到：一次挂起把整轮从 5.2 秒拖成 14 秒。
 
-14. **`unknown` 的第三种来源是挂起**（`dropUnavailableModels` 只丢 `dead`）：网络错 / 401 / 5xx / **服务端不返回**都归 unknown。真实死模型二次确认 **12/13 仍 dead**，唯一翻回的是 deepseek-v3-1（挂起）—— 这正是「挂起不算死证据」的实测依据。
+14. **`unknown` 的第三种来源是挂起**（`dropUnavailableModels` 只丢
+    `dead`）：网络错 / 401 / 5xx / **服务端不返回**都归
+    unknown。真实死模型二次确认 **12/13 仍 dead**，唯一翻回的是
+    deepseek-v3-1（挂起）—— 这正是「挂起不算死证据」的实测依据。
 
-15. **没有便宜的按 id 查活跃度的端点**（都试过了，别再试）：`GET /v3/config/models/{id}` 与 `GET /v3/models` → TypeError（网关不存在的路径行为）；`GET {SCOPED_MODELS_PATH}/{id}` → `http=403 access_denied not_authorized`；`GET /v2/models` 与 `GET /v2/plugin/models` → `http=404 Route Not Found`。探测仍是唯一信号源。
-
+15. **没有便宜的按 id
+    查活跃度的端点**（都试过了，别再试）：`GET /v3/config/models/{id}` 与
+    `GET /v3/models` →
+    TypeError（网关不存在的路径行为）；`GET {SCOPED_MODELS_PATH}/{id}` →
+    `http=403 access_denied not_authorized`；`GET /v2/models` 与
+    `GET /v2/plugin/models` → `http=404 Route Not Found`。探测仍是唯一信号源。
 
 - **客户端取消必须一路传回上游**：流包装层光 `getReader()` 不够，还得显式声明
   `cancel(reason) { return reader.cancel(reason) }`，否则客户端一关标签页，这一发仍在
   上游生成到结束、credit 照算，而代理这边零日志（请求确实成功了，什么都不报）。
-  判据：造一个「先给一帧、`pull()` 永不 resolve」的流，取消后断言上游的 `cancel()`
-  被调到 —— 否则 `read()` 循环会挂在那儿直到上游自己结束。
-- **请求级 abort 必须把客户端信号与超时**合成**，只挂超时不够**：实测客户端发请求后
-  20ms 中止，上游 fetch 仍跑到 400ms 自己的超时才结束。合成逻辑放 `src/` 不放
-  `main.ts` —— `deno task test` 只跑 `src/`，留在 `main.ts` 就等于**永远测不到**。
+  判据：造一个「先给一帧、`pull()` 永不 resolve」的流，取消后断言上游的
+  `cancel()` 被调到 —— 否则 `read()` 循环会挂在那儿直到上游自己结束。
+- **请求级 abort
+  必须把客户端信号与超时**合成**，只挂超时不够**：实测客户端发请求后 20ms
+  中止，上游 fetch 仍跑到 400ms 自己的超时才结束。合成逻辑放 `src/` 不放
+  `main.ts` —— `deno task test` 只跑 `src/`，留在 `main.ts`
+  就等于**永远测不到**。
 - **变异体存活不一定是漏测**：先问「平台是不是已经吞了」，再补用例。
-  `clientGone` 标志、取消后的提前 `return`、catch 里无条件 `controller.error` 三个
-  变异体全部存活，但探针证明：取消后 controller 的 `error`/`close`/`enqueue` 抛出的
-  TypeError 落在 `start()` 的 promise 上，而按 Streams 规范，start() 的 rejection 只在
-  state 仍是 `"readable"` 时才被记进 `[[storedError]]` —— 已被取消的流 state 是
+  `clientGone` 标志、取消后的提前 `return`、catch 里无条件 `controller.error`
+  三个 变异体全部存活，但探针证明：取消后 controller 的
+  `error`/`close`/`enqueue` 抛出的 TypeError 落在 `start()` 的 promise 上，而按
+  Streams 规范，start() 的 rejection 只在 state 仍是 `"readable"` 时才被记进
+  `[[storedError]]` —— 已被取消的流 state 是
   `"closed"`，一律丢弃。三者是**等价变异体**（防御性冗余），不是未断言的契约。
   拿不到红测时，先写探针证明该分支不可观测，再记成等价变异体，别硬凑用例。
 
-- **`Deno.serve` 的 `request.signal` 只在两种时刻 abort**（2026-10-03 实测，别照字面理解
-  「响应成功后就 abort」）：① 客户端断开；② **响应体被完整消费/结束后**（legacy 行为，
-  所以有那句 `request.signal aborts on successful responses` 警告）。它**不会**在 handler
-  `return` 的瞬间 abort —— 实测 handler 立刻返回、流还在陆续推送，客户端把 40 帧读完，
-  信号直到 +6070ms（全量消费完）才 abort，中间不受影响。
-  **所以把 `request.signal` 合成进上游 fetch 是安全的**：一个正常读到 [DONE] 的请求不会
+- **`Deno.serve` 的 `request.signal` 只在两种时刻 abort**（2026-10-03
+  实测，别照字面理解 「响应成功后就 abort」）：① 客户端断开；②
+  **响应体被完整消费/结束后**（legacy 行为， 所以有那句
+  `request.signal aborts on successful responses` 警告）。它**不会**在 handler
+  `return` 的瞬间 abort —— 实测 handler 立刻返回、流还在陆续推送，客户端把 40
+  帧读完， 信号直到 +6070ms（全量消费完）才 abort，中间不受影响。 **所以把
+  `request.signal` 合成进上游 fetch 是安全的**：一个正常读到 [DONE] 的请求不会
   在流到一半时被我们自己掐断，而客户端中途关标签页会在断开那一刻就中止上游。
-  若未来要区分「客户端走了」与「正常读完」，判据是 handler 第二个参数上的 `completed`
-  promise，不是 `request.signal`。
+  若未来要区分「客户端走了」与「正常读完」，判据是 handler 第二个参数上的
+  `completed` promise，不是 `request.signal`。
 
-- **代理把流聚合成 JSON 时，`[DONE]` 必须在聚合期就被记住**：非流式调用方拿到的是
-  一个对象，**唯一的终止证据在聚合时就被丢掉了**。WorkBuddy 的 `aggregateWorkBuddySse`
-  过去只认 `finish_reason`，于是「正常结束」和「被掐断」产出**逐字节相同**的响应
-  （实测 A/B 两份 JSON 完全一致），半截回答以 HTTP 200 的形式交出去，agent loop 判定
+- **代理把流聚合成 JSON 时，`[DONE]`
+  必须在聚合期就被记住**：非流式调用方拿到的是
+  一个对象，**唯一的终止证据在聚合时就被丢掉了**。WorkBuddy 的
+  `aggregateWorkBuddySse` 过去只认
+  `finish_reason`，于是「正常结束」和「被掐断」产出**逐字节相同**的响应 （实测
+  A/B 两份 JSON 完全一致），半截回答以 HTTP 200 的形式交出去，agent loop 判定
   回合说完、标记目标完成。判据：**先在源上证明终止帧一定到**（实测 5 个模型
-  deepseek-v4-flash/hy3-c/glm-5.3/minimax-m3/kimi-k2.7 的成功流**全部**以 `data: [DONE]`
-  收尾），再把它的缺席当成故障。四个细节：①判据是**整帧等于 `[DONE]`**，不是
-  `includes`（正文里完全可能出现「数组里有 "[DONE]" 这个字样」）；②**上游自己说的
-  `finish_reason: "stop"` 不算终止证据**；③**内容拦截（11140）是业务收尾不是截断**，
+  deepseek-v4-flash/hy3-c/glm-5.3/minimax-m3/kimi-k2.7 的成功流**全部**以
+  `data: [DONE]` 收尾），再把它的缺席当成故障。四个细节：①判据是**整帧等于
+  `[DONE]`**，不是 `includes`（正文里完全可能出现「数组里有 "[DONE]"
+  这个字样」）；②**上游自己说的 `finish_reason: "stop"`
+  不算终止证据**；③**内容拦截（11140）是业务收尾不是截断**，
   它有独立的失败通道，被新判定吞掉就成了静默失败；④「有内容」和「什么都没交付」
   是两种错误形状，后者不能报成普通截断，否则调用方拿到一份空回答还以为模型答完了
   ——与插件侧「完整结束但什么都没吐不是正常结束」同型。
-- **配对逻辑（聚合 + 取形）必须一起放进 `src/`**：`main.ts` 不在 `deno task test`
-  的范围里（那条任务只跑 `src/`），只把判定放 `src/` 而把「该回什么形状」留在
-  `main.ts` 等于只测了一半。同 `workBuddyChatSignal` 那条。
+- **配对逻辑（聚合 + 取形）必须一起放进 `src/`**：`main.ts` 不在
+  `deno task test` 的范围里（那条任务只跑 `src/`），只把判定放 `src/`
+  而把「该回什么形状」留在 `main.ts` 等于只测了一半。同 `workBuddyChatSignal`
+  那条。
 
-- **内容拦截（11140）之后必须 `cancel()` 上游，不能只 `releaseLock()`**：这两个动作看起来像，
-  其实差着一整个请求的生命周期。`releaseLock()` 只把 reader 上的锁解开，底层 socket
-  照旧在跑 —— 那一发会**继续生成到结束**，而内容已经没人要了，credit 照算。判据：
+- **内容拦截（11140）之后必须 `cancel()` 上游，不能只
+  `releaseLock()`**：这两个动作看起来像，
+  其实差着一整个请求的生命周期。`releaseLock()` 只把 reader 上的锁解开，底层
+  socket 照旧在跑 —— 那一发会**继续生成到结束**，而内容已经没人要了，credit
+  照算。判据：
   遇到「我们决定不再读它」的地方（拦截、客户端取消）要问「上游还在跑吗」，而不是
-  「锁解开了吗」。`guardWorkBuddyStream` 的 `finally` 与 `aggregateWorkBuddySse` 的
-  `finally` 都必须留这条，且**只在真拦截时 cancel**（正常读完不 cancel）。
+  「锁解开了吗」。`guardWorkBuddyStream` 的 `finally` 与 `aggregateWorkBuddySse`
+  的 `finally` 都必须留这条，且**只在真拦截时 cancel**（正常读完不 cancel）。
 - **断言的判据变量必须取自真正被测的那个对象**：本轮一条「正常结束的流不该被取消」
-  的断言拿的是**另一条**流上的 `cancelled` 标志，被测的那条流压根没有 cancel 钩子 ——
-  无论实现怎么改都绿。与 AGENTS.md 上文「assertions must be falsifiable」同族：
-  写完先问「把被测代码换成任何别的行为，这条会不会红」。
+  的断言拿的是**另一条**流上的 `cancelled` 标志，被测的那条流压根没有 cancel
+  钩子 —— 无论实现怎么改都绿。与 AGENTS.md 上文「assertions must be
+  falsifiable」同族： 写完先问「把被测代码换成任何别的行为，这条会不会红」。
 - **变异体存活不等于漏测，先问平台是不是已经吞了它**：本轮「在 finally 里无条件
   cancel」两个变异体都存活。写探针证明后得知 —— 流一旦 `done`（或 `error`），
-  `reader.cancel()` **不再落到源的 `cancel()` 钩子上**，所以该变异体在正常结束路径上
+  `reader.cancel()` **不再落到源的 `cancel()`
+  钩子上**，所以该变异体在正常结束路径上
   原理不可观测。这是「等价」的合法理由，但**必须留下探针和结论**，并在测试注释里
   写清是平台吞掉的，别让下一个人把它当成漏测去补测试。
 
-- **只认白名单的字段透传必须把白名单补齐**：第 4 轮 `tools` 漏传让 agent 循环停在第一轮，
-  第 10 轮同一族的毛病还在 —— `buildChatBody` 只认 6 个字段，`response_format`、
+- **只认白名单的字段透传必须把白名单补齐**：第 4 轮 `tools` 漏传让 agent
+  循环停在第一轮， 第 10 轮同一族的毛病还在 —— `buildChatBody` 只认 6
+  个字段，`response_format`、
   `top_p`、`top_k`、`seed`、`presence_penalty`、`frequency_penalty`、`logprobs`、
-  `top_logprobs`、`n`、`user`、`parallel_tool_calls`、`service_tier` 全部**静默丢弃**。
-  判据：**先查上游真会不会用**（实测上游忽略 `n` 与 `logprobs` ⇒ 那两个字段转发与否
-  在上游侧不可区分，不是缺陷；`max_completion_tokens` 只在与 `max_tokens` 同时出现时
-  被采纳 ⇒ 必须两个一起下发），再决定转发还是显式拒绝 —— 但**不能默默吞掉**：
-  同 `src/commandcode/handler.ts` 那种「不支持就明说」是本项目的既有惯例。
-- **状态码有第二重语义时，必须先按报文分类再决定是否续期**：`guardWorkBuddyStream` 之外的
-  HTTP 层原来写成 `status === 401 || status === 403` 就一律「静默续期 + 重发一整轮」，而
-  **403 同时承载 11140 内容拦截**（账号级，续期毫无用处）⇒ 每次确定性拦截都白烧一次
-  refresh_token 额度加一发全额计费的请求，结果还是同样的 403。根因是
-  `isContentRejection` 在生产代码里**零调用方** —— 分类器写了却没接上。
-  配对动作：错误体必须是 OpenAI 的 `{error:{message,type,code}}`（原来回的是
+  `top_logprobs`、`n`、`user`、`parallel_tool_calls`、`service_tier`
+  全部**静默丢弃**。 判据：**先查上游真会不会用**（实测上游忽略 `n` 与
+  `logprobs` ⇒ 那两个字段转发与否
+  在上游侧不可区分，不是缺陷；`max_completion_tokens` 只在与 `max_tokens`
+  同时出现时 被采纳 ⇒ 必须两个一起下发），再决定转发还是显式拒绝 ——
+  但**不能默默吞掉**： 同 `src/commandcode/handler.ts`
+  那种「不支持就明说」是本项目的既有惯例。
+- **状态码有第二重语义时，必须先按报文分类再决定是否续期**：`guardWorkBuddyStream`
+  之外的 HTTP 层原来写成 `status === 401 || status === 403` 就一律「静默续期 +
+  重发一整轮」，而 **403 同时承载 11140 内容拦截**（账号级，续期毫无用处）⇒
+  每次确定性拦截都白烧一次 refresh_token
+  额度加一发全额计费的请求，结果还是同样的 403。根因是 `isContentRejection`
+  在生产代码里**零调用方** —— 分类器写了却没接上。 配对动作：错误体必须是 OpenAI
+  的 `{error:{message,type,code}}`（原来回的是
   `{error:"字符串", detail}`,客户端按标准形状读 message 会整个丢掉），
   且这段判定要放 `src/` 才测得到，同 `workBuddyTruncationError`。
 - **流扫描必须按真实 chunk 边界逐行判**：`guardWorkBuddyStream` 的扫描循环曾写成
-  `carry.lastIndexOf("\n")` + `carry.slice(0, at)`，`slice(0, at)` 取的是**整个前缀**
-  不是一行。上游把「心跳注释 + 若干帧 + [DONE]」放在同一个 TCP chunk 里是常态，
-  于是前缀以 `: heartbeat` 开头，`startsWith("data:")` 恒 false ⇒
-  **整块缓冲区的帧一个都没判**，原始 11140 原样透传给客户端，而老测试全绿 ——
-  因为夹具一行一个 chunk。判据：**先问真实 socket 怎么切 chunk，再造夹具**；
-  同形状喂 `aggregateWorkBuddySse`（它用 `indexOf` 逐行）才是对照组。
+  `carry.lastIndexOf("\n")` + `carry.slice(0, at)`，`slice(0, at)`
+  取的是**整个前缀** 不是一行。上游把「心跳注释 + 若干帧 + [DONE]」放在同一个
+  TCP chunk 里是常态， 于是前缀以 `: heartbeat` 开头，`startsWith("data:")` 恒
+  false ⇒ **整块缓冲区的帧一个都没判**，原始 11140
+  原样透传给客户端，而老测试全绿 —— 因为夹具一行一个 chunk。判据：**先问真实
+  socket 怎么切 chunk，再造夹具**； 同形状喂 `aggregateWorkBuddySse`（它用
+  `indexOf` 逐行）才是对照组。
 - **变异体存活时，还要问「夹具是不是正好落在守卫的盲区外」**：本轮「去掉
   `startsWith("data:")` 守卫」这个变异体存活了很久。原因是老夹具的前缀
   「`: note`」有 6 个字符，切片点落在 JSON 中间，删掉守卫也切不出合法 JSON ——
   差一个字符就活了。唯一能暴露它的形状是**前缀恰好 5 个字符**（切片点正好落在
   `{` 上），补上那条用例后立刻被杀。与上一条「平台吞掉了它」并列为两种存活理由。
-- **同一个路由不许有两种错误形状**（第 11 轮，端到端复验时从 400 响应体里发现）：
-  第 10 轮只把**上游**失败改成了 `{error:{message,type,code}}`，**路由自己产生的
-  400/404/409/502 仍然是 `{error:"…字符串"}`** —— 客户端按 OpenAI 形状读
-  `error.message` 时，上游错误读得到、本地错误读不到，同一个接口两种形状比两种
-  都不对还难查。判据：**grep 同一个路由里的 `error:` 字面量，把每一种失败都过一遍**，
-  上游来源和本地来源都要 OpenAI 化；本地失败没有上游业务码可抄，`code` 就用 HTTP
-  状态码本身，形状仍放 `src/`（`workBuddyLocalError`）才测得到。改完用真实请求
-  打一次 **本地**失败（未知模型 / 缺凭据），只跑上游路径的测试是抓不到的。
-- **组装响应体的代码也必须住 `src/`**（第 11 轮，同一条规则的第二次翻车）：形状定义
-  放在 `src/` 不等于拼装也住了 `src/`。`jsonResponse({ ...local.error, available })`
-  把 `error` 键整个**展开**掉了，线上拿到的是 `{message,type,code,available}` ——
-  顶层连 `error` 键都没有，而 `deno task test` 只加载 `src/`，一行测试都覆盖不到。
-  判据：**组装处不许出现 `...local.error` 这类展开**，一律 `workBuddyLocalErrorBody`
-  这种收口函数；额外字段进 `extra`，不能和 `error` 同级拼回去。
+- **同一个路由不许有两种错误形状**（第 11 轮，端到端复验时从 400
+  响应体里发现）： 第 10 轮只把**上游**失败改成了
+  `{error:{message,type,code}}`，**路由自己产生的 400/404/409/502 仍然是
+  `{error:"…字符串"}`** —— 客户端按 OpenAI 形状读 `error.message`
+  时，上游错误读得到、本地错误读不到，同一个接口两种形状比两种
+  都不对还难查。判据：**grep 同一个路由里的 `error:`
+  字面量，把每一种失败都过一遍**， 上游来源和本地来源都要 OpenAI
+  化；本地失败没有上游业务码可抄，`code` 就用 HTTP 状态码本身，形状仍放
+  `src/`（`workBuddyLocalError`）才测得到。改完用真实请求 打一次
+  **本地**失败（未知模型 / 缺凭据），只跑上游路径的测试是抓不到的。
+- **组装响应体的代码也必须住 `src/`**（第 11
+  轮，同一条规则的第二次翻车）：形状定义 放在 `src/` 不等于拼装也住了
+  `src/`。`jsonResponse({ ...local.error, available })` 把 `error`
+  键整个**展开**掉了，线上拿到的是 `{message,type,code,available}` —— 顶层连
+  `error` 键都没有，而 `deno task test` 只加载 `src/`，一行测试都覆盖不到。
+  判据：**组装处不许出现 `...local.error` 这类展开**，一律
+  `workBuddyLocalErrorBody` 这种收口函数；额外字段进 `extra`，不能和 `error`
+  同级拼回去。
 - **展开顺序类的变异体，断言键集合杀不掉**（第 11 轮 M1 存活）：
-  `{error: local.error, ...extra}` 和 `{...extra, error: local.error}` 两种写法产出的
-  **键集合完全相同**，只要测试的 `extra` 里没有 `error` 键，断言就是摆设。必须补一条
-  「`extra` 里塞了同名 `error` 键、断言真的那个不被覆盖」的顺序敏感用例。判据：凡是
+  `{error: local.error, ...extra}` 和 `{...extra, error: local.error}`
+  两种写法产出的 **键集合完全相同**，只要测试的 `extra` 里没有 `error`
+  键，断言就是摆设。必须补一条 「`extra` 里塞了同名 `error`
+  键、断言真的那个不被覆盖」的顺序敏感用例。判据：凡是
   变异体现在交换属性顺序，一律先问「我的用例能不能观测到这个顺序」。
 
-- **`.tmp-*.ts` 是运行时依赖，被跟踪是故意的（2026-10-04 核实）**：`.gitignore` 早就有 `tmp-*.mjs`，但那匹配不到**带点前缀**的形式，于是本地的 `.tmp-*.cjs` 取证脚本既没被忽略、又被顺手 `git add` 过 —— 现在补的是 `.tmp-*.cjs/.mjs/.jsonl/.json`，**刻意不含 `.tmp-*.ts`**：`.tmp-extract-deepseek-cookies.ts` 被 `dsh-plugin/index.js`（`path.join(root, ...)` 后 `spawn(deno, ["run","-A", ...])`）按路径拉起，`main.ts` 的四个错误文案、`src/deepseek-web.ts:1473` 的提示、README 与 `docs/workbuddy-integration-plan.md` 都指名它；六个脚本（extract-cookies / trae-login / trae-checkin / trae-infer-probe / trae-raw / workbuddy-login）全部已跟踪且凭据扫描 0 命中。**把它们 gitignore 掉，面板的「一键配置」会当场报 capture script not found。**
-   **2026-10-05 新增第七个 `.tmp-cnb-login.ts`**：cnb 的一键登录。cnb 原先**没有**自动捕获，只有「F12 复制 Cookie 粘进 `cnb-login.txt`」这条手工路，而**粘完没有任何验证**——成没成要等下一次推理撞 403 才知道。新脚本拉浏览器 → 用户正常登录 → 自动抓会话 cookie → **先发一次真实请求确认能出字，成功才写盘**（失败不写，保留原有凭据）。两条设计判据值得记住：①**判据只能是「带凭据的请求能不能出字」**，不能认状态码或错误文案（`401 [NOT_LOGIN]` → `403 errcode 7` 就是一次漂移，见本文档顶部那条）；②**写盘格式必须与 `src/cnb.ts` 的读取器逐字对拍**——脚本写、代理读，两边各自看都对、合起来是错的，而且是静默的。已用 `.tmp-parser-check.ts` 做对拍（9 个用例，含用户实际粘贴的形状），并刻意保留一处**已知差异**记在测试里而不是抹平：手工粘带空格的 `" A = 1 "` 时代理会得到键名 `"A "`（带尾空格，服务端不匹配），脚本 trim 掉——抹平等于把代理侧的健壮性缺陷复制进脚本，让脚本再也发现不了它。
-- **ZLK Pro 新增渠道（2026-10-03，`/zlkpro/v1`）**：用户给了 `https://zlkpro.tech` + `sk-…` 要求接入。实测是**标准 OpenAI 契约**：`GET /v1/models` 回 17 个模型（`owned_by:"openai"`、带 `supported_endpoint_types:["openai"]`），非流式 / 流式（末帧 `data: [DONE]`）/ 工具调用（标准 `choices[].message.tool_calls`）全部正常，没有任何厂商扩展要还原，所以照 `tokenharbor` 的纯透传形状落 `src/core.ts` 的 `providers.zlkpro`（`filterModels: null`）。**它是 key 渠道，五处必须同时加**：`src/core.ts` 的 `ENV.ZLKPRO_API_KEY`、插件 `KEYED_CHANNELS`（面板渲染输入框）、`CHANNEL_GROUPS['ai-proxy-zlkpro']`（选择器分组，`Object.keys(CHANNEL_GROUPS)` 就是被注册的 provider id 列表）、`V1_AGGREGATE_MEMBERS`（不加则面板有、harness 目录没有）、`/health/probe` 的 `channelPrefixes` + 插件 `PROBE_CHANNELS`。**模型 id 自带斜杠**（`zlkpro/openai/gpt-oss-20b`、`zlkpro/google/gemma-4-31b-it`）不影响路由——`v1ResolveModel` 只切第一个 `/`，与既有的 `kilo/openrouter/free` 同形，实测可正常出流。两个不是故障的现象：它给小提示也报 `prompt_tokens≈2035`（网关自带 system prompt 或计费口径不同）；`deepseek-v4-flash`/`kimi-k2.6`/`step-3.x` 会先出 `reasoning_content`，`max_tokens` 给小会把正文挤成空串（`finish_reason:"length"`）。
-- **聚合成员的「干净请求」曾把每个 key 渠道的 key 换掉（2026-10-03 修）**：`v1FetchMemberModels` 的 `shimReq` 带着 `authorization: Bearer public`（注释写「zen 要 Bearer public」），而 `cloneHeadersForUpstream` 的取值顺序是 `userToken || defaultToken || env[envToken] || DEFAULT_BEARER_TOKEN`——**调用方的 token 优先级最高**，于是每个 bearer 成员收到的都是 `Bearer public` 而不是自己的 key；401 的响应体没有 `data` 数组 → `arr = []` → `catalog.ok(key, 0, 0)`，**报成功、0 个模型、既无 catalogIssue 也无日志**。实测：加完 zlkpro 聚合里 0 行而 `/health` 的 `credentials.zlkpro.configured = true`；把 shim 的 authorization 去掉后立刻 17 行（聚合 152 → 169）。zen 从来不走这个 shim（它由 `fetchZenModels()` 直接答），所以那行头是**遗留物**。**判据：「调用方优先」的取值顺序里没有「装饰性占位凭据」这种角色，写上去就是覆盖——要给上游带默认凭据，就别让调用方那一层带任何东西。**
-- **`envToken` 写了不等于读了（2026-10-03 修）**：`TOKENHARBOR_API_KEY` 在 provider 的 `auth.envToken` 与插件 `KEYED_CHANNELS` 里都在，但 `src/core.ts` 的 `ENV` 映射**从来没加过它**——`env[auth.envToken]` 恒 `undefined`，静默回落到 `DEFAULT_BEARER_TOKEN`（也就是「一个渠道的 key 变成另一个的」，正是第 46 行那条要修的病）。加 zlkpro 时一并补上。**判据：`envToken` 是跨三处的同一个字符串（provider 的 `auth.envToken` / `ENV` 映射 / 插件的 `KEYED_CHANNELS`），加 key 渠道时三处都 `grep` 一遍，别只看两处满意。**
-- **cnb 垃圾工具语法：诊断 / 落盘 / 熔断（2026-10-05 修）**：提示词只教 等价标签对 一种写法，而模型的训练先验把它写成一整座别家协议的动物园（复数 `tool_calls`、`<invoke>`+`<parameter>`、`<function_calls>`、以及带属性的复数包裹）。**三类问题的病因各不相同，只治一类没用**：
-  ①**反馈是死的**——解析不出来时只回一句 "invalid syntax"，模型不知道错在哪，于是把同一种坏写法原样再写一遍。用户实测：单会话连续 13 次大输出回合全是这么来的，输入增长 34 倍、99% 的 token 花在重发上下文上。现在 `cnbDiagnoseJunkSyntax()` 说出**这一轮**具体违反了哪一条（哪个禁用标签、有没有 JSON、缺 `name` 还是缺 `arguments`），并**不猜意图**——猜错会把模型引到错误方向，比没有反馈更糟。
-  ②**证据留不住**——`console.warn` 只进插件 200 行内存日志，长会话里几秒就被冲掉（实测连续拒收时 warn 存活时间以秒计，日志文件里一行都没留下）。现在 `cnbJournalJunk()` 同步追加到 `./cnb-junk.log`（同 `cnb-login.txt` 的目录约定，500ms 防抖 + 512KB 到量重开 + 读写失败静默吞掉——**日志坏了绝不能把正常响应打死**）。**同步写是必须的**：调用点在纯同步的 `cnbParseToolCalls` 里，改 `await` 会把整个流式响应卡住。
-  ③**拒收没有上限**——同一种坏写法连着被拒时，那句长说明每轮原样再发一遍，而这正是 34 倍增长的来源。现在 `cnbJunkStreak` 计数，第 3 次起熔断成短版（诊断仍然每轮都发，砍掉的只是已证明无效的长说明），**60 秒无拒收算新的一串**（熔断描述「连续」，不是「进程生命期内累计」）。
-  配套 `src/cnb.test.ts` 25 个用例，用内存假件测（`deno task test` 只开 `--allow-env`），计时与文件 IO 都注入。
+- **`.tmp-*.ts` 是运行时依赖，被跟踪是故意的（2026-10-04 核实）**：`.gitignore`
+  早就有 `tmp-*.mjs`，但那匹配不到**带点前缀**的形式，于是本地的 `.tmp-*.cjs`
+  取证脚本既没被忽略、又被顺手 `git add` 过 —— 现在补的是
+  `.tmp-*.cjs/.mjs/.jsonl/.json`，**刻意不含
+  `.tmp-*.ts`**：`.tmp-extract-deepseek-cookies.ts` 被
+  `dsh-plugin/index.js`（`path.join(root, ...)` 后
+  `spawn(deno, ["run","-A", ...])`）按路径拉起，`main.ts`
+  的四个错误文案、`src/deepseek-web.ts:1473` 的提示、README 与
+  `docs/workbuddy-integration-plan.md` 都指名它；六个脚本（extract-cookies /
+  trae-login / trae-checkin / trae-infer-probe / trae-raw /
+  workbuddy-login）全部已跟踪且凭据扫描 0 命中。**把它们 gitignore
+  掉，面板的「一键配置」会当场报 capture script not found。** **2026-10-05
+  新增第七个 `.tmp-cnb-login.ts`**：cnb 的一键登录。cnb
+  原先**没有**自动捕获，只有「F12 复制 Cookie 粘进
+  `cnb-login.txt`」这条手工路，而**粘完没有任何验证**——成没成要等下一次推理撞
+  403 才知道。新脚本拉浏览器 → 用户正常登录 → 自动抓会话 cookie →
+  **先发一次真实请求确认能出字，成功才写盘**（失败不写，保留原有凭据）。两条设计判据值得记住：①**判据只能是「带凭据的请求能不能出字」**，不能认状态码或错误文案（`401 [NOT_LOGIN]`
+  → `403 errcode 7` 就是一次漂移，见本文档顶部那条）；②**写盘格式必须与
+  `src/cnb.ts`
+  的读取器逐字对拍**——脚本写、代理读，两边各自看都对、合起来是错的，而且是静默的。已用
+  `.tmp-parser-check.ts` 做对拍（9
+  个用例，含用户实际粘贴的形状），并刻意保留一处**已知差异**记在测试里而不是抹平：手工粘带空格的
+  `" A = 1 "` 时代理会得到键名 `"A "`（带尾空格，服务端不匹配），脚本 trim
+  掉——抹平等于把代理侧的健壮性缺陷复制进脚本，让脚本再也发现不了它。
+- **ZLK Pro 新增渠道（2026-10-03，`/zlkpro/v1`）**：用户给了
+  `https://zlkpro.tech` + `sk-…` 要求接入。实测是**标准 OpenAI
+  契约**：`GET /v1/models` 回 17 个模型（`owned_by:"openai"`、带
+  `supported_endpoint_types:["openai"]`），非流式 / 流式（末帧 `data: [DONE]`）/
+  工具调用（标准
+  `choices[].message.tool_calls`）全部正常，没有任何厂商扩展要还原，所以照
+  `tokenharbor` 的纯透传形状落 `src/core.ts` 的
+  `providers.zlkpro`（`filterModels: null`）。**它是 key
+  渠道，五处必须同时加**：`src/core.ts` 的 `ENV.ZLKPRO_API_KEY`、插件
+  `KEYED_CHANNELS`（面板渲染输入框）、`CHANNEL_GROUPS['ai-proxy-zlkpro']`（选择器分组，`Object.keys(CHANNEL_GROUPS)`
+  就是被注册的 provider id 列表）、`V1_AGGREGATE_MEMBERS`（不加则面板有、harness
+  目录没有）、`/health/probe` 的 `channelPrefixes` + 插件
+  `PROBE_CHANNELS`。**模型 id
+  自带斜杠**（`zlkpro/openai/gpt-oss-20b`、`zlkpro/google/gemma-4-31b-it`）不影响路由——`v1ResolveModel`
+  只切第一个 `/`，与既有的 `kilo/openrouter/free`
+  同形，实测可正常出流。两个不是故障的现象：它给小提示也报
+  `prompt_tokens≈2035`（网关自带 system prompt
+  或计费口径不同）；`deepseek-v4-flash`/`kimi-k2.6`/`step-3.x` 会先出
+  `reasoning_content`，`max_tokens`
+  给小会把正文挤成空串（`finish_reason:"length"`）。
+- **聚合成员的「干净请求」曾把每个 key 渠道的 key 换掉（2026-10-03
+  修）**：`v1FetchMemberModels` 的 `shimReq` 带着
+  `authorization: Bearer public`（注释写「zen 要 Bearer public」），而
+  `cloneHeadersForUpstream` 的取值顺序是
+  `userToken || defaultToken || env[envToken] || DEFAULT_BEARER_TOKEN`——**调用方的
+  token 优先级最高**，于是每个 bearer 成员收到的都是 `Bearer public`
+  而不是自己的 key；401 的响应体没有 `data` 数组 → `arr = []` →
+  `catalog.ok(key, 0, 0)`，**报成功、0 个模型、既无 catalogIssue
+  也无日志**。实测：加完 zlkpro 聚合里 0 行而 `/health` 的
+  `credentials.zlkpro.configured = true`；把 shim 的 authorization 去掉后立刻 17
+  行（聚合 152 → 169）。zen 从来不走这个 shim（它由 `fetchZenModels()`
+  直接答），所以那行头是**遗留物**。**判据：「调用方优先」的取值顺序里没有「装饰性占位凭据」这种角色，写上去就是覆盖——要给上游带默认凭据，就别让调用方那一层带任何东西。**
+- **`envToken` 写了不等于读了（2026-10-03 修）**：`TOKENHARBOR_API_KEY` 在
+  provider 的 `auth.envToken` 与插件 `KEYED_CHANNELS` 里都在，但 `src/core.ts`
+  的 `ENV` 映射**从来没加过它**——`env[auth.envToken]` 恒 `undefined`，静默回落到
+  `DEFAULT_BEARER_TOKEN`（也就是「一个渠道的 key 变成另一个的」，正是第 46
+  行那条要修的病）。加 zlkpro 时一并补上。**判据：`envToken`
+  是跨三处的同一个字符串（provider 的 `auth.envToken` / `ENV` 映射 / 插件的
+  `KEYED_CHANNELS`），加 key 渠道时三处都 `grep` 一遍，别只看两处满意。**
+- **cnb 垃圾工具语法：诊断 / 落盘 / 熔断（2026-10-05 修）**：提示词只教
+  等价标签对 一种写法，而模型的训练先验把它写成一整座别家协议的动物园（复数
+  `tool_calls`、`<invoke>`+`<parameter>`、`<function_calls>`、以及带属性的复数包裹）。**三类问题的病因各不相同，只治一类没用**：
+  ①**反馈是死的**——解析不出来时只回一句 "invalid
+  syntax"，模型不知道错在哪，于是把同一种坏写法原样再写一遍。用户实测：单会话连续
+  13 次大输出回合全是这么来的，输入增长 34 倍、99% 的 token
+  花在重发上下文上。现在 `cnbDiagnoseJunkSyntax()`
+  说出**这一轮**具体违反了哪一条（哪个禁用标签、有没有 JSON、缺 `name` 还是缺
+  `arguments`），并**不猜意图**——猜错会把模型引到错误方向，比没有反馈更糟。
+  ②**证据留不住**——`console.warn` 只进插件 200
+  行内存日志，长会话里几秒就被冲掉（实测连续拒收时 warn
+  存活时间以秒计，日志文件里一行都没留下）。现在 `cnbJournalJunk()` 同步追加到
+  `./cnb-junk.log`（同 `cnb-login.txt` 的目录约定，500ms 防抖 + 512KB 到量重开 +
+  读写失败静默吞掉——**日志坏了绝不能把正常响应打死**）。**同步写是必须的**：调用点在纯同步的
+  `cnbParseToolCalls` 里，改 `await` 会把整个流式响应卡住。
+  ③**拒收没有上限**——同一种坏写法连着被拒时，那句长说明每轮原样再发一遍，而这正是
+  34 倍增长的来源。现在 `cnbJunkStreak` 计数，第 3
+  次起熔断成短版（诊断仍然每轮都发，砍掉的只是已证明无效的长说明），**60
+  秒无拒收算新的一串**（熔断描述「连续」，不是「进程生命期内累计」）。 配套
+  `src/cnb.test.ts` 25 个用例，用内存假件测（`deno task test` 只开
+  `--allow-env`），计时与文件 IO 都注入。
 
-- **变异验证三条纪律（2026-10-05 实测；每一条都是这一轮踩坑换来的）**：写完断言必须问「把实现改坏哪一处，它才会红」。这一轮跑 14 个变异，抓到四个**方法论层面的错误**：
-  ①**判红绿只能看退出码，不能看输出文本**。cnb 的用例会往 stderr 写 `[junk]` warn，执行**成功**时输出也非空——我用 `execSync` 拿 stdout 判空，于是把全绿的基线判成「BASELINE NOT GREEN」，白折腾一轮。管道里的 warn 不是失败信号。
-  ②**改坏后的代码必须仍能编译**。我把一行 `clean.replace(...)` 改成注释、把字符串引号拆坏，deno 直接报 `TS2554`/`SyntaxError`——那种红是**假红**，什么都没验证到。这一轮有 3 个变异因此被误判成「断言太弱」，实际它们都能被抓住。改法要语义等价（`belongs to another tool protocol` → `belongs to a different protocol`），不是把语法拆掉。
-  ③**锚点要从文件里读出真实文本，不要手写转义**。JUNK 正则那条我手写 `\\\\b` 报 ANCHOR MISS，误以为变异没生效；单独一版从 `orig.split("\n")[570]` 取行才确认它真能被抓。
-  ④**每轮跑完立刻写回原文，结尾再校验「字节相同 + 退出码 0」**。我有一轮忘了还原，好文件被留在半完成状态，接着 `git checkout` 把整段工作冲掉了，全部重做一遍。
-- **逐行删实验：判定「哪一行在干活」的唯一办法（2026-10-05）**：我以为自己修好了一个 bug（给复数包裹的清理正则加「匹配任意属性」以覆盖带属性的写法）。变异测试显示改坏它照样全绿——于是对清理区**每一行**做「删掉它看哪个用例变红」。结论是最后那行 `/<\/?\w*call\w*\b[^>]*>/gi` 早就在兜底（`\w*call\w*` 连属性串和 `function_calls` 家族一起收），我加的那行是**冗余的**。**教训：先逐行问哪行在干活，再决定加什么。** 顺带一条更重要的：实验里上面几行删掉也全绿，但**全绿不代表那几行是死的**——它们覆盖的是没有用例钉住的形状，按「测试没红」去精简就是在删没人测过的保险。已把这条写进代码注释。
-- **`.tmp-*.ts` 是运行时依赖，`.tmp-*` 通配不是（2026-10-05 差点删掉用户资产）**：清理临时文件时我用 `Remove-Item .tmp-*.cjs, .tmp-*.ts`，**把已跟踪的 `.tmp-cnb-login.ts` 删了**——而 `.tmp-*.ts` 被 gitignore **刻意排除**在忽略规则外（`main.ts`/插件/README 都指名拉起它，见上面那条）。`git checkout --` 救回来了，字节与 HEAD 一致。**判据：跑批量删除前先 `git ls-files` 看一眼通配会不会碰到被跟踪的文件**；`.tmp-` 前缀是「临时」的意思，但其中七个是**运行时的组成部分**，不是临时产物。
-- **cnb 上游真的拒 >1MiB 请求体（2026-10-05 实测；这条当初零记录，我一度误判成幻觉）**：`src/cnb.ts` 的 1MiB 预检是 2026-09-24 加 DeepSeek provider 那次**顺手带进来的**，提交说明没提、AGENTS.md 零命中——用户拿到 413 时直接怀疑「是不是你的幻觉」，我去查也只能说「查不到出处」。于是绕过代理直接打上游（`.tmp-cnb-1mib-probe.ts`，只发给 cnb.cool，不占隧道和串行闸）：**1.000MiB 通过、1.050MiB 起 `413 [BODY_TOO_LARGE]`、1.5/3/8MiB 同样**。所以预检该留、阈值 1048576 也对（甚至略保守）。
-  两条比结论更重要的教训：
-  ①**「查不到记录」不等于「不存在」**。我查证了「没有出处」，就顺着用户的话说「你是对的，我证明不了它」——那是把**未记录**误当成**已证伪**。用户质疑的语气对（它确实该被质疑），但方向对不等于结论对，结论只能由实测给。连带把预检的措辞改诚实：原来写 "cnb gateway rejects…" 像是上游回的，**实际请求根本没发出去**，排查的人会被指向上游；现在明说「ai-proxy 在发送前拒绝了」，并附上游原文佐证。
-  ②**第一版探针六个请求全被 401 挡在鉴权层，等于一个都没测**。原因是我把 CSRF 头写成 `X-CSRFToken`，而 `cnbCall` 用的是 **`Csrftoken`**（无 `X-` 前缀）。401 和 413 是**两个不同的失败层**，混在一起看就会把「没测到」当成「测过了」——**探针必须复刻被测路径的头，连头名的拼法都一样**。
-- **cnb 不是「不支持工具调用」，是「禁止在这个场景用」（2026-10-06 实测；这条纠正了 README/AGENTS 里存在很久的错误表述）**：查由是用户问「为什么上游的模型不支持 tool 调用」。同一个问题做四点对照：
-  | 请求 | 结果 |
-  |---|---|
-  | 不带 `tools` | 200 |
-  | 带 `tools`（OpenAI 标准形状） | **403** `[FORBIDDEN]Agent calls are not allowed in this scenario` |
-  | 带 `tool_choice` | 403 同上 |
-  | 带伪造的 `tool_calls` + `tool` 结果历史 | 403 同上 |
+- **变异验证三条纪律（2026-10-05
+  实测；每一条都是这一轮踩坑换来的）**：写完断言必须问「把实现改坏哪一处，它才会红」。这一轮跑
+  14 个变异，抓到四个**方法论层面的错误**：
+  ①**判红绿只能看退出码，不能看输出文本**。cnb 的用例会往 stderr 写 `[junk]`
+  warn，执行**成功**时输出也非空——我用 `execSync` 拿 stdout
+  判空，于是把全绿的基线判成「BASELINE NOT GREEN」，白折腾一轮。管道里的 warn
+  不是失败信号。 ②**改坏后的代码必须仍能编译**。我把一行 `clean.replace(...)`
+  改成注释、把字符串引号拆坏，deno 直接报
+  `TS2554`/`SyntaxError`——那种红是**假红**，什么都没验证到。这一轮有 3
+  个变异因此被误判成「断言太弱」，实际它们都能被抓住。改法要语义等价（`belongs to another tool protocol`
+  → `belongs to a different protocol`），不是把语法拆掉。
+  ③**锚点要从文件里读出真实文本，不要手写转义**。JUNK 正则那条我手写 `\\\\b` 报
+  ANCHOR MISS，误以为变异没生效；单独一版从 `orig.split("\n")[570]`
+  取行才确认它真能被抓。 ④**每轮跑完立刻写回原文，结尾再校验「字节相同 + 退出码
+  0」**。我有一轮忘了还原，好文件被留在半完成状态，接着 `git checkout`
+  把整段工作冲掉了，全部重做一遍。
+- **逐行删实验：判定「哪一行在干活」的唯一办法（2026-10-05）**：我以为自己修好了一个
+  bug（给复数包裹的清理正则加「匹配任意属性」以覆盖带属性的写法）。变异测试显示改坏它照样全绿——于是对清理区**每一行**做「删掉它看哪个用例变红」。结论是最后那行
+  `/<\/?\w*call\w*\b[^>]*>/gi` 早就在兜底（`\w*call\w*` 连属性串和
+  `function_calls`
+  家族一起收），我加的那行是**冗余的**。**教训：先逐行问哪行在干活，再决定加什么。**
+  顺带一条更重要的：实验里上面几行删掉也全绿，但**全绿不代表那几行是死的**——它们覆盖的是没有用例钉住的形状，按「测试没红」去精简就是在删没人测过的保险。已把这条写进代码注释。
+- **`.tmp-*.ts` 是运行时依赖，`.tmp-*` 通配不是（2026-10-05
+  差点删掉用户资产）**：清理临时文件时我用
+  `Remove-Item .tmp-*.cjs, .tmp-*.ts`，**把已跟踪的 `.tmp-cnb-login.ts`
+  删了**——而 `.tmp-*.ts` 被 gitignore
+  **刻意排除**在忽略规则外（`main.ts`/插件/README
+  都指名拉起它，见上面那条）。`git checkout --` 救回来了，字节与 HEAD
+  一致。**判据：跑批量删除前先 `git ls-files`
+  看一眼通配会不会碰到被跟踪的文件**；`.tmp-`
+  前缀是「临时」的意思，但其中七个是**运行时的组成部分**，不是临时产物。
+- **cnb 上游真的拒 >1MiB 请求体（2026-10-05
+  实测；这条当初零记录，我一度误判成幻觉）**：`src/cnb.ts` 的 1MiB 预检是
+  2026-09-24 加 DeepSeek provider 那次**顺手带进来的**，提交说明没提、AGENTS.md
+  零命中——用户拿到 413
+  时直接怀疑「是不是你的幻觉」，我去查也只能说「查不到出处」。于是绕过代理直接打上游（`.tmp-cnb-1mib-probe.ts`，只发给
+  cnb.cool，不占隧道和串行闸）：**1.000MiB 通过、1.050MiB 起
+  `413 [BODY_TOO_LARGE]`、1.5/3/8MiB 同样**。所以预检该留、阈值 1048576
+  也对（甚至略保守）。 两条比结论更重要的教训：
+  ①**「查不到记录」不等于「不存在」**。我查证了「没有出处」，就顺着用户的话说「你是对的，我证明不了它」——那是把**未记录**误当成**已证伪**。用户质疑的语气对（它确实该被质疑），但方向对不等于结论对，结论只能由实测给。连带把预检的措辞改诚实：原来写
+  "cnb gateway rejects…"
+  像是上游回的，**实际请求根本没发出去**，排查的人会被指向上游；现在明说「ai-proxy
+  在发送前拒绝了」，并附上游原文佐证。 ②**第一版探针六个请求全被 401
+  挡在鉴权层，等于一个都没测**。原因是我把 CSRF 头写成 `X-CSRFToken`，而
+  `cnbCall` 用的是 **`Csrftoken`**（无 `X-` 前缀）。401 和 413
+  是**两个不同的失败层**，混在一起看就会把「没测到」当成「测过了」——**探针必须复刻被测路径的头，连头名的拼法都一样**。
+- **cnb 不是「不支持工具调用」，是「禁止在这个场景用」（2026-10-06
+  实测；这条纠正了 README/AGENTS
+  里存在很久的错误表述）**：查由是用户问「为什么上游的模型不支持 tool
+  调用」。同一个问题做四点对照：
+  | 请求                                    | 结果                                                              |
+  | --------------------------------------- | ----------------------------------------------------------------- |
+  | 不带 `tools`                            | 200                                                               |
+  | 带 `tools`（OpenAI 标准形状）           | **403** `[FORBIDDEN]Agent calls are not allowed in this scenario` |
+  | 带 `tool_choice`                        | 403 同上                                                          |
+  | 带伪造的 `tool_calls` + `tool` 结果历史 | 403 同上                                                          |
 
-  措辞是 **"not allowed in *this scenario*"**——模型有能力，是路径被禁。上游的商业逻辑由此清楚：**纯对话免费，工具调用是收费能力，只在 NPC 场景开放**（NPC 按 token 计费）。同一实测批次还确认：**`model` 参数在这条路径上被完全忽略**（5 个模型名，含收费的 glm-5.3/kimi-k3，＋补 `user:"xxx@cnb"` 字段，＋改用 UI 真实路径 `/${slug}/-/ai/chat/completions` 跑 3 个仓库，全部回落 `deepseek-v4.1-flash`，连 usage 都逐字相同），所以 **cnb 只该发布 `deepseek-v4.1-flash` 一个模型**，加 hy4/glm 是死控件。
-  **所以 `cnbBuildToolPrompt` 的本质是「把 `tools` 字段整个拿掉」而不是协议翻译**——上游收到的是普通对话请求，403 从未被触发。三条推论：
-  ①**这是绕过，不是适配**：它依赖对方的检测盲区（现在只看「请求里有没有 `tools` 字段」）。哪天改成看响应内容或提示词特征就失效。配合 `/codebuddy` 页面官方那句「临时免费，年后再说」，**cnb 只能是补充渠道**，别在它上面做不可替代的设计。
+  措辞是 **"not allowed in _this
+  scenario_"**——模型有能力，是路径被禁。上游的商业逻辑由此清楚：**纯对话免费，工具调用是收费能力，只在
+  NPC 场景开放**（NPC 按 token 计费）。同一实测批次还确认：**`model`
+  参数在这条路径上被完全忽略**（5 个模型名，含收费的 glm-5.3/kimi-k3，＋补
+  `user:"xxx@cnb"` 字段，＋改用 UI 真实路径 `/${slug}/-/ai/chat/completions` 跑
+  3 个仓库，全部回落 `deepseek-v4.1-flash`，连 usage 都逐字相同），所以 **cnb
+  只该发布 `deepseek-v4.1-flash` 一个模型**，加 hy4/glm 是死控件。 **所以
+  `cnbBuildToolPrompt` 的本质是「把 `tools`
+  字段整个拿掉」而不是协议翻译**——上游收到的是普通对话请求，403
+  从未被触发。三条推论：
+  ①**这是绕过，不是适配**：它依赖对方的检测盲区（现在只看「请求里有没有 `tools`
+  字段」）。哪天改成看响应内容或提示词特征就失效。配合 `/codebuddy`
+  页面官方那句「临时免费，年后再说」，**cnb
+  只能是补充渠道**，别在它上面做不可替代的设计。
   ②**「不支持」和「禁止」是两种截然不同的处境**，写文档时不能混：前者该做适配层（翻译协议），后者只是在赌检测不升级。旧表述把后者写成前者，等于把风险藏起来了。
-  ③**判据来自四点对照实验**，不是读代码推的——代码里只有「把 tools 渲染成 prompt」这个既成事实，看不出上游到底是不支持还是禁止；只有真发一次带 `tools` 的请求才会暴露 403。
-- **cnb 的输出上限整整两周没生效过：键名写成了 camelCase（2026-10-06 实测；从 70d9de4 起）**：`src/cnb.ts` 一直发 `maxTokens`，而上游**只认** `max_tokens`。直连对照（同一 prompt，只改键名）：
-  | 发出的键 | 结果 |
-  |---|---|
-  | `max_tokens: 1` | `finish_reason:"length"`，正文 1 字符 ✅ |
-  | `maxTokens: 1` | 照常输出 **399** token ❌ |
-  | `max_new_tokens: 1` / `max_completion_tokens: 1` | 399 token ❌ |
+  ③**判据来自四点对照实验**，不是读代码推的——代码里只有「把 tools 渲染成
+  prompt」这个既成事实，看不出上游到底是不支持还是禁止；只有真发一次带 `tools`
+  的请求才会暴露 403。
+- **cnb 的输出上限整整两周没生效过：键名写成了 camelCase（2026-10-06 实测；从
+  70d9de4 起）**：`src/cnb.ts` 一直发 `maxTokens`，而上游**只认**
+  `max_tokens`。直连对照（同一 prompt，只改键名）：
+  | 发出的键                                         | 结果                                     |
+  | ------------------------------------------------ | ---------------------------------------- |
+  | `max_tokens: 1`                                  | `finish_reason:"length"`，正文 1 字符 ✅ |
+  | `maxTokens: 1`                                   | 照常输出 **399** token ❌                |
+  | `max_new_tokens: 1` / `max_completion_tokens: 1` | 399 token ❌                             |
 
-  后果：**客户端传的 `max_tokens` 被静默丢弃，那个 `120000` 兜底也从没到达上游**——cnb 实际跑在「完全不设上限」上。已改成 snake，并加回归断言（这套单测不打网络，所以只能守「键名/透传」这个形状；上游认不认的对照记在 `cnb.ts` 的注释里）。
-  两条比这条 bug 更值钱的判据：**①「代码里有这个参数」不等于「这个参数生效了」**——验证只能做 `值=1` 的边界对照，`200` 什么都不证明（它同时兼容「照收」和「忽略」）；本项目已在 kilo `opencode.variants`、workbuddy `max_completion_tokens`、cnb `maxTokens` 三处撞上同一种「字段名/形状没对上、静默失效」。**②经代理测出的是「代理＋上游」的合成结果**——我第一次探针打的是本地代理，三个不同 cap 返回逐字节相同，差点写成「cnb 完全忽略 max_tokens」，真相是代理把键名改错了；先用直连确立上游基线，再测代理有没有忠实转发。
-  **附带实测**：cnb 的 thinking token **计入** `max_tokens`（`completion = reasoning + 正文`）。`max_tokens=32`+high → completion 32 / reasoning 32 / **正文 0 字符** / `finish_reason:"length"`。所以 cap 给小了会被思考吃光，界面上表现为「模型不说话」而不是「参数给小了」——兜底 120000 远大于实测思考量，不会踩到。
+  后果：**客户端传的 `max_tokens` 被静默丢弃，那个 `120000`
+  兜底也从没到达上游**——cnb 实际跑在「完全不设上限」上。已改成
+  snake，并加回归断言（这套单测不打网络，所以只能守「键名/透传」这个形状；上游认不认的对照记在
+  `cnb.ts` 的注释里）。 两条比这条 bug
+  更值钱的判据：**①「代码里有这个参数」不等于「这个参数生效了」**——验证只能做
+  `值=1` 的边界对照，`200`
+  什么都不证明（它同时兼容「照收」和「忽略」）；本项目已在 kilo
+  `opencode.variants`、workbuddy `max_completion_tokens`、cnb `maxTokens`
+  三处撞上同一种「字段名/形状没对上、静默失效」。**②经代理测出的是「代理＋上游」的合成结果**——我第一次探针打的是本地代理，三个不同
+  cap 返回逐字节相同，差点写成「cnb 完全忽略
+  max_tokens」，真相是代理把键名改错了；先用直连确立上游基线，再测代理有没有忠实转发。
+  **附带实测**：cnb 的 thinking token **计入**
+  `max_tokens`（`completion = reasoning + 正文`）。`max_tokens=32`+high →
+  completion 32 / reasoning 32 / **正文 0 字符** /
+  `finish_reason:"length"`。所以 cap
+  给小了会被思考吃光，界面上表现为「模型不说话」而不是「参数给小了」——兜底
+  120000 远大于实测思考量，不会踩到。
 
 ## 行为规则
 
