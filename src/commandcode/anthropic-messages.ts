@@ -107,12 +107,35 @@ export function anthropicMessagesToChat(input: unknown):
     const system = textFromBlocks(input.system);
     if (system) messages.push({ role: "system", content: system });
   }
+  // ★ 非 user/assistant 的 role 不再整单拒绝（2026-10-18）。Claude Code 的
+  // 会话续接/转发链会在 messages 里混进 role:"system"/"tool"/"developer"
+  // 甚至缺 role 的条目，硬拒等于整轮 400。降级策略：
+  //   system/developer → 并入开头的 system 消息（语义就是系统级指令）
+  //   tool → 转成 user 文本（与下方 tool_result 块同一套处理思路）
+  //   其它/缺失 → 跳过，但记进 skippedRoles 供响应诊断
+  const skippedRoles: string[] = [];
+  const extraSystem: string[] = [];
   for (const raw of input.messages) {
-    if (!isRecord(raw) || (raw.role !== "user" && raw.role !== "assistant")) {
-      return {
-        ok: false,
-        message: "each message must have role user or assistant",
-      };
+    if (!isRecord(raw)) {
+      skippedRoles.push("(non-object)");
+      continue;
+    }
+    const role = typeof raw.role === "string" ? raw.role.toLowerCase() : "";
+    if (role === "system" || role === "developer") {
+      const extra = textFromBlocks(raw.content);
+      if (extra) extraSystem.push(extra);
+      continue;
+    }
+    if (role === "tool") {
+      const toolText = textFromBlocks(raw.content);
+      if (toolText) {
+        messages.push({ role: "user", content: `[Tool Result]\n${toolText}` });
+      }
+      continue;
+    }
+    if (role !== "user" && role !== "assistant") {
+      skippedRoles.push(role || "(missing)");
+      continue;
     }
     const content = raw.content;
     const blocks = Array.isArray(content) ? content : [content];
@@ -142,7 +165,9 @@ export function anthropicMessagesToChat(input: unknown):
             arguments: JSON.stringify(block.input ?? {}),
           },
         });
-      } else if (block.type === "tool_result" && raw.role === "user") {
+      } else if (block.type === "tool_result") {
+        // tool_result 规范上只出现在 user 消息里，但转发链可能挪到 assistant
+        // 名下——内容本身仍是工具结果，按同一套处理，不拒。
         if (typeof block.tool_use_id !== "string") {
           return { ok: false, message: "tool_result requires tool_use_id" };
         }
@@ -170,6 +195,33 @@ export function anthropicMessagesToChat(input: unknown):
         content: result.content,
       });
     }
+  }
+  // messages 里混入的 system/developer 指令并到最前面（Anthropic 语义里它们
+  // 本来就该是 system 层）；若上游需要单一 system 形状就拼一条。
+  if (extraSystem.length > 0) {
+    const merged = extraSystem.join("\n\n");
+    if (
+      messages[0] && messages[0].role === "system" &&
+      typeof messages[0].content === "string"
+    ) {
+      messages[0] = {
+        role: "system",
+        content: messages[0].content + "\n\n" + merged,
+      };
+    } else {
+      messages.unshift({ role: "system", content: merged });
+    }
+  }
+  // 降级跳过可能清空整个 messages（例如全部条目缺 role）——这时上游只会回
+  // 一句看不懂的 "cnb upstream request failed"。在转换层就给出明确诊断。
+  if (messages.length === 0) {
+    return {
+      ok: false,
+      message: "no usable messages after conversion" +
+        (skippedRoles.length
+          ? ` (skipped roles: ${skippedRoles.join(", ")})`
+          : ""),
+    };
   }
 
   const body: Json = {

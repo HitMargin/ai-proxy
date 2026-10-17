@@ -104,6 +104,63 @@ Deno.test("Anthropic stop_sequences/top_k map into the chat body instead of fail
   equal("thinking" in result.body, false);
 });
 
+Deno.test("Anthropic messages with foreign roles are downgraded, not rejected", () => {
+  // 2026-10-18：Claude Code 的会话续接/转发链会在 messages 里混进
+  // role:"system"/"tool"/"developer" 甚至缺 role 的条目，硬拒等于整轮 400。
+  const result = anthropicMessagesToChat({
+    model: "deepseek/test",
+    max_tokens: 10,
+    messages: [
+      { role: "system", content: "injected system" },
+      { role: "user", content: "hi" },
+      { role: "tool", content: "tool output" },
+      { role: "developer", content: "developer note" },
+      { content: "no role at all" },
+    ],
+  });
+  equal(result.ok, true);
+  if (!result.ok) return;
+  const msgs = result.body.messages as Array<Record<string, unknown>>;
+  // system/developer 的内容都进了 system 层
+  const sys = msgs.find((m) => m.role === "system") as { content: string };
+  assert(
+    typeof sys?.content === "string",
+    "system message must exist with string content",
+  );
+  assert(
+    sys.content.includes("injected system"),
+    "injected system must survive",
+  );
+  assert(
+    sys.content.includes("developer note"),
+    "developer content must merge into system",
+  );
+  // tool 转成 user 文本
+  const toolAsUser = msgs.find((m) =>
+    m.role === "user" && String(m.content).includes("[Tool Result]")
+  );
+  assert(!!toolAsUser, "a foreign tool message must become user text");
+  // 原 user 消息仍在
+  assert(
+    msgs.some((m) => m.role === "user" && m.content === "hi"),
+    "the real user message must survive",
+  );
+});
+
+Deno.test("Anthropic messages that degrade to empty produce a diagnostic, not an upstream 400", () => {
+  const result = anthropicMessagesToChat({
+    model: "deepseek/test",
+    max_tokens: 10,
+    messages: [{ content: "no role at all" }],
+  });
+  equal(result.ok, false);
+  if (result.ok) return;
+  assert(
+    result.message.includes("no usable messages"),
+    `the error must name the empty-conversion problem; got: ${result.message}`,
+  );
+});
+
 Deno.test("Chat response converts to Anthropic message with usage", () => {
   const message = chatResponseToAnthropic({
     id: "chatcmpl-1",
