@@ -338,7 +338,11 @@ function v1ResolveModel(model: string): { key: string; raw: string } | null {
     if (V1_AGGREGATE_MEMBERS.includes(key)) {
       return { key, raw: model.slice(slash + 1) };
     }
-    return null;
+    // ★ 2026-10-18：裸 id 本身可能含斜杠（kilo 的 id 全是 kilo-auto/free、
+    // nvidia/nemotron-3.5-super-vl:free 这种形状）。第一个斜杠把 "kilo-auto"
+    // 当成了渠道名 → 解析失败 → cc-haha 这类把裸 id 填进模型槽位的客户端
+    // 每轮 400。修法：斜杠分支失败时不要 return，落到下面的裸 id 扫描——
+    // 目录 warm 后（hint 里承诺的 "after the list is warm"）裸 id 依然可解析。
   }
   for (const key of V1_AGGREGATE_MEMBERS) {
     if (v1MemberModelIds(key).includes(model)) return { key, raw: model };
