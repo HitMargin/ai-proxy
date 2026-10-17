@@ -1387,3 +1387,34 @@ Deno.test("cnb: the rewritten request passes cnbBuildUpstream without the trigge
     "the wire body carries the neutral identity instead",
   );
 });
+
+Deno.test("cnb: gitStatus template fingerprint is rewritten (2026-10-18 second fingerprint)", () => {
+  // cnb 的渠道校验还有第二个指纹：Claude Code 注入的 gitStatus 模板
+  // "Main branch (you will usually use this for PRs): <branch>"——到冒号即触发。
+  // cc-haha 的会话必带 gitStatus 块，主身份句改写后仍被拦就是它。
+  const body = {
+    model: "cnb/deepseek-v4.1-flash",
+    max_tokens: 16,
+    messages: [
+      {
+        role: "system",
+        content:
+          "gitStatus: This is the git status at the start of the conversation.\n\n" +
+          "Current branch: master\n\n" +
+          "Main branch (you will usually use this for PRs): master\n\n" +
+          "Git user: Someone",
+      },
+      { role: "user", content: "hi" },
+    ],
+  };
+  const up = cnbBuildUpstream(body);
+  const sys = String((up.upstream.messages as any[])[0].content);
+  assert(
+    !sys.includes("(you will usually use this for PRs)"),
+    "the gitStatus template wording must be rewritten away",
+  );
+  assert(
+    sys.includes("Main branch: master"),
+    "the branch name must survive the rewrite",
+  );
+});

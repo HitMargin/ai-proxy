@@ -1585,13 +1585,21 @@ function commonPrefixLen(a: string, b: string) {
  * 内容为数组（多模态）时逐个 text 块处理，图片块原样保留。
  */
 export function neutraliseClientIdentity(msgs: any[]): any[] {
-  // 完整短语，以及它能被容忍的标点/空白变体。大小写不敏感在下面统一处理。
+  // 指纹 A：完整身份句，以及它能被容忍的标点/空白变体。大小写不敏感在下面统一处理。
   // 故意只匹配这个"整句"：拆开就不被拦（实测），改了就别无谓地动其它文本。
   const IDENTITY =
     /You are Claude Code,{1,2}\s*Anthropic['’]s official CLI for Claude\.?/gi;
   const REPLACEMENT = "You are a coding agent working inside a CLI tool.";
 
-  const rewrite = (text: string): string => text.replace(IDENTITY, REPLACEMENT);
+  // 指纹 B（2026-10-18 第二次实拆）：Claude Code 注入的 gitStatus 模板
+  // "Main branch (you will usually use this for PRs): <branch>"——**到冒号即触发**，
+  // 分支名可有无。cc-haha 的会话必带 gitStatus 块，主身份句改写后仍被拦就是它。
+  // 替换保留信息量（分支名还在），只去掉那段标志性模板措辞。
+  const GIT_STATUS = /Main branch \(you will usually use this for PRs\)\s*:/gi;
+  const GIT_REPLACEMENT = "Main branch:";
+
+  const rewrite = (text: string): string =>
+    text.replace(IDENTITY, REPLACEMENT).replace(GIT_STATUS, GIT_REPLACEMENT);
 
   return msgs.map((m) => {
     const role = String(m?.role ?? "").toLowerCase();
