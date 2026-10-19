@@ -357,6 +357,85 @@ Deno.test("fallback truncation says so when even the note does not fit", () => {
   assert(after > 10, "fixture: the note alone exceeds the tiny budget");
 });
 
+// ---------- 2026-10-19 第二次：截断必须把「非消息开销」也扣掉 ----------
+//
+// 第一次修好了单位（字节 vs token），但生产日志仍有
+//   [compacted via truncation] bytes 1096888 -> 1018872 | WARNING: still over budget (921600B)
+// 因为 budget 管的是**整个 body**，而函数只看得见 messages；差额是 model /
+// max_tokens / tools 定义等固定开销。消息装到 92 万内，body 仍 101 万。
+Deno.test("fallback truncation subtracts overhead that is not in the messages", () => {
+  const chunk = "中".repeat(300); // 900 字节
+  const messages: any[] = [];
+  for (let i = 0; i < 200; i += 1) {
+    messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: chunk });
+  }
+  const budget = 40000;
+  // 上游真实形态：工具定义等固定开销占了 15 KB。
+  const overhead = 15000;
+
+  const withoutOverhead = fallbackTruncate(messages, budget);
+  const withOverhead = fallbackTruncate(messages, budget, overhead);
+  const sizeOf = (list: any[]) =>
+    new TextEncoder().encode(JSON.stringify(list)).length;
+
+  // 不扣开销时，消息可以用满 40K；扣了之后必须明显更少。
+  assert(
+    sizeOf(withOverhead.messages) < sizeOf(withoutOverhead.messages),
+    "knowing the overhead must leave less room for messages",
+  );
+  // 判据：消息 + 开销必须落进 budget，而不是只有消息落进去。
+  assert(
+    sizeOf(withOverhead.messages) + overhead <= budget,
+    `messages + overhead must fit the budget, got ${
+      sizeOf(withOverhead.messages) + overhead
+    } > ${budget}`,
+  );
+});
+
+Deno.test("a failed summary carries its reason", async () => {
+  resetCompactionStates();
+  const messages = [
+    { role: "user", content: "z".repeat(6000) },
+    { role: "assistant", content: "final" },
+  ];
+  const result = await compactIfNeeded({
+    messages,
+    body: { messages },
+    contextWindow: 900,
+    maxOutputTokens: 90,
+    sessionId: "ses_reason",
+    config: { keepTokens: 20, buffer: 100, maxSummaryTokens: 32 },
+    writeSummary: async () => {
+      throw new Error("upstream said 413 BODY_TOO_LARGE");
+    },
+  });
+  assertEqual(result.note, "summary-failed");
+  // 没有原因时日志只有“summary generation failed”五个字，排查只能靠猜。
+  assert(
+    (result.error ?? "").includes("BODY_TOO_LARGE"),
+    `the failure reason must survive, got ${JSON.stringify(result.error)}`,
+  );
+});
+
+Deno.test("an empty summary is reported as empty, not as a generic failure", async () => {
+  resetCompactionStates();
+  const messages = [
+    { role: "user", content: "z".repeat(6000) },
+    { role: "assistant", content: "final" },
+  ];
+  const result = await compactIfNeeded({
+    messages,
+    body: { messages },
+    contextWindow: 900,
+    maxOutputTokens: 90,
+    sessionId: "ses_empty",
+    config: { keepTokens: 20, buffer: 100, maxSummaryTokens: 32 },
+    writeSummary: async () => "   ",
+  });
+  assertEqual(result.note, "summary-failed");
+  assertEqual(result.error, "summary response was empty");
+});
+
 Deno.test("compaction state is evicted once the table is full", async () => {
   resetCompactionStates();
   // 表上限 256。塞满之后再压一个新的键，最旧的必须被淘汰，否则就是泄漏。

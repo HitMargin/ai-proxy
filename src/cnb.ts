@@ -3270,6 +3270,19 @@ export async function maybeCompactCnb(
   })();
   const keyLabel = stateKey === "" ? "(none)" : stateKey;
 
+  // ★ 非消息部分的字节数。`budget` 管的是**整个 body**，而 fallbackTruncate
+  // 只看得见 `messages`——差额（model/max_tokens/tools 定义/system 指令）必须
+  // 显式扣掉，否则截断永远差那一截。实测：消息已装到 92 万内，body 仍有
+  // 101 万，于是每轮都退化成截断并报 `WARNING: still over budget`。
+  const overheadBytes = (() => {
+    try {
+      const probe = { ...body, messages: [] as any[] };
+      return new TextEncoder().encode(JSON.stringify(probe)).length;
+    } catch {
+      return 0;
+    }
+  })();
+
   if (result.changed) {
     body.messages = result.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
@@ -3284,7 +3297,7 @@ export async function maybeCompactCnb(
     // 这里不递归重压（重压只会再烧一次摘要、成本翻倍），而是**如实说出来**并
     // 直接降级到字节截断：截断是确定性的、不花钱、且保证收敛到预算内。
     if (after > budget) {
-      const truncated = fallbackTruncate(body.messages, budget);
+      const truncated = fallbackTruncate(body.messages, budget, overheadBytes);
       body.messages = truncated.messages;
       const final = new TextEncoder().encode(JSON.stringify(body)).length;
       cnbLastCompactNote +=
@@ -3300,11 +3313,14 @@ export async function maybeCompactCnb(
     // 到实际体积之上，于是**一条消息都没删**，只多加 149 字节的说明。
     // 日志里因此有 `bytes 4121421 -> 4121570`（变大）与
     // `bytes 4296416 -> 4296565`。现在直接传字节预算，与上游同一把尺子。
-    const truncated = fallbackTruncate(messages, budget);
+    const truncated = fallbackTruncate(messages, budget, overheadBytes);
     body.messages = truncated.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
+    // 失败原因必须可见：日志里连续几十行都只有 "summary generation failed"，
+    // 没有任何线索说明是超时、401、还是上游拒答——那等于没有诊断。
+    const why = result.error ? `: ${result.error}` : "";
     cnbLastCompactNote = `${truncated.note} session=${keyLabel} ` +
-      `(summary generation failed) bytes ${bytes} -> ${after}`;
+      `(summary generation failed${why}) bytes ${bytes} -> ${after}`;
     if (after > budget) {
       // 连截断都没压下来（例如单条 system 指令就超预算）。说出来，别假装成功。
       cnbLastCompactNote += ` | WARNING: still over budget (${budget}B)`;

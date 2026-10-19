@@ -1094,6 +1094,31 @@ async function handleWorkBuddy(
 const customListingWarn = new DedupedWarn((reason) =>
   console.warn(`[v1] custom: ${reason}`)
 );
+/**
+ * 每个渠道一份去重器。
+ *
+ * ★ 2026-10-19 加。修 `custom` 刷屏时只修了 `custom` 一个分支，而**同一个
+ * 函数里其余渠道是同一写法**——生产日志随即证明这一点：
+ *
+ *     [v1] zen: Zen returned no free models   × 11 行
+ *
+ * 判据：**一处刷屏意味着同类分支全都刷屏**。`v1FetchMemberModels()` 每个
+ * `/v1/models` 与每个 `/v1/chat/completions` 都会跑，任何“稳定失败”都会按
+ * 请求数增长。所以按渠道各持一份，而不是只给 custom 打补丁。
+ */
+const channelListingWarn = new Map<string, DedupedWarn>();
+function warnChannelOnce(key: string, reason: string): void {
+  let w = channelListingWarn.get(key);
+  if (!w) {
+    w = new DedupedWarn((r) => console.warn(`[v1] ${key}: ${r}`));
+    channelListingWarn.set(key, w);
+  }
+  w.warn(reason);
+}
+/** 渠道恢复成功时调用，好让下一次故障重新可见。 */
+function clearChannelWarning(key: string): void {
+  channelListingWarn.get(key)?.reset();
+}
 let lastCustomListingIssue = "";
 function logCustomListingIssueOnce(reason: string): void {
   customListingWarn.warn(reason);
@@ -1131,7 +1156,7 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
       else {
         const reason = "Zen returned no free models";
         catalog.failed(key, reason, now);
-        console.warn(`[v1] ${key}: ${reason}`);
+        warnChannelOnce(key, reason);
       }
       return;
     }
@@ -1155,7 +1180,7 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
         const reason =
           "deepseek-web has no login state yet (cookie, token, headers)";
         catalog.failed(key, reason, now);
-        console.warn(`[v1] ${key}: ${reason}`);
+        warnChannelOnce(key, reason);
       }
       return;
     }
@@ -1173,7 +1198,7 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
         // a channel that quietly went missing.
         const reason = error instanceof Error ? error.message : String(error);
         catalog.failed(key, reason, now);
-        console.warn(`[v1] ${key}: ${reason}`);
+        warnChannelOnce(key, reason);
       }
       return;
     }
@@ -1192,7 +1217,7 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
         // difference between a fixable message and a channel that went missing.
         const reason = error instanceof Error ? error.message : String(error);
         catalog.failed(key, reason, now);
-        console.warn(`[v1] ${key}: ${reason}`);
+        warnChannelOnce(key, reason);
       }
       return;
     }
@@ -1203,7 +1228,7 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
       else {
         const reason = "CommandCode returned no models";
         catalog.failed(key, reason, now);
-        console.warn(`[v1] ${key}: ${reason}`);
+        warnChannelOnce(key, reason);
       }
       return;
     }
@@ -1281,7 +1306,7 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
       // channel fewer and nothing said why. Record it instead of swallowing it.
       const reason = error instanceof Error ? error.message : String(error);
       catalog.failed(key, `listing request failed: ${reason}`, now);
-      console.warn(`[v1] ${key} model list failed: ${reason}`);
+      warnChannelOnce(key, "model list failed: " + reason);
       return;
     }
     const parsed = await tryParseResponse(resp);
@@ -1290,8 +1315,9 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
         ? `upstream answered ${JSON.stringify(parsed.error).slice(0, 160)}`
         : "upstream returned no model list";
       catalog.failed(key, reason, now, { status: resp.status });
-      console.warn(
-        `[v1] ${key} model list unusable (HTTP ${resp.status}): ${reason}`,
+      warnChannelOnce(
+        key,
+        `model list unusable (HTTP ${resp.status}): ${reason}`,
       );
       return;
     }
@@ -1313,10 +1339,13 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
         status: resp.status,
         listedModels: listed,
       });
-      console.warn(`[v1] ${key}: ${reason}`);
+      warnChannelOnce(key, reason);
       return;
     }
     catalog.ok(key, listed, arr.length, now);
+    // 恢复成功 → 允许下一次故障重新出现。不 reset 的话，「坏 → 好 → 同样的坏」
+    // 的第二次会被去重器吃掉，而那一次正是用户最该看见的。
+    clearChannelWarning(key);
   }));
   return out;
 }

@@ -303,6 +303,16 @@ export interface CompactResult {
   compactTokens: number;
   /** Rebuilt transcript when `changed`; empty otherwise. */
   messages: any[];
+  /**
+   * 摘要调用失败时的原因（仅 `note === "summary-failed"` 时存在）。
+   *
+   * ★ 2026-10-19 加。此前调用方只能看到「summary generation failed」这五个字，
+   * 而生产日志里它连续出现几十行，没有任何线索区分超时、401、上游拒答、
+   * 或返回空内容——**那不是日志，是一句没有信息的噪音**。判据：失败必须带上
+   * 自己的原因，否则排查时只能靠猜（和 AGENTS.md 里“只在统计里出现的失败
+   * 等于没有日志的失败”同一条）。
+   */
+  error?: string;
 }
 
 /**
@@ -370,12 +380,14 @@ export async function compactIfNeeded(
       summaryModel,
       config.maxSummaryTokens,
     );
-  } catch {
+  } catch (e) {
     return {
       changed: false,
       note: "summary-failed",
       compactTokens: 0,
       messages: [],
+      // 把真实原因带上去：调用方会写进日志。
+      error: e instanceof Error ? e.message : String(e),
     };
   }
   if (typeof summary !== "string" || summary.trim() === "") {
@@ -384,6 +396,7 @@ export async function compactIfNeeded(
       note: "summary-failed",
       compactTokens: 0,
       messages: [],
+      error: "summary response was empty",
     };
   }
 
@@ -457,9 +470,27 @@ export async function compactIfNeeded(
  * 与 `maybeCompactCnb` 里那道 `bytes <= budget` 的闸门同一把尺子，不再做
  * 任何单位换算——换算正是这个 bug 的来源。
  */
+/**
+ * 最后一道截断：摘要调用失败、或摘要压不到线以下时使用。
+ *
+ * ⚠️ 2026-10-19 第二次修（第一次修掉了单位错误，但没修掉**口径**错误）：
+ * 第一次改成按字节做账之后，日志里仍是
+ *
+ *     [compacted via truncation] (summary generation failed)
+ *     bytes 1096888 -> 1018872 | WARNING: still over budget (921600B)
+ *
+ * 也就是说消息已经按字节装到 92 万以内，**但整个 body 仍有 101 万**。差额是
+ * 消息之外的固定开销：`model` / `max_tokens` / `tools` 定义 / system 指令等。
+ * 函数只看见了 `messages`，把 `budgetBytes` 全部给了它们，于是永远差那一截。
+ *
+ * 现在由调用方把「非消息部分的字节数」显式传进来（`overheadBytes`），
+ * 预算先扣掉它再分给消息。判据：**截断后的 body 必须落进 budget**，
+ * 而不是“消息部分落进 budget’”——后者是这次 WARNING 一直不退的原因。
+ */
 export function fallbackTruncate(
   messages: any[],
   budgetBytes: number,
+  overheadBytes = 0,
 ): { changed: boolean; note: string; messages: any[] } {
   if (!Array.isArray(messages) || messages.length === 0) {
     return { changed: false, note: "", messages };
@@ -479,8 +510,8 @@ export function fallbackTruncate(
     `[context compaction] 请求体积超过该渠道的字节上限(约 ${budgetBytes} 字节),早期消息已被截断以继续会话。`;
   const noteBytes = sizeOf({ role: "system", content: noteContent });
 
-  // 预算要同时容纳那条说明；否则说明本身就把预算吃掉，仍然超限。
-  const usable = Math.max(0, budgetBytes - noteBytes);
+  // 预算要同时容纳那条说明与非消息开销；否则说明本身就把预算吃掉，仍然超限。
+  const usable = Math.max(0, budgetBytes - overheadBytes - noteBytes);
 
   const kept: { index: number; message: any }[] = [];
   let used = 0;
