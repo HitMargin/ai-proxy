@@ -2415,7 +2415,45 @@ async function cnbCallUpstreamInner(upBody: any): Promise<Response> {
 // OpenAI Responses API (/v1/responses) → cnb 适配
 // ============================================
 
-// Responses 请求 → 内部 OpenAI chat 格式（随后走 cnbBuildUpstream 的 XYML 管线）
+/**
+ * Responses 请求 → 已压缩、可直接交给 cnbBuildUpstream 的 chat body。
+ *
+ * ★ 2026-10-19 修（用户报的 413）：responses 这条路一直没接压缩。
+ *
+ * 现场：DSH 的 desktop profile 里 provider `cnb` 声明的是
+ * `api: openai-responses`（`~/.dsh/profiles/desktop/cordis.patch.yml:1545`，
+ * baseURL `http://localhost:8000/cnb/v1`），默认模型就是 `cnb/deepseek-v4.1-flash`，
+ * 于是每一轮都打 /responses。而 /chat/completions 有压缩、/messages 靠自转发
+ * 白送压缩，**只有 /responses** 把 responsesToChat 的结果直接喂给
+ * cnbBuildUpstream，全程不调 maybeCompactCnb —— body 一路涨过上游 1 MiB 硬限，
+ * 上游回 413，而本地闸门只打一行 `sending anyway` 就放行。
+ *
+ * 实测（同一份 1.15 MiB 内容打三个端点）：
+ *   /chat/completions → 200，日志有 compacted
+ *   /messages         → 200，日志有 compacted
+ *   /responses        → 413，只有 `[cnb-gate] large body`，零 compacted
+ *
+ * 之所以抽成函数而不是在两处各写一遍：压缩与构造 upstream 的**顺序**是
+ * 这条链上唯一容易写错的约束（compress 之后再 build，否则改写后的 messages
+ * 进不了真实请求——AGENTS.md 里 Zen 那条记的就是这个坑）。抽出来之后
+ * 调用方只剩一行，顺序不可能写反。
+ */
+async function cnbResponsesChatBody(
+  rb: any,
+  session: string,
+): Promise<any> {
+  const chatBody = responsesToChat(rb);
+  const compactNote = await maybeCompactCnb(chatBody, session);
+  if (compactNote) console.warn(`[cnb] ${compactNote}`);
+  return chatBody;
+}
+
+/**
+ * Responses 请求 → 内部 OpenAI chat 格式（随后走 cnbBuildUpstream 的 XYML 管线）。
+ *
+ * 只做形状转换，**不管体积**。压缩由调用方的 cnbResponsesChatBody 统一负责，
+ * 这样「转换」与「瘦身」各自只有一个地方可写错。
+ */
 function responsesToChat(rb: any) {
   const messages: any[] = [];
   if (rb.instructions) {
@@ -2560,7 +2598,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
 
   // ─── 非流式：保持同步（本来就没有流式头的问题） ───
   if (!wantStream) {
-    const chatBody = responsesToChat(rb);
+    const chatBody = await cnbResponsesChatBody(rb, sessionIdOf(request));
     let built;
     try {
       built = cnbBuildUpstream(chatBody);
@@ -2676,7 +2714,8 @@ async function handleCnbResponses(request: Request): Promise<Response> {
         response: shell("in_progress", []),
       });
 
-      const chatBody = responsesToChat(rb);
+      // 与非流式分支走同一个入口：压缩→构造的顺序只在一处定义。
+      const chatBody = await cnbResponsesChatBody(rb, sessionIdOf(request));
       const built = cnbBuildUpstream(chatBody);
       const upBody = built.upstream;
       shell = responsesShell(

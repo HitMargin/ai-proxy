@@ -1899,3 +1899,199 @@ Deno.test("cnb: reasoning starvation is recognised by three conditions together"
     "whitespace-only content must count as empty",
   );
 });
+
+// ---------- 2026-10-19 第十次修：/responses 这条路必须压缩 ----------
+//
+// 用户报的 413 就是这个。DSH 的 desktop profile 里 provider `cnb` 声明的是
+// `api: openai-responses`（~/.dsh/profiles/desktop/cordis.patch.yml:1545），
+// 于是每轮都打 /responses。而压缩只接在 /chat/completions 上（/messages 靠
+// 自转发白送），/responses 直接把 responsesToChat 的结果喂给 cnbBuildUpstream
+// —— 1.5 MB 的会话原样发出去，上游 413。
+//
+// 判据必须是**离开代理的请求体**，不是 helper 的返回值：helper 可以正确、
+// 而调用方忘了接。所以这里 stub 掉 fetch，量真正发往上游的字节。
+Deno.test("cnb: an oversized /responses body is compacted before it leaves", async () => {
+  const originalFetch = globalThis.fetch;
+  const postedBytes: number[] = [];
+  globalThis.fetch = (async (input: any, init: RequestInit = {}) => {
+    const url = String(input);
+    // ① 取 CSRF 的那一次：回一个带 csrftoken 与 csrfkey 的首页
+    if (url === "https://cnb.cool/" || url === "https://cnb.cool") {
+      return new Response(
+        '<html><script>window.csrftoken = "' +
+          "a".repeat(32) + '";</script></html>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=123456789",
+          },
+        },
+      );
+    }
+    // ② 真正的推理调用：记下体积，回一个最小的 SSE
+    postedBytes.push(
+      new TextEncoder().encode(String(init.body ?? "")).length,
+    );
+    return new Response(
+      'data: {"id":"x","choices":[{"delta":{"content":"ok"},' +
+        '"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  }) as typeof fetch;
+
+  try {
+    // 造一个约 1.2 MiB 的 Responses 会话（工具结果最容易把 body 顶大）。
+    const inputItems: any[] = [];
+    for (let i = 0; i < 6; i++) {
+      inputItems.push({
+        type: "function_call",
+        call_id: `call_${i}`,
+        name: "pwsh",
+        arguments: JSON.stringify({ command: `echo ${i}` }),
+      });
+      inputItems.push({
+        type: "function_call_output",
+        call_id: `call_${i}`,
+        output: `[${i}] ` + "排查输出。".repeat(20000),
+      });
+    }
+    inputItems.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "回复 OK" }],
+    });
+
+    const rb = {
+      model: "cnb/deepseek-v4.1-flash",
+      stream: false,
+      instructions: "You are a coding agent.",
+      input: inputItems,
+    };
+    const rawBytes = new TextEncoder().encode(JSON.stringify(rb)).length;
+    assert(
+      rawBytes > 1048576,
+      "the fixture must actually exceed the upstream limit, got " + rawBytes,
+    );
+
+    const request = new Request("http://x/cnb/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-session-id": "probe-responses-413",
+      },
+      body: JSON.stringify(rb),
+    });
+    const r = await handleCnb(
+      "/cnb/v1/responses",
+      request,
+      new URL("http://x/cnb/v1/responses"),
+    );
+
+    assertEquals(
+      r.status,
+      200,
+      "compaction must save the request, not fail it",
+    );
+    assert(postedBytes.length > 0, "the upstream must have been called");
+    // 核心断言：**任何**一次发往上游的请求体都不许超 1 MiB。修之前这里
+    // 会是 ~1.2 MB，上游回 [BODY_TOO_LARGE] 413。
+    const biggest = Math.max(...postedBytes);
+    assert(
+      biggest <= 1048576,
+      `every upstream body must fit the 1 MiB limit, biggest was ${biggest}`,
+    );
+    // 也别只是"刚好过"：压缩应该把它砍回预算内（900 KiB）。
+    assert(
+      biggest < 950 * 1024,
+      `compaction should bring it under budget, biggest was ${biggest}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// 流式分支是同一段顺序，但它跑在 TransformStream 的后台任务里，
+// 所以断言方式不同：只看上游收到的字节（上面那条覆盖了"压缩真的发生"，
+// 这条只盯住"流式这条路也没有绕过压缩"）。
+Deno.test("cnb: the streaming /responses path compacts too", async () => {
+  const originalFetch = globalThis.fetch;
+  const postedBytes: number[] = [];
+  globalThis.fetch = (async (input: any, init: RequestInit = {}) => {
+    const url = String(input);
+    if (url === "https://cnb.cool/" || url === "https://cnb.cool") {
+      return new Response(
+        '<html><script>window.csrftoken = "' +
+          "b".repeat(32) + '";</script></html>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=987654321",
+          },
+        },
+      );
+    }
+    postedBytes.push(
+      new TextEncoder().encode(String(init.body ?? "")).length,
+    );
+    return new Response(
+      'data: {"id":"x","choices":[{"delta":{"content":"ok"},' +
+        '"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const inputItems: any[] = [];
+    for (let i = 0; i < 6; i++) {
+      inputItems.push({
+        type: "function_call",
+        call_id: `call_${i}`,
+        name: "pwsh",
+        arguments: JSON.stringify({ command: `echo ${i}` }),
+      });
+      inputItems.push({
+        type: "function_call_output",
+        call_id: `call_${i}`,
+        output: `[${i}] ` + "排查输出。".repeat(20000),
+      });
+    }
+    inputItems.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "回复 OK" }],
+    });
+
+    const request = new Request("http://x/cnb/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-session-id": "probe-responses-stream",
+      },
+      body: JSON.stringify({
+        model: "cnb/deepseek-v4.1-flash",
+        stream: true,
+        instructions: "You are a coding agent.",
+        input: inputItems,
+      }),
+    });
+    const r = await handleCnb(
+      "/cnb/v1/responses",
+      request,
+      new URL("http://x/cnb/v1/responses"),
+    );
+    assertEquals(r.status, 200);
+    // 把流读干，后台任务才会真的发出上游请求。
+    await r.text();
+
+    assert(postedBytes.length > 0, "the upstream must have been called");
+    const biggest = Math.max(...postedBytes);
+    assert(
+      biggest <= 1048576,
+      `the streaming path must fit the 1 MiB limit, biggest was ${biggest}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
