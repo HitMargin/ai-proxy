@@ -269,8 +269,21 @@ async function verifyInPage(page: any, model: string): Promise<Verdict> {
   };
 }
 
-/** 仅供 --verify 模式用：只验证「网页能打开」，不涉及凭据。 */
-async function fetchCsrfToken(cookieHeader: string): Promise<string | null> {
+/**
+ * 抓 CSRF **对**（token + csrfkey），与 `src/cnb.ts:cnbFetchCsrf()` 同一判据。
+ *
+ * ⚠️ 2026-10-19 修：第一版只返回 `token`，把 `csrfkey` 丢了，于是 verify() 发出的
+ * 请求**只有 `Csrftoken` 头、没有 `csrfkey` cookie**，上游回 `403 errcode 7`
+ * （"User has no permission"）。而 `src/cnb.ts` 拼的是
+ * `Cookie: csrfkey=<..>; <登录cookie>` ——**两边形状不一致，脚本因此会把一份
+ * 有效的凭据判成失效**。实测对照（2026-10-19，真实登录态）：
+ *   CNBSESSION + csrfkey + Csrftoken → 200 出字
+ *   CNBSESSION + Csrftoken（无 csrfkey cookie）→ 403 errcode 7
+ * 所以 csrfkey 不是可选项。**判据必须与生产路径同形，否则测的是另一条路。**
+ */
+async function fetchCsrfPair(
+  cookieHeader: string,
+): Promise<{ token: string; csrfkey: string } | null> {
   try {
     const r = await fetch(CNB_ORIGIN + "/", {
       headers: {
@@ -284,7 +297,26 @@ async function fetchCsrfToken(cookieHeader: string): Promise<string | null> {
     });
     const html = await r.text();
     const m = html.match(/window\.csrftoken\s*=\s*"([0-9a-fA-F]{32,64})"/);
-    return m ? m[1] : null;
+    if (!m) return null;
+
+    let setCookies: string[] = [];
+    try {
+      if (typeof (r.headers as any).getSetCookie === "function") {
+        setCookies = (r.headers as any).getSetCookie();
+      }
+    } catch { /* 回落下面的单串解析 */ }
+    if (!setCookies.length) {
+      const raw = r.headers.get("set-cookie") || "";
+      if (raw) setCookies = raw.split(/,(?=\s*[A-Za-z0-9_-]+=)/);
+    }
+    // 不猜格式：csrfkey 实测是 9~10 位十进制（也可能变），取到分号/空白即止。
+    let csrfkey = "";
+    for (const c of setCookies) {
+      const km = c.match(/csrfkey=([^;\s]+)/);
+      if (km) { csrfkey = km[1]; break; }
+    }
+    if (!csrfkey) return null;
+    return { token: m[1], csrfkey };
   } catch {
     return null;
   }
@@ -300,17 +332,18 @@ async function verify(cookieHeader: string, model: string): Promise<Verdict> {
   let text = "";
   let detail = "";
   try {
-    const csrfToken = await fetchCsrfToken(cookieHeader);
+    // 与 src/cnb.ts 同形：csrfkey 走 cookie，token 走 Csrftoken 头，缺一不可。
+    const csrf = await fetchCsrfPair(cookieHeader);
     const r = await fetch(CNB_CHAT, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "cookie": cookieHeader,
+        "cookie": csrf ? `csrfkey=${csrf.csrfkey}; ${cookieHeader}` : cookieHeader,
         "accept": "text/event-stream, application/json",
         "origin": CNB_ORIGIN,
         "referer": CNB_ORIGIN + "/ai",
         // ★ 这一行是必需项；没有它一律 401 Blocked by CSRF。
-        ...(csrfToken ? { "Csrftoken": csrfToken } : {}),
+        ...(csrf ? { "Csrftoken": csrf.token } : {}),
       },
       body: JSON.stringify({
         model,
