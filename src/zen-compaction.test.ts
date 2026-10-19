@@ -1,5 +1,6 @@
 import {
   buildSummaryPrompt,
+  compactionState,
   compactIfNeeded,
   estimateTokens,
   fallbackTruncate,
@@ -269,5 +270,117 @@ Deno.test("a failed summary call falls back to truncation", async () => {
     truncated.messages[truncated.messages.length - 1].content,
     "final",
     "the newest turn must survive truncation",
+  );
+});
+
+// ---------- 2026-10-19：降级截断必须按字节收敛 ----------
+//
+// 旧实现把参数当 token、内部再乘 0.6，于是调用方传进来的**字节预算**被当成
+// token 用：420 万字节的中文历史估算成约 35 万 token，永远小于虚高的预算，
+// 结果一条消息都不删、只多加 149 字节的说明。
+// 生产日志里因此留下 `bytes 4121421 -> 4121570`（**变大**）与
+// `bytes 4296416 -> 4296565`，而且每轮重复。
+Deno.test("fallback truncation actually shrinks a body over the byte budget", () => {
+  // 中文一字符三字节：构造一个明显超过预算的真实形态。
+  const big = "长".repeat(20000); // ≈60000 字节
+  const messages = [
+    { role: "system", content: "sys" },
+    { role: "user", content: big },
+    { role: "assistant", content: big },
+    { role: "user", content: "最新问题" },
+  ];
+  const before = new TextEncoder().encode(JSON.stringify(messages)).length;
+  const budget = 20000;
+  assert(before > budget, `fixture must start over budget (${before} > ${budget})`);
+
+  const out = fallbackTruncate(messages, budget);
+  const after = new TextEncoder().encode(JSON.stringify(out.messages)).length;
+
+  // 判据一：必须真的变小，而且落到预算内。旧实现这里会 after > before。
+  assert(
+    after <= budget,
+    `truncated body must fit the byte budget (got ${after}, budget ${budget})`,
+  );
+  // 判据二：最新的那条对话必须留下——截断是为了继续会话，不是为了清空。
+  assertEqual(
+    out.messages[out.messages.length - 1].content,
+    "最新问题",
+    "the newest turn must survive",
+  );
+  // 判据三：说明文字要在，且它本身计入预算（否则说明一次就超限）。
+  assert(
+    String(out.messages[0].content).startsWith("[context compaction]"),
+    "the fallback must say that it truncated",
+  );
+});
+
+// ★ 这条是上面那条的「单位哨兵」：旧 bug 的本质是把**字节**当 **token** 用。
+// 只断言 after <= budget 抓不到它——因为旧式预算 `budget/4*0.6` 在数值上
+// 恰好还是比 after 大，测试会假绿（我第一次就是这样，变异验证当场没红）。
+// 真正的判别是**装进去的字节数**：按字节解释时能装下接近 budget 的内容，
+// 按 token 解释时只能装 budget/4*0.6，差 6.7 倍。
+Deno.test("fallback truncation fills the byte budget, not a token-derived one", () => {
+  // 每条 900 字节左右的中文消息，堆到远超预算。
+  const chunk = "中".repeat(300); // 900 字节
+  const messages: any[] = [{ role: "system", content: "s" }];
+  for (let i = 0; i < 200; i += 1) {
+    messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: chunk });
+  }
+  const budget = 60000;
+  const before = new TextEncoder().encode(JSON.stringify(messages)).length;
+  assert(before > budget * 2, `fixture must be well over budget (${before})`);
+
+  const out = fallbackTruncate(messages, budget);
+  const after = new TextEncoder().encode(JSON.stringify(out.messages)).length;
+
+  // 按字节解释：应装到接近 budget（>= 一半即说明没有按 1/6.7 打折）。
+  // 按旧的 token 解释：预算仅 60000/4*0.6 = 9000 字节，只能装 10 条左右。
+  assert(
+    after >= budget * 0.5,
+    `byte-based truncation should keep roughly the whole budget, got ${after} of ${budget}`,
+  );
+  assert(after <= budget, `and must not exceed it (got ${after})`);
+});
+
+Deno.test("fallback truncation says so when even the note does not fit", () => {
+  // 预算小到连说明都装不下：不能假装成功，note 必须标出来。
+  const messages = [{ role: "user", content: "x".repeat(5000) }];
+  const out = fallbackTruncate(messages, 10);
+  const after = new TextEncoder().encode(JSON.stringify(out.messages)).length;
+  assert(
+    out.note.includes("all messages dropped"),
+    `an empty keep must be labelled, got ${JSON.stringify(out.note)}`,
+  );
+  assert(after > 10, "fixture: the note alone exceeds the tiny budget");
+});
+
+Deno.test("compaction state is evicted once the table is full", async () => {
+  resetCompactionStates();
+  // 表上限 256。塞满之后再压一个新的键，最旧的必须被淘汰，否则就是泄漏。
+  const big = "z".repeat(4000);
+  for (let i = 0; i < 300; i += 1) {
+    const messages = [
+      { role: "user", content: big },
+      { role: "assistant", content: "ok" },
+    ];
+    await compactIfNeeded({
+      messages,
+      body: { messages },
+      contextWindow: 100,
+      maxOutputTokens: 10,
+      sessionId: `evict_${i}`,
+      config: { keepTokens: 5, buffer: 10, maxSummaryTokens: 8 },
+      writeSummary: async () => "summary",
+    });
+  }
+  // 早期键应已被淘汰，近期的必须还在。
+  assertEqual(
+    compactionState("evict_0"),
+    undefined,
+    "the oldest key must be evicted once the table is full",
+  );
+  assert(
+    compactionState("evict_299") !== undefined,
+    "the newest key must survive eviction",
   );
 });

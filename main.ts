@@ -18,6 +18,7 @@ import {
   isCustomPath,
 } from "./src/custom-handler.ts";
 import { envBackedStore } from "./src/credential-source.ts";
+import { DedupedWarn } from "./src/deduped-warn.ts";
 import { CNB_MODELS, handleCnb } from "./src/cnb.ts";
 import { readJsonBodyLimited } from "./src/deepseek-responses.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
@@ -1075,6 +1076,36 @@ async function handleWorkBuddy(
     unknownRoute.status,
   );
 }
+/**
+ * `custom` 列表为空的告警只在**原因变化**时打一次。
+ *
+ * 为什么需要它：`v1FetchMemberModels()` 在每次 `/v1/models` 与每次
+ * `/v1/chat/completions` 上都会执行，「没配置自定义供应商」是一个稳定状态，
+ * 无条件 warn 会让面板的 10 秒轮询把它刷成一堵墙（实测单段日志约 60 行），
+ * 把真正该看的上游错误挤出去。
+ *
+ * 为什么不是直接删掉：AGENTS.md 明确记着「静默零」这类缺陷——一个明明是
+ * “配了但列不出模型”的渠道不能因为怕刷屏就完全不说话。所以保留消息，只加
+ * 去重：原因变了才说（“还没配” → “配了但空” 是一次真实的状态变化）。
+ *
+ * 恢复成功时必须 `reset()`，否则“坏 → 好 → 同样的坏”第二次会静默——那正好
+ * 是用户最需要看到的一次。
+ */
+const customListingWarn = new DedupedWarn((reason) =>
+  console.warn(`[v1] custom: ${reason}`)
+);
+let lastCustomListingIssue = "";
+function logCustomListingIssueOnce(reason: string): void {
+  customListingWarn.warn(reason);
+  lastCustomListingIssue = reason;
+}
+/** 列表恢复成功时调用：让“坏→好→同样的坏”第二次能重新报警。 */
+function clearCustomListingIssue(): void {
+  if (lastCustomListingIssue === "") return;
+  lastCustomListingIssue = "";
+  customListingWarn.reset();
+}
+
 async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
   const out: Record<string, any[]> = {};
   const now = Date.now();
@@ -1186,6 +1217,8 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
       out[key] = models;
       if (models.length > 0) {
         catalog.ok(key, models.length, models.length, now);
+        // 恢复成功：允许下一次故障重新报警（否则“坏→好→同样的坏”会静默）。
+        clearCustomListingIssue();
       } else {
         // Empty has two meanings here and neither is "the channel is broken":
         // nothing configured yet, or every configured vendor answered with nothing.
@@ -1194,7 +1227,19 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
           ? "no custom providers are configured yet"
           : "the configured custom providers listed no models";
         catalog.failed(key, reason, now);
-        console.warn(`[v1] ${key}: ${reason}`);
+        // ★ 2026-10-19 修：这里原本无条件 `console.warn`。
+        //
+        // `v1FetchMemberModels()` 每个 `/v1/models` **和**每个 `/v1/chat/
+        // completions` 都会跑一遍，而自定义供应商“没配置”是一个**稳定状态**
+        // ——它不会因为重试而恢复。于是面板每 10 秒的轮询就把这行刷一次，
+        // 实测一段日志里出现约 60 行同样的文案，把渠道报错、额度、上游 5xx
+        // 全挤出了环形缓冲。这正是 AGENTS.md 记过的那条：新增一个会被周期性
+        // 访问的渠道时，要先查它有没有请求级日志。
+        //
+        // 判据不能是「沉默」——那会让“配了但列不出模型”这件事消失（AGENTS.md
+        // 的静默零）。所以只在**状态变化**时记：上一次不是同一个原因才说一句。
+        // “配坏了/配了但空”与“还没配”是两种状态，各自只会各说一次。
+        logCustomListingIssueOnce(reason);
       }
       return;
     }

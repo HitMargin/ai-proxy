@@ -254,6 +254,28 @@ export type SummaryWriter = (
 
 const states = new Map<string, CompactionState>();
 
+/**
+ * 压缩状态表的上限。
+ *
+ * 历史：这张表原本只被「有 `x-session-id` 的客户端」写入，键的数量天然有限，
+ * 所以没有淘汰逻辑。2026-10-19 引入 `auto:` 派生键之后，每个不带会话头的
+ * 对话都会新增一个键——不设限就是一处只增不减的泄漏。
+ *
+ * 256 足够覆盖并发会话数；淘汰按 `updatedAt` 最旧优先，丢掉的只是“下一轮要
+ * 多算一次全量摘要”，不会串会话（键仍然按内容区分）。
+ */
+const COMPACTION_STATE_LIMIT = 256;
+
+function evictOldestStates(count: number): void {
+  if (count <= 0) return;
+  const ordered = [...states.entries()].sort(
+    (a, b) => a[1].updatedAt - b[1].updatedAt,
+  );
+  for (let i = 0; i < count && i < ordered.length; i += 1) {
+    states.delete(ordered[i][0]);
+  }
+}
+
 export function compactionState(
   sessionId: string,
 ): CompactionState | undefined {
@@ -393,6 +415,13 @@ export async function compactIfNeeded(
   messages.push(...rebuilt);
   input.messages = messages;
   if (input.sessionId !== "") {
+    // ★ 2026-10-19：引入 `auto:` 派生键之后，键的数量不再天然有界——每个
+    // 不带头部的对话都会新增一个。原注释说“不要每请求造唯一 id，因为 map
+    // 没有淘汰”，这个理由现在同样要落实成代码：超上限时按最旧优先淘汰。
+    // 淘汰是安全的：丢失状态只会让下一次压缩退化成全量重算一次，不会串会话。
+    if (!states.has(input.sessionId) && states.size >= COMPACTION_STATE_LIMIT) {
+      evictOldestStates(states.size - COMPACTION_STATE_LIMIT + 1);
+    }
     states.set(input.sessionId, {
       summary,
       recent: selection.recent.join("\n\n"),
@@ -413,41 +442,83 @@ export async function compactIfNeeded(
  *
  * Keeps every system message plus as much of the tail as the budget allows,
  * and says so in a system note rather than silently dropping turns.
+ *
+ * ⚠️ 2026-10-19 修（旧版的判据是错的，导致这个函数**什么都没删**）：
+ * 旧签名收的是 `contextWindow`（token），而调用方 `maybeCompactCnb` 传的是
+ * `Math.floor(bytesBudget / 4)`——一个**由字节预算推导出来的数**，看似 token，
+ * 实则按 `bytes/4` 换算。函数内部又乘一次 0.6，于是预算被算成
+ * `bytes * 0.6 / 4`。而 `estimateTokens` 是 `字符数/4`：中文一字符三字节，
+ * 420 万字节 ≈ 140 万字符 ≈ **35 万 token**，永远小于那个 63 万的假预算
+ * ⇒ 一条消息都不丢，只多加 149 字节的 system note。
+ * 日志里因此出现 `bytes 4121421 -> 4121570`（**变大** 149）这种「说了压缩
+ * 却一个字节没减」的形态，而且每轮重复。
+ *
+ * 判据：**上游限的是字节，降级截断就必须按字节做账**。参数直接收字节预算，
+ * 与 `maybeCompactCnb` 里那道 `bytes <= budget` 的闸门同一把尺子，不再做
+ * 任何单位换算——换算正是这个 bug 的来源。
  */
 export function fallbackTruncate(
   messages: any[],
-  contextWindow: number,
+  budgetBytes: number,
 ): { changed: boolean; note: string; messages: any[] } {
   if (!Array.isArray(messages) || messages.length === 0) {
     return { changed: false, note: "", messages };
   }
-  const budget = Math.floor(contextWindow * 0.6);
+  const encoder = new TextEncoder();
+  // 序列化后的字节数才是上游会看到的大小；按角色文本估会漏掉 tool_calls、
+  // image_url 等字段，而图片恰恰是最占体积的那一类。
+  const sizeOf = (message: any): number => {
+    try {
+      return encoder.encode(JSON.stringify(message)).length;
+    } catch {
+      return 0;
+    }
+  };
+
+  const noteContent =
+    `[context compaction] 请求体积超过该渠道的字节上限(约 ${budgetBytes} 字节),早期消息已被截断以继续会话。`;
+  const noteBytes = sizeOf({ role: "system", content: noteContent });
+
+  // 预算要同时容纳那条说明；否则说明本身就把预算吃掉，仍然超限。
+  const usable = Math.max(0, budgetBytes - noteBytes);
+
   const kept: { index: number; message: any }[] = [];
   let used = 0;
+  // system 消息先留（它们是指令，丢了会改变行为）。但 system 自己也可能是
+  // 超大的那一条，所以这里同样受预算约束，而不是无条件全收。
   for (let i = 0; i < messages.length; i += 1) {
     const message = messages[i];
-    if (message && typeof message === "object" && message.role === "system") {
-      kept.push({ index: i, message });
-      used += estimateTokens(messageText(message));
+    if (!message || typeof message !== "object" || message.role !== "system") {
+      continue;
     }
+    const cost = sizeOf(message);
+    if (used + cost > usable) continue;
+    kept.push({ index: i, message });
+    used += cost;
   }
-  for (let i = messages.length - 1; i >= 0 && used < budget; i -= 1) {
-    if (kept.some((entry) => entry.index === i)) continue;
+  const keptIndex = new Set(kept.map((entry) => entry.index));
+  // 再从尾部往回装：最近的对话最该留在模型眼前。
+  for (let i = messages.length - 1; i >= 0 && used < usable; i -= 1) {
+    if (keptIndex.has(i)) continue;
     const message = messages[i];
     if (!message || typeof message !== "object") continue;
-    const cost = estimateTokens(messageText(message));
-    if (used + cost > budget) continue;
+    const cost = sizeOf(message);
+    // 单条就超预算时跳过而不是 break：更早的那些也许更小，仍值得留下。
+    if (used + cost > usable) continue;
     kept.push({ index: i, message });
+    keptIndex.add(i);
     used += cost;
   }
   kept.sort((a, b) => a.index - b.index);
   const out = [
-    {
-      role: "system",
-      content:
-        `[context compaction] 上下文估算超过该模型限制(约 ${contextWindow} token),早期消息已被截断以继续会话。`,
-    },
+    { role: "system", content: noteContent },
     ...kept.map((entry) => entry.message),
   ];
-  return { changed: true, note: "[compacted via truncation]", messages: out };
+
+  // 一条都没能留下时仍算“改了”——但那等于清空历史，必须在 note 里说清楚，
+  // 不能让它看起来像一次成功压缩。
+  const note = kept.length === 0
+    ? "[compacted via truncation] (all messages dropped)"
+    : "[compacted via truncation]";
+  return { changed: true, note, messages: out };
 }

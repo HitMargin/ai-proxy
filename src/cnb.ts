@@ -1,4 +1,5 @@
 import { safeJsonParse } from "./core.ts";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   compactIfNeeded,
   fallbackTruncate,
@@ -2144,6 +2145,45 @@ function cnbErr(status: number, msg: string, detail?: string) {
 //   fp 是会话指纹（模型+消息数+首尾消息前缀的 djb2 hash），
 //   日志里"waited ... for previous stream"且 fp 不同 = 跨会话并发（串台实锤）。
 let cnbGate: Promise<void> = Promise.resolve();
+
+/**
+ * 摘要请求专用的串行闸，与 `cnbGate` **并列而不是排进它**。
+ *
+ * ★ 2026-10-19 加。生产日志里出现大量
+ *
+ *     [cnb-gate] fp=1mhmhah waited 188077ms for previous stream (slow; 60000ms)
+ *     [cnb-gate] fp=4e5wyw released after 190232ms (slow hold; 120000ms)
+ *
+ * 单次持有 190~210 秒、后续请求排队近 190 秒。原因是压缩链路：
+ *
+ *     maybeCompactCnb → writeCnbSummary → handleCnb → cnbCallUpstream → 拿 cnbGate
+ *
+ * 摘要调用**本身也是一次上游生成**，却和用户请求抢同一个串行闸。一次超预算
+ * 请求要先做完 1~3 次摘要（每次几十秒），才能发出真正的那一次——在此期间
+ * 闸被反复占用，其他会话全部排队。
+ *
+ * 为什么**不是**“摘要不占闸”：cnb 上游对并发敏感（串行闸存在的原因），
+ * 完全不限并发会把正常请求也拖下水。所以是**各自串行**：摘要内部一次只跑
+ * 一个，但不挡住用户流；用户流内部一次只跑一个，也不被摘要挡住。两者的
+ * 代价是同一时刻最多 2 个在途请求——这是有意的取舍，因为摘要只在超预算时
+ * 才发生，而它卡住主队列的影响是全局的。
+ */
+let cnbSummaryGate: Promise<void> = Promise.resolve();
+
+interface CnbGateOptions {
+  /** 摘要等内部调用走独立闸，不占用户请求的队首。 */
+  internal?: boolean;
+}
+
+/**
+ * 当前请求是否内部摘要调用。
+ *
+ * 用 `AsyncLocalStorage` 而不是给 `cnbCallUpstream` 加参数，是因为调用链
+ * 中间隔着 `handleCnb`（一个完整 HTTP 处理函数，签名是公开契约）；把
+ * internal 一路穿下去要改 4 个签名，而 ALS 让“谁发起的”这件事自己传播。
+ * 只用在这一处标记，不做其他用途。
+ */
+const cnbInternalScope = new AsyncLocalStorage<boolean>();
 function cnbFingerprint(body: any): string {
   const msgs: any[] = Array.isArray(body?.messages) ? body.messages : [];
   const pick = (
@@ -2195,7 +2235,10 @@ function cnbGatedResponse(resp: Response, done: () => void): Response {
     headers: resp.headers,
   });
 }
-async function cnbCallUpstream(upBody: any): Promise<Response> {
+async function cnbCallUpstream(
+  upBody: any,
+  options: CnbGateOptions = {},
+): Promise<Response> {
   // 这里**曾经**有一道字节预检：body > 1MiB 就在本地直接回 413，不发出去。
   // 2026-10-05 把它删了。两条理由，第二条是主因：
   //
@@ -2227,9 +2270,16 @@ async function cnbCallUpstream(upBody: any): Promise<Response> {
     Number(Deno.env.get("CNB_GATE_SLOW_WAIT_MS") ?? 60_000) || 60_000;
   const CNB_GATE_SLOW_HOLD_MS =
     Number(Deno.env.get("CNB_GATE_SLOW_HOLD_MS") ?? 120_000) || 120_000;
-  const prev = cnbGate;
+  // 内部摘要调用走独立队列：既不排在用户请求后面（那样摘要会等到用户流
+  // 结束才动，一次超预算请求就要串两轮完整生成），也不把用户请求堵在它
+  // 后面（那正是日志里那批 190 秒等待的来源）。
+  const internal = options.internal === true ||
+    cnbInternalScope.getStore() === true;
+  const prev = internal ? cnbSummaryGate : cnbGate;
   let release!: () => void;
-  cnbGate = new Promise<void>((r) => (release = r));
+  const opened = new Promise<void>((r) => (release = r));
+  if (internal) cnbSummaryGate = opened;
+  else cnbGate = opened;
   let released = false;
   const t0 = Date.now();
   let safety: ReturnType<typeof setTimeout>;
@@ -3014,6 +3064,49 @@ export function sessionIdOf(request: Request): string {
     "";
 }
 
+/**
+ * 派生一个**稳定但按内容区分**的会话键，供没有 `x-session-id` 的客户端使用。
+ *
+ * ★ 2026-10-19 加。起因是生产日志里几乎每行都是 `session=(none)`：
+ * DSH 的 openai-completions 路径不带 `x-session-id`，于是
+ *
+ *   session === "" ⇒ sessionId 传 "" ⇒ zen-compaction **不保存状态**
+ *     (`if (input.sessionId !== "") states.set(...)`)
+ *   ⇒ 下一轮 `compactionState("")` 恒为 undefined
+ *   ⇒ 每轮都当「第一次压缩」**全量重算摘要**
+ *
+ * 代价直接写在日志里：`cost≈10582 → 13611 → 17617 → 19536 → 21083`，
+ * 每次都从头总结整段历史，而且历史越长越贵——一个会自我放大的正反馈。
+ *
+ * 判据：**同一段对话的相邻请求必须命中同一个压缩状态**，不同对话必须互不
+ * 干扰。所以键取自「首条消息」而不是整个历史：历史每轮都会增长，用整段内容
+ * 做哈希会让每轮的键都变，等于还是无状态（而且表会无限长）。
+ * 首条消息在一次对话里是不变的，跨对话则通常不同。
+ *
+ * 空 id 的老语义保留给显式调用方：本函数只在**确实没有会话头**时才被调用，
+ * 且返回值带 `auto:` 前缀，不会和真实的客户端 id 撞车。
+ */
+export function deriveSessionKey(messages: readonly any[]): string {
+  if (!Array.isArray(messages) || messages.length === 0) return "";
+  // 首条消息 + 消息总数落在同一个桶里也太宽（对话进行中总数一直变）。
+  // 只用首条消息的内容做锚：它是整段对话的“身份”。
+  const first = messages[0];
+  let seed = "";
+  try {
+    seed = JSON.stringify(first) ?? "";
+  } catch {
+    return "";
+  }
+  if (seed === "") return "";
+  // 32 位 FNV-1a：够分散、无依赖、同步、成本可忽略。
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `auto:${hash.toString(16).padStart(8, "0")}`;
+}
+
 /** 摘要写入器：走本代理自己的 cnb chat 路由，带上完整闸与重试。 */
 async function writeCnbSummary(
   prompt: string,
@@ -3037,7 +3130,14 @@ async function writeCnbSummary(
     body: JSON.stringify(summaryBody),
     signal: AbortSignal.timeout(120_000),
   });
-  const resp = await handleCnb("/cnb/v1/chat/completions", req, url);
+  // ★ 标记为内部调用：这一路会经 handleCnb → cnbCallUpstream 拿串行闸。
+  // 不打标记时它排进用户队列，日志里因此出现「单次持有 190~210 秒、后续
+  // 请求等待 190 秒」——一次超预算请求要先跑完摘要才能发出真正的请求，
+  // 期间所有会话都在排队。标记后摘要走 cnbSummaryGate，与用户流各自串行。
+  const resp = await cnbInternalScope.run(
+    true,
+    () => handleCnb("/cnb/v1/chat/completions", req, url),
+  );
   if (!resp.ok) {
     const detail = await resp.text().catch(() => "");
     throw new Error(
@@ -3141,7 +3241,18 @@ export async function maybeCompactCnb(
     // non-empty. `cnb:${session}` with an empty session yields the constant
     // "cnb:" - stored, and shared by every caller without an id, which is the
     // very collapse this guards against.
-    sessionId: session === "" ? "" : `cnb:${session}`,
+    //
+    // ★ 2026-10-19 修：没有会话头时不再退化成“无状态”。无状态的代价是
+    // **每轮全量重算摘要**（日志实测 cost≈10582→21083 递增），因为
+    // zen-compaction 拿不到上一轮的 anchored summary。现在按首条消息派生一个
+    // 稳定键：同一段对话的相邻请求命中同一份状态（走增量更新），不同对话
+    // 因首条消息不同而互相隔离。前缀 `auto:` 不会与真实客户端 id 冲突。
+    sessionId: session !== ""
+      ? `cnb:${session}`
+      : (() => {
+        const derived = deriveSessionKey(messages);
+        return derived === "" ? "" : `cnb:${derived}`;
+      })(),
     config: {
       keepTokens: cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000),
       buffer: cnbIntSetting("CNB_COMPACTION_BUFFER", 20000),
@@ -3151,21 +3262,57 @@ export async function maybeCompactCnb(
     writeSummary: writeSummaryOverride ?? writeCnbSummary,
   });
 
+  // 日志里要显示**真正用到的那个键**，而不是入参。
+  // 2026-10-19 实测踩过：修复后日志仍打印 `session=(none)`，看起来像派生键没
+  // 生效（我就是这么误判了一次）。实际上键已经派生，只是日志字段取的是入参。
+  // 判据：**日志要能回答“状态存在哪”**，否则它在排查时是误导而不是证据。
+  const stateKey = session !== ""
+    ? `cnb:${session}`
+    : (() => {
+      const d = deriveSessionKey(messages);
+      return d === "" ? "" : `cnb:${d}`;
+    })();
+  const keyLabel = stateKey === "" ? "(none)" : stateKey;
+
   if (result.changed) {
     body.messages = result.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
     cnbLastCompactNote = `compacted ${result.note} ` +
-      `session=${session || "(none)"} ` +
+      `session=${keyLabel} ` +
       `bytes ${bytes} -> ${after} cost≈${result.compactTokens}`;
+    // ★ 摘要压缩**自己也可能压不到线以下**（尾部原文 + system 指令有时就占了
+    // 大半预算）。旧版对这种情况什么都不说，于是同一个请求下一轮又超预算、
+    // 再压一次，日志里出现「4239357 -> 153454」与「4240081 -> 150934」交替，
+    // 每轮烧 2~3 次摘要（cost≈15000+）。
+    //
+    // 这里不递归重压（重压只会再烧一次摘要、成本翻倍），而是**如实说出来**并
+    // 直接降级到字节截断：截断是确定性的、不花钱、且保证收敛到预算内。
+    if (after > budget) {
+      const truncated = fallbackTruncate(body.messages, budget);
+      body.messages = truncated.messages;
+      const final = new TextEncoder().encode(JSON.stringify(body)).length;
+      cnbLastCompactNote +=
+        ` | summary still over budget (${after}B > ${budget}B), fell back to truncation -> ${final}B`;
+      return;
+    }
     return;
   }
   // 摘要失败：降级成截断。**仍然要说一句**——静默丢历史比丢历史更糟。
   if (result.note === "summary-failed") {
-    const truncated = fallbackTruncate(messages, Math.floor(budget / 4));
+    // ★ 2026-10-19 修：这里原本传 `Math.floor(budget / 4)`，而 fallbackTruncate
+    // 内部把它当 token 再乘 0.6 —— 字节被当成 token、又被二次打折，预算虚高
+    // 到实际体积之上，于是**一条消息都没删**，只多加 149 字节的说明。
+    // 日志里因此有 `bytes 4121421 -> 4121570`（变大）与
+    // `bytes 4296416 -> 4296565`。现在直接传字节预算，与上游同一把尺子。
+    const truncated = fallbackTruncate(messages, budget);
     body.messages = truncated.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
-    cnbLastCompactNote = `${truncated.note} session=${session || "(none)"} ` +
+    cnbLastCompactNote = `${truncated.note} session=${keyLabel} ` +
       `(summary generation failed) bytes ${bytes} -> ${after}`;
+    if (after > budget) {
+      // 连截断都没压下来（例如单条 system 指令就超预算）。说出来，别假装成功。
+      cnbLastCompactNote += ` | WARNING: still over budget (${budget}B)`;
+    }
   }
 }
 

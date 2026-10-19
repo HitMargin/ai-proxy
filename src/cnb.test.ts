@@ -22,6 +22,7 @@ import {
   handleCnb,
   maybeCompactCnb,
   neutraliseClientIdentity,
+  deriveSessionKey,
   sessionIdOf,
 } from "./cnb.ts";
 import { compactionState, resetCompactionStates } from "./zen-compaction.ts";
@@ -1055,9 +1056,19 @@ Deno.test("a request with a session header keeps it, and x-session-id wins over 
   assertEquals(sessionIdOf(both), "sess-abc");
 });
 
-Deno.test("an unidentified session still compacts, and leaves no state behind", async () => {
+Deno.test("an unidentified session still compacts, and keys state by content", async () => {
   // 空 id 不能把压缩一起关掉——那会让「没带头的调用者」永远压不动、每轮 413。
-  // 它只是不该留下会被下一个会话读到的状态。
+  //
+  // ★ 2026-10-19 修：这里原本断言「不留状态」（`compactionState("cnb:")` 必须
+  // undefined）。那条判据本身没错（不能塌成共用常量），但它带来的副作用在
+  // 生产日志里暴露得很清楚：几乎每行都是 `session=(none)`，于是
+  // zen-compaction 从不存状态 ⇒ 下一轮拿不到 anchored summary ⇒ **每轮全量
+  // 重算摘要**，cost≈ 从 10582 一路涨到 21083（历史越长越贵，自我放大）。
+  //
+  // 新判据拆成两条，各自守住一件事：
+  //   ① 仍然不能存到共用常量 `cnb:` 下（防串味）；
+  //   ② 必须按**首条消息**派生稳定键并存状态（换取增量更新）。
+  // 两条都要，缺一条就退回旧故障的某一端。
   resetCompactionStates();
   const messages: any[] = [
     { role: "system", content: "You are helpful." },
@@ -1080,13 +1091,112 @@ Deno.test("an unidentified session still compacts, and leaves no state behind", 
   assert(asked, "an unidentified session must still compact");
   const after = new TextEncoder().encode(JSON.stringify(body)).length;
   assert(after < before, "it must actually shrink: " + before + " -> " + after);
-  // 关键：不留状态。留了就会被下一个「同样没有 id」的会话读到。
+  // ① 绝不塌成共用常量：那会让所有无头调用者共用一份摘要。
   assertEquals(
     compactionState("cnb:"),
     undefined,
     'the empty-id path must not store under the constant "cnb:"',
   );
   assertEquals(compactionState(""), undefined);
+  // ② 但必须按内容派生一个键并存下来，否则每轮都要重算全量摘要。
+  const derived = deriveSessionKey(messages);
+  assert(derived !== "", "a headless request must still derive a key");
+  assert(
+    compactionState(`cnb:${derived}`) !== undefined,
+    "state must be stored under the content-derived key so the next turn is incremental",
+  );
+});
+
+// ─── 内容派生键：同一对话命中同一状态，不同对话互不干扰 ───
+//
+// 这是上面那条 ② 的判据基础。键必须取自「首条消息」而不是整个历史：
+// 历史每轮都会增长，用整段内容做哈希会让每轮的键都变，等于仍然无状态；
+// 而表的容量有限，每轮新键还会把它撑爆。
+Deno.test("the derived session key is stable across turns and distinct across conversations", () => {
+  const first = { role: "system", content: "You are a coding agent." };
+  const turn1 = [first, { role: "user", content: "第一轮" }];
+  const turn2 = [
+    first,
+    { role: "user", content: "第一轮" },
+    { role: "assistant", content: "回答" },
+    { role: "user", content: "第二轮" },
+  ];
+  assertEquals(
+    deriveSessionKey(turn1),
+    deriveSessionKey(turn2),
+    "the same conversation must keep one key as it grows - otherwise every turn is stateless",
+  );
+  const other = [
+    { role: "system", content: "You are a translator." },
+    { role: "user", content: "第一轮" },
+  ];
+  assert(
+    deriveSessionKey(other) !== deriveSessionKey(turn1),
+    "a different conversation must not share the key",
+  );
+  assertEquals(deriveSessionKey([]), "", "no messages means no identity");
+  // 前缀保证不会和真实客户端 id 撞车。
+  assert(
+    deriveSessionKey(turn1).startsWith("auto:"),
+    "the derived key must be namespaced away from client-supplied ids",
+  );
+});
+
+// ─── 端到端：无会话头的第二轮必须走「增量更新」而不是全量重算 ───
+//
+// 这是 `session=(none)` 那条故障的真正判据。生产日志里 cost≈ 从 10582 一路
+// 涨到 21083，原因是每轮都拿不到上一轮的 anchored summary、从头总结整段历史。
+// 只断言「键稳定」不够——键稳定但没被用到，现象完全一样。所以这里直接看
+// **第二次摘要请求的 prompt 里有没有上一轮的摘要**。
+Deno.test("a headless second turn updates the anchored summary instead of restarting", async () => {
+  resetCompactionStates();
+  const head: any[] = [{ role: "system", content: "You are helpful." }];
+  const filler = "用来把请求体撑过上游 1 MiB 硬限的填充文本。".repeat(4000);
+  for (let i = 0; i < 60; i += 1) {
+    head.push({ role: "user", content: filler + i });
+    head.push({ role: "assistant", content: "收到" + i });
+  }
+  const makeMessages = (tag: string) => [
+    ...head.map((m) => ({ ...m })),
+    { role: "user", content: "最新一轮 " + tag },
+  ];
+
+  const prompts: string[] = [];
+  const summarize = async (prompt: string) => {
+    prompts.push(prompt);
+    return prompts.length === 1
+      ? "## Objective\n- 第一轮生成的锚定摘要 FIRST_ANCHOR"
+      : "## Objective\n- 第二轮增量更新 SECOND_ANCHOR";
+  };
+
+  // 第一轮
+  const body1: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 32,
+    messages: makeMessages("A"),
+  };
+  await maybeCompactCnb(body1, "", summarize);
+  assertEquals(prompts.length, 1, "the first turn must summarise once");
+
+  // 第二轮：同一段对话（首条消息相同）继续变长
+  const body2: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 32,
+    messages: makeMessages("B"),
+  };
+  await maybeCompactCnb(body2, "", summarize);
+  assertEquals(prompts.length, 2, "the second turn must summarise once more");
+
+  // ★ 判据：第二次的 prompt 必须带上第一次的摘要（增量更新），
+  // 而不是“从头创建”。旧代码（无状态）这里永远是 create。
+  assert(
+    prompts[1].includes("FIRST_ANCHOR"),
+    "the second summary must carry the previous anchored summary; without it the model restarts from scratch every turn",
+  );
+  assert(
+    prompts[1].includes("Update the anchored summary"),
+    "and it must be phrased as an update, not a fresh creation",
+  );
 });
 
 Deno.test("an oversized image being sent right now is refused, not silently dropped", () => {
