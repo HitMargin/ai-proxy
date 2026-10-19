@@ -23,6 +23,7 @@ import {
   handleCnb,
   maybeCompactCnb,
   neutraliseClientIdentity,
+  runAsCnbInternal,
   sessionIdOf,
 } from "./cnb.ts";
 import { compactionState, resetCompactionStates } from "./zen-compaction.ts";
@@ -1624,5 +1625,132 @@ Deno.test("cnb: skipping compaction is reported, not silent", async () => {
     note.includes("truncation") || note.includes("skipped"),
     "the note must say the body was truncated / the summary was skipped, got: " +
       note,
+  );
+});
+
+// ---------- 2026-10-19 第六次：摘要请求不得再被压缩（递归） ----------
+//
+// 生产日志里出现过这一行：
+//   [compacted via truncation] (all messages dropped)
+//   session=cnb:cnb-summary:1792404332945 ... bytes 1314332 -> 232
+// session 前缀 cnb-summary: 说明这是**摘要调用自己**在压缩。它的 prompt
+// 就是「被压缩掉的那段历史」，天然巨大，于是它超预算、被截成一条说明，
+// 上游只收到 63 个字符，摘要必然为空 —— 这正是同时期高频出现的
+// "summary response carried no content" 的来源。
+Deno.test("cnb: an internal summary call is never compacted again", async () => {
+  const filler = "中文填充".repeat(100000);
+  const messages: any[] = [{
+    role: "system",
+    content: "You are a coding agent.",
+  }];
+  for (let i = 0; i < 6; i += 1) {
+    messages.push({ role: "user", content: filler + i });
+    messages.push({ role: "assistant", content: "收到" + i });
+  }
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 120000,
+    messages,
+  };
+  const before = JSON.stringify(body);
+
+  let summaryCalls = 0;
+  const note = await runAsCnbInternal(() =>
+    maybeCompactCnb(body, "cnb-summary:t", async () => {
+      summaryCalls += 1;
+      return "unused";
+    })
+  );
+
+  // 判据一：内部调用不许压缩，body 必须一个字节都没动。
+  assertEquals(
+    JSON.stringify(body),
+    before,
+    "an internal call must not be compacted",
+  );
+  // 判据二：不许白跑一次摘要（那既费钱又会再次触发同样的递归）。
+  assertEquals(summaryCalls, 0, "an internal call must not spawn a summary");
+  // 判据三：什么都不做就不要说做了什么，否则日志又会误导。
+  assertEquals(note, "", "an internal call must not report a compaction");
+});
+
+Deno.test("cnb: the same oversized body is compacted when it is not internal", async () => {
+  // 上一条的反面对照：证明「没压缩」是因为 internal 标记，而不是因为
+  // 这个 body 本来就不超预算（否则上一条会永远绿）。
+  const filler = "中文填充".repeat(100000);
+  const messages: any[] = [{
+    role: "system",
+    content: "You are a coding agent.",
+  }];
+  for (let i = 0; i < 6; i += 1) {
+    messages.push({ role: "user", content: filler + i });
+    messages.push({ role: "assistant", content: "收到" + i });
+  }
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 120000,
+    messages,
+  };
+  const before = JSON.stringify(body).length;
+
+  const note = await maybeCompactCnb(body, "user-session", async () => {
+    throw new Error("simulated");
+  });
+
+  assert(note !== "", "a user call over budget must report what it did");
+  assert(
+    JSON.stringify(body).length < before,
+    "a user call over budget must actually shrink",
+  );
+});
+
+// ---------- 2026-10-19 第六次（其二）：摘要 prompt 里 tool_calls 也要截 ----------
+//
+// forSummary 旧逻辑只截 `typeof m.content === "string"` 的 message。但带
+// tool_calls 的 assistant 消息 content 是 null，真正占体积的是
+// `tool_calls[].function.arguments`；tool 消息的体积在 content 上，但它是
+// 另一条 role。两者都绕过了截断，实测把摘要 prompt 顶到 4.5 MB
+// —— CNB 上游上限 921600 字节的 4 倍，摘要请求必被截断成空壳。
+Deno.test("cnb: giant tool payloads are truncated out of the summary prompt", async () => {
+  const big = "工具输出：".repeat(5000);
+  const messages: any[] = [{
+    role: "system",
+    content: "You are a coding agent.",
+  }];
+  for (let i = 0; i < 60; i += 1) {
+    messages.push({ role: "user", content: `第 ${i} 轮` });
+    messages.push({
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: `c${i}`,
+        type: "function",
+        function: {
+          name: "read",
+          arguments: JSON.stringify({ path: "/x", body: big }),
+        },
+      }],
+    });
+    messages.push({ role: "tool", tool_call_id: `c${i}`, content: big });
+  }
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 120000,
+    messages,
+  };
+
+  let promptBytes = -1;
+  await maybeCompactCnb(body, "probe-tool-prompt", (prompt) => {
+    promptBytes = new TextEncoder().encode(prompt).length;
+    return Promise.resolve("fake summary");
+  });
+
+  assert(promptBytes > 0, "fixture must actually reach the summary writer");
+  // 判据：摘要 prompt 必须低于上游 1 MiB 线（留出 envelope 余量）。
+  // 旧逻辑这里是 4.5 MB 量级，会红。
+  const limit = 900 * 1024;
+  assert(
+    promptBytes <= limit,
+    `the summary prompt must stay under the upstream limit, got ${promptBytes} > ${limit}`,
   );
 });

@@ -2184,6 +2184,17 @@ interface CnbGateOptions {
  * 只用在这一处标记，不做其他用途。
  */
 const cnbInternalScope = new AsyncLocalStorage<boolean>();
+
+/**
+ * 在「这是一次内部调用」的上下文里跑 fn。
+ *
+ * 导出只为测试：递归防护（内部摘要请求不得再被压缩）是本模块的一条安全
+ * 属性，必须能在不打上游的前提下验证。生产代码只用 cnbInternalScope.run。
+ */
+export function runAsCnbInternal<T>(fn: () => Promise<T>): Promise<T> {
+  return cnbInternalScope.run(true, fn);
+}
+
 function cnbFingerprint(body: any): string {
   const msgs: any[] = Array.isArray(body?.messages) ? body.messages : [];
   const pick = (
@@ -3188,6 +3199,24 @@ export async function maybeCompactCnb(
   if (!Array.isArray(messages) || messages.length === 0) return "";
   if (Deno.env.get("CNB_COMPACTION") === "off") return "";
 
+  // ★ 摘要调用自己绝不能再被压缩一次。
+  //
+  // 2026-10-19 实测抓到的递归：writeCnbSummary 打的是本代理自己的
+  // /cnb/v1/chat/completions，于是摘要请求也流到这里。它的 prompt 是
+  // 「被压缩掉的那段历史」，按定义就是巨大的（实测 4.5 MB，含 tool_calls
+  // 与 tool 结果时尤其大）。于是它自己超预算 → 被 fallbackTruncate 截成
+  // 一条说明 → 上游收到的 prompt 只剩 63 个字符 → 摘要要么为空
+  // ("summary response carried no content")，要么是无意义的内容。
+  //
+  // 日志证据：`[compacted via truncation] (all messages dropped)
+  // session=cnb:cnb-summary:1792404332945 ... bytes 1314332 -> 232`。
+  // 那个 session 前缀就是摘要调用的，它本不该出现在压缩日志里。
+  //
+  // 放在函数里而不是调用方，是因为这是**安全属性**：任何新增的调用路径
+  // （responses / messages）都不该自动继承这个递归。摘要请求的体积由
+  // forSummary 的截断负责，不靠这里再压一遍。
+  if (cnbInternalScope.getStore() === true) return "";
+
   // 用**实际编码后的字节数**估，而不是字符数：base64 图片一头就占掉大半个
   // 预算，字符数会把它算成 1/4（这正是 Zen 那边踩过的：估算跳过 image_url）。
   let bytes = 0;
@@ -3221,12 +3250,28 @@ export async function maybeCompactCnb(
   const headSplit = selection?.split ?? messages.length;
   const forSummary = messages.map((m: any, i: number) => {
     if (i >= headSplit || !m || typeof m !== "object") return m;
-    if (typeof m.content !== "string" || m.content.length <= summaryMsgChars) {
-      return m;
+    if (typeof m.content === "string" && m.content.length > summaryMsgChars) {
+      return {
+        ...m,
+        content: m.content.slice(0, summaryMsgChars) +
+          "\n[truncated for summary]",
+      };
     }
+    // ★ 只截 `content` 是不够的。2026-10-19 实测：带 tool_calls 与 tool 结果的
+    // 会话，头部每条消息的 content 是 null，真正占体积的是
+    // `tool_calls[].function.arguments` 和 tool 消息的 content（那是另一条
+    // role，体积却一样大）。这些消息原样进了摘要 prompt，实测把 prompt 顶到
+    // 4.5 MB —— 是 CNB 1 MiB 上限的 4 倍，摘要请求必被截断成空壳。
+    //
+    // 判据：按**序列化后的实际体积**判断要不要截，而不是按某个字段的类型。
+    const size = serializeMessage(m).length;
+    if (size <= summaryMsgChars) return m;
+    // 整体仍按体积截：序列化后切到 summaryMsgChars，再作为纯文本塞回去。
+    // 丢掉 tool_calls 的结构没关系 —— 摘要只需要知道「做过什么」，不需要
+    // 能在摘要里重放工具调用。
     return {
-      ...m,
-      content: m.content.slice(0, summaryMsgChars) +
+      role: m.role,
+      content: serializeMessage(m).slice(0, summaryMsgChars) +
         "\n[truncated for summary]",
     };
   });
@@ -3414,6 +3459,7 @@ export async function handleCnb(path: string, request: Request, url: URL) {
     //
     // 打破它的办法是让摘要请求**远小于** 1 MiB：只送被压缩掉的那段历史
     // （compactIfNeeded 自己选定的 head），而不是整个 transcript。
+    // 摘要调用由 maybeCompactCnb 内部拦掉（cnbInternalScope），这里不用判。
     const compactNote = await maybeCompactCnb(p.data, sessionIdOf(request));
     // 压缩失败也要说一句：静默截断会让用户以为历史还在。
     if (compactNote) {
