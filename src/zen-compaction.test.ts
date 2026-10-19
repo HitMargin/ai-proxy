@@ -392,6 +392,48 @@ Deno.test("fallback truncation subtracts overhead that is not in the messages", 
   );
 });
 
+Deno.test("fallback truncation counts the JSON array structure, not just the elements", () => {
+  // 生产日志（2026-10-19）：
+  //   bytes 1329523 -> 922121 | WARNING: still over budget (921600B)
+  // 超出 521 字节。根因不是估算误差，而是装箱只算每条消息自身大小，
+  // 完全没算数组结构：元素之间每个逗号 1 字节，[ ] 另 2 字节。
+  // 消息越小、条数越多，漏得越多 —— 这条用大量小消息把它放大。
+  const sizeOf = (list: any[]) =>
+    new TextEncoder().encode(JSON.stringify(list)).length;
+  const budget = 921600;
+
+  for (const size of [40, 100, 300, 900, 1500]) {
+    const messages: any[] = [];
+    let i = 0;
+    // 增量记账，别每加一条就 JSON.stringify 整个数组（那是 O(n²)，实测 68 秒）。
+    let arrayBytes = 2;
+    while (arrayBytes < budget + 400_000) {
+      const head = `m${i}:`;
+      const message = {
+        role: i % 2 === 0 ? "user" : "assistant",
+        content: head + "x".repeat(Math.max(0, size - head.length - 30)),
+      };
+      arrayBytes += sizeOf([message]) - 2 + (messages.length === 0 ? 0 : 1);
+      messages.push(message);
+      i += 1;
+    }
+    const out = fallbackTruncate(messages, budget);
+    const kept = sizeOf(out.messages);
+    // 判据必须够紧：旧代码在 size=1500 时留下 615 条，body 922103（超 503）。
+    // 只断言 <= budget 是不够的 —— 要断言它确实填满了，否则把预算砍半也能通过。
+    assert(
+      kept <= budget,
+      `messages of ~${size}B must fit ${budget}, got ${kept} (over by ${
+        kept - budget
+      }, kept ${out.messages.length})`,
+    );
+    assert(
+      kept >= budget - 4 * (out.messages.length + 2),
+      `must fill the budget, not undershoot it: kept ${kept} of ${budget}`,
+    );
+  }
+});
+
 Deno.test("a failed summary carries its reason", async () => {
   resetCompactionStates();
   const messages = [

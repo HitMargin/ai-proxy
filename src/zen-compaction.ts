@@ -575,7 +575,17 @@ export function fallbackTruncate(
   const noteBytes = sizeOf({ role: "system", content: noteContent });
 
   // 预算要同时容纳那条说明与非消息开销；否则说明本身就把预算吃掉，仍然超限。
-  const usable = Math.max(0, budgetBytes - overheadBytes - noteBytes);
+  // 还要预留消息数组自身的结构字节：元素之间每个逗号 1 字节。这部分此前被
+  // 完全漏算 —— 消息越小、条数越多漏得越多：每条 1500 字节的消息能留下 615
+  // 条，光逗号就有 615 字节，body 因此超出预算 500 多字节（生产 922121/921600）。
+  // 做法是装箱时每条按 sizeOf+1 记账（+1 是它后面的逗号），另留 2 字节方括号；
+  // overheadBytes 通常已含空数组的 2 字节，故这里是净保守 2 字节。
+  const STRUCT_BYTES = 2;
+  const usable = Math.max(
+    0,
+    budgetBytes - overheadBytes - noteBytes - STRUCT_BYTES,
+  );
+  const costOf = (message: any): number => sizeOf(message) + 1;
 
   const kept: { index: number; message: any }[] = [];
   let used = 0;
@@ -586,7 +596,7 @@ export function fallbackTruncate(
     if (!message || typeof message !== "object" || message.role !== "system") {
       continue;
     }
-    const cost = sizeOf(message);
+    const cost = costOf(message);
     if (used + cost > usable) continue;
     kept.push({ index: i, message });
     used += cost;
@@ -597,7 +607,7 @@ export function fallbackTruncate(
     if (keptIndex.has(i)) continue;
     const message = messages[i];
     if (!message || typeof message !== "object") continue;
-    const cost = sizeOf(message);
+    const cost = costOf(message);
     // 单条就超预算时跳过而不是 break：更早的那些也许更小，仍值得留下。
     if (used + cost > usable) continue;
     kept.push({ index: i, message });
