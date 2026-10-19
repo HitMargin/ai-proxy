@@ -1634,12 +1634,29 @@ Worker 远端链。 为 dsh 提供免费模型入口。
 - **`.tmp-*.ts` 是运行时依赖，`.tmp-*` 通配不是（2026-10-05
   差点删掉用户资产）**：清理临时文件时我用
   `Remove-Item .tmp-*.cjs, .tmp-*.ts`，**把已跟踪的 `.tmp-cnb-login.ts`
-  删了**——而 `.tmp-*.ts` 被 gitignore
-  **刻意排除**在忽略规则外（`main.ts`/插件/README
-  都指名拉起它，见上面那条）。`git checkout --` 救回来了，字节与 HEAD
+  删了**。`git checkout --` 救回来了，字节与 HEAD
   一致。**判据：跑批量删除前先 `git ls-files`
-  看一眼通配会不会碰到被跟踪的文件**；`.tmp-`
-  前缀是「临时」的意思，但其中七个是**运行时的组成部分**，不是临时产物。
+  看一眼通配会不会碰到被跟踪的文件**。
+
+  **2026-10-19 修正这条的归因**：原文写「`.tmp-*.ts` 被 gitignore 刻意排除在
+  忽略规则外，因为 `main.ts`/插件/README 都指名拉起它」——那个理由**对多数
+  文件并不成立**，我当时是把三种完全不同的东西混成了一句概括：
+
+  | 类别 | 实际机制 | 文件 |
+  |---|---|---|
+  | ① 真·运行时依赖 | 插件 `spawn()` 它们，删了功能直接哑 | `.tmp-extract-deepseek-cookies.ts`（`dsh-plugin/index.js:4007,4016`）、`.tmp-workbuddy-login.ts`（`index.js:4175,4184`） |
+  | ② 只被文案提到 | 错误消息 / README 里叫**用户手动**去跑，没有任何代码 spawn | `.tmp-cnb-login.ts`、`.tmp-trae-login.ts`、`.tmp-trae-checkin.ts`、`.tmp-trae-raw.ts`、`.tmp-trae-infer-probe.ts`、`.tmp-parser-check.ts` |
+  | ③ 纯一次性取证 | 用完即弃 | 排查期间临时写的各种 probe |
+
+  **"被文案提到" 和 "被代码调用" 是两件事**。核实方法是 grep 生产代码
+  （`main.ts` / `worker.ts` / `src/**` / `dsh-plugin/**` / `scripts/**`）里的
+  `spawn(...)`，而不是 grep 文件名——文件名出现在错误消息里同样会命中。
+  `.tmp-trae-login.ts` 就是典型：`main.ts:454,1574` 与 `client.js:82,171`
+  都只是「run: deno run -A .tmp-trae-login.ts」这类提示字符串。
+
+  **取舍保留**：`.tmp-*.ts` 仍全部不忽略。理由改成诚实的那个——新增 ② 类
+  脚本时很难预料它会不会被改造成 ① 类，宁可多跟踪几个手工脚本，也不要让
+  插件某天 spawn 一个被 gitignore 掉的路径而静默失败。
 - **cnb 上游真的拒 >1MiB 请求体（2026-10-05
   实测；这条当初零记录，我一度误判成幻觉）**：`src/cnb.ts` 的 1MiB 预检是
   2026-09-24 加 DeepSeek provider 那次**顺手带进来的**，提交说明没提、AGENTS.md

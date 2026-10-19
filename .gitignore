@@ -26,14 +26,33 @@ cloudflared.exe
 # --- captured page snapshots / scratch ---
 page.html
 tmp-*.mjs
-# Local forensics probes written during an investigation. The .tmp-*.ts login and
-# cookie-capture scripts below are the deliberate exception: main.ts and the plugin
-# run them by path, so they are tracked on purpose - see AGENTS.md. Ignore the
-# dotted form only, or that machinery stops finding its own scripts.
+# 排查期间写的一次性取证脚本。`.tmp-*.ts` **故意没有**加进忽略规则——但理由
+# 不是一句"它们都是运行时依赖"，实测（2026-10-19）8 个已跟踪的 `.tmp-*.ts`
+# 分成三类，混淆它们正是错误结论的来源：
+#
+#   ① 真·运行时依赖（3 个，插件会 spawn 它们，删了功能就哑）：
+#        .tmp-extract-deepseek-cookies.ts  dsh-plugin/index.js:4007-4016
+#        .tmp-workbuddy-login.ts           dsh-plugin/index.js:4175-4184
+#        .tmp-trae-login.ts                只在错误文案里被提到（见 ②）
+#   ② 只被**错误消息/README** 提到（用户手动去跑）：其余 5 个。
+#        提到 ≠ 调用。之前把两者混为一谈，于是给整批文件编了个"按路径调用"
+#        的理由，那个理由对其中 5 个并不成立。
+#   ③ 纯一次性取证：用完即弃，本该被忽略。
+#
+# 现在的处理：`.tmp-*.ts` 仍然全部保持"未忽略"，因为**新增一个 ② 类脚本时
+# 很难预料它会不会被改造成 ① 类**；宁可多跟踪几个手工脚本，也不要让插件
+# 某天 spawn 一个被 gitignore 掉的路径而静默失败。这条取舍写在这里，是为了
+# 下次想"顺手加个 .tmp-*.ts 忽略"的人先看到代价。
+#
+# ⚠️ 与本文件无关但同等重要的一条：这些文件看起来是"临时"，实际有 3 个在
+# 生产路径上。批量删除前必须 `git ls-files '.tmp-*.ts'` 对照——2026-10-05
+# 曾用 `Remove-Item .tmp-*.ts` 把已跟踪的登录脚本删掉过。
 .tmp-*.cjs
 .tmp-*.mjs
 .tmp-*.jsonl
 .tmp-*.json
+# 取证脚本可能把凭据写进同名的 .txt（不在上面的通配里），单独挡住。
+.tmp-*.txt
 .git-commit-msg-tmp
 
 # --- backups ---

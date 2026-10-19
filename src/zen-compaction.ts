@@ -319,7 +319,7 @@ export interface CompactResult {
    * ★ 2026-10-19 加，第五次修这个函数。前四次都在修「压了但没压够」，
    * 直到实测发现还有一条更糟的路径：**压根没压，而且一声不吭**。
    *
-   * 复现（`.tmp-verify-bytes5.ts` 形态 B，6 轮 × 40 万字符，body 7.2 MB）：
+   * 复现（形态 B：6 轮 × 40 万字符，body 7.2 MB）：
    *
    *     writeSummaryCalled = false
    *     after = before = 7204563   <= 预算? NO

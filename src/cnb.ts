@@ -3542,8 +3542,8 @@ export async function maybeCompactCnb(
   // 走到这里意味着 `compactIfNeeded` 什么都没改（`changed === false`），
   // 而上面两道闸门都要求 `bytes > budget` —— 也就是说 body **确定**超限。
   // 旧代码在这个位置直接函数结束：一个 7.2 MB 的请求原样发出去，被上游
-  // 413 挡掉，而日志里连一行都没有（实测 `.tmp-verify-bytes5.ts` 形态 B：
-  // `writeSummaryCalled=false, after=before=7204563`）。
+  // 413 挡掉，而日志里连一行都没有（实测形态 B —— 6 轮 × 40 万字符、
+  // body 7.2 MB：`writeSummaryCalled=false, after=before=7204563`）。
   //
   // 典型成因：`forSummary` 把头部每条消息截到 600 字符后，整个 transcript
   // 缩到了 `keepTokens` 以下，于是 `selectTail` 认为「没有需要总结的部分」。
