@@ -3117,18 +3117,126 @@ export function deriveSessionKey(messages: readonly any[]): string {
   return `auto:${hash.toString(16).padStart(8, "0")}`;
 }
 
+/**
+ * 摘要重试编排：先按默认思考档跑，被思考吃光额度就关思考再跑一次。
+ *
+ * 抽成独立函数是因为这是本模块里唯一一段"重试是否真的发生"的逻辑，
+ * 而它必须能在不打上游的前提下验证——真实触发一次需要特定内容的
+ * prompt 让模型思考失控（生产上确实会发生，但不该是测试的前提）。
+ * runner 由调用方注入：生产传真实请求，测试传按脚本作答的假函数。
+ */
+export async function summariseWithThinkingFallback(
+  runner: (effort: "off" | null) => Promise<CnbSummaryAttempt>,
+): Promise<string> {
+  const first = await runner(null);
+  if (first.content.trim() !== "") return first.content;
+  if (!first.exhaustedByReasoning) {
+    // 不是被思考吃光（比如上游直接回了错），重试无意义，如实报错。
+    throw new Error(
+      `summary response carried no content (status=${first.status} ` +
+        `content-type=${first.contentType} bytes=${first.bytes} ` +
+        `data-lines=${first.dataLines} reasoning-chars=${first.reasoningChars} ` +
+        `finish=${first.finishReason || "none"} head=${
+          JSON.stringify(first.prefix)
+        })`,
+    );
+  }
+
+  const second = await runner("off");
+  if (second.content.trim() !== "") {
+    // 值得记一笔：重试救回来的次数本身就是"思考吃光额度"这个问题的
+    // 出现频率。没有这行，日志只能看到成功，看不出上游在恶化。
+    cnbSummaryRetryLogState.record(first.reasoningChars);
+    return second.content;
+  }
+  throw new Error(
+    `summary response carried no content even with thinking disabled ` +
+      `(first: reasoning-chars=${first.reasoningChars} finish=${first.finishReason}; ` +
+      `second: data-lines=${second.dataLines} bytes=${second.bytes} ` +
+      `finish=${second.finishReason || "none"} head=${
+        JSON.stringify(second.prefix)
+      })`,
+  );
+}
+
 /** 摘要写入器：走本代理自己的 cnb chat 路由，带上完整闸与重试。 */
 async function writeCnbSummary(
   prompt: string,
   model: string,
   maxTokens: number,
 ): Promise<string> {
-  const summaryBody = {
+  // 第一次用默认思考档（high）跑；若正文为空且 finish=length，说明
+  // 思考把 max_tokens 全吃光了（2026-10-19 生产日志实测：
+  // data-lines=4095 reasoning-chars=16476 finish=length，正文 0 字符）。
+  // 那种情况下关掉思考再跑一次是确定性的翻盘，不是碰运气：
+  // 同一 prompt 实测 effort=off 时 reasoning 恒为 0，正文必然产得出来。
+  return await summariseWithThinkingFallback((effort) =>
+    requestCnbSummary(prompt, model, maxTokens, effort)
+  );
+}
+
+/**
+ * "摘要因思考耗尽额度、靠关思考重试救回"的计数与日志节流。
+ *
+ * 每次救回都打一行会把日志淹掉（生产上这个会话每轮都触发），所以按
+ * 累计次数打点：第 1 次立刻打，之后每 10 次打一次，每次都带上累计量与
+ * 上一次的思考字符数——足够看出趋势，又不至于刷屏。
+ */
+export const cnbSummaryRetryLogState = {
+  attempts: 0,
+  rescued: 0,
+  lastReasoningChars: 0,
+  record(reasoningChars: number) {
+    this.attempts += 1;
+    this.rescued += 1;
+    this.lastReasoningChars = reasoningChars;
+    if (this.rescued === 1 || this.rescued % 10 === 0) {
+      console.warn(
+        `[cnb] summary needed thinking disabled to produce content ` +
+          `(rescued ${this.rescued}x so far, last run burnt ${reasoningChars} ` +
+          `chars of reasoning on a zero-length answer)`,
+      );
+    }
+  },
+  reset() {
+    this.attempts = 0;
+    this.rescued = 0;
+    this.lastReasoningChars = 0;
+  },
+};
+
+export interface CnbSummaryAttempt {
+  content: string;
+  status: number;
+  contentType: string;
+  bytes: number;
+  dataLines: number;
+  reasoningChars: number;
+  finishReason: string;
+  /** 正文为空**且**是思考把额度用尽导致的截断。 */
+  exhaustedByReasoning: boolean;
+  prefix: string;
+}
+
+/** 打一次摘要请求，把"为什么空"的诊断量一并带回来。 */
+async function requestCnbSummary(
+  prompt: string,
+  model: string,
+  maxTokens: number,
+  effort: "off" | null,
+): Promise<CnbSummaryAttempt> {
+  const summaryBody: Record<string, unknown> = {
     model: model || "deepseek-v4.1-flash",
     max_tokens: maxTokens,
     stream: true,
     messages: [{ role: "user", content: prompt }],
   };
+  // off 必须**完全不发** reasoning_effort 之外的档位字段：上游把
+  // `reasoning_effort: "off"` 判成不支持的档位（400 code 11150），
+  // 只认 enable_thinking=false 且不带 effort。cnbBuildUpstream 已经处理
+  // 这个形状，这里只需把 effort 传成 off。
+  if (effort !== null) summaryBody.reasoning_effort = effort;
+
   const url = new URL("http://cnb.local/cnb/v1/chat/completions");
   const req = new Request(url.toString(), {
     method: "POST",
@@ -3148,31 +3256,81 @@ async function writeCnbSummary(
     true,
     () => handleCnb("/cnb/v1/chat/completions", req, url),
   );
+  const contentType = resp.headers.get("content-type") ?? "?";
   if (!resp.ok) {
     const detail = await resp.text().catch(() => "");
-    throw new Error(
-      `summary request HTTP ${resp.status}: ${detail.slice(0, 120)}`,
-    );
+    return {
+      content: "",
+      status: resp.status,
+      contentType,
+      bytes: detail.length,
+      dataLines: 0,
+      reasoningChars: 0,
+      finishReason: "",
+      exhaustedByReasoning: false,
+      prefix: detail.slice(0, 160).replace(/\s+/g, " "),
+    };
   }
+
   // 非流式收集（stream:true 时上游回 SSE，这里由 cnb 分支自己聚合）
   const text = await resp.text();
   let content = "";
+  let dataLines = 0;
+  let reasoningChars = 0;
+  let finishReason = "";
   try {
     for (const line of text.split("\n")) {
       if (!line.startsWith("data: ")) continue;
       const payload = line.slice(6).trim();
       if (payload === "" || payload === "[DONE]") continue;
+      dataLines += 1;
       const chunk = JSON.parse(payload);
       const delta = chunk?.choices?.[0]?.delta;
       if (delta?.content) content += delta.content;
+      if (delta?.reasoning_content) {
+        reasoningChars += String(delta.reasoning_content).length;
+      }
+      const fr = chunk?.choices?.[0]?.finish_reason;
+      if (fr) finishReason = String(fr);
     }
   } catch {
     content = "";
   }
-  if (content.trim() === "") {
-    throw new Error("summary response carried no content");
-  }
-  return content;
+
+  return {
+    content,
+    status: resp.status,
+    contentType,
+    bytes: text.length,
+    dataLines,
+    reasoningChars,
+    finishReason,
+    exhaustedByReasoning: isReasoningStarvation(
+      content,
+      finishReason,
+      reasoningChars,
+    ),
+    prefix: text.slice(0, 160).replace(/\s+/g, " "),
+  };
+}
+
+/**
+ * 判断一次摘要请求的失败是不是"思考把额度吃光"。
+ *
+ * 抽成纯函数是因为这是重试的总开关：判据写错了，重试就被静默禁用，
+ * 而所有测试都还在绿——因为测试是**注入** attempt 的，绕过了这段推导。
+ * 三个条件缺一不可：
+ *   ① 正文为空（不是"短"，是空）；
+ *   ② finish=length（是被额度截断，不是自然说完）；
+ *   ③ 确实产生了思考（否则是上游不肯给正文，关思考也没用）。
+ */
+export function isReasoningStarvation(
+  content: string,
+  finishReason: string,
+  reasoningChars: number,
+): boolean {
+  return content.trim() === "" && finishReason === "length" &&
+    reasoningChars > 0;
 }
 
 // 导出给 src/cnb.test.ts：压缩的判据（超预算才动、压缩后必须能过上游的

@@ -21,12 +21,15 @@ import {
   cnbParseToolCalls,
   deriveSessionKey,
   handleCnb,
+  isReasoningStarvation,
   maybeCompactCnb,
   neutraliseClientIdentity,
   runAsCnbInternal,
   sessionIdOf,
+  summariseWithThinkingFallback,
 } from "./cnb.ts";
 import { compactionState, resetCompactionStates } from "./zen-compaction.ts";
+import type { CnbSummaryAttempt } from "./cnb.ts";
 
 // LT 是源码里唯一允许出现尖括号的地方。测试正文到处要断言「没有一个裸的尖括号
 // 漏到客户端」，写字面量会把标签配对搞坏——这个文件正是靠这条纪律生成的。
@@ -1752,5 +1755,147 @@ Deno.test("cnb: giant tool payloads are truncated out of the summary prompt", as
   assert(
     promptBytes <= limit,
     `the summary prompt must stay under the upstream limit, got ${promptBytes} > ${limit}`,
+  );
+});
+
+// ---------- 2026-10-19 第七次：思考吃光摘要额度 ----------
+//
+// 生产日志（新诊断打出来的）：
+//   summary response carried no content (status=200
+//   content-type=text/event-stream bytes=881289 data-lines=4095
+//   reasoning-chars=16476 finish=length head="data: {...")
+// 也就是说模型把 4096 tokens 全花在思考上，正文一个字没输出。
+// 这不是解析 bug，是模型行为；能确定翻盘的办法是把思考关掉重跑。
+const summaryAttempt = (over: Partial<CnbSummaryAttempt>) => ({
+  content: "",
+  status: 200,
+  contentType: "text/event-stream",
+  bytes: 881289,
+  dataLines: 4095,
+  reasoningChars: 16476,
+  finishReason: "length",
+  exhaustedByReasoning: false,
+  prefix: "",
+  ...over,
+});
+
+Deno.test("cnb: an empty summary caused by burnt reasoning budget is retried with thinking off", async () => {
+  const efforts: Array<"off" | null> = [];
+  const text = await summariseWithThinkingFallback(async (effort) => {
+    efforts.push(effort);
+    if (effort === null) {
+      return summaryAttempt({
+        content: "",
+        finishReason: "length",
+        reasoningChars: 16476,
+        exhaustedByReasoning: true,
+      });
+    }
+    return summaryAttempt({
+      content: "会话摘要：改了三处截断逻辑。",
+      finishReason: "stop",
+      reasoningChars: 0,
+    });
+  });
+
+  // 判据一：必须真的重试过，且第二次明确关掉思考。
+  assertEquals(
+    efforts,
+    [null, "off"],
+    "must retry exactly once with thinking off",
+  );
+  // 判据二：返回值必须是第二次的正文，不是空串。
+  assertEquals(text, "会话摘要：改了三处截断逻辑。");
+});
+
+Deno.test("cnb: an empty summary that is NOT reasoning starvation is not retried", async () => {
+  // 反面对照：上游直接报错 / 不肯给正文时，重试只是浪费一次调用和一次
+  // 摘要 token。判据是"没重试"，而不是"重试了但失败"。
+  let calls = 0;
+  let error = "";
+  try {
+    await summariseWithThinkingFallback(() => {
+      calls += 1;
+      return Promise.resolve(summaryAttempt({
+        content: "",
+        status: 500,
+        finishReason: "",
+        reasoningChars: 0,
+        exhaustedByReasoning: false,
+      }));
+    });
+  } catch (e) {
+    error = e instanceof Error ? e.message : String(e);
+  }
+
+  assertEquals(calls, 1, "a non-reasoning failure must not trigger a retry");
+  assert(
+    error.includes("carried no content"),
+    "the failure must still be reported, got: " + error,
+  );
+  // 诊断量必须带上，否则这条日志在生产里等于没有信息。
+  assert(
+    error.includes("data-lines=") && error.includes("reasoning-chars="),
+    "the error must carry the diagnostic counters, got: " + error,
+  );
+});
+
+Deno.test("cnb: a summary that fails even with thinking off reports both attempts", async () => {
+  let error = "";
+  try {
+    await summariseWithThinkingFallback((effort) =>
+      Promise.resolve(summaryAttempt({
+        content: "",
+        finishReason: effort === "off" ? "stop" : "length",
+        reasoningChars: effort === "off" ? 0 : 16476,
+        exhaustedByReasoning: effort !== "off",
+      }))
+    );
+  } catch (e) {
+    error = e instanceof Error ? e.message : String(e);
+  }
+  // 两个 attempt 的信息都要在，否则没法判断是"思考问题"还是"上游坏了"。
+  assert(error.includes("even with thinking disabled"), "got: " + error);
+  assert(
+    error.includes("first:"),
+    "must report the first attempt, got: " + error,
+  );
+  assert(
+    error.includes("second:"),
+    "must report the second attempt, got: " + error,
+  );
+});
+
+// ---------- 2026-10-19 第七次（其二）：重试的总开关要单独测 ----------
+//
+// 上面那几条测试是**注入** attempt 的，绕过了 requestCnbSummary 里推导
+// exhaustedByReasoning 的那段代码。判据写错时它们照样全绿，重试却被
+// 静默禁用——所以判据本身必须单独对着输入测。
+Deno.test("cnb: reasoning starvation is recognised by three conditions together", () => {
+  // 正例：真实失败现场的形状（2026-10-19 生产日志）。
+  assert(
+    isReasoningStarvation("", "length", 16476),
+    "empty body + length cut + real reasoning must count as starvation",
+  );
+  // 三个条件各缺一个都必须为假，否则会误触发重试。
+  assertEquals(
+    isReasoningStarvation("有正文", "length", 16476),
+    false,
+    "a non-empty answer is never starvation",
+  );
+  assertEquals(
+    isReasoningStarvation("", "stop", 16476),
+    false,
+    "a natural stop is not a length cut",
+  );
+  assertEquals(
+    isReasoningStarvation("", "length", 0),
+    false,
+    "no reasoning at all means disabling thinking cannot help",
+  );
+  // 纯空白正文要算空：上游有时回 " " 或 "\n"。
+  assert(
+    isReasoningStarvation("  \n ", "length", 500),
+    "whitespace-only content must count as empty",
   );
 });
