@@ -11,7 +11,11 @@ import {
   tryParseResponse,
 } from "./src/core.ts";
 export { ENV } from "./src/core.ts";
-import { CatalogRegistry, isRosterDegraded } from "./src/runtime/health.ts";
+import {
+  CatalogRegistry,
+  isChannelDormant,
+  isRosterDegraded,
+} from "./src/runtime/health.ts";
 import {
   customProvidersSnapshot,
   handleCustom,
@@ -1396,17 +1400,28 @@ async function handleAggregateV1(
       // user's choice, and counting it pinned the roster to DEGRADED_TTL forever
       // - a 20x refetch rate and a warning at every start, for a channel that
       // was never going to answer until a key was pasted.
+      // 提到循环外：customProvidersSnapshot 会读文件，没必要每个成员读一遍。
+      const customProviderCount = customProvidersSnapshot(ENV).providers.length;
       const degraded = isRosterDegraded(
         V1_AGGREGATE_MEMBERS,
         members,
         (key) =>
-          !hasChannelCredential(key, (providers as any)[key]) ||
-          // WorkBuddy declares auth:{type:'none'} (the credential is a file, not
-          // an env var), so the shared check says "has one" even when nothing has
-          // ever logged in. Without this the roster is degraded from the first
-          // boot until the user runs the login script - a 20x refetch rate and a
-          // startup warning for a channel that was never going to answer.
-          (key === "workbuddy" && !workBuddyCatalog.configured),
+          isChannelDormant(key, {
+            hasCredential: hasChannelCredential(
+              key,
+              (providers as any)[key],
+            ),
+            // WorkBuddy declares auth:{type:'none'} (the credential is a login
+            // session file, not an env var), so the shared check says "has one"
+            // even when nothing has ever logged in. Without this the roster is
+            // degraded from the first boot until the user runs the login script.
+            workBuddyLoggedIn: workBuddyCatalog.configured,
+            // custom 声明 auth:{type:'none'} 是因为用户加的每个上游各自带 key，
+            // 渠道本身没有"一个"凭据。没配任何自定义上游时它必然回空列表，
+            // 于是名册恒判 degraded、TTL 从 5 分钟塌到 15 秒（实测 7 分钟内
+            // /v1/models 被打了 21 次）。「没配」不是「坏了」。
+            customProviderCount,
+          }),
       );
       if (degraded && previous?.degraded !== true) {
         console.warn(

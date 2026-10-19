@@ -1,6 +1,48 @@
 export type CatalogState = "ok" | "failed";
 
 /**
+ * What the aggregate roster knows about one channel's ability to answer.
+ *
+ * These are the only three things that can make a member legitimately silent,
+ * and they are passed in rather than looked up so the dormant decision can be
+ * tested without booting the server or reading the environment.
+ */
+export interface ChannelPresenceFacts {
+  /** The channel's own auth block is satisfied (env var / default token). */
+  hasCredential: boolean;
+  /** WorkBuddy's credential is a login session file, not an env var. */
+  workBuddyLoggedIn: boolean;
+  /** How many user-defined upstreams exist under the `custom` channel. */
+  customProviderCount: number;
+}
+
+/**
+ * Whether a member is dormant - silent because it was never set up, not broken.
+ *
+ * The distinction matters because the roster's degraded verdict drives the cache
+ * TTL: a member that SHOULD answer but came back empty means "retry in 15s", and
+ * a dormant member means nothing at all. Every channel defaults to carrying its
+ * own credential, so `auth: {type: "none"}` is not evidence that a channel can
+ * answer - for WorkBuddy and `custom` it means the opposite: the real credential
+ * lives somewhere the shared env check cannot see.
+ *
+ * Getting this wrong is not cosmetic. `custom` with no user-defined upstreams
+ * always lists zero models, so treating it as "should answer" pinned the roster
+ * to DEGRADED_TTL **forever**: measured over seven minutes, `/v1/models` was
+ * fetched 21 times instead of ~2, and the trae/workbuddy catalogs were re-pulled
+ * and re-logged four times over.
+ */
+export function isChannelDormant(
+  key: string,
+  facts: ChannelPresenceFacts,
+): boolean {
+  if (!facts.hasCredential) return true;
+  if (key === "workbuddy" && !facts.workBuddyLoggedIn) return true;
+  if (key === "custom" && facts.customProviderCount === 0) return true;
+  return false;
+}
+
+/**
  * Whether a freshly fetched aggregate roster counts as degraded.
  *
  * "Degraded" means "shorter than it should be", so the real question is not
@@ -8,7 +50,7 @@ export type CatalogState = "ok" | "failed";
  * member with no credential is dormant by the user's own choice; counting it as
  * degraded pinned the roster to DEGRADED_TTL permanently - a 20x refetch rate
  * and a warning on every start, for a channel that would not answer until a key
- * was pasted.
+ * was pasted. See {@link isChannelDormant} for the per-channel cases.
  */
 export function isRosterDegraded(
   keys: readonly string[],

@@ -3,6 +3,7 @@ import {
   CatalogRegistry,
   classifyProbeStatus,
   HealthRegistry,
+  isChannelDormant,
   isRosterDegraded,
 } from "./health.ts";
 
@@ -168,4 +169,99 @@ Deno.test("a roster nobody is missing is not degraded", () => {
   // 全休眠 = 全都不会应答 = 无从变短。这条是上面那条的反面，防止把
   // isDormant 写成「只要有一个休眠就返回 false」以外的东西。
   equal(isRosterDegraded(["a", "b"], {}, () => true), false);
+});
+
+// ---------- 2026-10-20：dormant 判错会把 TTL 永久压到 15 秒 ----------
+//
+// 这条 bug 之所以能活到今天，是因为「哪些成员该沉默」这个决定写在 main.ts
+// 的调用点里，而 main.ts 一 import 就起服务器——测不了。判据搬出来之后，
+// 每个渠道的沉默理由都可以单独钉住。
+Deno.test("a channel is dormant for the reason that actually applies to it", () => {
+  const facts = {
+    hasCredential: true,
+    workBuddyLoggedIn: true,
+    customProviderCount: 1,
+  };
+
+  // 没有凭据的渠道：用户没配 key，沉默是选择。
+  equal(
+    isChannelDormant("openrouter", { ...facts, hasCredential: false }),
+    true,
+  );
+
+  // WorkBuddy 的凭据是登录态文件，env 检查看不见它。
+  equal(
+    isChannelDormant("workbuddy", { ...facts, workBuddyLoggedIn: false }),
+    true,
+    "workbuddy without a login session must be dormant even though auth is 'none'",
+  );
+  equal(isChannelDormant("workbuddy", facts), false);
+
+  // ★ 真正的坑：custom 的 auth 是 'none'（每个自定义上游自带 key），所以
+  // hasCredential 恒真。没配上游时它必然空列表——必须当休眠，否则名册
+  // 永久 degraded。这一条是本轮 bug 的回归测试。
+  equal(
+    isChannelDormant("custom", { ...facts, customProviderCount: 0 }),
+    true,
+    "custom with no upstreams configured must be dormant, not 'should answer but empty'",
+  );
+  equal(
+    isChannelDormant("custom", facts),
+    false,
+    "custom with a configured upstream must be expected to answer",
+  );
+
+  // custom 的特殊性不能蔓延到别的渠道：它们没有「数量为 0」这种状态。
+  equal(
+    isChannelDormant("kilo", { ...facts, customProviderCount: 0 }),
+    false,
+    "customProviderCount must only affect the custom channel",
+  );
+});
+
+Deno.test("an unconfigured custom channel does not pin the roster to degraded", () => {
+  // 真实名册形状（2026-10-20 实测 153 个模型）：除 custom 外全部有行。
+  const members: Record<string, unknown[]> = {
+    kilo: [{}],
+    zen: [{}],
+    cnb: [{}],
+    commandcode: [{}],
+    "deepseek-web": [{}],
+    workbuddy: [{}],
+    trae: [{}],
+    openrouter: [],
+    zlkpro: [],
+    custom: [],
+  };
+  const keys = Object.keys(members);
+  const factsFor = (key: string) => ({
+    hasCredential: key !== "openrouter" && key !== "zlkpro",
+    workBuddyLoggedIn: true,
+    customProviderCount: 0,
+  });
+
+  equal(
+    isRosterDegraded(keys, members, (k) => isChannelDormant(k, factsFor(k))),
+    false,
+    "an unconfigured custom channel plus keyless channels is a healthy roster",
+  );
+
+  // 反过来：一个真该答的渠道回空，必须仍然判 degraded——别把判据放宽到失效。
+  const broken = { ...members, trae: [] };
+  equal(
+    isRosterDegraded(keys, broken, (k) => isChannelDormant(k, factsFor(k))),
+    true,
+    "a credentialed channel returning nothing must still degrade the roster",
+  );
+
+  // custom 配了上游却回空，同样是坏的。
+  equal(
+    isRosterDegraded(
+      keys,
+      members,
+      (k) => isChannelDormant(k, { ...factsFor(k), customProviderCount: 2 }),
+    ),
+    true,
+    "custom with upstreams configured but no rows is a real failure",
+  );
 });
