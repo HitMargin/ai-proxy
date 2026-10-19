@@ -3247,12 +3247,10 @@ export async function maybeCompactCnb(
     // zen-compaction 拿不到上一轮的 anchored summary。现在按首条消息派生一个
     // 稳定键：同一段对话的相邻请求命中同一份状态（走增量更新），不同对话
     // 因首条消息不同而互相隔离。前缀 `auto:` 不会与真实客户端 id 冲突。
-    sessionId: session !== ""
-      ? `cnb:${session}`
-      : (() => {
-        const derived = deriveSessionKey(messages);
-        return derived === "" ? "" : `cnb:${derived}`;
-      })(),
+    sessionId: session !== "" ? `cnb:${session}` : (() => {
+      const derived = deriveSessionKey(messages);
+      return derived === "" ? "" : `cnb:${derived}`;
+    })(),
     config: {
       keepTokens: cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000),
       buffer: cnbIntSetting("CNB_COMPACTION_BUFFER", 20000),
@@ -3266,12 +3264,10 @@ export async function maybeCompactCnb(
   // 2026-10-19 实测踩过：修复后日志仍打印 `session=(none)`，看起来像派生键没
   // 生效（我就是这么误判了一次）。实际上键已经派生，只是日志字段取的是入参。
   // 判据：**日志要能回答“状态存在哪”**，否则它在排查时是误导而不是证据。
-  const stateKey = session !== ""
-    ? `cnb:${session}`
-    : (() => {
-      const d = deriveSessionKey(messages);
-      return d === "" ? "" : `cnb:${d}`;
-    })();
+  const stateKey = session !== "" ? `cnb:${session}` : (() => {
+    const d = deriveSessionKey(messages);
+    return d === "" ? "" : `cnb:${d}`;
+  })();
   const keyLabel = stateKey === "" ? "(none)" : stateKey;
 
   if (result.changed) {

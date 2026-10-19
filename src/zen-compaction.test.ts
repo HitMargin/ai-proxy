@@ -1,7 +1,7 @@
 import {
   buildSummaryPrompt,
-  compactionState,
   compactIfNeeded,
+  compactionState,
   estimateTokens,
   fallbackTruncate,
   findExistingSummary,
@@ -291,7 +291,10 @@ Deno.test("fallback truncation actually shrinks a body over the byte budget", ()
   ];
   const before = new TextEncoder().encode(JSON.stringify(messages)).length;
   const budget = 20000;
-  assert(before > budget, `fixture must start over budget (${before} > ${budget})`);
+  assert(
+    before > budget,
+    `fixture must start over budget (${before} > ${budget})`,
+  );
 
   const out = fallbackTruncate(messages, budget);
   const after = new TextEncoder().encode(JSON.stringify(out.messages)).length;

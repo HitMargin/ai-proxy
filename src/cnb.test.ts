@@ -19,10 +19,10 @@ import {
   type CnbJunkStore,
   cnbJunkStreak,
   cnbParseToolCalls,
+  deriveSessionKey,
   handleCnb,
   maybeCompactCnb,
   neutraliseClientIdentity,
-  deriveSessionKey,
   sessionIdOf,
 } from "./cnb.ts";
 import { compactionState, resetCompactionStates } from "./zen-compaction.ts";

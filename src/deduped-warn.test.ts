@@ -41,9 +41,9 @@ Deno.test("a changed reason is reported immediately", () => {
 Deno.test("recovery re-arms the warning", () => {
   const seen: string[] = [];
   const warn = new DedupedWarn((m) => seen.push(m));
-  warn.warn("boom");       // 第一次坏：报
-  warn.reset();            // 恢复好
-  warn.warn("boom");       // 又坏：必须再报一次
+  warn.warn("boom"); // 第一次坏：报
+  warn.reset(); // 恢复好
+  warn.warn("boom"); // 又坏：必须再报一次
   assertEquals(
     seen.length,
     2,
