@@ -313,6 +313,28 @@ export interface CompactResult {
    * 等于没有日志的失败”同一条）。
    */
   error?: string;
+  /**
+   * 没有压缩时**为什么没压**（`changed === false` 且 `note === ""` 时存在）。
+   *
+   * ★ 2026-10-19 加，第五次修这个函数。前四次都在修「压了但没压够」，
+   * 直到实测发现还有一条更糟的路径：**压根没压，而且一声不吭**。
+   *
+   * 复现（`.tmp-verify-bytes5.ts` 形态 B，6 轮 × 40 万字符，body 7.2 MB）：
+   *
+   *     writeSummaryCalled = false
+   *     after = before = 7204563   <= 预算? NO
+   *
+   * 原因链：`maybeCompactCnb` 为了给摘要 prompt 限体积，先把**头部**每条
+   * 消息截到 600 字符；这一步把整个 transcript 也缩小了，于是
+   * `selectTail` 认为「全都装得下」→ 返回 undefined → `split <= 0`
+   * → `compactIfNeeded` 在 line 355 静默 return `{changed:false, note:""}`。
+   * 而 `maybeCompactCnb` 只处理 `changed` 与 `note === "summary-failed"`，
+   * 这条路径两个都不命中 ⇒ body 一个字节不改、日志一行不打、上游继续 413。
+   *
+   * 判据：**「没压」和「压了没压够」都不许静默**。调用方拿到原因后才能决定
+   * 是否降级到字节截断。
+   */
+  skipped?: string;
 }
 
 /**
@@ -327,22 +349,46 @@ export async function compactIfNeeded(
 ): Promise<CompactResult> {
   const config = { ...DEFAULT_COMPACTION, ...(input.config ?? {}) };
   if (!config.enabled) {
-    return { changed: false, note: "", compactTokens: 0, messages: [] };
+    return {
+      changed: false,
+      note: "",
+      compactTokens: 0,
+      messages: [],
+      skipped: "compaction disabled",
+    };
   }
   const contextWindow = input.contextWindow;
   if (contextWindow <= 0) {
-    return { changed: false, note: "", compactTokens: 0, messages: [] };
+    return {
+      changed: false,
+      note: "",
+      compactTokens: 0,
+      messages: [],
+      skipped: "contextWindow <= 0",
+    };
   }
   const messages = input.messages;
   if (!Array.isArray(messages) || messages.length === 0) {
-    return { changed: false, note: "", compactTokens: 0, messages: [] };
+    return {
+      changed: false,
+      note: "",
+      compactTokens: 0,
+      messages: [],
+      skipped: "no messages",
+    };
   }
 
   const threshold = contextWindow -
     Math.max(input.maxOutputTokens, config.buffer);
   const estimate = estimateJsonTokens(input.body ?? { messages });
   if (estimate <= threshold) {
-    return { changed: false, note: "", compactTokens: 0, messages: [] };
+    return {
+      changed: false,
+      note: "",
+      compactTokens: 0,
+      messages: [],
+      skipped: `estimate ${estimate} <= threshold ${threshold}`,
+    };
   }
 
   // One serialized line per original message, index-aligned with `messages`.
@@ -353,7 +399,19 @@ export async function compactIfNeeded(
   );
   const selection = selectTail(serialized, config.keepTokens);
   if (!selection || selection.split <= 0) {
-    return { changed: false, note: "", compactTokens: 0, messages: [] };
+    // ★ 2026-10-19 第五次修。这条分支曾让一个 7.2 MB 的请求**原样发出去**：
+    // 调用方（maybeCompactCnb）为了给摘要限体积先把头部消息截到 600 字符，
+    // 整个 transcript 随之缩到 keepTokens 之下，于是这里判定“没有可压缩的
+    // 部分”——但 body 仍远超字节上限。什么都不改、什么都不说，是这套逻辑里
+    // 最坏的失败形态：上游 413，日志干净，看起来一切正常。
+    return {
+      changed: false,
+      note: "",
+      compactTokens: 0,
+      messages: [],
+      skipped: `nothing to summarise: keepTokens=${config.keepTokens} ` +
+        `already covers all ${serialized.length} messages`,
+    };
   }
 
   const state = compactionState(input.sessionId);
@@ -366,7 +424,13 @@ export async function compactIfNeeded(
   const head = selection.head.join("\n\n");
   const context = [previousRecent, head].filter((part) => part !== "");
   if (previousSummary === "" && context.length === 0) {
-    return { changed: false, note: "", compactTokens: 0, messages: [] };
+    return {
+      changed: false,
+      note: "",
+      compactTokens: 0,
+      messages: [],
+      skipped: "no head content and no previous summary",
+    };
   }
 
   const prompt = buildSummaryPrompt(previousSummary, context);

@@ -1528,3 +1528,101 @@ Deno.test("cnb: gitStatus template fingerprint is rewritten (2026-10-18 second f
     "the branch name must survive the rewrite",
   );
 });
+
+// ─── 第五次修：body 超预算却「压根没压缩」也必须在返回前收敛 ───
+//
+// 前四次修的都是「压了但没压够」。这两条守的是更糟的形态：**压根没压，一声不吭**。
+//
+// 起因是用户质疑「所以你修复了字节和token？真的吗」（m01090）。当时我用一个
+// 6.25 MB 的 body 测得 `writeSummaryCalled=false, after=before`，第一反应是
+// 测量脚本有问题。脚本确实有问题（构造方式不真实），但换到真实形态后漏洞仍在：
+//
+// 形态 B（6 轮 × 40 万字符）：
+//     writeSummaryCalled = false
+//     after = before = 7204563   ← body 一个字节没动
+//
+// 链条是：maybeCompactCnb 为给摘要 prompt 限体积，先把头部每条消息截到 600
+// 字符；这一步把整个 transcript 也缩小了 → selectTail 认为「全都装得下」→
+// 返回 undefined → compactIfNeeded 静默 return {changed:false, note:""} →
+// 调用方只处理 changed 与 note==="summary-failed"，两个都不命中 → 直接结束。
+// 上游收到 7.2 MB，413，而日志一行没有。
+//
+// 判据：**只要进了 maybeCompactCnb 且 bytes > budget，返回时 body 必须 <= budget。**
+// 下面两条分别守住「必须收敛」与「收敛了要如实说」。
+Deno.test("cnb: an oversized body still converges when compaction finds nothing to summarise", async () => {
+  // 形态 B：轮数少、每条极大。头部截到 600 字符后总 token 落进 keepTokens，
+  // selectTail 判定没有可总结的部分——但 body 仍远超字节预算。
+  const filler = "中文填充".repeat(100000); // 单条 40 万字符
+  const messages: any[] = [{
+    role: "system",
+    content: "You are a coding agent.",
+  }];
+  for (let i = 0; i < 6; i += 1) {
+    messages.push({ role: "user", content: filler + i });
+    messages.push({ role: "assistant", content: "收到" + i });
+  }
+  messages.push({ role: "user", content: "最新一轮，压缩后必须保留" });
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 120000,
+    stream: true,
+    messages,
+    tools: Array.from({ length: 10 }, (_, i) => ({
+      type: "function",
+      function: {
+        name: `t${i}`,
+        description: "x".repeat(300),
+        parameters: { type: "object" },
+      },
+    })),
+  };
+  const before = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(before > 900 * 1024, "fixture must exceed the budget, got " + before);
+
+  let asked = false;
+  await maybeCompactCnb(body, "", async () => {
+    asked = true;
+    throw new Error("simulated");
+  });
+
+  const after = new TextEncoder().encode(JSON.stringify(body)).length;
+  // 这条断言就是本次修复的判据。旧代码下 after === before，测试必红。
+  assert(
+    after <= 900 * 1024,
+    `body must fit the budget even when the summary path is skipped: ${before} -> ${after}`,
+  );
+  // 摘要没被问过——这不是缺陷，是这个形态的正常结果；真正的缺陷是「没人兜底」。
+  assertEquals(asked, false, "this fixture is meant to skip the summary path");
+});
+
+Deno.test("cnb: skipping compaction is reported, not silent", async () => {
+  // 「没压」与「压了没压够」都要有话说。旧代码这条路径不打任何日志，
+  // 于是 7.2 MB 的请求被上游 413 时，日志里找不到任何线索。
+  const filler = "中文填充".repeat(100000);
+  const messages: any[] = [{
+    role: "system",
+    content: "You are a coding agent.",
+  }];
+  for (let i = 0; i < 6; i += 1) {
+    messages.push({ role: "user", content: filler + i });
+    messages.push({ role: "assistant", content: "收到" + i });
+  }
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 120000,
+    messages,
+  };
+
+  const note = await maybeCompactCnb(body, "", async () => {
+    throw new Error("simulated");
+  });
+
+  // 返回值本身就是判据：旧签名返回 void，调用方无从知道「做了什么」。
+  assert(note !== "", "a skipped compaction must report what it did");
+  // 必须看得出是「跳过摘要、改成截断」，而不是「成功压缩」。
+  assert(
+    note.includes("truncation") || note.includes("skipped"),
+    "the note must say the body was truncated / the summary was skipped, got: " +
+      note,
+  );
+});

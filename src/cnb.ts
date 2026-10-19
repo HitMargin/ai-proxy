@@ -3040,7 +3040,6 @@ async function handleCnbMessages(request: Request): Promise<Response> {
  *    内容泄漏，AGENTS.md 有记）。
  */
 const CNB_BODY_BUDGET_BYTES = 900 * 1024; // 1 MiB 留 128 KiB 给 envelope
-let cnbLastCompactNote = "";
 
 function cnbIntSetting(name: string, fallback: number): number {
   const raw = Number(Deno.env.get(name));
@@ -3178,10 +3177,16 @@ export async function maybeCompactCnb(
     model: string,
     maxTokens: number,
   ) => Promise<string>,
-): Promise<void> {
+): Promise<string> {
   const messages = body?.messages;
-  if (!Array.isArray(messages) || messages.length === 0) return;
-  if (Deno.env.get("CNB_COMPACTION") === "off") return;
+  // 返回「这次压缩做了什么」，而不是 void。
+  //
+  // ★ 2026-10-19 第五次修：旧签名返回 void，调用方只能通过模块级的
+  // `compactNote` 侧面读结果——那既让单测必须导出测试专用访问器，
+  // 也让「什么都没做」和「做了一次截断」在类型上无法区分。实测正是这个
+  // 不可区分性掩盖了形态 B 的静默失败：body 一个字节没改，日志一行没有。
+  if (!Array.isArray(messages) || messages.length === 0) return "";
+  if (Deno.env.get("CNB_COMPACTION") === "off") return "";
 
   // 用**实际编码后的字节数**估，而不是字符数：base64 图片一头就占掉大半个
   // 预算，字符数会把它算成 1/4（这正是 Zen 那边踩过的：估算跳过 image_url）。
@@ -3191,10 +3196,10 @@ export async function maybeCompactCnb(
     json = JSON.stringify(body);
     bytes = new TextEncoder().encode(json).length;
   } catch {
-    return;
+    return "";
   }
   const budget = cnbIntSetting("CNB_BODY_BUDGET_BYTES", CNB_BODY_BUDGET_BYTES);
-  if (bytes <= budget) return;
+  if (bytes <= budget) return "";
 
   // ★ 摘要请求自身的体积上限。
   //
@@ -3283,10 +3288,11 @@ export async function maybeCompactCnb(
     }
   })();
 
+  let compactNote = "";
   if (result.changed) {
     body.messages = result.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
-    cnbLastCompactNote = `compacted ${result.note} ` +
+    compactNote = `compacted ${result.note} ` +
       `session=${keyLabel} ` +
       `bytes ${bytes} -> ${after} cost≈${result.compactTokens}`;
     // ★ 摘要压缩**自己也可能压不到线以下**（尾部原文 + system 指令有时就占了
@@ -3300,11 +3306,11 @@ export async function maybeCompactCnb(
       const truncated = fallbackTruncate(body.messages, budget, overheadBytes);
       body.messages = truncated.messages;
       const final = new TextEncoder().encode(JSON.stringify(body)).length;
-      cnbLastCompactNote +=
+      compactNote +=
         ` | summary still over budget (${after}B > ${budget}B), fell back to truncation -> ${final}B`;
-      return;
+      return compactNote;
     }
-    return;
+    return compactNote;
   }
   // 摘要失败：降级成截断。**仍然要说一句**——静默丢历史比丢历史更糟。
   if (result.note === "summary-failed") {
@@ -3319,13 +3325,42 @@ export async function maybeCompactCnb(
     // 失败原因必须可见：日志里连续几十行都只有 "summary generation failed"，
     // 没有任何线索说明是超时、401、还是上游拒答——那等于没有诊断。
     const why = result.error ? `: ${result.error}` : "";
-    cnbLastCompactNote = `${truncated.note} session=${keyLabel} ` +
+    compactNote = `${truncated.note} session=${keyLabel} ` +
       `(summary generation failed${why}) bytes ${bytes} -> ${after}`;
     if (after > budget) {
       // 连截断都没压下来（例如单条 system 指令就超预算）。说出来，别假装成功。
-      cnbLastCompactNote += ` | WARNING: still over budget (${budget}B)`;
+      compactNote += ` | WARNING: still over budget (${budget}B)`;
+    }
+    return compactNote;
+  }
+
+  // ★ 2026-10-19 第五次修：**没压缩**也必须收敛到预算内。
+  //
+  // 走到这里意味着 `compactIfNeeded` 什么都没改（`changed === false`），
+  // 而上面两道闸门都要求 `bytes > budget` —— 也就是说 body **确定**超限。
+  // 旧代码在这个位置直接函数结束：一个 7.2 MB 的请求原样发出去，被上游
+  // 413 挡掉，而日志里连一行都没有（实测 `.tmp-verify-bytes5.ts` 形态 B：
+  // `writeSummaryCalled=false, after=before=7204563`）。
+  //
+  // 典型成因：`forSummary` 把头部每条消息截到 600 字符后，整个 transcript
+  // 缩到了 `keepTokens` 以下，于是 `selectTail` 认为「没有需要总结的部分」。
+  // 这个判断对**摘要**是对的，对**体积**是致命的——消息变小了不代表 body
+  // 变小了，更不代表它落进了字节预算。
+  //
+  // 判据：**只要进了这个函数且 body 超预算，返回前就必须让 body 落进预算**，
+  // 无论中间走的是摘要、还是哪一条捷径。截断是确定性的、不花钱、必然收敛。
+  {
+    const reason = result.skipped ? `: ${result.skipped}` : "";
+    const truncated = fallbackTruncate(messages, budget, overheadBytes);
+    body.messages = truncated.messages;
+    const after = new TextEncoder().encode(JSON.stringify(body)).length;
+    compactNote = `${truncated.note} session=${keyLabel} ` +
+      `(summary skipped${reason}) bytes ${bytes} -> ${after}`;
+    if (after > budget) {
+      compactNote += ` | WARNING: still over budget (${budget}B)`;
     }
   }
+  return compactNote;
 }
 
 export async function handleCnb(path: string, request: Request, url: URL) {
@@ -3379,13 +3414,10 @@ export async function handleCnb(path: string, request: Request, url: URL) {
     //
     // 打破它的办法是让摘要请求**远小于** 1 MiB：只送被压缩掉的那段历史
     // （compactIfNeeded 自己选定的 head），而不是整个 transcript。
-    await maybeCompactCnb(p.data, sessionIdOf(request));
-    if (Array.isArray(p.data?.messages)) {
-      // 压缩失败也要说一句：静默截断会让用户以为历史还在。
-      if (cnbLastCompactNote) {
-        console.warn(`[cnb] ${cnbLastCompactNote}`);
-        cnbLastCompactNote = "";
-      }
+    const compactNote = await maybeCompactCnb(p.data, sessionIdOf(request));
+    // 压缩失败也要说一句：静默截断会让用户以为历史还在。
+    if (compactNote) {
+      console.warn(`[cnb] ${compactNote}`);
     }
 
     let built;
