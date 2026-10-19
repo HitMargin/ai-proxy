@@ -3089,7 +3089,29 @@ async function handleCnbMessages(request: Request): Promise<Response> {
  *    摘要请求绕过闸，和模型请求并发打同一个 cookie 会话（曾观测到跨会话
  *    内容泄漏，AGENTS.md 有记）。
  */
-const CNB_BODY_BUDGET_BYTES = 900 * 1024; // 1 MiB 留 128 KiB 给 envelope
+
+/**
+ * 压缩触发的字节预算。
+ *
+ * ★ 2026-10-20 从 `900 * 1024` 提到 `992 * 1024`。原因不是"更保险"，而是
+ * 旧值让**几乎每一轮**都做一次没必要的摘要：生产日志里同一个会话连续 24 次
+ * `[compacted via summary] ... bytes 921847 / 922447 / 929143 / ... / 979173`，
+ * 全部只是刚过 921600 这条线，而每个 body 之后都被压到 15~17 万——也就是说
+ * 压完之后上游收到的远小于 1 MiB，那 24 次压缩**一次都不需要**。
+ *
+ * 那把尺子该放哪，只有实测说了算：
+ *   · 上游收 1,048,169 B，1,049,193 B 起回 413 `[BODY_TOO_LARGE]`；
+ *   · 但这里量的是 **chat body**，发出去的是 `cnbBuildUpstream` 转换后的
+ *     body，两者不一定等大。实测转换比在各类内容下是 0.8417（大量小 tool
+ *     消息会缩）到 1.00008（纯 CJK、少量消息），即最坏增大 0.008%。
+ *
+ * 所以余量只需要覆盖转换的增大，不需要再按"留 128 KiB 给 envelope"猜。
+ * 取 992 KiB = 1,015,808 B：即使转换按最坏比例放大，落到上游也只有
+ * ~1,015,889 B，仍比实测通过线低 32 KiB。envelope（model/max_tokens/tools）
+ * 已经算在这个 body 里了，不是额外开销——旧注释把它当成"额外的 128 KiB"
+ * 是重复计算。
+ */
+export const CNB_BODY_BUDGET_BYTES = 992 * 1024;
 
 function cnbIntSetting(name: string, fallback: number): number {
   const raw = Number(Deno.env.get(name));

@@ -11,6 +11,7 @@
  */
 import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
+  CNB_BODY_BUDGET_BYTES,
   CNB_MODELS,
   cnbBuildUpstream,
   cnbDiagnoseJunkSyntax,
@@ -1160,8 +1161,12 @@ Deno.test("a headless second turn updates the anchored summary instead of restar
     head.push({ role: "user", content: filler + i });
     head.push({ role: "assistant", content: "收到" + i });
   }
-  const makeMessages = (tag: string) => [
+  const makeMessages = (tag: string, extra = 0) => [
     ...head.map((m) => ({ ...m })),
+    ...Array.from({ length: extra }, (_, i) => ({
+      role: i % 2 ? "assistant" : "user",
+      content: filler + `额外${tag}${i}`,
+    })),
     { role: "user", content: "最新一轮 " + tag },
   ];
 
@@ -1182,11 +1187,17 @@ Deno.test("a headless second turn updates the anchored summary instead of restar
   await maybeCompactCnb(body1, "", summarize);
   assertEquals(prompts.length, 1, "the first turn must summarise once");
 
-  // 第二轮：同一段对话（首条消息相同）继续变长
+  // 第二轮：同一段对话继续变长。
+  //
+  // ★ fixture 必须**真的变长**。早先这里是 `makeMessages("B")`，条数与第一轮
+  // 完全相同，只有末条文字不同——于是新增内容全部落在 keepTokens 保留的尾部
+  // 里，头部一条没多，增量实现据此判定"没有新内容需要总结"、直接复用上一轮
+  // 摘要（这是对的：省掉一次 6 万 token 的调用）。但那样一来这个用例就测不到
+  // 它名字里的东西（"更新锚定摘要"），断言只会因为增量短路而红。
   const body2: any = {
     model: "deepseek-v4.1-flash",
     max_tokens: 32,
-    messages: makeMessages("B"),
+    messages: makeMessages("B", 6),
   };
   await maybeCompactCnb(body2, "", summarize);
   assertEquals(prompts.length, 2, "the second turn must summarise once more");
@@ -1200,6 +1211,115 @@ Deno.test("a headless second turn updates the anchored summary instead of restar
   assert(
     prompts[1].includes("Update the anchored summary"),
     "and it must be phrased as an update, not a fresh creation",
+  );
+});
+
+// 增量压缩的省钱侧：当客户端这一轮只是"重发同一段历史、末尾多问一句"时，
+// 头部一条都没多，摘要里没有任何新信息。这时**不该**再花一次几万 token 的
+// 上游调用——复用上一轮的摘要就够了。
+//
+// 这条路径在真实 DSH 会话里是最常见的那条（每轮重发完整历史），所以它必须
+// 被单独盯住：写错的话要么白烧钱（不复用），要么丢掉新内容（复用太早）。
+Deno.test("an unchanged head is reused instead of paying for a second summary", async () => {
+  resetCompactionStates();
+  const head: any[] = [{ role: "system", content: "You are helpful." }];
+  const filler = "用来把请求体撑过上游 1 MiB 硬限的填充文本。".repeat(4000);
+  for (let i = 0; i < 60; i += 1) {
+    head.push({ role: "user", content: filler + i });
+    head.push({ role: "assistant", content: "收到" + i });
+  }
+
+  const prompts: string[] = [];
+  const summarize = (prompt: string) => {
+    prompts.push(prompt);
+    return Promise.resolve("## Objective\n- 锚定摘要 ANCHOR");
+  };
+
+  // 第一轮：触发压缩。
+  const body1: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 32,
+    messages: [...head, { role: "user", content: "最新一轮 A" }],
+  };
+  await maybeCompactCnb(body1, "reuse-session", summarize);
+  assertEquals(prompts.length, 1, "the first turn must summarise");
+
+  // 第二轮：历史逐字相同，只有最后一句是新的（落在 keepTokens 保留的尾部）。
+  const body2: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 32,
+    messages: [...head, { role: "user", content: "最新一轮 B" }],
+  };
+  const note = await maybeCompactCnb(body2, "reuse-session", summarize);
+  assertEquals(
+    prompts.length,
+    1,
+    "an unchanged head carries no new information, so paying for another summary is pure waste",
+  );
+  assert(
+    note.includes("[compacted reuse]"),
+    "and the log must say it reused, so the saving is visible: " + note,
+  );
+});
+
+// 增量复用的安全阀：索引对不上（客户端重写了历史、或换了会话）时必须退回
+// 全量重算，绝不能按下标切片——那会把没总结过的内容当成"已覆盖"而丢掉。
+Deno.test("a rewritten history invalidates the covered range", async () => {
+  resetCompactionStates();
+  const head: any[] = [{ role: "system", content: "You are helpful." }];
+  const filler = "用来把请求体撑过上游 1 MiB 硬限的填充文本。".repeat(4000);
+  for (let i = 0; i < 60; i += 1) {
+    head.push({ role: "user", content: filler + i });
+    head.push({ role: "assistant", content: "收到" + i });
+  }
+
+  const prompts: string[] = [];
+  const summarize = (prompt: string) => {
+    prompts.push(prompt);
+    return Promise.resolve("## Objective\n- 锚定摘要 ANCHOR");
+  };
+
+  await maybeCompactCnb(
+    {
+      model: "deepseek-v4.1-flash",
+      max_tokens: 32,
+      messages: [...head, { role: "user", content: "最新一轮" }],
+    },
+    "rewrite-session",
+    summarize,
+  );
+  assertEquals(prompts.length, 1, "the first turn must summarise");
+
+  // 同一会话 id，但整段历史被换掉了。★ 必须是**等长**替换：长度一变，
+  // split 会跟着移动，`covered > selection.split` 那条边界检查就会先挡住，
+  // 于是这个用例根本没测到指纹——实测把指纹校验删掉它照样绿。
+  // 等长替换下 split 不变，只有内容指纹能识破，判据才落得住。
+  const rewritten = head.map((m, i) => ({
+    role: m.role,
+    content: String(m.content).replace(/./gsu, "X"),
+  }));
+  assertEquals(
+    rewritten.map((m) => String(m.content).length),
+    head.map((m) => String(m.content).length),
+    "fixture must keep every message the same length, otherwise the bounds guard fires first",
+  );
+  await maybeCompactCnb(
+    {
+      model: "deepseek-v4.1-flash",
+      max_tokens: 32,
+      messages: [...rewritten, { role: "user", content: "最新一轮" }],
+    },
+    "rewrite-session",
+    summarize,
+  );
+  assertEquals(
+    prompts.length,
+    2,
+    "a fingerprint mismatch must fall back to a full re-summary, not slice by index",
+  );
+  assert(
+    prompts[1].includes("ANCHOR"),
+    "the re-summary still carries the previous anchor as context",
   );
 });
 
@@ -1581,7 +1701,10 @@ Deno.test("cnb: an oversized body still converges when compaction finds nothing 
     })),
   };
   const before = new TextEncoder().encode(JSON.stringify(body)).length;
-  assert(before > 900 * 1024, "fixture must exceed the budget, got " + before);
+  assert(
+    before > CNB_BODY_BUDGET_BYTES,
+    "fixture must exceed the budget, got " + before,
+  );
 
   let asked = false;
   await maybeCompactCnb(body, "", async () => {
@@ -1592,7 +1715,7 @@ Deno.test("cnb: an oversized body still converges when compaction finds nothing 
   const after = new TextEncoder().encode(JSON.stringify(body)).length;
   // 这条断言就是本次修复的判据。旧代码下 after === before，测试必红。
   assert(
-    after <= 900 * 1024,
+    after <= CNB_BODY_BUDGET_BYTES,
     `body must fit the budget even when the summary path is skipped: ${before} -> ${after}`,
   );
   // 摘要没被问过——这不是缺陷，是这个形态的正常结果；真正的缺陷是「没人兜底」。
@@ -1751,7 +1874,7 @@ Deno.test("cnb: giant tool payloads are truncated out of the summary prompt", as
   assert(promptBytes > 0, "fixture must actually reach the summary writer");
   // 判据：摘要 prompt 必须低于上游 1 MiB 线（留出 envelope 余量）。
   // 旧逻辑这里是 4.5 MB 量级，会红。
-  const limit = 900 * 1024;
+  const limit = CNB_BODY_BUDGET_BYTES;
   assert(
     promptBytes <= limit,
     `the summary prompt must stay under the upstream limit, got ${promptBytes} > ${limit}`,
@@ -2001,10 +2124,12 @@ Deno.test("cnb: an oversized /responses body is compacted before it leaves", asy
       biggest <= 1048576,
       `every upstream body must fit the 1 MiB limit, biggest was ${biggest}`,
     );
-    // 也别只是"刚好过"：压缩应该把它砍回预算内（900 KiB）。
+    // 也别只是"刚好过"：压缩该把它砍回预算内。这里用常量而不是写死的
+    // 900/950 KiB——预算调过一次（900 KiB → 992 KiB），写死的数字会在调预算
+    // 时静默失效（本来就是它先红，才暴露出夹具与阈值绑死的问题）。
     assert(
-      biggest < 950 * 1024,
-      `compaction should bring it under budget, biggest was ${biggest}`,
+      biggest <= CNB_BODY_BUDGET_BYTES,
+      `compaction should bring it under the budget, biggest was ${biggest}`,
     );
   } finally {
     globalThis.fetch = originalFetch;

@@ -76,6 +76,40 @@ export interface CompactionState {
   summary: string;
   recent: string;
   updatedAt: number;
+  /**
+   * `summary` 已经覆盖了前多少条消息。
+   *
+   * ★ 2026-10-20 加。起因是生产日志里同一个会话连续 24 次
+   * `[compacted via summary] ... cost≈48449 → 64512`：每轮把**同一批已被
+   * 总结过的历史**重新送进摘要 prompt，成本随轮次单调增长。
+   *
+   * 为什么代理场景必然重复：客户端（harness）每轮重发**完整**历史，而我们只
+   * 压缩“这一次请求”，客户端自己的 transcript 不变。所以 [0, covered) 这段
+   * 内容下一轮原样再来一遍——对摘要来说没有任何新信息。
+   */
+  covered?: number;
+  /**
+   * `messages[covered - 1]` 的指纹。
+   *
+   * 索引只在“历史只追加”时才有意义。客户端重写、截断、或换了会话时索引会
+   * 指向别的消息，那时按 covered 切片就会**跳过未被总结的内容**——这是比多
+   * 花钱严重得多的错。指纹对不上就退回全量重算。
+   */
+  coveredHash?: string;
+}
+
+/**
+ * 一条消息的稳定指纹：长度 + djb2。
+ *
+ * 不用加密哈希：这里只需要区分“还是那条消息吗”，碰撞概率 2^-32 已远超需要，
+ * 而摘要历史里每条消息都要算一次，便宜的算法就是对的算法。
+ */
+export function messageFingerprint(text: string): string {
+  let hash = 5381;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash * 33) ^ text.charCodeAt(i)) >>> 0;
+  }
+  return `${text.length}:${hash.toString(16)}`;
 }
 
 export interface CompactionOutcome {
@@ -421,8 +455,42 @@ export async function compactIfNeeded(
     previousSummary = findExistingSummary(messages, selection.split);
   }
 
-  const head = selection.head.join("\n\n");
-  const context = [previousRecent, head].filter((part) => part !== "");
+  // ── 增量总结的起点（2026-10-20）─────────────────────────────────────
+  //
+  // 判据：**上一轮已经总结过的消息，这一轮不再送进摘要 prompt。**
+  //
+  // 代理场景下这段内容每轮都会原样重发（客户端重发完整历史，我们只压缩本次
+  // 请求），所以不跳过的话，摘要成本随会话长度单调增长。生产日志实测同一个
+  // session 连续 24 次 `cost≈48449 → 64512`，而其中绝大部分字节是重复的。
+  //
+  // 索引本身不可信：它只在“历史只追加”的前提下有意义。客户端重写历史、换了
+  // 会话、或上游截断过时，同一个下标指向的是**别的消息**——那时按索引切片会
+  // 跳过没被总结的内容，那是比多花钱严重得多的错（模型会失去它以为还在的
+  // 上下文）。所以索引必须配一个指纹：对不上就退回全量重算。
+  const trustedCovered = (() => {
+    if (previousSummary === "") return -1;
+    const covered = state?.covered;
+    if (typeof covered !== "number" || covered <= 0) return -1;
+    if (covered > serialized.length || covered > selection.split) return -1;
+    if (
+      state?.coveredHash !== messageFingerprint(serialized[covered - 1] ?? "")
+    ) {
+      return -1;
+    }
+    return covered;
+  })();
+
+  // 起点之前的内容已在 previousSummary 里；起点之后到 split 才是新内容。
+  const delta = serialized.slice(
+    trustedCovered >= 0 ? trustedCovered : 0,
+    selection.split,
+  );
+  // 走增量时**不能**再拼 previousRecent：它落在 [0, covered) 里，已经由
+  // previousSummary 代表，而它又必然出现在本轮重发的完整历史中。实测它占
+  // head 的 31%，等于每轮白送三成摘要成本。
+  const context = trustedCovered >= 0
+    ? (delta.length > 0 ? [delta.join("\n\n")] : [])
+    : [previousRecent, selection.head.join("\n\n")].filter((p) => p !== "");
   if (previousSummary === "" && context.length === 0) {
     return {
       changed: false,
@@ -433,35 +501,46 @@ export async function compactIfNeeded(
     };
   }
 
-  const prompt = buildSummaryPrompt(previousSummary, context);
-  const summaryModel = config.summaryModel !== "" ? config.summaryModel : "";
-  // A refused summary must not surface as a failed request: the caller falls
-  // back to truncation so an over-long session still gets an answer.
-  let summary: string;
-  try {
-    summary = await input.writeSummary(
-      prompt,
-      summaryModel,
-      config.maxSummaryTokens,
-    );
-  } catch (e) {
-    return {
-      changed: false,
-      note: "summary-failed",
-      compactTokens: 0,
-      messages: [],
-      // 把真实原因带上去：调用方会写进日志。
-      error: e instanceof Error ? e.message : String(e),
-    };
-  }
-  if (typeof summary !== "string" || summary.trim() === "") {
-    return {
-      changed: false,
-      note: "summary-failed",
-      compactTokens: 0,
-      messages: [],
-      error: "summary response was empty",
-    };
+  // 增量起点已经越过尾部边界 = 上一轮的摘要仍然完全覆盖，本轮没有新内容可
+  // 总结。直接复用，**一次摘要调用都不发**（成本 0，而不是再花几万 token 把
+  // 同样的历史重算一遍）。
+  const reuseOnly = trustedCovered >= 0 && delta.length === 0 &&
+    previousSummary !== "";
+
+  let summary = "";
+  let prompt = "";
+  if (!reuseOnly) {
+    prompt = buildSummaryPrompt(previousSummary, context);
+    const summaryModel = config.summaryModel !== "" ? config.summaryModel : "";
+    // A refused summary must not surface as a failed request: the caller falls
+    // back to truncation so an over-long session still gets an answer.
+    try {
+      summary = await input.writeSummary(
+        prompt,
+        summaryModel,
+        config.maxSummaryTokens,
+      );
+    } catch (e) {
+      return {
+        changed: false,
+        note: "summary-failed",
+        compactTokens: 0,
+        messages: [],
+        // 把真实原因带上去：调用方会写进日志。
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+    if (typeof summary !== "string" || summary.trim() === "") {
+      return {
+        changed: false,
+        note: "summary-failed",
+        compactTokens: 0,
+        messages: [],
+        error: "summary response was empty",
+      };
+    }
+  } else {
+    summary = previousSummary;
   }
 
   const rebuilt: any[] = [];
@@ -471,7 +550,9 @@ export async function compactIfNeeded(
     }
   }
   rebuilt.push({ role: "system", content: `${SUMMARY_PREFIX}\n${summary}` });
-  if (state?.summary) {
+  // 复用路径下 `summary` 就是 `state.summary`，再推一份 `[Previous ...]` 会让
+  // 同一段文本在上下文里出现两次：字节翻倍、还不带任何新信息。
+  if (state?.summary && !reuseOnly) {
     rebuilt.push({
       role: "system",
       content: `${PREVIOUS_SUMMARY_PREFIX}\n${state.summary}`,
@@ -503,12 +584,19 @@ export async function compactIfNeeded(
       summary,
       recent: selection.recent.join("\n\n"),
       updatedAt: Date.now(),
+      // 记下“总结到哪了”：下一轮从这里继续，不再重算 [0, covered)。
+      // 复用路径下摘要没变，但覆盖范围仍应随 split 前移——从 covered 到
+      // 新 split 之间的内容已经由同一份摘要代表了（它本来就是覆盖到 split 的）。
+      covered: selection.split,
+      coveredHash: messageFingerprint(serialized[selection.split - 1] ?? ""),
     });
   }
 
   return {
     changed: true,
-    note: `[compacted via summary] kept=${kept} msgs`,
+    note: reuseOnly
+      ? `[compacted reuse] kept=${kept} msgs`
+      : `[compacted via summary] kept=${kept} msgs`,
     compactTokens: estimateTokens(prompt) + estimateTokens(summary),
     messages: rebuilt,
   };
