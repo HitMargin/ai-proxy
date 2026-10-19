@@ -2037,7 +2037,6 @@ export function cnbBuildUpstream(openaiBody: any) {
   //
   // 未知值**报错**而不是静默回落——静默回落会让调用方以为自己的选择生效了。
   const CNB_EFFORTS = [
-    "off",
     "minimal",
     "low",
     "medium",
@@ -2045,20 +2044,28 @@ export function cnbBuildUpstream(openaiBody: any) {
     "max",
     "xhigh",
   ];
+  // ★ 2026-10-20：`"off"` 与 `"none"` 都是"关思考"，且**必须都不透传给上游**。
+  // 上游实测拒绝 `reasoning_effort: "off"`（400 code 11150），关思考只能靠
+  // `enable_thinking: false`。原来只把 "off" 认作关闭值、其余一律报错，于是
+  // OpenAI 官方形状的 `"none"` 被当成非法值直接 throw —— 调用方（dsh 的
+  // `reasoningEffort: "none"`）收到的是 `upstream_error`，它没法自己纠错。
+  // Responses API 里关思考的规范值就是 `"none"`，所以两个都收。
+  const OFF_EFFORTS = ["off", "none"];
   const effortRaw = openaiBody.reasoning_effort || openaiBody.reasoning?.effort;
   const effort = String(effortRaw ?? "").toLowerCase();
+  const wantsOff = OFF_EFFORTS.includes(effort);
   if (
-    effortRaw !== undefined && effortRaw !== null &&
+    effortRaw !== undefined && effortRaw !== null && !wantsOff &&
     !CNB_EFFORTS.includes(effort)
   ) {
     throw new Error(
       `cnb: reasoning_effort "${effortRaw}" is not supported (upstream accepts ${
-        CNB_EFFORTS.join("/")
-      })`,
+        OFF_EFFORTS.join("/")
+      }/${CNB_EFFORTS.join("/")})`,
     );
   }
-  up.enable_thinking = effort !== "off";
-  if (effort !== "off") up.reasoning_effort = effort || "high";
+  up.enable_thinking = !wantsOff;
+  if (!wantsOff) up.reasoning_effort = effort || "high";
 
   return { upstream: up, hasTools };
 }

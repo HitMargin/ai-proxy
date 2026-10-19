@@ -459,6 +459,34 @@ Deno.test("effort off really switches thinking off", () => {
   );
 });
 
+Deno.test("effort none is the same request as off, not a rejected value", () => {
+  // 2026-10-20 生产实证：dsh 的 `reasoningEffort: "none"` 被拒成
+  //   `cnb: reasoning_effort "none" is not supported (...)`
+  // 而这条错误冒泡成 upstream_error，调用方（iot-thinking 插件）把它记成
+  // 压缩失败、转去走确定性兜底，最终把整段思考替换成 196 字符。
+  // 一个词的拼写差别，代价是 100 万字符的思考被丢掉。
+  //
+  // `"none"` 是 OpenAI Responses API 里关思考的规范值，`"off"` 是 dsh 内部
+  // 的写法；两者对上游必须是**同一个**请求。
+  const off = build("off");
+  const none = build("none");
+  assertEquals(
+    none.enable_thinking,
+    false,
+    "none must disable thinking exactly like off",
+  );
+  assertEquals(
+    "reasoning_effort" in none,
+    false,
+    "none must omit reasoning_effort entirely, same as off",
+  );
+  assertEquals(
+    JSON.stringify(none),
+    JSON.stringify(off),
+    "off and none must produce byte-identical upstream bodies",
+  );
+});
+
 Deno.test("every published effort survives the request body verbatim", () => {
   // 这是"档位丢失"那条 bug 的回归：白名单里没有的档位曾被静默改成 high，
   // 调用方看到自己的选择被接受，实际发出去的是另一个值。
