@@ -5,7 +5,7 @@
 Deno 本地反代（端口 8000，`restart.ps1 -Local`）+ cloudflared 隧道 + Cloudflare
 Worker 远端链。 为 dsh 提供免费模型入口。
 
-## 当前状态（2026-10-07 核实，改动此节请更新日期）
+## 当前状态（2026-10-20 核实，改动此节请更新日期）
 
 - **自调用必须带本进程会接受的凭据（2026-10-07 修
   `f6f9dd1`）**：`v1FetchOwnListing` 发的是

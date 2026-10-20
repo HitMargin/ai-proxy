@@ -890,6 +890,41 @@ deno deploy env add CNB_LOGIN_COOKIES "$(Get-Content cnb-login.txt -Raw)" --org 
 > 万一泄露，去 cnb.cool 退出登录（或轮换会话）即可让旧值在服务端失效。
 > 脚本自己在终端**只打印 cookie 的名字、不打印值**，就是为了不把它漏进日志和截图。
 
+### 1.6 渠道校验（errcode 11128）与自愈重试
+
+cnb 会拦「非官方客户端」：`400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`
+（文案「请求被拦截，请重新发送」）。**2026-10-20 直连实测**，它的匹配面是**消息正文的开头**，
+不是「正文里出现过」：
+
+| 消息正文 | 结果 |
+|---|---|
+| 身份句在开头 | 400 / 11128 |
+| 身份句在开头 + 后面接大段文本 | 400 / 11128 |
+| **前面先插一句**（句号 / 空行 / 反引号 / `## 标题` 都行） | **200** |
+| 身份句放在长文中间 | 200 |
+| 身份句只出现在 `user` 消息里 | 200 |
+
+同一批实测里还有两条容易踩的边界：
+
+- **上游只收流式**：`stream:false` 一律 `400 code 11101 "Non-stream chat request is currently not supported"`；
+- **直连带原生 `tools` 字段一律 403** `[FORBIDDEN]Agent calls are not allowed in this scenario`——这是第 2 节那套文本协议模拟存在的原因，也意味着「带 tools 直连」永远测不通，别拿它当回归基线。
+
+指纹本身会漂：10-18 是 Claude Code 身份句，之后多了 gitStatus 模板，10-20 又出现了第三个
+正则没覆盖的。所以这里**不再靠认指纹**，而是两条并行的机制：
+
+1. **`neutraliseClientIdentity()`**（2026-10-18 加）：把已知指纹改写成语义等价的中性表述。
+   只动 `system` / `assistant`（`user` 不在检测面上，改它等于篡改用户原文），数组形态逐 `text` 块处理；
+2. **`cnbHardenClientHead()`**（2026-10-20 加，自愈）：命中 `400 + 11128` 时，给每条
+   `system` / `assistant` / `developer` 正文前置一句中性前缀（`CNB_HEAD_PREFIX`）后**重发一次**。
+   400 表示上游什么都没投递，所以重试不会重复计费、也不会重复执行工具。只加固一次——
+   加固后仍被拦就原样透传上游原文，不无限重试。非 11128 的 400 不重试（那是确定性失败）。
+
+自愈那条还有一处**必须**做的收尾：恢复响应时剔掉 `content-encoding` / `content-length`——
+`fetch` 已经把 body 解压了，原样复制这两个头会让下游按「这段 JSON 是 gzip」去解，直接解不开。
+
+> ⚠️ **仍然是规避，不是适配**。自愈只赌「检测锚定消息开头」这一点；如果上游改成「正文任意位置
+> 出现」就失效，届时重新实测边界再改判据，别照抄本段。
+
 ### 2. 工具调用的「文本协议」模拟
 
 **上游不是「不支持」工具调用，而是「禁止在这个场景用」。** 实测（2026-10-06）同一个问题：
@@ -919,7 +954,7 @@ deno deploy env add CNB_LOGIN_COOKIES "$(Get-Content cnb-login.txt -Raw)" --org 
 ### 4. 可靠性
 
 - `cnbCallUpstream` 按 `[0, 500, 1500, 3500, 8000, 20000]` ms 退避重试；
-- 网络层失败会刷新 CSRF 会话再试；4xx（429 除外）视为确定性错误直接透传；
+- 网络层失败会刷新 CSRF 会话再试；4xx（429 除外）默认视为确定性错误直接透传，**唯一例外是 `400 + errcode 11128`**（渠道校验），见 1.6 节；
 - 上游**只支持流式**：`stream:false` 会拿到 `400 code 11101 "Non-stream chat request is currently not supported"`，所以非流式的调用方由代理聚合 SSE 后返回；
 - `cnbCall` 带 **30 秒无响应头超时**——cnb 偶发无限挂起，中止后交给退避重试（只罩到响应头返回，不限流式生成总时长）；
 - **串行闸**：cnb 网页会话按 cookie 归属，多客户端并发共用一个 cookie 会互踩（曾观测到跨会话内容泄漏）。所有 cnb 上游调用同一时刻只放行一个，锁持有到**响应流真正消费完**（流结束/出错/消费方取消/2 分钟无数据/10 分钟硬安全阀任一条件释放），日志以 `[cnb-gate] fp=...` 记录排队与释放（fp 为会话指纹，重叠且 fp 不同即跨会话并发）；
@@ -927,10 +962,10 @@ deno deploy env add CNB_LOGIN_COOKIES "$(Get-Content cnb-login.txt -Raw)" --org 
 
 ### 5. 其它
 
-- **可用模型**：`deepseek-v4-flash`、`deepseek-v4-pro`；
+- **可用模型**：只发布 `deepseek-v4.1-flash`——上游把**所有**模型名都路由到同一个后端（响应里一律回 `"model":"deepseek-v4.1-flash"`），`deepseek-v4-flash` / `-pro` 只是会被静默重定向的旧名，留着它们会在选择器里造出一个假的等级；
 - **视觉**：`user` / `system` 消息中的 `image_url` 块会被保留为多模态数组，而不是被折叠成纯文本（`src/cnb.ts` 中保留了这次修复的注释）；
-- **思考强度**：`enable_thinking` 恒为 `true`，`reasoning_effort` 取客户端值（`low` / `medium` / `high` / `max`），默认 `high`；
-- **输出上限**：cnb 通道 `max_tokens` 默认 `flash: 120000` / `pro: 60000`（预算含思考 token；实测 flash 思考最多吃掉约一半，故单独调大）；
+- **思考强度**：`enable_thinking` 默认 `true`；客户端要 `off` / `none` 时**关掉思考**（`enable_thinking:false` 且**不**发 `reasoning_effort`——上游把 `reasoning_effort:"off"` 判成非法档位，回 `400 code 11150`）；其余档位 `minimal` / `low` / `medium` / `high` / `max` / `xhigh` 逐个真调过，默认 `high`，未知值报错而不是静默回落；
+- **输出上限**：客户端不给 `max_tokens` 时默认 `120000`——**不按模型名分档**（上游只会路由到同一个后端，见上面「可用模型」）；预算含思考 token（completion = reasoning + 正文），实测思考最多吃掉约一半，所以默认值调得远高于预期正文长度；
 
 ### 6. 实测能力与上限（2026-09，直连本地服务实测）
 
@@ -984,7 +1019,7 @@ deno deploy env add CNB_LOGIN_COOKIES "$(Get-Content cnb-login.txt -Raw)" --org 
 
 ## 已知限制
 
-- cnb 通道完全依赖网页端私有接口，**上游改版即失效**；
+- cnb 通道完全依赖网页端私有接口，**上游改版即失效**；渠道校验（`errcode 11128`）尤其如此——自愈重试只赌「检测锚定消息开头」，上游改成任意位置匹配就失效（见 1.6 节）；
 - DeepSeek 网页端、TRAE、WorkBuddy 三个渠道同样依赖网页端私有接口：TRAE 的推理走 `trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`、签到走 `api.trae.cn`（两套主机，且客户端版号不匹配时新模型直接报流内 4001），WorkBuddy 的目录靠逐模型实发探测剔除调不通的 id（上游改版后探测结论要重跑），两者都与上游页面强绑定；
 - 原先的 `/anthropic/v1`（api.anthropic.com）与 `/gemini/v1`（generativelanguage.googleapis.com）两条路由**已下线**，`ANTHROPIC_API_KEY` / `GEMINI_API_KEY` 也随之失效。Anthropic Messages 的转换能力保留在 `/commandcode/v1/messages`；
 - 模型选择器里的**按渠道分组依赖重启 DSH Host** 才生效：插件的渠道分组是模块级代码，热重载只换 `stream` / `resolveModel`。不重启的话模型仍然是全挤在 `ai-proxy` 一个 provider 下（功能可用，只是没分组）。
