@@ -102,6 +102,7 @@ window.__ModuleLoader__.load({
         deepseekMissing: '缺少：{what}',
         deepseekHint: '会打开浏览器，扫码登录后自动保存 cookie / token / 浏览器头。过程见「日志」。',
         speedNote: '输出速度只统计解码窗口 ≥250ms 且速率 ≤250 tok/s 的调用；窗口太短的一次性回答不算速度。',
+        badgeFree: 'free', badge1017: '1017',
       },
       en: {
         nav: 'ai-proxy', tagline: 'Runtime panel for the local multi-provider proxy',
@@ -201,6 +202,7 @@ window.__ModuleLoader__.load({
         localOnly: 'Counted on this machine only; nothing is uploaded.', noUsage: 'No calls recorded yet — send a message in DSH and this fills in.',
         usageFailed: 'Could not read usage',
         speedNote: 'Output speed only counts calls whose decode window is ≥250ms and whose rate is ≤250 tok/s; a one-shot answer is not evidence of speed.',
+        badgeFree: 'free', badge1017: '1017',
       },
     }
 
@@ -315,6 +317,11 @@ window.__ModuleLoader__.load({
 .apx_metric b{font-size:17px;font-weight:640;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
 .apx_metric em{font-style:normal;font-size:10.5px;color:var(--dsw-alias-label-tertiary)}
 @keyframes apx-skel{from{background-position:200% 0}to{background-position:-200% 0}}
+/* Model-label badge: one wrapper for the label slot, shared by the free and 1017 marks. */
+.apxml{display:inline-flex;align-items:center;gap:4px;vertical-align:baseline;white-space:nowrap}
+.apxml_badge{display:inline-flex;align-items:center;justify-content:center;flex:none;min-width:0;padding:0 5px;height:16px;border-radius:5px;font-size:10px;font-weight:600;line-height:1;letter-spacing:.02em;text-transform:lowercase;font-variant-numeric:tabular-nums;border:1px solid transparent;white-space:nowrap}
+.apxml_badge.info{color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 14%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-business-primary) 30%,transparent)}
+.apxml_badge.free{color:var(--dsw-alias-state-success-primary);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 14%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 32%,transparent)}
 `
 
     async function api(path, init = {}) {
@@ -1630,6 +1637,33 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'apx' }, hero, tabs, body)
     }
 
+    // The input model label slot is `single`: whatever is registered last wins and
+    // the shipped 1017 label is shadowed outright. So this component has to keep
+    // the 1017 mark alive itself, then add the free mark for the cnb channel.
+    const MODEL_LABEL_1017 = 'DeepSeek-V4.1-Flash'
+
+    function ModelLabel(props) {
+      const provider = (props && props.provider) || {}
+      const model = (props && props.model) || {}
+      const name = model.name == null ? '' : String(model.name)
+      const t = props && typeof props.t === 'function' ? props.t : null
+      const official = provider.id === 'deepseek-account' || provider.id === 'deepseek-official'
+      let tone = ''
+      let text = ''
+      if (official && model.id === 'deepseek-flash' && name === MODEL_LABEL_1017) {
+        tone = 'info'
+        text = t ? t('badge1017') : '1017'
+      } else if (provider.id === 'cnb' && model.id === 'deepseek-v4.1-flash') {
+        tone = 'free'
+        text = t ? t('badgeFree') : 'free'
+      }
+      if (!tone) return name
+      return h('span', { className: 'apxml' },
+        h('span', null, name),
+        ' ',
+        h('span', { className: `apxml_badge ${tone}` }, text))
+    }
+
     function apply(ctx) {
       const t = ctx.locale.bind(NS)
       ctx.effect(() => ctx.locale.register(NS, DICT), 'ai-proxy bridge: dictionaries')
@@ -1644,6 +1678,9 @@ window.__ModuleLoader__.load({
         name: 'settings.section', id: 'ai-proxy', order: 34,
         label: () => t('nav'), locale: NS,
       }, () => h(Panel, { t })))
+      ctx.slots.inject('conversation.input.model.label', () => ctx.slots.register({
+        name: 'conversation.input.model.label', locale: NS,
+      }, ModelLabel))
     }
 
     return { apply, inject: ['slots', 'locale'], name: 'ai-proxy-dsh-bridge' }
