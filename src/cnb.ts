@@ -1624,6 +1624,60 @@ export function neutraliseClientIdentity(msgs: any[]): any[] {
   });
 }
 
+/**
+ * 渠道校验自愈：给每条 system/assistant 消息的**正文开头**加一句中性前缀。
+ *
+ * 为什么不再靠"认出指纹"：11128 的匹配面是**消息开头**，且指纹会随上游更新
+ * 漂移（2026-10-18 上线时只认身份句，之后多了 gitStatus 模板，2026-10-20 本轮
+ * 又被拦——第三个指纹不是那两个正则里任何一个）。直连上游实测（逐条只改一个
+ * 变量）：
+ *
+ *   | 消息正文                                  | 结果        |
+ *   | ----------------------------------------- | ----------- |
+ *   | 身份句在开头                              | 400 / 11128 |
+ *   | 身份句在开头 + 后面接大段文本             | 400 / 11128 |
+ *   | 前面先插一句（句号/空行/反引号/## 标题）  | 200         |
+ *   | 身份句在长文中间                          | 200         |
+ *   | 身份句只出现在 user 消息                  | 200         |
+ *
+ * 即**只要把可疑的开头挪开就不再拦**，与它具体是哪个品牌、哪段模板无关。所以
+ * 命中后统一做同一个动作重发，而不是继续往正则里堆第三个、第四个字符串——
+ * 那种做法永远落后上游一步。
+ *
+ * 只动 system/assistant/developer：user 不在检测面上，改它等于篡改用户原文。
+ * 返回 null 表示没有可加固的消息（调用方据此决定不重试）。
+ */
+export const CNB_HEAD_PREFIX = "Context: the instructions below apply.\n\n";
+
+export function cnbHardenClientHead(body: any): any | null {
+  const msgs = body?.messages;
+  if (!Array.isArray(msgs) || msgs.length === 0) return null;
+  let changed = false;
+  const next = msgs.map((m: any) => {
+    const role = String(m?.role ?? "").toLowerCase();
+    if (role !== "system" && role !== "assistant" && role !== "developer") {
+      return m;
+    }
+    if (typeof m.content === "string") {
+      changed = true;
+      return { ...m, content: CNB_HEAD_PREFIX + m.content };
+    }
+    if (Array.isArray(m.content)) {
+      let touched = false;
+      const parts = m.content.map((p: any) => {
+        if (p?.type !== "text" || typeof p.text !== "string") return p;
+        touched = true;
+        return { ...p, text: CNB_HEAD_PREFIX + p.text };
+      });
+      if (!touched) return m;
+      changed = true;
+      return { ...m, content: parts };
+    }
+    return m;
+  });
+  return changed ? { ...body, messages: next } : null;
+}
+
 // 导出给 src/cnb.test.ts：推理档位那一组断言（off 真的关掉思考、未知值报错
 // 而不是静默回落）只能对着这个函数的输出来测。它不发网络，纯构造请求体。
 export function cnbBuildUpstream(openaiBody: any) {
@@ -2361,7 +2415,10 @@ function cnbUpstreamFail(status: number, errBody: string): Response {
 }
 
 // cnb 上游调用：瞬时 502/网络抖动时退避重试（境外出口 IP 偶发被 cnb 拒）
-async function cnbCallUpstreamInner(upBody: any): Promise<Response> {
+async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
+  // 可重新赋值：11128 自愈时会把加固后的 body 换进来重发。
+  let upBody = _upBody;
+  let headHardened = false;
   const waits = [0, 500, 1500, 3500, 8000, 20000];
   let last: Response | null = null;
   for (let i = 0; i < waits.length; i++) {
@@ -2388,6 +2445,44 @@ async function cnbCallUpstreamInner(upBody: any): Promise<Response> {
         );
       }
       last = resp;
+      // ★ 400 + 11128 是**唯一**值得重试的 4xx：它表达的是"这次的客户端指纹
+      // 没通过渠道校验"，而不是"这个请求本身不合法"（后者才确定性失败）。
+      // 2026-10-20 实测上游判据是「消息正文开头是不是某段客户端指纹」，而指纹
+      // 会随上游更新漂移，所以这里不认指纹、只认错误码，把开头挪开重发一次
+      // （见 cnbHardenClientHead 的实测表）。400 意味着上游什么都没投递，
+      // 重试不会重复计费、也不会重复执行工具。
+      //
+      // 只加固一次：若加固后仍被拦，说明判断错了（可能是别的原因），把上游
+      // 原文透传比无限重试诚实。
+      if (resp.status === 400 && !headHardened) {
+        let errText = "";
+        try {
+          errText = await resp.text();
+        } catch {}
+        if (errText.includes("11128")) {
+          const hardened = cnbHardenClientHead(upBody);
+          if (hardened) {
+            headHardened = true;
+            console.warn(
+              "[cnb] upstream 400/11128 (channel verification) — retrying once " +
+                "with client-identity heads neutralised",
+            );
+            upBody = hardened;
+            continue;
+          }
+        }
+        // 不是 11128（或没有可加固的消息）：把已读掉的 body 还原成 Response 再
+        // 透传，别丢诊断信息。★ headers 必须剔掉 content-encoding/length：
+        // fetch 已解压，原样复制会告诉下游"这段 JSON 是 gzip 的"从而解不开。
+        const h = new Headers(resp.headers);
+        h.delete("content-encoding");
+        h.delete("content-length");
+        return new Response(errText, {
+          status: resp.status,
+          statusText: resp.statusText,
+          headers: h,
+        });
+      }
       // 4xx（除 429）是确定性的，重试无意义，直接透传
       if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
         return resp;

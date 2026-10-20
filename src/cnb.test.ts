@@ -12,9 +12,11 @@
 import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
   CNB_BODY_BUDGET_BYTES,
+  CNB_HEAD_PREFIX,
   CNB_MODELS,
   cnbBuildUpstream,
   cnbDiagnoseJunkSyntax,
+  cnbHardenClientHead,
   cnbJournalJunk,
   cnbJunkLogState,
   type CnbJunkStore,
@@ -1648,6 +1650,203 @@ Deno.test("cnb: the rewritten request passes cnbBuildUpstream without the trigge
     String(sys.content).startsWith("You are a coding agent"),
     "the wire body carries the neutral identity instead",
   );
+});
+
+// ── 11128 自愈：不认指纹，只把正文开头挪开 ──
+//
+// 判据来自 2026-10-20 直连上游的实测表：任意指纹只在**消息开头**被拦，
+// 前面插一句就 200，放在长文中间也 200。所以加固动作必须真的改变开头，
+// 且必须只动检测面上的角色。
+Deno.test("cnb: cnbHardenClientHead moves the head of system/assistant but not user", () => {
+  const out = cnbHardenClientHead({
+    messages: [
+      { role: "system", content: "SOME UNKNOWN FINGERPRINT" },
+      { role: "assistant", content: "SOME UNKNOWN FINGERPRINT" },
+      { role: "developer", content: "SOME UNKNOWN FINGERPRINT" },
+      { role: "user", content: "SOME UNKNOWN FINGERPRINT" },
+    ],
+  });
+  assert(out, "must report a change");
+  const msgs = out!.messages as any[];
+  for (const i of [0, 1, 2]) {
+    assert(
+      msgs[i].content.startsWith(CNB_HEAD_PREFIX),
+      `role ${msgs[i].role} must be prefixed`,
+    );
+  }
+  assertEquals(
+    msgs[3].content,
+    "SOME UNKNOWN FINGERPRINT",
+    "user content is not on the detection surface and must not be rewritten",
+  );
+});
+
+Deno.test("cnb: cnbHardenClientHead handles array content and returns null when nothing to do", () => {
+  const out = cnbHardenClientHead({
+    messages: [
+      {
+        role: "system",
+        content: [
+          { type: "text", text: "FINGERPRINT" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,AA" } },
+        ],
+      },
+    ],
+  });
+  const parts = out!.messages[0].content as any[];
+  assert(
+    parts[0].text.startsWith(CNB_HEAD_PREFIX),
+    "text block must be prefixed",
+  );
+  assertEquals(
+    parts[1].type,
+    "image_url",
+    "image blocks must survive untouched",
+  );
+
+  assertEquals(
+    cnbHardenClientHead({ messages: [{ role: "user", content: "hi" }] }),
+    null,
+    "no system/assistant message means nothing to harden",
+  );
+});
+
+// 端到端：自愈必须真的发生在**出站请求**上，而不是只通过函数单测。
+// 用 monkeypatch 掉全局 fetch 造一个"第一次 11128、加固后 200"的上游，
+// 断言出站第二次的 body 开头确实被挪开了。
+Deno.test("cnb: a 400/11128 is retried once with hardened heads", async () => {
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  let chatCalls = 0;
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      bodies.push(String(init?.body ?? ""));
+      chatCalls += 1;
+      if (chatCalls === 1) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              code: 11128,
+              msg: "Illegal API invocation from an unapproved channel",
+            }),
+            { status: 400, headers: { "content-type": "application/json" } },
+          ),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          'data: {"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}]}\n\n' +
+            "data: [DONE]\n\n",
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "a".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567890; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        messages: [
+          { role: "system", content: "SOME UNKNOWN FINGERPRINT" },
+          { role: "user", content: "hi" },
+        ],
+        stream: false,
+        max_tokens: 16,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/chat/completions",
+      req,
+      new URL(req.url),
+    );
+    assertEquals(resp.status, 200, "the hardened retry must succeed");
+    assertEquals(chatCalls, 2, "exactly one extra attempt");
+    assert(
+      bodies[1].includes(CNB_HEAD_PREFIX.trim()),
+      "the retried wire body must carry the neutral head prefix",
+    );
+    assert(
+      !bodies[0].includes(CNB_HEAD_PREFIX.trim()),
+      "the first attempt must be unmodified (no cost when upstream is happy)",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+Deno.test("cnb: a non-11128 400 is passed through without a retry", async () => {
+  const realFetch = globalThis.fetch;
+  let chatCalls = 0;
+  const upstreamBody = JSON.stringify({ code: 11101, msg: "bad request" });
+  globalThis.fetch = ((input: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      chatCalls += 1;
+      return Promise.resolve(
+        new Response(upstreamBody, {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "b".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567891; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        messages: [
+          { role: "system", content: "You are a coding agent." },
+          { role: "user", content: "hi" },
+        ],
+        stream: false,
+        max_tokens: 16,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/chat/completions",
+      req,
+      new URL(req.url),
+    );
+    assertEquals(resp.status, 400, "deterministic 4xx must not be retried");
+    assertEquals(chatCalls, 1, "no extra attempt");
+    assert(
+      (await resp.text()).includes("11101"),
+      "the upstream diagnosis must survive the Response rebuild",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 Deno.test("cnb: gitStatus template fingerprint is rewritten (2026-10-18 second fingerprint)", () => {
