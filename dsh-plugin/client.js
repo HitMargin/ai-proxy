@@ -1645,21 +1645,21 @@ window.__ModuleLoader__.load({
     function ModelLabel(props) {
       const provider = (props && props.provider) || {}
       const model = (props && props.model) || {}
-      const name = model.name == null ? '' : String(model.name)
+      const labelText = model.name == null ? '' : String(model.name)
       const t = props && typeof props.t === 'function' ? props.t : null
       const official = provider.id === 'deepseek-account' || provider.id === 'deepseek-official'
       let tone = ''
       let text = ''
-      if (official && model.id === 'deepseek-flash' && name === MODEL_LABEL_1017) {
+      if (official && model.id === 'deepseek-flash' && labelText === MODEL_LABEL_1017) {
         tone = 'info'
         text = t ? t('badge1017') : '1017'
       } else if (provider.id === 'cnb' && model.id === 'deepseek-v4.1-flash') {
         tone = 'free'
         text = t ? t('badgeFree') : 'free'
       }
-      if (!tone) return name
+      if (!tone) return labelText
       return h('span', { className: 'apxml' },
-        h('span', null, name),
+        h('span', null, labelText),
         ' ',
         h('span', { className: `apxml_badge ${tone}` }, text))
     }
