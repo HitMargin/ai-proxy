@@ -14,7 +14,9 @@ import {
   CNB_BODY_BUDGET_BYTES,
   CNB_MODELS,
   cnbBuildUpstream,
+  cnbCallUpstream,
   cnbDiagnoseJunkSyntax,
+  cnbGatedResponse,
   cnbJournalJunk,
   cnbJunkLogState,
   type CnbJunkStore,
@@ -2429,5 +2431,150 @@ Deno.test("cnb: the streaming /responses path compacts too", async () => {
     );
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+// ── 串行闸的两条生产日志（2026-10-21）──────────────────────────────────────
+//
+// 生产里 [cnb-gate] fp=1f2kn02 released after 277260ms 是两件事叠出来的：
+// ① 消费方（cnbIter）读到 data: [DONE] 就 return，既不 cancel 也不读完，闸只能
+//    等 2 分钟空闲兜底才放；② 排队的请求把「排队时间」算进了自己的持有时间，
+//    于是每个并发请求都打一条假的 slow hold。两处都修了，各钉一个用例。
+const NL = String.fromCharCode(10);
+const SENTINEL = "data: [DONE]" + NL + NL;
+
+Deno.test("cnb-gate: the upstream [DONE] sentinel releases the gate before the body closes", async () => {
+  const enc = new TextEncoder();
+  let released = 0;
+  // 真实 cnb 发完哨兵**不关流**，连接就挂在那儿。所以这里故意不 close()。
+  const upstream = new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(enc.encode('data: {"choices":[]}' + NL + NL));
+      c.enqueue(enc.encode(SENTINEL));
+    },
+  });
+  const gated = cnbGatedResponse(
+    new Response(upstream, { status: 200 }),
+    () => {
+      released += 1;
+    },
+  );
+  const reader = gated.body!.getReader();
+  // 读到哨兵为止，**不 cancel** —— 正是 cnbIter 的行为。
+  const dec = new TextDecoder();
+  let seen = "";
+  while (!seen.includes("[DONE]")) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    seen += dec.decode(value, { stream: true });
+  }
+  assertEquals(
+    released,
+    1,
+    "the [DONE] sentinel must release the gate itself, not the 2min idle backstop",
+  );
+  await reader.cancel().catch(() => {});
+});
+
+Deno.test("cnb-gate: [DONE] is still recognised when it straddles a chunk boundary", async () => {
+  const enc = new TextEncoder();
+  let released = 0;
+  const upstream = new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(enc.encode("data: [DO")); // 切在哨兵中间
+      c.enqueue(enc.encode("NE]" + NL + NL));
+    },
+  });
+  const gated = cnbGatedResponse(
+    new Response(upstream, { status: 200 }),
+    () => {
+      released += 1;
+    },
+  );
+  const reader = gated.body!.getReader();
+  const dec = new TextDecoder();
+  let seen = "";
+  while (!seen.includes("[DONE]")) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    seen += dec.decode(value, { stream: true });
+  }
+  assertEquals(released, 1, "a split sentinel must still release the gate");
+  await reader.cancel().catch(() => {});
+});
+
+Deno.test("cnb: a request that queued behind another does not report the queue wait as a hold", async () => {
+  const realFetch = globalThis.fetch;
+  const realWarn = console.warn;
+  const warns: string[] = [];
+  // 阈值压到 1.5 秒：真持有 2 秒的记一条（合法），排队 2 秒的**不该**再记一条。
+  // 修之前它会把 2 秒排队算进持有，于是多出一条假日志。
+  const HOLD = 1500;
+  const WAIT = 1500;
+  globalThis.fetch = ((input: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      const hung = new ReadableStream<Uint8Array>({
+        start() {/* 永远不吐也不关 */},
+      });
+      return Promise.resolve(
+        new Response(hung, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "a".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567890; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+  console.warn = (...args: any[]) => {
+    warns.push(args.map((a) => String(a)).join(" "));
+  };
+  const saveHold = Deno.env.get("CNB_GATE_SLOW_HOLD_MS");
+  const saveWait = Deno.env.get("CNB_GATE_SLOW_WAIT_MS");
+  Deno.env.set("CNB_GATE_SLOW_HOLD_MS", String(HOLD));
+  Deno.env.set("CNB_GATE_SLOW_WAIT_MS", String(WAIT));
+  const body = () => ({
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: "hi" }],
+    stream: true,
+    max_tokens: 16,
+  });
+  try {
+    // a 拿到闸但**不读** body → 闸被它占着；b 排在它后面。
+    const a = await cnbCallUpstream(body());
+    const bP = cnbCallUpstream(body());
+    await new Promise((r) => setTimeout(r, WAIT + 500));
+    await a.body!.cancel().catch(() => {});
+    const b = await bP;
+    await b.body!.cancel().catch(() => {});
+    const holds = warns.filter((w) => w.includes("slow hold"));
+    assertEquals(
+      holds.length,
+      1,
+      "only the request that actually held the gate may log a slow hold; got:" +
+        NL + warns.join(NL),
+    );
+    assert(
+      warns.some((w) => w.includes("waited")),
+      "the queued request should still report how long it waited",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    console.warn = realWarn;
+    if (saveHold === undefined) Deno.env.delete("CNB_GATE_SLOW_HOLD_MS");
+    else Deno.env.set("CNB_GATE_SLOW_HOLD_MS", saveHold);
+    if (saveWait === undefined) Deno.env.delete("CNB_GATE_SLOW_WAIT_MS");
+    else Deno.env.set("CNB_GATE_SLOW_WAIT_MS", saveWait);
   }
 });

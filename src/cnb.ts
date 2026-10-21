@@ -2265,13 +2265,13 @@ function cnbFingerprint(body: any): string {
   for (let i = 0; i < src.length; i++) h = ((h * 33) ^ src.charCodeAt(i)) >>> 0;
   return h.toString(36);
 }
-function cnbGatedResponse(resp: Response, done: () => void): Response {
+export function cnbGatedResponse(resp: Response, done: () => void): Response {
   if (!resp.body) {
     done();
     return resp;
   }
-  // 逐块透传并刷新空闲计时。释放条件（任一）：流正常结束、出错、消费方取消（cancel 会传导回来）、2 分钟无数据。
-  // （消费方读到 [DONE] 提前 return 且不 cancel 时，靠空闲计时兜底，闸不会吊死）
+  // 逐块透传并刷新空闲计时。释放条件（任一）：上游终止哨兵 [DONE]（见下）、流正常结束、
+  // 出错、消费方取消（cancel 会传导回来）、2 分钟无数据。
   let idle: ReturnType<typeof setTimeout> = setTimeout(() => {
     console.warn("[cnb-gate] idle 2min, releasing");
     done();
@@ -2287,10 +2287,30 @@ function cnbGatedResponse(resp: Response, done: () => void): Response {
     clearTimeout(idle);
     done();
   };
+  // ★ 看到上游的终止哨兵就放闸，不等流真正关闭。
+  //
+  // `cnbIter` 读到 `data: [DONE]` 就 return，但**不 cancel**，闸原本要空转到 2 分钟
+  // 空闲兜底。生产日志里 `fp=1f2kn02 released after 277260ms` 就是「~157 秒数据 +
+  // 120 秒白等」，而排在它后面的五个请求各等了 90~264 秒——全部由这 120 秒放大。
+  // 上游已经把终止哨兵发完了，这场会话就不再被占用，此时放闸是安全的：字节仍然
+  // 照常往下游流（先 enqueue 再 finish）。
+  const TERMINAL = "[DONE]";
+  let probe = new Uint8Array(0);
+  const hitTerminal = (chunk: Uint8Array) => {
+    // 哨兵可能跨 chunk：把上次的尾巴（长度足够覆盖哨兵本身）拼回来再找。
+    const buf = new Uint8Array(probe.length + chunk.length);
+    buf.set(probe);
+    buf.set(chunk, probe.length);
+    probe = buf.slice(Math.max(0, buf.length - TERMINAL.length));
+    let text = "";
+    for (let i = 0; i < buf.length; i++) text += String.fromCharCode(buf[i]);
+    return text.includes(TERMINAL);
+  };
   const t = new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       touch();
       controller.enqueue(chunk);
+      if (hitTerminal(chunk)) finish();
     },
     flush() {
       finish();
@@ -2302,7 +2322,7 @@ function cnbGatedResponse(resp: Response, done: () => void): Response {
     headers: resp.headers,
   });
 }
-async function cnbCallUpstream(
+export async function cnbCallUpstream(
   upBody: any,
   options: CnbGateOptions = {},
 ): Promise<Response> {
@@ -2348,16 +2368,16 @@ async function cnbCallUpstream(
   if (internal) cnbSummaryGate = opened;
   else cnbGate = opened;
   let released = false;
-  const t0 = Date.now();
-  let safety: ReturnType<typeof setTimeout>;
+  let t0 = 0;
+  let safety: ReturnType<typeof setTimeout> | undefined;
   const done = () => {
     if (released) return;
     released = true;
-    clearTimeout(safety);
+    if (safety) clearTimeout(safety);
     // 同样只在异常时记：正常释放（流跑完/取消）是一条流水账，每个请求都打
     // 一次会把日志刷成同样的墙。这里只在**持有时间明显超过一次正常生成**时
     // 记账，正常的十几到几十秒不再逐条输出。
-    const held = Date.now() - t0;
+    const held = t0 ? Date.now() - t0 : 0;
     if (held > CNB_GATE_SLOW_HOLD_MS) {
       console.warn(
         `[cnb-gate] fp=${fp} released after ${held}ms (slow hold; ${CNB_GATE_SLOW_HOLD_MS}ms threshold)`,
@@ -2365,14 +2385,20 @@ async function cnbCallUpstream(
     }
     release();
   };
+  const queuedAt = Date.now();
+  await prev;
+  const waited = Date.now() - queuedAt;
+  // ★ t0 与安全阀都从「真的拿到闸」才开始计时。
+  // 2026-10-21 修：原来两者都写在 `await prev` 之前，于是 `held` = 排队 + 持有，
+  // 日志里的 slow hold 全是假的（实测 released 289624 - waited 263906 = 真实
+  // 持有 25.7s；另有 213039 - 211197 = 1.8s）。更糟的是 10 分钟安全阀会在
+  // **还没进场**的请求上触发，凭空多放一条并行流进来，正是串行闸要防的事。
+  t0 = Date.now();
   // 安全阀：流挂死时 10 分钟强制放行，避免闸被永久占死（正常释放时清除，不留误报日志）
   safety = setTimeout(() => {
     console.warn(`[cnb-gate] fp=${fp} safety release after 10min`);
     done();
   }, 10 * 60 * 1000);
-  const queuedAt = Date.now();
-  await prev;
-  const waited = Date.now() - queuedAt;
   // 只在**异常**排队时记一行。
   //
   // 阈值原本是 200ms，而 cnb 上游单次生成实测就要 30 秒上下、闸又是串行的，
