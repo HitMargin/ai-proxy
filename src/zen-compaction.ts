@@ -661,7 +661,8 @@ export function fallbackTruncate(
   // ★ 2026-10-21 缩短：旧文案 81 个字节约 225 字节，对 cnb 的 1 MiB 预算不算事，
   // 但它出现在**每一条** system 消息被砍的位置，而 system 是 cnb 上游的检测面；
   // 越短越不容易把真正的指令挤掉。
-  const noteContent = `[context compaction] 早期消息已按体积上限(${budgetBytes}B)截断。`;
+  const noteContent =
+    `[context compaction] 早期消息已按体积上限(${budgetBytes}B)截断。`;
   const noteBytes = sizeOf({ role: "system", content: noteContent });
 
   // 预算要同时容纳那条说明与非消息开销；否则说明本身就把预算吃掉，仍然超限。

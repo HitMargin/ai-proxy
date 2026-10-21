@@ -19,12 +19,12 @@ import {
   cnbJunkLogState,
   type CnbJunkStore,
   cnbJunkStreak,
+  cnbNeutraliseHead,
   cnbParseToolCalls,
   deriveSessionKey,
   handleCnb,
   isReasoningStarvation,
   maybeCompactCnb,
-  cnbNeutraliseHead,
   runAsCnbInternal,
   sessionIdOf,
   summariseWithThinkingFallback,
@@ -1586,7 +1586,8 @@ Deno.test("cnb: cnbNeutraliseHead cuts past padding, arrays, and refuses an empt
     messages: [{
       role: "system",
       // 48 字符的刀口落在指纹末尾之后，TAIL 必须完整留下
-      content: " ".repeat(100) + "FINGERPRINT".repeat(3) + "T".repeat(40) + "TAIL",
+      content: " ".repeat(100) + "FINGERPRINT".repeat(3) + "T".repeat(40) +
+        "TAIL",
     }],
   })!;
   const cut = String(padded.messages[0].content);
@@ -1611,7 +1612,11 @@ Deno.test("cnb: cnbNeutraliseHead cuts past padding, arrays, and refuses an empt
     }],
   })!;
   const parts = arr.messages[0].content as any[];
-  assertEquals(parts[0].text, "TAIL", "the text block keeps only what is past the 48-character cut");
+  assertEquals(
+    parts[0].text,
+    "TAIL",
+    "the text block keeps only what is past the 48-character cut",
+  );
   assertEquals(parts[1].type, "image_url", "image blocks are never touched");
 
   // 空头部没法删：返回 null，让调用方照原样透传错误，而不是假装修过。
@@ -1622,11 +1627,10 @@ Deno.test("cnb: cnbNeutraliseHead cuts past padding, arrays, and refuses an empt
   );
 });
 
-
 // 端到端：自愈必须真的发生在**出站请求**上，而不是只通过函数单测。
-// 用 monkeypatch 掉全局 fetch 造一个"第一次 11128、加固后 200"的上游，
-// 断言出站第二次的 body 开头确实被挪开了。
-Deno.test("cnb: a 400/11128 is retried once with hardened heads", async () => {
+// 用 monkeypatch 掉全局 fetch 造一个"第一次 11128、删掉头部后 200"的上游，
+// 断言出站第二次的 body 里那段指纹真的没了。
+Deno.test("cnb: a 400/11128 is retried once with the detected head removed", async () => {
   const realFetch = globalThis.fetch;
   const bodies: string[] = [];
   let chatCalls = 0;
@@ -1687,7 +1691,7 @@ Deno.test("cnb: a 400/11128 is retried once with hardened heads", async () => {
       req,
       new URL(req.url),
     );
-    assertEquals(resp.status, 200, "the hardened retry must succeed");
+    assertEquals(resp.status, 200, "the retry must succeed");
     assertEquals(chatCalls, 2, "exactly one extra attempt");
     // 自愈现在是「删掉头部那段文字」，不是「加前缀」：
     //   · 第一次出站必须原样（上游没拦就不改，一分钱不花）；
@@ -1695,13 +1699,10 @@ Deno.test("cnb: a 400/11128 is retried once with hardened heads", async () => {
     const sent = (i: number) =>
       JSON.parse(bodies[i]).messages.find((m: any) => m.role === "system");
     const first = String(sent(0).content);
-    assert(
-      first.trimEnd().endsWith("SOME UNKNOWN FINGERPRINT"),
-      "the first attempt must carry the text as sent (only blank padding is added)",
-    );
-    assert(
-      /^[\s\u200b-\u200d\ufeff]*$/.test(first.slice(0, first.length - "SOME UNKNOWN FINGERPRINT".length)),
-      "anything in front of the text must be invisible padding, never words",
+    assertEquals(
+      first,
+      "SOME UNKNOWN FINGERPRINT",
+      "the first attempt must carry the head untouched: nothing is prepended",
     );
     const retried = String(sent(1).content);
     assert(
@@ -1720,10 +1721,10 @@ Deno.test("cnb: a 400/11128 is retried once with hardened heads", async () => {
 Deno.test("cnb: the head of an oversized body is never an empty system message", async () => {
   // ★ 2026-10-21 生产实测的形状：/`responses` 的 `instructions` 转换后是 chat body 的
   // **第一条 system**；它单条就超过 1 MiB 预算时，fallbackTruncate 的
-  // 「system 也受预算约束」分支会把它砍成 0 字节，于是出站 `messages[0]}` 是
-  // `{role:"system", content:""}`。自愈往空串前面加前缀等于什么都没挪 ——
-  // 那一次 retry 必然再被拦（生产日志里连续两轮都只有 "retrying once"，
-  // 没有任何一行成功）。
+  // 「system 也受预算约束」分支会把它砍成 0 字节，于是出站 `messages[0]` 是
+  // `{role:"system", content:""}`。空头部没有可以删的文字，
+  // 自愈只能作罢，那一次 retry 必然再被拦（生产日志里连续两轮都只有
+  // "retrying once"，没有任何一行成功）。
   //
   // 这个用例钉两件事：①空头部真的会从 handleCnb 的出站 body 里出现；
   // ②出站头部永远不是空串——空头部意味着自愈无从下手，重试必然白费。
@@ -1777,10 +1778,13 @@ Deno.test("cnb: the head of an oversized body is never an empty system message",
       new URL(respReq.url),
     );
     assert(resp.status >= 400, "the stubbed upstream blocks everything");
-    // 现在是最多**两段**加固：换行 → 空引用行。这里只断言"有重试、且第二次的
-    // 头部已经不是原文开头"，不锁死段数（段数是策略，不是这条用例要保护的性质）。
-    assert(bodies.length >= 2, "first try + at least one hardened retry");
-    assert(bodies.length <= 3, "hardening must be bounded, not an infinite retry loop");
+    // 自愈只有一次重试：把头部第一句删掉。这里只断言"试过重试"，
+    // 不锁死上限的具体取值（次数是策略，不是这条用例保护的性质）。
+    assert(bodies.length >= 2, "first try + one head-removed retry");
+    assert(
+      bodies.length <= 3,
+      "the retry must be bounded, not an infinite loop",
+    );
     const heads = bodies.map((b) =>
       JSON.parse(b).messages[0] as { role: string; content: any }
     );
@@ -1790,8 +1794,8 @@ Deno.test("cnb: the head of an oversized body is never an empty system message",
         : JSON.stringify(h.content ?? "").length;
       assert(
         len > 0,
-        "the outbound head must not be an empty system message: a prefix " +
-          "added to it moves nothing and the retry is wasted",
+        "the outbound head must not be an empty system message: an empty head " +
+          "gives the head cut nothing to remove, so the retry would be wasted",
       );
     }
   } finally {
