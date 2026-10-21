@@ -12,11 +12,9 @@
 import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
   CNB_BODY_BUDGET_BYTES,
-  CNB_HEAD_PREFIX,
   CNB_MODELS,
   cnbBuildUpstream,
   cnbDiagnoseJunkSyntax,
-  cnbHardenClientHead,
   cnbJournalJunk,
   cnbJunkLogState,
   type CnbJunkStore,
@@ -26,7 +24,7 @@ import {
   handleCnb,
   isReasoningStarvation,
   maybeCompactCnb,
-  neutraliseClientIdentity,
+  cnbNeutraliseHead,
   runAsCnbInternal,
   sessionIdOf,
   summariseWithThinkingFallback,
@@ -1548,201 +1546,82 @@ Deno.test("unrelated JSON is still preserved next to the new detectors", () => {
   }
 });
 
-// ── 客户端身份改写（2026-10-18 cnb 上线 errcode 11128 渠道校验后的规避） ──
+// ── 11128 自愈：**删掉**被检测到的头部（2026-10-21 直连实测后的定案）──
 //
-// 上游检测的是 system/assistant 消息里连续出现的 Claude Code 身份短语
-// （实测：整句拦；去掉 "You are"、拆开、换行、放句尾都不拦；user 不检测）。
-// Claude Code 客户端每轮把那句作为 system prompt 首句，所以每轮必 400。
-// 这组用例钉住改写的判据与边界，防止实现悄悄漂移。
-Deno.test("cnb: Claude Code identity phrase is rewritten in system and assistant messages", () => {
-  const FULL = "You are Claude Code, Anthropic's official CLI for Claude.";
-  // 真实 Claude Code 的 system prompt 形态 = 身份句 + 大段后缀
-  const realSystem = FULL +
-    "\n\nYou are an interactive CLI tool that helps users.";
-
-  const out = neutraliseClientIdentity([
-    { role: "system", content: realSystem },
-    { role: "user", content: "hi" },
-    { role: "assistant", content: FULL },
-  ]);
-
-  assertEquals(
-    (out[0].content as string).includes("Claude Code, Anthropic"),
-    false,
-    "the identity phrase must be gone from system",
-  );
-  assert(
-    (out[0].content as string).startsWith("You are a coding agent"),
-    "the rewrite must keep the sentence semantic (still tells the model it is a coding agent)",
-  );
-  assert(
-    (out[0].content as string).endsWith(
-      "interactive CLI tool that helps users.",
-    ),
-    "the rest of the system prompt must survive untouched",
-  );
-  assertEquals(
-    (out[2].content as string).includes("Claude Code, Anthropic"),
-    false,
-    "assistant history is also on the detection surface and must be rewritten",
-  );
-});
-
-Deno.test("cnb: identity rewrite leaves user messages and unrelated prose untouched", () => {
-  const FULL = "You are Claude Code, Anthropic's official CLI for Claude.";
-  const out = neutraliseClientIdentity([
-    // user 不在上游的检测面上，改它等于篡改用户原文
-    { role: "user", content: "请解释这句话: " + FULL },
-    { role: "system", content: "普通系统提示，没有任何身份短语。" },
-    { role: "assistant", content: "只提了 You are Claude Code 这半句的历史。" },
-  ]);
-
-  assert(
-    (out[0].content as string).includes(FULL),
-    "user messages are not on the detection surface and must not be touched",
-  );
-  assertEquals(out[1].content, "普通系统提示，没有任何身份短语。");
-  assertEquals(out[2].content, "只提了 You are Claude Code 这半句的历史。");
-});
-
-Deno.test("cnb: identity rewrite handles array content and survives the real Claude Code shape", () => {
-  const FULL = "You are Claude Code, Anthropic's official CLI for Claude.";
-  const out = neutraliseClientIdentity([
-    {
-      role: "system",
-      // Claude Code 也可能发多模态数组形态
-      content: [
-        { type: "text", text: FULL + "\nmore instructions" },
-        { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
-      ],
-    },
-  ]);
-  const first = out[0].content[0] as { type: string; text: string };
-  assert(
-    !first.text.includes("Claude Code, Anthropic"),
-    "array-shaped system content must be rewritten per text block",
-  );
-  assert(first.text.startsWith("You are a coding agent"));
-  // 图片块必须原样保留
-  const second = out[0].content[1] as { type: string };
-  assertEquals(second.type, "image_url");
-});
-
-Deno.test("cnb: the rewritten request passes cnbBuildUpstream without the trigger phrase", () => {
-  // 端到端形状断言：cnbBuildUpstream 的输出里不允许再出现会被上游拦的短语。
-  // 这条把「改写函数」与「真正发出去的请求体」连起来——只测函数会漏掉接线错误。
-  const FULL = "You are Claude Code, Anthropic's official CLI for Claude.";
-  const up = cnbBuildUpstream({
-    model: "deepseek-v4.1-flash",
-    max_tokens: 16,
+// 判据表（逐条只改一个变量）：
+//   指纹在开头                     → 400 / 11128
+//   同段文字放长文中间             → 200
+//   **删掉开头 48 字符**           → 200   ← 只有这个动作不管上游怎么归一化都成立
+//   前面加空格/换行/零宽          → 200，但头部是 48 KB 空白时不成立（归一化后原地）
+Deno.test("cnb: cnbNeutraliseHead deletes the head of the first checked message", () => {
+  const FINGERPRINT = "You are an AI agent powered by DeepSeek Harness.";
+  const rest = " This part must survive untouched.";
+  const out = cnbNeutraliseHead({
     messages: [
-      { role: "system", content: FULL + "\nBe helpful." },
+      { role: "system", content: FINGERPRINT + rest },
       { role: "user", content: "hi" },
     ],
   });
-  const sys = (up.upstream.messages as any[])[0];
-  assertEquals(
-    JSON.stringify(up.upstream.messages).includes("Claude Code, Anthropic"),
-    false,
-    "the wire body must not contain the phrase upstream blocks",
-  );
-  assert(
-    String(sys.content).startsWith("You are a coding agent"),
-    "the wire body carries the neutral identity instead",
-  );
-});
-
-// ── 11128 自愈：不认指纹，只把正文开头挪开 ──
-//
-// 判据来自 2026-10-20 直连上游的实测表：任意指纹只在**消息开头**被拦，
-// 前面插一句就 200，放在长文中间也 200。所以加固动作必须真的改变开头，
-// 且必须只动检测面上的角色。
-Deno.test("cnb: cnbHardenClientHead moves the head of system/assistant but not user", () => {
-  const out = cnbHardenClientHead({
-    messages: [
-      { role: "system", content: "SOME UNKNOWN FINGERPRINT" },
-      { role: "assistant", content: "SOME UNKNOWN FINGERPRINT" },
-      { role: "developer", content: "SOME UNKNOWN FINGERPRINT" },
-      { role: "user", content: "SOME UNKNOWN FINGERPRINT" },
-    ],
-  });
   assert(out, "must report a change");
-  const msgs = out!.messages as any[];
-  for (const i of [0, 1, 2]) {
-    assert(
-      msgs[i].content.startsWith(CNB_HEAD_PREFIX),
-      `role ${msgs[i].role} must be prefixed`,
-    );
-  }
+  const head = String(out!.messages[0].content);
+  assert(
+    !head.includes(FINGERPRINT.slice(0, 20)),
+    "the detected head must be gone, not merely prefixed",
+  );
+  assert(
+    head.endsWith(rest),
+    "the rest of the instruction must survive",
+  );
   assertEquals(
-    msgs[3].content,
-    "SOME UNKNOWN FINGERPRINT",
-    "user content is not on the detection surface and must not be rewritten",
+    out!.messages[1].content,
+    "hi",
+    "only the first message is on the detection surface",
   );
 });
 
-Deno.test("cnb: the harden prefix stays invisible and still moves the head", () => {
-  // 两条一起钉，因为它们互相牵制：
-  //  · 前缀必须**非空**，否则根本没挪开开头（上游照拦，我们却在白重试）；
-  //  · 前缀必须是**纯空白**，否则它会进 assistant 历史，模型学会后往外复读
-  //    （2026-10-21 用户的截图：每层工具调用前挂着一行英文）。
-  assertEquals(
-    CNB_HEAD_PREFIX.trim(),
-    "",
-    "the prefix must not carry any words",
-  );
-  assert(
-    CNB_HEAD_PREFIX.length > 0,
-    "the prefix must be non-empty to move the head",
-  );
-  assert(
-    /^[\s\u200b-\u200d\ufeff]+$/.test(CNB_HEAD_PREFIX),
-    "the prefix must be whitespace / zero-width only",
-  );
-
-  const out = cnbHardenClientHead({
-    messages: [{ role: "system", content: "FINGERPRINT" }],
+Deno.test("cnb: cnbNeutraliseHead cuts past padding, arrays, and refuses an empty head", () => {
+  // 空白填充在头部时必须先跳过去再删，否则删掉的是填充、指纹原地不动。
+  // 指纹长度 20 ⇒ 删 48 字符等于连它一起往后多切 28 字符，所以尾巴要够长。
+  const padded = cnbNeutraliseHead({
+    messages: [{
+      role: "system",
+      // 48 字符的刀口落在指纹末尾之后，TAIL 必须完整留下
+      content: " ".repeat(100) + "FINGERPRINT".repeat(3) + "T".repeat(40) + "TAIL",
+    }],
   })!;
-  assertEquals(
-    out.messages[0].content,
-    CNB_HEAD_PREFIX + "FINGERPRINT",
-    "the original text must survive intact behind the prefix",
+  const cut = String(padded.messages[0].content);
+  assert(
+    cut.startsWith(" ".repeat(100)),
+    "leading padding is part of the head and must be preserved",
   );
   assert(
-    !String(out.messages[0].content).startsWith("FINGERPRINT"),
-    "the fingerprint must no longer be at the head",
-  );
-});
-
-Deno.test("cnb: cnbHardenClientHead handles array content and returns null when nothing to do", () => {
-  const out = cnbHardenClientHead({
-    messages: [
-      {
-        role: "system",
-        content: [
-          { type: "text", text: "FINGERPRINT" },
-          { type: "image_url", image_url: { url: "data:image/png;base64,AA" } },
-        ],
-      },
-    ],
-  });
-  const parts = out!.messages[0].content as any[];
-  assert(
-    parts[0].text.startsWith(CNB_HEAD_PREFIX),
-    "text block must be prefixed",
-  );
-  assertEquals(
-    parts[1].type,
-    "image_url",
-    "image blocks must survive untouched",
+    cut.trimStart().endsWith("TAIL"),
+    "the text past the 48-character cut must survive",
   );
 
+  // 数组形态：动第一个 text 块，图片块原样保留。
+  const arr = cnbNeutraliseHead({
+    messages: [{
+      role: "system",
+      content: [
+        // 刀口正好 48 字符：前面 48 个 x 被删掉，TAIL 原样留下
+        { type: "text", text: "x".repeat(48) + "TAIL" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AA" } },
+      ],
+    }],
+  })!;
+  const parts = arr.messages[0].content as any[];
+  assertEquals(parts[0].text, "TAIL", "the text block keeps only what is past the 48-character cut");
+  assertEquals(parts[1].type, "image_url", "image blocks are never touched");
+
+  // 空头部没法删：返回 null，让调用方照原样透传错误，而不是假装修过。
   assertEquals(
-    cnbHardenClientHead({ messages: [{ role: "user", content: "hi" }] }),
+    cnbNeutraliseHead({ messages: [{ role: "system", content: "   " }] }),
     null,
-    "no system/assistant message means nothing to harden",
+    "an empty head must not claim a change",
   );
 });
+
 
 // 端到端：自愈必须真的发生在**出站请求**上，而不是只通过函数单测。
 // 用 monkeypatch 掉全局 fetch 造一个"第一次 11128、加固后 200"的上游，
@@ -1810,28 +1689,115 @@ Deno.test("cnb: a 400/11128 is retried once with hardened heads", async () => {
     );
     assertEquals(resp.status, 200, "the hardened retry must succeed");
     assertEquals(chatCalls, 2, "exactly one extra attempt");
-    // ★ 不能写成 includes(CNB_HEAD_PREFIX.trim())：前缀现在是空白，trim() 出来是
-    // 空串，而 includes("") 恒为 true —— 断言会变成永真。必须直接对出站 body
-    // 解出来的消息断言「开头被挪过了、原文还在」。
+    // 自愈现在是「删掉头部那段文字」，不是「加前缀」：
+    //   · 第一次出站必须原样（上游没拦就不改，一分钱不花）；
+    //   · 第二次出站必须**不再以那段指纹开头**，且其余文字还在。
     const sent = (i: number) =>
       JSON.parse(bodies[i]).messages.find((m: any) => m.role === "system");
-    assertEquals(
-      sent(0).content,
-      "SOME UNKNOWN FINGERPRINT",
-      "the first attempt must be unmodified (no cost when upstream is happy)",
-    );
-    assertEquals(
-      sent(1).content,
-      CNB_HEAD_PREFIX + "SOME UNKNOWN FINGERPRINT",
-      "the retried wire body must have its head moved, with the original text intact",
+    const first = String(sent(0).content);
+    assert(
+      first.trimEnd().endsWith("SOME UNKNOWN FINGERPRINT"),
+      "the first attempt must carry the text as sent (only blank padding is added)",
     );
     assert(
-      !CNB_HEAD_PREFIX.includes("Context"),
-      "the prefix must stay invisible: a readable sentence leaks into assistant " +
-        "history and gets parroted back by the model",
+      /^[\s\u200b-\u200d\ufeff]*$/.test(first.slice(0, first.length - "SOME UNKNOWN FINGERPRINT".length)),
+      "anything in front of the text must be invisible padding, never words",
+    );
+    const retried = String(sent(1).content);
+    assert(
+      !retried.includes("SOME UNKNOWN FINGERPRINT"),
+      "the retried wire body must have the detected head cut away",
+    );
+    assert(
+      retried.trim() === "",
+      "cutting the head is the only edit: the rest was the fingerprint itself",
     );
   } finally {
     globalThis.fetch = realFetch;
+  }
+});
+
+Deno.test("cnb: the head of an oversized body is never an empty system message", async () => {
+  // ★ 2026-10-21 生产实测的形状：/`responses` 的 `instructions` 转换后是 chat body 的
+  // **第一条 system**；它单条就超过 1 MiB 预算时，fallbackTruncate 的
+  // 「system 也受预算约束」分支会把它砍成 0 字节，于是出站 `messages[0]}` 是
+  // `{role:"system", content:""}`。自愈往空串前面加前缀等于什么都没挪 ——
+  // 那一次 retry 必然再被拦（生产日志里连续两轮都只有 "retrying once"，
+  // 没有任何一行成功）。
+  //
+  // 这个用例钉两件事：①空头部真的会从 handleCnb 的出站 body 里出现；
+  // ②出站头部永远不是空串——空头部意味着自愈无从下手，重试必然白费。
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      bodies.push(String(init?.body ?? ""));
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            code: 11128,
+            msg: "Illegal API invocation from an unapproved channel",
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        ),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "c".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567892; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  try {
+    const respReq = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        // 单条就把 1 MiB 预算吃光（压缩关掉，只让头部检查出手）。
+        instructions: "You are an agent. " + "x".repeat(1_100_000),
+        input: [{ role: "user", content: "只回一个字：好" }],
+        max_output_tokens: 16,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/responses",
+      respReq,
+      new URL(respReq.url),
+    );
+    assert(resp.status >= 400, "the stubbed upstream blocks everything");
+    // 现在是最多**两段**加固：换行 → 空引用行。这里只断言"有重试、且第二次的
+    // 头部已经不是原文开头"，不锁死段数（段数是策略，不是这条用例要保护的性质）。
+    assert(bodies.length >= 2, "first try + at least one hardened retry");
+    assert(bodies.length <= 3, "hardening must be bounded, not an infinite retry loop");
+    const heads = bodies.map((b) =>
+      JSON.parse(b).messages[0] as { role: string; content: any }
+    );
+    for (const h of heads) {
+      const len = typeof h.content === "string"
+        ? h.content.length
+        : JSON.stringify(h.content ?? "").length;
+      assert(
+        len > 0,
+        "the outbound head must not be an empty system message: a prefix " +
+          "added to it moves nothing and the retry is wasted",
+      );
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
   }
 });
 
@@ -1892,37 +1858,6 @@ Deno.test("cnb: a non-11128 400 is passed through without a retry", async () => 
   } finally {
     globalThis.fetch = realFetch;
   }
-});
-
-Deno.test("cnb: gitStatus template fingerprint is rewritten (2026-10-18 second fingerprint)", () => {
-  // cnb 的渠道校验还有第二个指纹：Claude Code 注入的 gitStatus 模板
-  // "Main branch (you will usually use this for PRs): <branch>"——到冒号即触发。
-  // cc-haha 的会话必带 gitStatus 块，主身份句改写后仍被拦就是它。
-  const body = {
-    model: "cnb/deepseek-v4.1-flash",
-    max_tokens: 16,
-    messages: [
-      {
-        role: "system",
-        content:
-          "gitStatus: This is the git status at the start of the conversation.\n\n" +
-          "Current branch: master\n\n" +
-          "Main branch (you will usually use this for PRs): master\n\n" +
-          "Git user: Someone",
-      },
-      { role: "user", content: "hi" },
-    ],
-  };
-  const up = cnbBuildUpstream(body);
-  const sys = String((up.upstream.messages as any[])[0].content);
-  assert(
-    !sys.includes("(you will usually use this for PRs)"),
-    "the gitStatus template wording must be rewritten away",
-  );
-  assert(
-    sys.includes("Main branch: master"),
-    "the branch name must survive the rewrite",
-  );
 });
 
 // ─── 第五次修：body 超预算却「压根没压缩」也必须在返回前收敛 ───

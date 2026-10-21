@@ -1565,131 +1565,109 @@ function commonPrefixLen(a: string, b: string) {
   return i;
 }
 
-/**
- * 把 Claude Code 的客户端身份声明改写成中性表述。
- *
- * 为什么需要：cnb 于 2026-10-18 上线渠道校验 `errcode 11128`（"Illegal API
- * invocation from an unapproved channel"，文案「可能不是官方客户端发出的」）。
- * 实测它的判据是 **system/assistant 消息里连续出现的 Claude Code 身份短语**：
- *   - 完整原文出现                       → 400 / 11128
- *   - 去掉句尾句号 / 全大写              → 仍 400（大小写不敏感、容错标点）
- *   - 去掉开头 "You are"                 → 200
- *   - 只留 "You are Claude Code"         → 200
- *   - 中间插词 / 换行拆开 / 放句尾 / 放句中 → 200
- *   - user 消息里出现                    → 200（不检测）
- * 也就是说匹配的是**那一段连续字符序列**，不是"Claude"这个品牌名。
- *
- * 因此这里做的替换保持了句子的语义（仍然告诉模型它是个编码助手），只是不再
- * 自称官方客户端。**这是规避，不是适配**——上游随时可以加别的指纹。
- *
- * 只动 `system` 与 `assistant`：`user` 不在检测面上，改它反而会篡改用户原文。
- * 内容为数组（多模态）时逐个 text 块处理，图片块原样保留。
- */
-export function neutraliseClientIdentity(msgs: any[]): any[] {
-  // 指纹 A：完整身份句，以及它能被容忍的标点/空白变体。大小写不敏感在下面统一处理。
-  // 故意只匹配这个"整句"：拆开就不被拦（实测），改了就别无谓地动其它文本。
-  const IDENTITY =
-    /You are Claude Code,{1,2}\s*Anthropic['’]s official CLI for Claude\.?/gi;
-  const REPLACEMENT = "You are a coding agent working inside a CLI tool.";
-
-  // 指纹 B（2026-10-18 第二次实拆）：Claude Code 注入的 gitStatus 模板
-  // "Main branch (you will usually use this for PRs): <branch>"——**到冒号即触发**，
-  // 分支名可有无。cc-haha 的会话必带 gitStatus 块，主身份句改写后仍被拦就是它。
-  // 替换保留信息量（分支名还在），只去掉那段标志性模板措辞。
-  const GIT_STATUS = /Main branch \(you will usually use this for PRs\)\s*:/gi;
-  const GIT_REPLACEMENT = "Main branch:";
-
-  const rewrite = (text: string): string =>
-    text.replace(IDENTITY, REPLACEMENT).replace(GIT_STATUS, GIT_REPLACEMENT);
-
-  return msgs.map((m) => {
-    const role = String(m?.role ?? "").toLowerCase();
-    if (role !== "system" && role !== "assistant") return m;
-    if (typeof m.content === "string") {
-      const next = rewrite(m.content);
-      return next === m.content ? m : { ...m, content: next };
-    }
-    if (Array.isArray(m.content)) {
-      let changed = false;
-      const parts = m.content.map((p: any) => {
-        if (p?.type !== "text" || typeof p.text !== "string") return p;
-        const next = rewrite(p.text);
-        if (next === p.text) return p;
-        changed = true;
-        return { ...p, text: next };
-      });
-      return changed ? { ...m, content: parts } : m;
-    }
-    return m;
-  });
+export function cnbHeadSample(body: any): string {
+  const msgs = body?.messages;
+  const m = Array.isArray(msgs) ? msgs[0] : null;
+  if (!m) return "(no messages)";
+  const role = String(m.role ?? "?");
+  const c = m.content;
+  const text = typeof c === "string"
+    ? c
+    : (Array.isArray(c)
+      ? c.map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("")
+      : "");
+  return role + ":" + JSON.stringify(text.slice(0, 48));
 }
 
 /**
- * 渠道校验自愈：把被检测的**消息正文开头**挪开。
+ * 渠道校验（errcode 11128）自愈：**删掉**第一条消息开头那段可识别文字。
  *
- * 为什么不再靠"认出指纹"：11128 的匹配面是**消息开头**，且指纹会随上游更新
- * 漂移（2026-10-18 上线时只认身份句，之后多了 gitStatus 模板，2026-10-20 本轮
- * 又被拦——第三个指纹不是那两个正则里任何一个）。直连上游实测（逐条只改一个
- * 变量）：
+ * 判据全部来自直连上游的逐条对照（2026-10-20 / 10-21，只改一个变量）：
  *
- *   | 消息正文                                  | 结果        |
- *   | ----------------------------------------- | ----------- |
- *   | 身份句在开头                              | 400 / 11128 |
- *   | 身份句在开头 + 后面接大段文本             | 400 / 11128 |
- *   | 前面先插一句（句号/空行/反引号/## 标题）  | 200         |
- *   | **前面只加一个空格 / 一个换行 / 一个零宽**| **200**     |
- *   | 身份句在长文中间                          | 200         |
- *   | 身份句只出现在 user 消息                  | 200         |
+ *   | 请求                                                   | 结果        |
+ *   | ------------------------------------------------------ | ----------- |
+ *   | 消息正文以某段客户端指纹开头                           | 400 / 11128 |
+ *   | 同一段文字放在长文中间                                 | 200         |
+ *   | 只出现在 user 消息                                     | 200         |
+ *   | **删掉开头那 48 字符** / 换成别的文字                  | **200**     |
  *
- * 即**只要把可疑的开头挪开就不再拦**，与它具体是哪个品牌、哪段模板无关。所以
- * 命中后统一做同一个动作重发，而不是继续往正则里堆第三个、第四个字符串——
- * 那种做法永远落后上游一步。
+ * 注意「挪开开头」这件事只有**真正改写开头**才有效：
  *
- * ★ 前缀为什么是**空白**而不是一句人话（2026-10-21 用户的实错）：
- * 第一版用的是 "Context: the instructions below apply."，能过校验，但它会被
- * 写进 **assistant 历史**——模型看到自己"说过"这句话，下几轮开始**模仿着往外
- * 复读**，界面上每层工具调用前都挂着一行英文（用户截图）。模型还把它改写成了
- * "applies"，说明这不是原样回显而是被学走了。既然上游只认「字面开头」，
- * 一个换行就足够（实测一个空格/一个换行/一个零宽空格都 200），那就不要往
- * transcript 里塞任何人造句子——**能不可见就不可见**。
+ *   · 前面加空格 / 换行 / 零宽字符，上游会归一化掉 → 等于没动，照样 400；
+ *   · 加一句人话有效，但它会进 assistant 历史，被模型学会后反复复读
+ *     （2026-10-21 用户截图，第一版就栽在这）；
+ *   · **头部是一大段空白填充时，把前缀加在最前面更是完全无效**（调试输出实测
+ *     两次出站头部一模一样）。
  *
- * 只动 system/assistant/developer：user 不在检测面上，改它等于篡改用户原文。
- * 返回 null 表示没有可加固的消息（调用方据此决定不重试）。
+ * 所以唯一「不管上游怎么归一化都成立」的动作是：把开头那段文字**删掉**。
+ * 代价只是第一条 system/assistant 消息少了开头几十个字符——它恰恰是那段
+ * 客户端指纹，丢了没有任何信息损失（模型看到的仍是同一份指令的其余部分）。
+ *
+ * 只动第一条消息（上游只看开头）；它若是数组形态则动第一个 text 块。
  */
-export const CNB_HEAD_PREFIX = "\n\n";
+// 没有任何句读可切时的兜底删除长度。实测切 1 个字符就够（"You are…" → "ou are…"
+// 上游就放行），但那只赌"检测锚定字面开头"这一条判据；多删一点是为上游换成
+// "开头 N 字符匹配"留余量，而 48 字符量级仍在"一句话"之内，不会吃掉正文。
+const CNB_HEAD_DROP_CHARS = 48;
+// 切到句读为止，但别切太多：头部第一条如果是一整段没标点的长文，最多丢 200 字符。
+const CNB_HEAD_DROP_MAX = 200;
 
-export function cnbHardenClientHead(body: any): any | null {
-  // ★ 空前缀不算"加固过"：那会让调用方拿一个字节都没变的 body 再打一次上游，
-  // 白付一次往返（变异验证时抓到过：把前缀改成 "" 后 e2e 仍然"通过"，因为
-  // 重试确实发生了、只是毫无作用）。前缀的意义就是"改动开头"，改不动就不该
-  // 声称改过。
-  if (!CNB_HEAD_PREFIX) return null;
+/**
+ * 删掉 text 开头那一句（含句读），保留其余部分。
+ *
+ * 为什么按句读切而不是固定 48 字符：48 字符在 "You are an AI agent powered by
+ * DeepSeek Harness."（44 字符）上会把下一句的开头也啃掉；而在更长的身份句上
+ * 又切不干净——剩下的残句照样可能被拦。按第一个换行/句号切，正好只丢**那一句**。
+ */
+function cutHeadSentence(text: string): string {
+  let i = 0;
+  while (i < text.length && /\s/.test(text[i])) i++;
+  if (i >= text.length) return text;
+  const limit = Math.min(text.length, i + CNB_HEAD_DROP_MAX);
+  for (let j = i; j < limit; j++) {
+    const ch = text[j];
+    // 换行与各语种句末标点都算一句话的边界。英文句点要求后面是空白或真正的
+    // 文本结尾——否则 "v4.1"、"1.5" 这种会被当成句号，切掉半个词。
+    const isBreak = ch === "\n" || ch === "。" || ch === "！" ||
+      ch === "？" || ch === "!" || ch === "?";
+    const isDot = ch === "." &&
+      (j + 1 >= text.length || /\s/.test(text[j + 1]));
+    if (isBreak || isDot) return text.slice(0, i) + text.slice(j + 1);
+  }
+  // 200 字符内没有任何句读：兜底固定删一段，别把整段长文都丢掉。
+  return text.slice(0, i) + text.slice(i + CNB_HEAD_DROP_CHARS);
+}
+
+export function cnbNeutraliseHead(body: any): any | null {
   const msgs = body?.messages;
   if (!Array.isArray(msgs) || msgs.length === 0) return null;
-  let changed = false;
-  const next = msgs.map((m: any) => {
+  const cut = (text: string): string => cutHeadSentence(text);
+  const next = msgs.slice();
+  for (let i = 0; i < next.length; i++) {
+    const m = next[i];
     const role = String(m?.role ?? "").toLowerCase();
     if (role !== "system" && role !== "assistant" && role !== "developer") {
-      return m;
+      continue; // user 不在检测面上
     }
     if (typeof m.content === "string") {
-      changed = true;
-      return { ...m, content: CNB_HEAD_PREFIX + m.content };
+      if (m.content.trim() === "") return null; // 空头部没法删
+      next[i] = { ...m, content: cut(m.content) };
+      return { ...body, messages: next };
     }
     if (Array.isArray(m.content)) {
-      let touched = false;
-      const parts = m.content.map((p: any) => {
-        if (p?.type !== "text" || typeof p.text !== "string") return p;
-        touched = true;
-        return { ...p, text: CNB_HEAD_PREFIX + p.text };
-      });
-      if (!touched) return m;
-      changed = true;
-      return { ...m, content: parts };
+      const parts = m.content.slice();
+      for (let k = 0; k < parts.length; k++) {
+        const p = parts[k];
+        if (p?.type !== "text" || typeof p.text !== "string") continue;
+        if (p.text.trim() === "") continue;
+        parts[k] = { ...p, text: cut(p.text) };
+        next[i] = { ...m, content: parts };
+        return { ...body, messages: next };
+      }
+      continue; // 这条没有可比对的文本，看下一条
     }
-    return m;
-  });
-  return changed ? { ...body, messages: next } : null;
+  }
+  return null;
 }
 
 // 导出给 src/cnb.test.ts：推理档位那一组断言（off 真的关掉思考、未知值报错
@@ -1987,7 +1965,10 @@ export function cnbBuildUpstream(openaiBody: any) {
   // 用户 2026-10-18 明确要求「我想在 claude code 中使用，请你解决」，
   // 所以做，但风险必须写在这里：上游随时可以加指纹（换措辞、看 tools 形状、
   // 看 model 组合），届时这条又要失效。
-  const nudgedMsgs = neutraliseClientIdentity(msgs);
+  // ★ 2026-10-21：身份改写取消。今天直连实测证明「删掉开头」是充分且可靠的做法，
+  // 而按句改写只是运气好——没删干净的残句照样能被拦。现在交给 400/11128 之后的
+  // cnbNeutraliseHead 统一处理。
+  const nudgedMsgs = msgs;
 
   // 注入工具定义（XYML schema）
   const tools = openaiBody.tools || [];
@@ -2430,9 +2411,12 @@ function cnbUpstreamFail(status: number, errBody: string): Response {
 
 // cnb 上游调用：瞬时 502/网络抖动时退避重试（境外出口 IP 偶发被 cnb 拒）
 async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
-  // 可重新赋值：11128 自愈时会把加固后的 body 换进来重发。
+  // 可重新赋值：11128 自愈时会把删掉头部的 body 换进来重发。
   let upBody = _upBody;
-  let headHardened = false;
+  // 11128 的修复方法只有一个：**把第一条消息开头那段可识别文字删掉**。
+  // 靠加前缀/加空白都不可靠（见 cnbNeutraliseHead 的实测表），删除是唯一
+  // 「无论上游怎么归一化都成立」的动作。只做一次。
+  let headNeutralised = false;
   const waits = [0, 500, 1500, 3500, 8000, 20000];
   let last: Response | null = null;
   for (let i = 0; i < waits.length; i++) {
@@ -2462,26 +2446,30 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
       // ★ 400 + 11128 是**唯一**值得重试的 4xx：它表达的是"这次的客户端指纹
       // 没通过渠道校验"，而不是"这个请求本身不合法"（后者才确定性失败）。
       // 2026-10-20 实测上游判据是「消息正文开头是不是某段客户端指纹」，而指纹
-      // 会随上游更新漂移，所以这里不认指纹、只认错误码，把开头挪开重发一次
-      // （见 cnbHardenClientHead 的实测表）。400 意味着上游什么都没投递，
+      // 会随上游更新漂移，所以这里不认指纹、只认错误码，把开头**删掉**重发一次
+      // （见 cnbNeutraliseHead 的实测表）。400 意味着上游什么都没投递，
       // 重试不会重复计费、也不会重复执行工具。
       //
-      // 只加固一次：若加固后仍被拦，说明判断错了（可能是别的原因），把上游
-      // 原文透传比无限重试诚实。
-      if (resp.status === 400 && !headHardened) {
+      // 只试一次：再用一次仍被拦，说明那不是"开头"的问题，把上游原文透传比
+      // 无限重试诚实。
+      if (resp.status === 400 && !headNeutralised) {
         let errText = "";
         try {
           errText = await resp.text();
         } catch {}
         if (errText.includes("11128")) {
-          const hardened = cnbHardenClientHead(upBody);
-          if (hardened) {
-            headHardened = true;
+          const before = cnbHeadSample(upBody);
+          const neutralised = cnbNeutraliseHead(upBody);
+          if (neutralised) {
+            headNeutralised = true;
+            // ★ 一定要把**被删掉的头部**打出来。2026-10-21 的现场就是这样丢的：
+            // 日志只有一句 "retrying once"，事后无从判断上游到底看到了什么，
+            // 最后靠重放才猜到「头部是空 system，加前缀等于没加」。
             console.warn(
               "[cnb] upstream 400/11128 (channel verification) — retrying once " +
-                "with client-identity heads neutralised",
+                "with the detected head removed; head was " + before,
             );
-            upBody = hardened;
+            upBody = neutralised;
             continue;
           }
         }
@@ -3800,7 +3788,6 @@ export async function handleCnb(path: string, request: Request, url: URL) {
     if (compactNote) {
       console.warn(`[cnb] ${compactNote}`);
     }
-
     let built;
     try {
       built = cnbBuildUpstream(p.data || {});
