@@ -1625,7 +1625,7 @@ export function neutraliseClientIdentity(msgs: any[]): any[] {
 }
 
 /**
- * 渠道校验自愈：给每条 system/assistant 消息的**正文开头**加一句中性前缀。
+ * 渠道校验自愈：把被检测的**消息正文开头**挪开。
  *
  * 为什么不再靠"认出指纹"：11128 的匹配面是**消息开头**，且指纹会随上游更新
  * 漂移（2026-10-18 上线时只认身份句，之后多了 gitStatus 模板，2026-10-20 本轮
@@ -1637,6 +1637,7 @@ export function neutraliseClientIdentity(msgs: any[]): any[] {
  *   | 身份句在开头                              | 400 / 11128 |
  *   | 身份句在开头 + 后面接大段文本             | 400 / 11128 |
  *   | 前面先插一句（句号/空行/反引号/## 标题）  | 200         |
+ *   | **前面只加一个空格 / 一个换行 / 一个零宽**| **200**     |
  *   | 身份句在长文中间                          | 200         |
  *   | 身份句只出现在 user 消息                  | 200         |
  *
@@ -1644,12 +1645,25 @@ export function neutraliseClientIdentity(msgs: any[]): any[] {
  * 命中后统一做同一个动作重发，而不是继续往正则里堆第三个、第四个字符串——
  * 那种做法永远落后上游一步。
  *
+ * ★ 前缀为什么是**空白**而不是一句人话（2026-10-21 用户的实错）：
+ * 第一版用的是 "Context: the instructions below apply."，能过校验，但它会被
+ * 写进 **assistant 历史**——模型看到自己"说过"这句话，下几轮开始**模仿着往外
+ * 复读**，界面上每层工具调用前都挂着一行英文（用户截图）。模型还把它改写成了
+ * "applies"，说明这不是原样回显而是被学走了。既然上游只认「字面开头」，
+ * 一个换行就足够（实测一个空格/一个换行/一个零宽空格都 200），那就不要往
+ * transcript 里塞任何人造句子——**能不可见就不可见**。
+ *
  * 只动 system/assistant/developer：user 不在检测面上，改它等于篡改用户原文。
  * 返回 null 表示没有可加固的消息（调用方据此决定不重试）。
  */
-export const CNB_HEAD_PREFIX = "Context: the instructions below apply.\n\n";
+export const CNB_HEAD_PREFIX = "\n\n";
 
 export function cnbHardenClientHead(body: any): any | null {
+  // ★ 空前缀不算"加固过"：那会让调用方拿一个字节都没变的 body 再打一次上游，
+  // 白付一次往返（变异验证时抓到过：把前缀改成 "" 后 e2e 仍然"通过"，因为
+  // 重试确实发生了、只是毫无作用）。前缀的意义就是"改动开头"，改不动就不该
+  // 声称改过。
+  if (!CNB_HEAD_PREFIX) return null;
   const msgs = body?.messages;
   if (!Array.isArray(msgs) || msgs.length === 0) return null;
   let changed = false;

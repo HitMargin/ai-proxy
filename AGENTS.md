@@ -75,6 +75,14 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   杀过：去掉 `errText.includes("11128")` → e2e 用例红。**重建 Response 时必须
   剔掉 `content-encoding`/`content-length`**（fetch 已解压，原样复制会让下游
   解不开）。实测该前缀字符串本身确实能把 400 变 200（前缀是硬编码的，不实测就是赌）。
+  > **前缀必须是空白，不能是句子（2026-10-21 实错，用户截图）**：第一版写
+  > `Context: the instructions below apply.`，能过校验，但**它进了 assistant 历史**，
+  > 模型学会后每轮往外复读（界面上每层工具调用前一行英文，且 `apply` 被改写成
+  > `applies`，证明是被学走而不是回显）。实测**一个空格 / 一个换行 / 一个零宽字符
+  > 都足够**（11 种变体全 200，只有"字面以指纹开头"才 400）⇒ 现用 `"\n\n"`。
+  > 判据：**为了让请求通过而写进 transcript 的东西，模型会当自己的话说出来**；
+  > 能不可见就不要写人话。另：空前缀会让自愈"重试了但什么都没改"（白打一次上游），
+  > 已加守卫 —— 这个漏洞正是变异验证（把前缀改空）时抓到的。
 - **DeepSeek 网页端**：`/deepseek-web/v1` 已支持自动登录凭证、PoW
   WASM、THINK/RESPONSE SSE 解析、OpenAI SSE、工具调用、图片 data URL 上传到
   `ref_file_ids`、Chat Completions、Responses API 和 `off/low/high/max`
@@ -1717,6 +1725,22 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   ③**判据来自四点对照实验**，不是读代码推的——代码里只有「把 tools 渲染成
   prompt」这个既成事实，看不出上游到底是不支持还是禁止；只有真发一次带 `tools`
   的请求才会暴露 403。
+- **cnb 上游至今没有新模型（2026-10-21 全链路复核）**：三条独立证据都指向
+  `deepseek-v4.1-flash` 一个：①**站点配置**（首页 `__NEXT_DATA__` 的
+  `initialState.global.systemConfigManage.ai`）里 `defaultModel` 与 `models[]` 都
+  只有 `deepseek-v4.1-flash`（type `deepthink`），且 `allowAnonymous:false`；
+  ②**models 端点仍然不存在**——`/ai/models`、`/ai/chat/models`、`/ai/v1/models`、
+  `/api/models`、`/api/ai/models`、`/ai/model/list`、`/api/ai/model/list` 七个路径回
+  Next.js 首页 HTML、`/v1/models` 回 404（这是 2026-10-06 那条的复现，不是新结论）；
+  ③直连上游逐个试了 21 个名字（`deepseek-v4.2`/`-flash`/`-pro`、`deepseek-v5`、
+  `glm-5`、`kimi-k2`、`qwen3-coder`、`gpt-5`、`claude-sonnet-4.5`、
+  `gemini-2.5-pro`，含故意编造的 `nonsense-model-xyz`）**全部 HTTP 200**，
+  而响应里的 `model` 字段一律回 `deepseek-v4.1-flash`。所以**判据是站点配置**，
+  不是「发个新名字能出字」——上游对任意字符串都回落同一后端，那个判据对一个
+  不存在的 id 同样成立。`CNB_MODELS` 因此**保持一个模型不动**。
+  附带一条探针纪律：**经本代理探测模型名是空转**——`/cnb/v1/chat/completions`
+  会把入站 `model` 原样回显进响应 `model` 字段（第一版探针因此得到
+  「18 个名字全命中」的假绿），真判据必须把请求直接打到 `cnb.cool`。
 - **cnb 的输出上限整整两周没生效过：键名写成了 camelCase（2026-10-06 实测；从
   70d9de4 起）**：`src/cnb.ts` 一直发 `maxTokens`，而上游**只认**
   `max_tokens`。直连对照（同一 prompt，只改键名）：

@@ -1681,6 +1681,39 @@ Deno.test("cnb: cnbHardenClientHead moves the head of system/assistant but not u
   );
 });
 
+Deno.test("cnb: the harden prefix stays invisible and still moves the head", () => {
+  // 两条一起钉，因为它们互相牵制：
+  //  · 前缀必须**非空**，否则根本没挪开开头（上游照拦，我们却在白重试）；
+  //  · 前缀必须是**纯空白**，否则它会进 assistant 历史，模型学会后往外复读
+  //    （2026-10-21 用户的截图：每层工具调用前挂着一行英文）。
+  assertEquals(
+    CNB_HEAD_PREFIX.trim(),
+    "",
+    "the prefix must not carry any words",
+  );
+  assert(
+    CNB_HEAD_PREFIX.length > 0,
+    "the prefix must be non-empty to move the head",
+  );
+  assert(
+    /^[\s\u200b-\u200d\ufeff]+$/.test(CNB_HEAD_PREFIX),
+    "the prefix must be whitespace / zero-width only",
+  );
+
+  const out = cnbHardenClientHead({
+    messages: [{ role: "system", content: "FINGERPRINT" }],
+  })!;
+  assertEquals(
+    out.messages[0].content,
+    CNB_HEAD_PREFIX + "FINGERPRINT",
+    "the original text must survive intact behind the prefix",
+  );
+  assert(
+    !String(out.messages[0].content).startsWith("FINGERPRINT"),
+    "the fingerprint must no longer be at the head",
+  );
+});
+
 Deno.test("cnb: cnbHardenClientHead handles array content and returns null when nothing to do", () => {
   const out = cnbHardenClientHead({
     messages: [
@@ -1777,13 +1810,25 @@ Deno.test("cnb: a 400/11128 is retried once with hardened heads", async () => {
     );
     assertEquals(resp.status, 200, "the hardened retry must succeed");
     assertEquals(chatCalls, 2, "exactly one extra attempt");
-    assert(
-      bodies[1].includes(CNB_HEAD_PREFIX.trim()),
-      "the retried wire body must carry the neutral head prefix",
+    // ★ 不能写成 includes(CNB_HEAD_PREFIX.trim())：前缀现在是空白，trim() 出来是
+    // 空串，而 includes("") 恒为 true —— 断言会变成永真。必须直接对出站 body
+    // 解出来的消息断言「开头被挪过了、原文还在」。
+    const sent = (i: number) =>
+      JSON.parse(bodies[i]).messages.find((m: any) => m.role === "system");
+    assertEquals(
+      sent(0).content,
+      "SOME UNKNOWN FINGERPRINT",
+      "the first attempt must be unmodified (no cost when upstream is happy)",
+    );
+    assertEquals(
+      sent(1).content,
+      CNB_HEAD_PREFIX + "SOME UNKNOWN FINGERPRINT",
+      "the retried wire body must have its head moved, with the original text intact",
     );
     assert(
-      !bodies[0].includes(CNB_HEAD_PREFIX.trim()),
-      "the first attempt must be unmodified (no cost when upstream is happy)",
+      !CNB_HEAD_PREFIX.includes("Context"),
+      "the prefix must stay invisible: a readable sentence leaks into assistant " +
+        "history and gets parroted back by the model",
     );
   } finally {
     globalThis.fetch = realFetch;
