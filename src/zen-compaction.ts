@@ -124,19 +124,32 @@ export interface CompactionOutcome {
 type Json = Record<string, any>;
 
 /**
- * OpenCode's token approximation: JSON length over four.
+ * Rough token estimate, **width aware**.
  *
- * Deliberately the same crude estimate upstream uses. A real tokenizer would
- * disagree with the server's own accounting and either compact far too early
- * or not at all.
+ * ★ 2026-10-21 修单位。旧版是 `字符数 / 4`，那只对 ASCII 成立：中文/日文/
+ * 韩文一个字符通常就是一个 token，按 4 折算会少算约 4 倍。混用之后出现的是
+ * 一种很难自查的账：日志说“尾巴只占 8000 token”，拼成 body 却是 886 KiB
+ * （预算的 89%），于是每一轮都压到刚好不超、下一轮立刻又超，反复烧摘要。
+ *
+ * 现在按码位分类：CJK 与全角区（U+2E80 以上）一个字符算一个 token，其余仍
+ * 按 4 折算。它依然是伪单位（没有真分词器），但和上游至少同一数量级；而
+ * **真正卡体积的地方用 utf8Bytes / selectTailByBytes**，那个才是字节。
  */
 export function estimateTokens(text: string): number {
-  return [...text].length / 4 | 0;
+  let wide = 0;
+  let narrow = 0;
+  for (const ch of text) {
+    if ((ch.codePointAt(0) ?? 0) >= 0x2e80) wide += 1;
+    else narrow += 1;
+  }
+  return wide + (narrow >> 2);
 }
 
 export function estimateJsonTokens(value: unknown): number {
   try {
-    return JSON.stringify(value).length / 4 | 0;
+    // 与 estimateTokens 同一把尺子：同一个字符串在两个函数里必须算出同一个数，
+    // 否则调用方之间又会出现单位漂移（这正是本节要修的那类 bug）。
+    return estimateTokens(JSON.stringify(value));
   } catch {
     return 0;
   }
@@ -249,6 +262,80 @@ export function selectTail(
   return { head, recent, split };
 }
 
+const utf8Encoder = new TextEncoder();
+
+/** UTF-8 bytes of `text` — the unit the upstream body limit is enforced in. */
+export function utf8Bytes(text: string): number {
+  return utf8Encoder.encode(text).length;
+}
+
+/**
+ * 一条消息在上游 body 里实际占的字节数。
+ *
+ * 用 `JSON.stringify` 而不是 `messageText`：图片的 base64、`tool_calls`
+ * 的 arguments、以及 tool 结果的原文才是体积本体。`messageText` 会把它们
+ * 丢掉（图片算 0）或截断（tool 结果截到 2000 字符）。实测一个真实会话：按消息
+ * 文本统计平均 893 字符/条，按序列化字节是 25159 字节/条 —— 相差 28 倍，
+ * 这就是“尾巴看着很小、body 却有 886 KiB”的来源。
+ */
+export function messageBytes(message: unknown): number {
+  try {
+    // +1: 消息之间的逗号。量级无关紧要，但便宜，且让界限偏向保守。
+    return utf8Bytes(JSON.stringify(message ?? "")) + 1;
+  } catch {
+    return 0;
+  }
+}
+
+export interface ByteTailSelection {
+  /** Index of the first message kept verbatim. */
+  split: number;
+  /** Bytes the kept tail actually occupies. */
+  bytes: number;
+}
+
+/**
+ * Pack the tail by **UTF-8 bytes** instead of estimated tokens.
+ *
+ * 与 `selectTail` 的唯一区别就是单位，而单位正是问题所在：伪 token 在中文
+ * （一字符三字节）和图片（base64 在 `messageText` 里直接消失）上会少算一个
+ * 数量级，于是“预算内”的尾巴拼成 body 后仍然贴着上限。
+ *
+ * 不切消息：整条放得下就放，放不下就把这条交给摘要。切开一条 base64 图片
+ * 只会得到一张坏图，而摘要那边本来就按字符数截头部。
+ */
+export function selectTailByBytes(
+  messages: readonly any[],
+  budgetBytes: number,
+): ByteTailSelection {
+  if (!Array.isArray(messages) || messages.length === 0 || budgetBytes <= 0) {
+    return { split: messages?.length ?? 0, bytes: 0 };
+  }
+  let used = 0;
+  let split = messages.length;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const cost = messageBytes(messages[i]);
+    if (used + cost > budgetBytes) break;
+    used += cost;
+    split = i;
+  }
+  // ★ 2026-10-22：一条都装不下时也不许把**尾巴清空**。
+  //
+  // 旧行为：最后一条自己就超过 budget ⇒ split 落到 messages.length ⇒ 尾巴是
+  // 零条消息 ⇒ 调用方拿到 `bytes: 0`，摘要那条捷径被判定为“没有可总结的部分”
+  // 而跳过（见 cnb.ts 的形态 B 注释），7.2 MB 的 body 原样上传，每轮 413。
+  //
+  // 这不是“切消息”（304 行那条规矩仍然成立：放不下就交给摘要），而是给
+  // **摘要留一个起点**：最新那一轮必须留在原文里，压缩是为了继续会话，
+  // 不是为了把问题也清掉。它可能仍然超预算，超出的部分由调用方的
+  // `fallbackTruncate` 收口（那边会把最后一条的正文硬截到剩余空间）。
+  if (messages.length > 0 && split === messages.length) {
+    const last = messages.length - 1;
+    return { split: last, bytes: messageBytes(messages[last]) };
+  }
+  return { split, bytes: used };
+}
+
 export function buildSummaryPrompt(
   previousSummary: string,
   context: readonly string[],
@@ -328,6 +415,15 @@ export interface CompactInput {
   maxOutputTokens: number;
   sessionId: string;
   config?: Partial<CompactionConfig>;
+  /**
+   * 由调用方按**字节**算好的尾部起点（见 `selectTailByBytes`）。
+   *
+   * 为什么不在这里自己算：本模块的预算单位是 token，而调用方（cnb）的预算是
+   * 上游那条 **1 MiB body** 的字节线。两把尺子必然漂开，实测就是“尾巴看着只
+   * 占 8000 token、拼出来 886 KiB”。调用方知道真实字节预算，所以由它给 split，
+   * 这里只负责按这个 split 切（0/缺省 = 沿用 keepTokens 的启发式）。
+   */
+  tailSplit?: number;
   writeSummary: SummaryWriter;
 }
 
@@ -431,7 +527,15 @@ export async function compactIfNeeded(
   const serialized = messages.map((message) =>
     message && typeof message === "object" ? serializeMessage(message) : ""
   );
-  const selection = selectTail(serialized, config.keepTokens);
+  // 调用方给了字节口径的 split，就按它切：那是上游真正会看到的体积。
+  const forcedSplit = input.tailSplit ?? 0;
+  const selection = forcedSplit > 0 && forcedSplit < serialized.length
+    ? {
+      head: [...serialized.slice(0, forcedSplit)],
+      recent: [...serialized.slice(forcedSplit)],
+      split: forcedSplit,
+    }
+    : selectTail(serialized, config.keepTokens);
   if (!selection || selection.split <= 0) {
     // ★ 2026-10-19 第五次修。这条分支曾让一个 7.2 MB 的请求**原样发出去**：
     // 调用方（maybeCompactCnb）为了给摘要限体积先把头部消息截到 600 字符，
@@ -639,6 +743,43 @@ export async function compactIfNeeded(
  * 预算先扣掉它再分给消息。判据：**截断后的 body 必须落进 budget**，
  * 而不是“消息部分落进 budget’”——后者是这次 WARNING 一直不退的原因。
  */
+/**
+ * 把一条消息的正文硬截到 `room` 字节以内（用于“最新一轮绝不能消失”的兜底）。
+ *
+ * 为什么需要它：`fallbackTruncate` 的装箱器只做「整条收 / 整条不收」的判断，
+ * 而生产里出现的恰恰是「最后一条自己就 > 预算」——于是两道循环都跳过它，
+ * 请求里一个用户问题都没有（日志：`(all messages dropped)`）。
+ * 截断的判据不是“字节数达标”，而是“字节数达标且还能继续会话”。
+ *
+ * 只改 `content`，其余字段（role / name / tool_call_id）原样保留，因为这些
+ * 字段是上游校验 schema 用的，缺了会被 400。非字符串正文（多模态）无从下手，
+ * 能整条放下就放下，否则返回 undefined 让调用方按“没留下”处理。
+ */
+function clipToRoom(message: any, room: number): any | undefined {
+  if (room <= 0) return undefined;
+  const encoder = new TextEncoder();
+  const sizeOf = (m: any): number => {
+    try {
+      return encoder.encode(JSON.stringify(m)).length;
+    } catch {
+      return 0;
+    }
+  };
+  if (typeof message.content !== "string") {
+    return sizeOf(message) + 1 <= room ? message : undefined;
+  }
+  const text: string = message.content;
+  const suffix = "\n[truncated]";
+  // UTF-8 每字符至少 1 字节，所以字符数就是字节数的上界，可作初值。
+  // 之后按 3/4 收敛：每轮严格变小，最坏 30 轮内结束（400 万字符的正文也一样）。
+  let keep = Math.min(text.length, room);
+  while (keep > 0) {
+    const candidate = { ...message, content: text.slice(0, keep) + suffix };
+    if (sizeOf(candidate) + 1 <= room) return candidate;
+    keep = Math.floor(keep * 0.75);
+  }
+  return undefined;
+}
 export function fallbackTruncate(
   messages: any[],
   budgetBytes: number,
@@ -705,6 +846,40 @@ export function fallbackTruncate(
     keptIndex.add(i);
     used += cost;
   }
+  // ★ 2026-10-22：最新那一轮不能消失。
+  //
+  // 生产形态：最后一条自己就超过预算时，上面两道循环都会跳过它，于是 kept
+  // 可能只剩 system、甚至全空，note 打出 `(all messages dropped)`——模型收到
+  // 的请求里**没有用户的问题**，所谓压缩变成了清空。
+  //
+  // 处理：还装得下就整条收（正常路径，行为不变）；装不下就把正文硬截到剩余
+  // 空间，至少保留“用户问了什么”的开头。判据是「装进预算**且**还能继续
+  // 会话」，只满足前者等于把会话掐死。
+  let clippedNewest = false;
+  const newestIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      if (!m || typeof m !== "object" || m.role === "system") continue;
+      return i;
+    }
+    return -1;
+  })();
+  if (newestIndex >= 0 && !keptIndex.has(newestIndex)) {
+    const newest = messages[newestIndex];
+    const cost = costOf(newest);
+    if (used + cost <= usable) {
+      kept.push({ index: newestIndex, message: newest });
+      keptIndex.add(newestIndex);
+      used += cost;
+    } else {
+      const clipped = clipToRoom(newest, usable - used - 1);
+      if (clipped !== undefined) {
+        kept.push({ index: newestIndex, message: clipped });
+        keptIndex.add(newestIndex);
+        clippedNewest = true;
+      }
+    }
+  }
   kept.sort((a, b) => a.index - b.index);
   const out = [
     { role: "system", content: noteContent },
@@ -715,6 +890,8 @@ export function fallbackTruncate(
   // 不能让它看起来像一次成功压缩。
   const note = kept.length === 0
     ? "[compacted via truncation] (all messages dropped)"
+    : clippedNewest
+    ? "[compacted via truncation] (newest turn clipped)"
     : "[compacted via truncation]";
   return { changed: true, note, messages: out };
 }

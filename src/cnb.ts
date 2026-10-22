@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import {
   compactIfNeeded,
   fallbackTruncate,
-  selectTail,
+  selectTailByBytes,
   serializeMessage,
 } from "./zen-compaction.ts";
 import {
@@ -3641,15 +3641,41 @@ export async function maybeCompactCnb(
   // 所以在把 messages 交给 compactIfNeeded 之前，先把**头部**（头部=要被总结的
   // 那段）逐条截到 CNB_SUMMARY_MSG_CHARS，让 prompt 的体积有界。
   // 关键在于**不能截尾部**：尾部是原样保留给模型的，截了就丢真话。
+  // 摘要 prompt 里每条头部消息的字符上限（见下文的 headSplit 截断）。
   const summaryMsgChars = cnbIntSetting("CNB_COMPACTION_MSG_CHARS", 600);
-  const serialized = messages.map((m: any) =>
-    m && typeof m === "object" ? serializeMessage(m) : ""
+
+  // ★ 非消息部分的字节数。`budget` 管的是**整个 body**，而尾部预算只看得见
+  // `messages`——差额（model/max_tokens/tools 定义/system 指令）必须先扣掉，
+  // 否则尾部永远差那一截。实测：消息已装到 92 万内，body 仍有 101 万。
+  const overheadBytes = (() => {
+    try {
+      const probe = { ...body, messages: [] as any[] };
+      return new TextEncoder().encode(JSON.stringify(probe)).length;
+    } catch {
+      return 0;
+    }
+  })();
+
+  // ★ 2026-10-21 修单位：尾部预算按**字节**算，不再按伪 token。
+  //
+  // 上游卡的是 body 字节，而 `selectTail` 用的是 `字符数/4`——中文一字符
+  // 三字节、图片 base64 在 `messageText` 里当作不存在、tool 结果被截到 2000
+  // 字符。日志实测：84 轮压缩**全部**落在预算的 89% 上下（均值 886 KiB），
+  // 于是下一轮立刻又超预算、再压一次、再烧一次摘要 —— 出站流量翻倍。
+  //
+  // 而且目标不是“刚好不超”而是**低水位**：只留 45% 给尾巴，压完约 50%，
+  // 后面几轮的新消息都装得下，不必每轮都压。
+  const tailPercent = Math.min(
+    90,
+    Math.max(10, cnbIntSetting("CNB_COMPACTION_TAIL_PERCENT", 45)),
   );
-  const selection = selectTail(
-    serialized,
-    cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000),
+  const usableBytes = Math.max(1, budget - overheadBytes);
+  const tailBytes = Math.max(
+    1,
+    Math.floor((usableBytes * tailPercent) / 100),
   );
-  const headSplit = selection?.split ?? messages.length;
+  const tail = selectTailByBytes(messages, tailBytes);
+  const headSplit = tail.split;
   const forSummary = messages.map((m: any, i: number) => {
     if (i >= headSplit || !m || typeof m !== "object") return m;
     if (typeof m.content === "string" && m.content.length > summaryMsgChars) {
@@ -3703,6 +3729,8 @@ export async function maybeCompactCnb(
       const derived = deriveSessionKey(messages);
       return derived === "" ? "" : `cnb:${derived}`;
     })(),
+    // 字节口径的尾部起点，见上面的 tailBytes。
+    tailSplit: headSplit,
     config: {
       keepTokens: cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000),
       buffer: cnbIntSetting("CNB_COMPACTION_BUFFER", 20000),
@@ -3722,18 +3750,11 @@ export async function maybeCompactCnb(
   })();
   const keyLabel = stateKey === "" ? "(none)" : stateKey;
 
-  // ★ 非消息部分的字节数。`budget` 管的是**整个 body**，而 fallbackTruncate
-  // 只看得见 `messages`——差额（model/max_tokens/tools 定义/system 指令）必须
-  // 显式扣掉，否则截断永远差那一截。实测：消息已装到 92 万内，body 仍有
-  // 101 万，于是每轮都退化成截断并报 `WARNING: still over budget`。
-  const overheadBytes = (() => {
-    try {
-      const probe = { ...body, messages: [] as any[] };
-      return new TextEncoder().encode(JSON.stringify(probe)).length;
-    } catch {
-      return 0;
-    }
-  })();
+  // ★ 低水位：无论最终走的是摘要、摘要失败、还是跳过，收敛目标都一样。
+  // 压在 100% 的后果是下一轮立刻又超、再压一次、再烧一次摘要（日志 84/84 全部如此）。
+  // 80% 触发、60% 落地，给后面几轮的新消息留出余量。
+  const watermark = Math.floor(budget * 0.8);
+  const target = Math.floor(budget * 0.6);
 
   let compactNote = "";
   if (result.changed) {
@@ -3749,12 +3770,20 @@ export async function maybeCompactCnb(
     //
     // 这里不递归重压（重压只会再烧一次摘要、成本翻倍），而是**如实说出来**并
     // 直接降级到字节截断：截断是确定性的、不花钱、且保证收敛到预算内。
-    if (after > budget) {
-      const truncated = fallbackTruncate(body.messages, budget, overheadBytes);
+    // ★ 2026-10-21：判据从“超过上限”改成“超过**水位线**”。
+    //
+    // 压到刚好不超（89%）是自伤：下一轮的新消息立刻又顶上去，于是每轮都要
+    // 再压一次、再烧一次摘要。日志里 84/84 轮都是这个形态。所以超过 80% 就
+    // 再截到 60%，让后面几轮都装得下。
+    if (after > watermark) {
+      const truncated = fallbackTruncate(body.messages, target, overheadBytes);
       body.messages = truncated.messages;
       const final = new TextEncoder().encode(JSON.stringify(body)).length;
       compactNote +=
-        ` | summary still over budget (${after}B > ${budget}B), fell back to truncation -> ${final}B`;
+        ` | over watermark (${after}B > ${watermark}B), trimmed to ${final}B`;
+      if (final > budget) {
+        compactNote += ` | WARNING: still over budget (${budget}B)`;
+      }
       return compactNote;
     }
     return compactNote;
@@ -3766,7 +3795,7 @@ export async function maybeCompactCnb(
     // 到实际体积之上，于是**一条消息都没删**，只多加 149 字节的说明。
     // 日志里因此有 `bytes 4121421 -> 4121570`（变大）与
     // `bytes 4296416 -> 4296565`。现在直接传字节预算，与上游同一把尺子。
-    const truncated = fallbackTruncate(messages, budget, overheadBytes);
+    const truncated = fallbackTruncate(messages, target, overheadBytes);
     body.messages = truncated.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
     // 失败原因必须可见：日志里连续几十行都只有 "summary generation failed"，
@@ -3798,7 +3827,7 @@ export async function maybeCompactCnb(
   // 无论中间走的是摘要、还是哪一条捷径。截断是确定性的、不花钱、必然收敛。
   {
     const reason = result.skipped ? `: ${result.skipped}` : "";
-    const truncated = fallbackTruncate(messages, budget, overheadBytes);
+    const truncated = fallbackTruncate(messages, target, overheadBytes);
     body.messages = truncated.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
     compactNote = `${truncated.note} session=${keyLabel} ` +

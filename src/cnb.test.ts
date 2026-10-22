@@ -2015,10 +2015,19 @@ Deno.test("cnb: a non-11128 400 is passed through without a retry", async () => 
 //
 // 判据：**只要进了 maybeCompactCnb 且 bytes > budget，返回时 body 必须 <= budget。**
 // 下面两条分别守住「必须收敛」与「收敛了要如实说」。
-Deno.test("cnb: an oversized body still converges when compaction finds nothing to summarise", async () => {
-  // 形态 B：轮数少、每条极大。头部截到 600 字符后总 token 落进 keepTokens，
-  // selectTail 判定没有可总结的部分——但 body 仍远超字节预算。
-  const filler = "中文填充".repeat(100000); // 单条 40 万字符
+Deno.test("cnb: an oversized body converges even when each message dwarfs the tail budget", async () => {
+  // 形态 B：轮数少、每条极大（单条 40 万字符 ≈ 1.2 MB，两头都超过 45% 的尾部预算）。
+  //
+  // 修复前的链条：没有一条装得进尾巴 → `selectTailByBytes` 的 split 落到末尾
+  // → 尾巴为空 → 摘要那条捷径被判定为“没有可总结的部分” → 7.2 MB 的 body 原样
+  // 上传、每轮 413，日志里只有 `(all messages dropped)`（历史见 1998–2017 行）。
+  //
+  // 现在有两条兜底：尾部至少留最后一条；装不下就把正文硬截到剩余空间。
+  // 判据因此换成两条**产品级**的不变量（旧版断言的 `asked === false` 是那个
+  // 缺陷的副产品，修复后尾巴不再为空，摘要自然会被问一次）：
+  //   a) body 必须收敛到预算之内；
+  //   b) 最新那一轮必须还在——压缩是为了继续会话，不是为了清空。
+  const filler = "中文填充".repeat(100000); // 单条 40 万字符 ≈ 1.2 MB UTF-8
   const messages: any[] = [{
     role: "system",
     content: "You are a coding agent.",
@@ -2055,13 +2064,33 @@ Deno.test("cnb: an oversized body still converges when compaction finds nothing 
   });
 
   const after = new TextEncoder().encode(JSON.stringify(body)).length;
-  // 这条断言就是本次修复的判据。旧代码下 after === before，测试必红。
   assert(
     after <= CNB_BODY_BUDGET_BYTES,
-    `body must fit the budget even when the summary path is skipped: ${before} -> ${after}`,
+    `body must converge under the budget: ${before} -> ${after}` +
+      (asked ? " (summary was asked)" : " (summary skipped)"),
   );
-  // 摘要没被问过——这不是缺陷，是这个形态的正常结果；真正的缺陷是「没人兜底」。
-  assertEquals(asked, false, "this fixture is meant to skip the summary path");
+
+  // ★ 这条是 2026-10-22 修复的判据：宁可超限（由截断收口）也不能把问题弄丢。
+  // 旧代码在这里一条消息都不留，模型收到的请求里没有用户的问题。
+  const survivors = (body.messages ?? []).filter((m: any) =>
+    m && m.role === "user" && typeof m.content === "string" &&
+    m.content.includes("最新一轮")
+  );
+  assertEquals(
+    survivors.length,
+    1,
+    "the newest turn must survive compaction: " +
+      JSON.stringify(
+        (body.messages ?? []).map((
+          m: any,
+        ) => [m?.role, String(m?.content ?? "").slice(0, 20)]),
+      ),
+  );
+  // 只有一条说明 = “全部丢光”。压缩可以丢历史，不能丢到没有对话。
+  assert(
+    (body.messages ?? []).length > 1,
+    "compaction must not reduce the request to the note alone",
+  );
 });
 
 Deno.test("cnb: skipping compaction is reported, not silent", async () => {
