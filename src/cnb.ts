@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import {
   compactIfNeeded,
   fallbackTruncate,
+  selectTail,
   selectTailByBytes,
   serializeMessage,
 } from "./zen-compaction.ts";
@@ -3656,15 +3657,21 @@ export async function maybeCompactCnb(
     }
   })();
 
-  // ★ 2026-10-21 修单位：尾部预算按**字节**算，不再按伪 token。
+  // ★ 2026-10-23 修口径：**两个预算，两个单位，都要满足**。
   //
-  // 上游卡的是 body 字节，而 `selectTail` 用的是 `字符数/4`——中文一字符
-  // 三字节、图片 base64 在 `messageText` 里当作不存在、tool 结果被截到 2000
-  // 字符。日志实测：84 轮压缩**全部**落在预算的 89% 上下（均值 886 KiB），
-  // 于是下一轮立刻又超预算、再压一次、再烧一次摘要 —— 出站流量翻倍。
+  // 上游卡的是 body 字节，所以字节是**天花板**；但“留多少历史给模型看”是
+  // 另一件事，由 keepTokens（token）决定。上一版把两者合并成一个——尾巴直接
+  // 设成“字节预算的 45%”，keepTokens 于是名存实亡。生产日志实测：
+  //   [compacted via summary] kept=198 msgs bytes 1964338 -> 482024
+  // 482 KB = 预算的 47.6%，比原来的 ~150 KB 高 3 倍多，每轮把十几万 token
+  // 的历史原样送给上游。
   //
-  // 而且目标不是“刚好不超”而是**低水位**：只留 45% 给尾巴，压完约 50%，
-  // 后面几轮的新消息都装得下，不必每轮都压。
+  // 现在两个约束一起上。split 是“第一条原样保留的消息”的下标，越大留得越少，
+  // 所以取两者的**较大值**就同时满足两个上限——不需要任何换算系数。
+  // 这也正是 bytes→token 除不出一个正确常数的原因：同样 907,264 字节，
+  // 纯 ASCII 约 22.7 万 token、纯中文约 30.2 万，固定除数只能对一半；
+  // 而“取下标较大值”让两个单位各自在自己的尺子上判定，压根不用换算。
+  const keepTokens = cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000);
   const tailPercent = Math.min(
     90,
     Math.max(10, cnbIntSetting("CNB_COMPACTION_TAIL_PERCENT", 45)),
@@ -3674,8 +3681,13 @@ export async function maybeCompactCnb(
     1,
     Math.floor((usableBytes * tailPercent) / 100),
   );
-  const tail = selectTailByBytes(messages, tailBytes);
-  const headSplit = tail.split;
+  const byteSplit = selectTailByBytes(messages, tailBytes).split;
+  // token 侧：selectTail 返回 undefined 表示“全都装得下”，此时它不构成约束。
+  const serialized = messages.map((m: any) =>
+    m && typeof m === "object" ? serializeMessage(m) : ""
+  );
+  const tokenSplit = selectTail(serialized, keepTokens)?.split ?? 0;
+  const headSplit = Math.max(byteSplit, tokenSplit);
   const forSummary = messages.map((m: any, i: number) => {
     if (i >= headSplit || !m || typeof m !== "object") return m;
     if (typeof m.content === "string" && m.content.length > summaryMsgChars) {
@@ -3732,7 +3744,7 @@ export async function maybeCompactCnb(
     // 字节口径的尾部起点，见上面的 tailBytes。
     tailSplit: headSplit,
     config: {
-      keepTokens: cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000),
+      keepTokens,
       buffer: cnbIntSetting("CNB_COMPACTION_BUFFER", 20000),
       maxSummaryTokens: cnbIntSetting("CNB_COMPACTION_MAX_SUMMARY", 4096),
       summaryModel: String(Deno.env.get("CNB_COMPACTION_SUMMARY_MODEL") || ""),

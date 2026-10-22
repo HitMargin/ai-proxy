@@ -2093,6 +2093,51 @@ Deno.test("cnb: an oversized body converges even when each message dwarfs the ta
   );
 });
 
+Deno.test("cnb: the kept tail follows keepTokens, not the byte budget", async () => {
+  // 生产日志实测（2026-10-22）：
+  //   [compacted via summary] kept=198 msgs bytes 1964338 -> 482024
+  // 482 KB 正好是字节预算的 47.6%：尾巴被设成了字节的 45%，keepTokens 于是
+  // 名存实亡，每轮把十几万 token 的历史原样送给上游。判据是 keepTokens。
+  const chunk = "数据块".repeat(500); // 1500 字符 ≈ 4.5 KB
+  const messages: any[] = [{
+    role: "system",
+    content: "You are a coding agent.",
+  }];
+  for (let i = 0; i < 260; i += 1) {
+    messages.push({ role: "user", content: chunk + i });
+    messages.push({ role: "assistant", content: "收到" + i });
+  }
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 8000,
+    messages,
+  };
+  const before = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(
+    before > CNB_BODY_BUDGET_BYTES,
+    "fixture must exceed the budget, got " + before,
+  );
+
+  await maybeCompactCnb(body, "", async () => "SUMMARY-PLACEHOLDER");
+
+  const after = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(
+    after <= CNB_BODY_BUDGET_BYTES,
+    "compacted body must fit the budget: " + before + " -> " + after,
+  );
+  // ★ 这条钉住口径：尾巴按 keepTokens(8000) 留 ≈ 几十 KB；
+  // 旧口径按字节预算的 45% 留，会是 ~450 KB。
+  assert(
+    after < 120000,
+    "the tail must follow keepTokens, not 45% of the byte budget: " +
+      before + " -> " + after + ", kept=" + body.messages.length + " msgs",
+  );
+  assert(
+    body.messages.length < 60,
+    "too many messages kept verbatim: " + body.messages.length,
+  );
+});
+
 Deno.test("cnb: skipping compaction is reported, not silent", async () => {
   // 「没压」与「压了没压够」都要有话说。旧代码这条路径不打任何日志，
   // 于是 7.2 MB 的请求被上游 413 时，日志里找不到任何线索。
