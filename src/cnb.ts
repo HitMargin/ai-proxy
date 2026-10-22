@@ -1670,6 +1670,47 @@ export function cnbNeutraliseHead(body: any): any | null {
   return null;
 }
 
+// ── 「学到的头部」：把 11128 自愈从「先挨一次 400 再整包重发」变成「首包就避开」──
+//
+// 2026-10-22 生产日志实测：2573 轮里 1198 轮撞 11128，而被拒的头部**只有两个
+// 固定字符串**（DSH 自己的身份句 865 次、伪装成 Claude Code 的 340 次）——不是
+// 随上游漂移的指纹。样本既然收敛，就没必要每轮都先白传一个整包（平均 357 KB）
+// 去换那声 400：见过一次就记住，下一轮在**首包之前**削掉。终态请求完全一样，
+// 省的是上行带宽（按月约 0.4 GB）和一次往返。
+//
+// 只记 cnbHeadSample 的字符串，且**命中才动**：样本不符就照旧，宁可多传一次
+// 也不擅自改写用户没被拒过的头部。
+const CNB_REJECTED_HEAD_MAX = 8;
+const cnbRejectedHeads: string[] = [];
+
+/** 清空「学到的头部」记忆（给测试用；生产里让它自然积累）。 */
+export function cnbForgetRejectedHeads() {
+  cnbRejectedHeads.length = 0;
+}
+
+/** 记下一个被上游 400/11128 拒过的头部样本（最近优先，容量有限）。 */
+export function cnbRememberRejectedHead(body: any) {
+  const s = cnbHeadSample(body);
+  if (!s || s === "(no messages)") return;
+  const i = cnbRejectedHeads.indexOf(s);
+  if (i >= 0) cnbRejectedHeads.splice(i, 1);
+  cnbRejectedHeads.unshift(s);
+  if (cnbRejectedHeads.length > CNB_REJECTED_HEAD_MAX) {
+    cnbRejectedHeads.length = CNB_REJECTED_HEAD_MAX;
+  }
+}
+
+/**
+ * 首包前的预防性削头：只有当前头部**正是**被拒过的那一段时才动手。
+ * 返回 null 表示「没命中 / 没得削」，调用方把原 body 原样发出去。
+ */
+export function cnbPreNeutraliseHead(body: any): any | null {
+  if (cnbRejectedHeads.length === 0) return null;
+  const s = cnbHeadSample(body);
+  if (!s || !cnbRejectedHeads.includes(s)) return null;
+  return cnbNeutraliseHead(body);
+}
+
 // 导出给 src/cnb.test.ts：推理档位那一组断言（off 真的关掉思考、未知值报错
 // 而不是静默回落）只能对着这个函数的输出来测。它不发网络，纯构造请求体。
 export function cnbBuildUpstream(openaiBody: any) {
@@ -2443,6 +2484,16 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
   // 靠加前缀/加空白都不可靠（见 cnbNeutraliseHead 的实测表），删除是唯一
   // 「无论上游怎么归一化都成立」的动作。只做一次。
   let headNeutralised = false;
+  // 学到的头部：命中就在首包之前削掉，省一次整包上传（见 cnbPreNeutraliseHead）。
+  // 削过就置位，下面那段 400 分支不会再削第二次——与「只做一次」的旧语义一致。
+  const pre = cnbPreNeutraliseHead(upBody);
+  if (pre) {
+    upBody = pre;
+    headNeutralised = true;
+    console.warn(
+      "[cnb] pre-neutralised a known-rejected head (saved one upload)",
+    );
+  }
   const waits = [0, 500, 1500, 3500, 8000, 20000];
   let last: Response | null = null;
   for (let i = 0; i < waits.length; i++) {
@@ -2485,6 +2536,8 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
         } catch {}
         if (errText.includes("11128")) {
           const before = cnbHeadSample(upBody);
+          // ★ 记下来：下一轮同一头部在首包就不再白传（实测只有两个固定值）。
+          cnbRememberRejectedHead(upBody);
           const neutralised = cnbNeutraliseHead(upBody);
           if (neutralised) {
             headNeutralised = true;

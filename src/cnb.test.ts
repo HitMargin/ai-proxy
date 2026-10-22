@@ -16,6 +16,7 @@ import {
   cnbBuildUpstream,
   cnbCallUpstream,
   cnbDiagnoseJunkSyntax,
+  cnbForgetRejectedHeads,
   cnbGatedResponse,
   cnbJournalJunk,
   cnbJunkLogState,
@@ -23,6 +24,8 @@ import {
   cnbJunkStreak,
   cnbNeutraliseHead,
   cnbParseToolCalls,
+  cnbPreNeutraliseHead,
+  cnbRememberRejectedHead,
   deriveSessionKey,
   handleCnb,
   isReasoningStarvation,
@@ -1633,6 +1636,9 @@ Deno.test("cnb: cnbNeutraliseHead cuts past padding, arrays, and refuses an empt
 // 用 monkeypatch 掉全局 fetch 造一个"第一次 11128、删掉头部后 200"的上游，
 // 断言出站第二次的 body 里那段指纹真的没了。
 Deno.test("cnb: a 400/11128 is retried once with the detected head removed", async () => {
+  // 记忆化开启后，「首包原样」只在**没记过**这个头部时成立——先清空，
+  // 否则本用例会变成测「首包就削」，丢掉它原本盯的「挨一下再重发」。
+  cnbForgetRejectedHeads();
   const realFetch = globalThis.fetch;
   const bodies: string[] = [];
   let chatCalls = 0;
@@ -1720,6 +1726,129 @@ Deno.test("cnb: a 400/11128 is retried once with the detected head removed", asy
   }
 });
 
+// ── 记忆化：被拒过的头部，下一轮**首包就削**（省一次整包上传）──
+//
+// 生产日志里 1198 次 11128 只对应两个固定头部，所以「先挨一次 400 再重发」
+// 是纯浪费：每轮白传 ~357 KB。记住样本后，首包就是已经削过的终态请求。
+Deno.test("cnb: a remembered head is stripped before the first upload", () => {
+  cnbForgetRejectedHeads();
+  const HEAD = "You are an AI agent powered by DeepSeek Harness.";
+  const body = () => ({
+    messages: [
+      { role: "system", content: HEAD + " Keep this." },
+      { role: "user", content: "hi" },
+    ],
+  });
+
+  // 没记过 → 一律不动（宁可多传一次，也不改写没被拒过的头部）
+  assertEquals(
+    cnbPreNeutraliseHead(body()),
+    null,
+    "an unremembered head must pass through untouched",
+  );
+
+  cnbRememberRejectedHead(body());
+  const out = cnbPreNeutraliseHead(body())!;
+  assert(out, "a remembered head must be pre-stripped");
+  const head = String(out.messages[0].content);
+  assert(
+    !head.includes(HEAD),
+    "the remembered head must be gone before the first upload",
+  );
+  assert(
+    head.trim() === "Keep this.",
+    "only the head is cut: the rest of the instruction survives",
+  );
+  assertEquals(
+    out.messages[1].content,
+    "hi",
+    "other messages are never touched",
+  );
+
+  // 换一个没被拒过的头部 → 仍然不动
+  assertEquals(
+    cnbPreNeutraliseHead({
+      messages: [{ role: "system", content: "Totally different rules." }],
+    }),
+    null,
+    "a different head must not be touched just because some head was",
+  );
+});
+
+// 端到端：记忆已热时，上游只该看到 **一次** 请求，且那次的首包头部已被削掉。
+Deno.test("cnb: a known-rejected head costs only one upload", async () => {
+  cnbForgetRejectedHeads();
+  const HEAD = "You are an AI agent powered by DeepSeek Harness.";
+  // 先让代理「见过」这个头部被拒（记忆化的来源就是真实的那一次 400）
+  cnbRememberRejectedHead({
+    messages: [{ role: "system", content: HEAD + " Keep this." }],
+  });
+
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      bodies.push(String(init?.body ?? ""));
+      return Promise.resolve(
+        new Response(
+          'data: {"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}]}' +
+            "\n\n" + "data: [DONE]\n\n",
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "a".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567890; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        messages: [
+          { role: "system", content: HEAD + " Keep this." },
+          { role: "user", content: "hi" },
+        ],
+        stream: false,
+        max_tokens: 16,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/chat/completions",
+      req,
+      new URL(req.url),
+    );
+    assertEquals(resp.status, 200);
+    assertEquals(
+      bodies.length,
+      1,
+      "a remembered head must not need a second upload",
+    );
+    const sent = JSON.parse(bodies[0]).messages.find((m: any) =>
+      m.role === "system"
+    );
+    assert(
+      !String(sent.content).includes(HEAD),
+      "the very first wire body must already have the head cut away",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    cnbForgetRejectedHeads();
+  }
+});
 Deno.test("cnb: the head of an oversized body is never an empty system message", async () => {
   // ★ 2026-10-21 生产实测的形状：/`responses` 的 `instructions` 转换后是 chat body 的
   // **第一条 system**；它单条就超过 1 MiB 预算时，fallbackTruncate 的
