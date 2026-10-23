@@ -3015,3 +3015,416 @@ Deno.test("cnb: a request that queued behind another does not report the queue w
     else Deno.env.set("CNB_GATE_SLOW_WAIT_MS", saveWait);
   }
 });
+
+// ─── 代理内修复轮（2026-10-24）───
+//
+// 坏语法反馈原来是拼在助手正文后面发给客户端的——那是一个**已经结束的回合**，
+// 模型永远没机会「重发」，harness 看到纯文本回合就收工（用户实测「不会重试
+// 直接就停止了」）。而且那段 [proxy] 文字进了 transcript，模型下一轮会把它
+// 当成自己的话复读出来。修复：反馈不出代理，对上游补问一轮，第二轮续在
+// 同一个响应里。
+
+const JUNK_OUT = "让我看看。" + "\n" + OPEN + "\n" +
+  '{"arguments":{"filepath":"x.ts"}}' + "\n" + CLOSE;
+// 参数名故意不撞任何工具参数：撞上会被「按参数形状猜工具」救回去，走不到垃圾闸
+const GOOD_OUT = OPEN + "\n" +
+  '{"name":"pwsh","arguments":{"command":"ls"}}' + "\n" + CLOSE;
+
+function sseChat(content: string): Response {
+  return new Response(
+    "data: " +
+      JSON.stringify({
+        choices: [{ delta: { content }, finish_reason: null }],
+      }) + "\n\n" +
+      "data: " +
+      JSON.stringify({
+        choices: [{ delta: {}, finish_reason: "stop" }],
+      }) + "\n\n" +
+      "data: [DONE]\n\n",
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+}
+
+function stubCnbUpstream(
+  bodies: string[],
+  replyFor: (call: number) => Response,
+): typeof fetch {
+  return ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      bodies.push(String(init?.body ?? ""));
+      return Promise.resolve(replyFor(bodies.length));
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "a".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567890; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+}
+
+function repairRequestBody(stream: boolean): Request {
+  return new Request("http://cnb.local/cnb/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "deepseek-v4.1-flash",
+      messages: [{ role: "user", content: "看看 x.ts" }],
+      tools: TOOLS,
+      max_tokens: 64,
+      stream,
+    }),
+  });
+}
+
+async function postRepair(body: Request): Promise<Response> {
+  return await handleCnb(
+    "/cnb/v1/chat/completions",
+    body,
+    new URL("http://cnb.local/cnb/v1/chat/completions"),
+  );
+}
+
+function resetJunkStreak() {
+  cnbJunkStreak.count = 0;
+  cnbJunkStreak.at = 0;
+}
+
+Deno.test("the parser flags junk and can leave the note out for the repair round", () => {
+  resetJunkStreak();
+  // 默认（notes 开）：clean 带反馈，junk/diagnosis 标记齐全
+  const withNote = cnbParseToolCalls(JUNK_OUT, TOOLS);
+  assertEquals(withNote.calls.length, 0);
+  assertEquals(withNote.junk, true);
+  assert(
+    withNote.diagnosis.includes("name"),
+    "the diagnosis must say what was wrong: " + withNote.diagnosis,
+  );
+  assert(
+    withNote.clean.includes("invalid syntax"),
+    "default behaviour keeps the note appended",
+  );
+  // notes 关：clean 不带反馈，标记照旧——反馈的去向由修复轮决定
+  const silent = cnbParseToolCalls(JUNK_OUT, TOOLS, { notes: false });
+  assertEquals(silent.junk, true);
+  assertEquals(silent.diagnosis, withNote.diagnosis);
+  assert(
+    !silent.clean.includes("invalid syntax"),
+    "notes:false must not append the note",
+  );
+  assert(
+    !silent.clean.includes(OPEN),
+    "notes:false must still strip the junk tags",
+  );
+  // notes 关不碰熔断计数——计数由修复轮的编排方（cnbJunkFeedback）择机调用
+  assertEquals(cnbJunkStreak.count, 1, "only the notes-on call may count");
+  // 好调用不受影响
+  const good = cnbParseToolCalls(GOOD_OUT, TOOLS, { notes: false });
+  assertEquals(good.calls.length, 1);
+  assertEquals(good.junk, false);
+  resetJunkStreak();
+});
+
+Deno.test("cnb: an unparseable tool call is repaired in-proxy, not shipped as a dead-end note", async () => {
+  resetJunkStreak();
+  cnbForgetRejectedHeads();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    (call) => call === 1 ? sseChat(JUNK_OUT) : sseChat(GOOD_OUT),
+  );
+  try {
+    const resp = await postRepair(repairRequestBody(true));
+    assertEquals(resp.status, 200);
+    const text = await resp.text();
+    assertEquals(bodies.length, 2, "the proxy must re-ask upstream once");
+    const repair = JSON.parse(bodies[1]);
+    assert(
+      repair.messages.some((m: any) =>
+        m.role === "assistant" && String(m.content).includes(OPEN)
+      ),
+      "the repair request must carry the model's own raw output",
+    );
+    assert(
+      repair.messages.some((m: any) =>
+        m.role === "user" && String(m.content).includes("invalid syntax")
+      ),
+      "the repair request must carry the feedback as a user message",
+    );
+    assert(
+      text.includes('"pwsh"'),
+      "the repaired call must reach the client",
+    );
+    assert(
+      text.includes('"finish_reason":"tool_calls"'),
+      "the repaired turn must end as a tool_calls turn",
+    );
+    assert(
+      !text.includes("[proxy]"),
+      "the feedback note must never reach the client",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    resetJunkStreak();
+  }
+});
+
+Deno.test("cnb: a plain-text round 2 continues the turn without any note", async () => {
+  resetJunkStreak();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    (call) =>
+      call === 1
+        ? sseChat(JUNK_OUT)
+        : sseChat("直接回答：读它需要 pwsh 工具。"),
+  );
+  try {
+    const resp = await postRepair(repairRequestBody(true));
+    assertEquals(resp.status, 200);
+    const text = await resp.text();
+    assertEquals(bodies.length, 2);
+    assert(
+      text.includes("直接回答"),
+      "round 2's plain text must continue the same turn",
+    );
+    assert(
+      !text.includes("[proxy]"),
+      "a round 2 that said something needs no fallback note",
+    );
+    assert(
+      !text.includes('"finish_reason":"tool_calls"'),
+      "no call materialised, so the turn must not claim tool_calls",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    resetJunkStreak();
+  }
+});
+
+Deno.test("cnb: when round 2 is unavailable the note comes back exactly once", async () => {
+  resetJunkStreak();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    (call) =>
+      call === 1 ? sseChat(JUNK_OUT) : new Response("boom", { status: 500 }),
+  );
+  try {
+    const resp = await postRepair(repairRequestBody(false));
+    assertEquals(resp.status, 200);
+    const out = await resp.json();
+    // 修复轮对 5xx 会在 cnbCallUpstreamInner 里退避重试（1 次首发 + 6 次重试）
+    assert(
+      bodies.length >= 2,
+      "the repair round must have been attempted: " + bodies.length,
+    );
+    const content = String(out.choices?.[0]?.message?.content ?? "");
+    assert(
+      content.includes("[proxy]"),
+      "the fallback note must reach the client when nothing else did",
+    );
+    assertEquals(
+      content.split("[proxy]").length - 1,
+      1,
+      "the note must appear exactly once",
+    );
+    assert(
+      !content.includes("filepath"),
+      "the raw junk payload must not leak into the content (the note's" +
+        " own shape example legitimately contains the literal tags)",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    resetJunkStreak();
+  }
+});
+
+Deno.test("cnb: a repaired non-streaming turn ships tool_calls with no note", async () => {
+  resetJunkStreak();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    (call) => call === 1 ? sseChat(JUNK_OUT) : sseChat(GOOD_OUT),
+  );
+  try {
+    const resp = await postRepair(repairRequestBody(false));
+    assertEquals(resp.status, 200);
+    const out = await resp.json();
+    assertEquals(bodies.length, 2);
+    const msg = out.choices?.[0]?.message;
+    assertEquals(out.choices?.[0]?.finish_reason, "tool_calls");
+    const calls = msg?.tool_calls ?? [];
+    assertEquals(calls.length, 1);
+    assertEquals(calls[0]?.function?.name, "pwsh");
+    const content = String(msg?.content ?? "");
+    assert(
+      !content.includes("[proxy]"),
+      "the note must not ride along with a repaired turn",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    resetJunkStreak();
+  }
+});
+
+// ─── 水位修剪不许清空会话（2026-10-24 遗忘根因）───
+//
+// 生产取证（.tmp-cnb-compact-*.json）：ZCode 会话 tools ≈ 826KB，60% 落地目标
+// (609484B) 比开销还小 → fallbackTruncate 的 usable ≤ 0 → 三道装箱循环一条
+// 都装不进 → 发给上游的整个 transcript 只剩一条 99 字节的说明。模型每轮都问
+// 「你要我干什么」。修复：开销吃掉 60% 目标时，修剪预算退到「硬预算 − 余量」。
+Deno.test("the watermark trim keeps the conversation alive when tools alone exceed the target", async () => {
+  resetCompactionStates();
+  const budget = CNB_BODY_BUDGET_BYTES;
+  // tools ≈ 0.72 × budget：非消息开销本身就超过 60% 目标（生产 ZCode 的形态）
+  const bigDescription = "x".repeat(Math.floor(budget * 0.72));
+  const bigTools = [{
+    type: "function",
+    function: {
+      name: "read_file",
+      description: bigDescription,
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" } },
+      },
+    },
+  }];
+  const TASK = "TASK：把落日滤镜的默认强度从 0.6 调到 0.8，然后跑 verify.ps1。";
+  const messages: any[] = [
+    { role: "system", content: "You are a coding agent. Keep this rule." },
+    { role: "user", content: TASK },
+  ];
+  const filler = "历".repeat(300);
+  for (let i = 0; i < 400; i++) {
+    messages.push({ role: "assistant", content: "step " + i + " " + filler });
+  }
+  messages.push({ role: "user", content: "最新一轮：继续" });
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 32,
+    messages,
+    tools: bigTools,
+  };
+  const before = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(before > budget, "fixture must exceed the budget: " + before);
+
+  const note = await maybeCompactCnb(
+    body,
+    "tools-squeeze-session",
+    // 摘要是模型写的——真实场景里它必然带上任务（生产 dump 里的 healthy 会话
+    // 正是如此）。这里如实模拟，并断言「摘要带任务」这一事实穿过修剪存活。
+    async () =>
+      "## Objective" + "\n" + "- TASK：把落日滤镜的默认强度从 0.6 调到 0.8",
+  );
+
+  const after = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(
+    !note.includes("(all messages dropped)"),
+    "the trim must not empty the conversation: " + note,
+  );
+  assert(
+    after <= budget,
+    "the trimmed body must still fit the budget: " + after,
+  );
+  assert(
+    body.messages.length > 3,
+    "the conversation must survive: got " + body.messages.length + " messages",
+  );
+  assert(
+    body.messages.some((m: any) =>
+      typeof m.content === "string" && m.content.includes("TASK：")
+    ),
+    "the task (inside the summary) must survive the trim",
+  );
+  assert(
+    body.messages.some((m: any) =>
+      typeof m.content === "string" &&
+      m.content.includes("Conversation Summary")
+    ),
+    "the anchored summary must survive the trim",
+  );
+});
+
+// 摘要失败路径：截断直接落在**原始** transcript 上，最老的任务消息受任务保护
+// 必须存活——这正是 2026-10-24 取证里被清空的那种现场（tools 挤占 + 修剪）。
+Deno.test("the summary-failed trim keeps the original task when tools alone exceed the target", async () => {
+  resetCompactionStates();
+  const budget = CNB_BODY_BUDGET_BYTES;
+  const bigDescription = "x".repeat(Math.floor(budget * 0.72));
+  const bigTools = [{
+    type: "function",
+    function: {
+      name: "read_file",
+      description: bigDescription,
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" } },
+      },
+    },
+  }];
+  const TASK =
+    "TASK：修复 Spectrum 渲染器的时序问题，pin 卸载后 Won_Update 必须等真实时间追平。";
+  const messages: any[] = [
+    { role: "system", content: "You are a coding agent. Keep this rule." },
+    { role: "user", content: TASK },
+  ];
+  const filler = "历".repeat(300);
+  for (let i = 0; i < 400; i++) {
+    messages.push({ role: "assistant", content: "step " + i + " " + filler });
+  }
+  messages.push({ role: "user", content: "最新一轮：继续" });
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    max_tokens: 32,
+    messages,
+    tools: bigTools,
+  };
+  const before = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(before > budget, "fixture must exceed the budget: " + before);
+
+  const note = await maybeCompactCnb(
+    body,
+    "tools-squeeze-fail-session",
+    async () => {
+      throw new Error("stub summary failure");
+    },
+  );
+
+  const after = new TextEncoder().encode(JSON.stringify(body)).length;
+  assert(
+    note.includes("summary generation failed"),
+    "the failure must be visible in the note: " + note,
+  );
+  assert(
+    !note.includes("(all messages dropped)"),
+    "the trim must not empty the conversation: " + note,
+  );
+  assert(
+    after <= budget,
+    "the trimmed body must still fit the budget: " + after,
+  );
+  assert(
+    body.messages.some((m: any) =>
+      typeof m.content === "string" && m.content.includes("TASK：")
+    ),
+    "the original task message must survive the trim",
+  );
+  assert(
+    body.messages.some((m: any) =>
+      typeof m.content === "string" && m.content.includes("最新一轮")
+    ),
+    "the newest turn must survive the trim",
+  );
+});

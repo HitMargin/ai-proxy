@@ -96,6 +96,28 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   后缀（篡改正文）。压缩 note 本身**不**触发 11128（10-24 实测 `[context compaction] …`
   开头 200），别再去改 note 文案。
 
+  **★ 2026-10-24 深夜之三：遗忘的最终根因——水位修剪把会话清成一条 99 字节的 stub（取证实锤）**。
+  加了压缩取证（`cnbDumpCompaction` → `.tmp-cnb-compact-<session>.json`，进站/出站
+  breakdown + 摘要全文 + 压缩状态）之后，拿真实 dump 对账：`final` 恰好只有一条
+  `[context compaction] 早期消息已按体积上限(609484B)截断。`（99B），summary 字段为空
+  ——**发给上游的整个 transcript 里没有任务、没有摘要、没有历史**，模型每轮当然问
+  「你要我干什么」。链条：ZCode 会话的 **tools 定义 ≈ 826 KB**（`overheadBytes` 是
+  「整个 body 减 messages」，几乎全是 tools）→ 60% 落地目标 609484B **比开销还小** →
+  `fallbackTruncate` 的 `usable = 预算 − overhead ≤ 0` → 三道装箱循环一条都装不进 →
+  只剩说明 stub；而调用方日志把 `truncated.note`（`(all messages dropped)`）**覆盖**成
+  `trimmed to 830047B`（那 830047B 全是 tools），看起来像成功。两个教训：
+  ①**「修剪预算」必须在开销吃掉目标时退到「硬预算 − 余量」（`trimBudget`）——
+  会话必须活着，60% 收敛是软目标不是硬目标**；注意 fallbackTruncate 收到的是
+  整个 body 的预算、自己减 overhead，调用方不能再扣一次。
+  ②**note 字段不许被调用方静默覆盖**——`(all messages dropped)` 这种后缀必须透出
+  （现在拼进 compactNote）。同场修掉第三个雷：`cnbCallUpstreamInner` 的退避重试
+  会**排空最后一次尝试的响应体再返回它**——`cnbGatedResponse` 对已锁定的流
+  `pipeTo` 静默拒绝、可读端永不闭合，调用方一句 `resp.text()` 永久挂起（测试实测：
+  33 秒退避结束后整体卡死、事件循环空转）。现在最后一次尝试把已读正文**还原**成
+  新 Response 再返回。
+  健康对照：DSH 会话（tools 小）同一套代码 final 42 条、摘要带任务、尾部原样——
+  机制本身是好的，坏的是「tools 巨大的会话走进修剪」这一条路径。
+
   **★ 2026-10-24 深夜：第三条判据——harness 的 gitStatus 快照段整体被拦（与指纹两套规则）**。
   削头自愈修完后会话**仍然**每轮 11128；给代理加失败取证（11128 现场落盘
   `.tmp-cnb-11128-attempt1.json` / 削头后仍拦落盘 `-persist.json`，且「persist 透传」不再静默）
@@ -1700,6 +1722,31 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   秒无拒收算新的一串**（熔断描述「连续」，不是「进程生命期内累计」）。 配套
   `src/cnb.test.ts` 25 个用例，用内存假件测（`deno task test` 只开
   `--allow-env`），计时与文件 IO 都注入。
+
+- **cnb 代理内修复轮：坏语法的反馈必须「当场给模型」，不是「事后写给用户」（2026-10-24 修）**。
+  上面 ①的反馈修好之后仍然治不了「**不会重试，直接就停止**」（用户 10-24 原话）：
+  那段 `[proxy] Your previous tool call used an invalid syntax…` 是拼在**助手正文**后面
+  发给客户端的——而这是一个**已经结束的回合**，harness 看到纯文本回合就收工，
+  模型永远等不到「重发」的下一个回合；说「immediately continue」等于对空气说话。
+  更糟的是这段文字进了 transcript，模型下一轮会**把它当成自己的话复读出来**
+  （用户贴的就是模型输出的这段——AGENTS.md 实错②「写进 transcript 的文字会被
+  模型学走」的同型复发）。**修复：反馈不出代理。** `cnbParseToolCalls(text, tools,
+  {notes:false})` 只剥标签不拼反馈（诊断/落盘照旧），chat 两条路径（流式/非流式）
+  在「有工具意图但零调用」时调 `cnbMaybeRepairJunkTurn` → `cnbRepairToolCallRound`：
+  把第一轮**原始输出**（assistant，尾部截 16KB）+ 反馈（user，`cnbJunkFeedback` 的
+  产物）追加进**已压缩的** transcript，经 `cnbBuildUpstream`/`cnbCallUpstream`
+  **对上游再问一次**（只一次，不递归），第二轮的正文/调用续在同一个客户端响应里。
+  成功时客户端看到正常回合（`finish_reason:tool_calls`），`[proxy]` 文字根本不进
+  transcript；第二轮 plain-text 也算成功（照发）；两轮全哑才退回旧行为（反馈当
+  正文发出 + 下一轮 RETRY REMINDER 兜底）。**三条判据**：
+  ①**反馈的时机决定它有没有人听**——同样的文字，拼在上一轮正文里是「事后说明」
+  （没人听），作为 user 消息发给模型是「当场纠正」（有人听）；
+  ②`saidSomething` 必须看**第二轮产出了什么**（filter 的 full），不能看
+  remainders——流式路径下第二轮正文早已实时发出，remainders 恒为空，按
+  remainders 判断会把「已经说过了」误判成「什么都没说」再补一条 note；
+  ③修复轮的基底用**清理后**的文本，raw fullText 里的坏标签不该随内容发给客户端
+  （非流式路径旧代码在零调用时原样发 raw）。Responses/messages 两条路径暂未接
+  修复轮（仍是旧行为）——harness 走的都是 chat completions。
 
 - **变异验证三条纪律（2026-10-05
   实测；每一条都是这一轮踩坑换来的）**：写完断言必须问「把实现改坏哪一处，它才会红」。这一轮跑

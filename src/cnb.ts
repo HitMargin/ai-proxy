@@ -2,6 +2,7 @@ import { safeJsonParse } from "./core.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   compactIfNeeded,
+  compactionState,
   fallbackTruncate,
   selectTail,
   selectTailByBytes,
@@ -926,6 +927,233 @@ export function cnbJournalJunk(
   } catch { /* 只读工作目录 / 权限不足：日志坏掉不影响响应 */ }
 }
 
+// ---------- 代理内修复轮（2026-10-24）----------
+//
+// 坏语法反馈原来是拼在**助手正文**后面发给客户端的。那是一个已经结束的回合：
+// 反馈说「立刻重发同一个调用」，但模型永远等不到下一个回合——harness 看到
+// 纯文本回合就收工（用户实测「不会重试 直接就停止了」）。更糟的是那段
+// [proxy] 文字进了 transcript，模型下一轮会把它当成自己的话复读出来
+// （AGENTS.md 实错②的同型：写进 transcript 的文字会被模型学走）。
+//
+// 修复：反馈不再出代理。第一轮解析出「有工具意图但不可解析」时，把第一轮的
+// **原始输出**（assistant）和反馈（user）追加进 transcript，对上游**再问一次**
+// ——只在代理内部，只问一次，不递归。成功时客户端看到的是正常回合（tool_calls
+// 或继续的正文），[proxy] 文字根本不进 transcript；两轮都哑才退回旧行为
+// （把反馈当正文发出，等下一轮请求的 RETRY REMINDER 兜底）。
+//
+// 第二轮的反馈时机是这套机制能成立的关键：同样的反馈，拼在上一轮正文里是
+// 「事后说明」（没人听），作为 user 消息发给模型是「当场纠正」（有人听）。
+
+/** 修复轮带的原始输出上限：模型只需要看清自己写错了什么，不需要整篇长文。 */
+const CNB_REPAIR_RAW_CAP_CHARS = 16000;
+
+export interface CnbRepairRoundInput {
+  /** 第一轮实际发出的（已压缩）transcript。 */
+  messages: any[];
+  model?: string;
+  tools?: any[];
+  /** 第一轮的原始输出（think + text，未清理）。 */
+  rawOut: string;
+  /** 反馈正文（cnbJunkFeedback 的产物或 DEGENERATE_NOTE）。 */
+  repairNote: string;
+  /** 第二轮的增量要原样续流进同一个响应；非流式调用方传空操作。 */
+  onDelta: (delta: Record<string, unknown>) => Promise<void>;
+}
+
+export interface CnbRepairRoundResult {
+  ok: boolean;
+  calls: any[];
+  thinkRem: string;
+  textRem: string;
+  usage: any | null;
+  /** 第二轮是否真的说了话（调用或至少有正文）——与 remainders 无关，
+   * 流式路径下正文早已实时发出，remainders 恒为空。 */
+  saidSomething: boolean;
+  error?: string;
+}
+
+/**
+ * 对上游补问一轮。`ok` 只表示「第二轮拿到了可用的回应」——calls 或至少有话说；
+ * 两轮全哑时调用方负责把 repairNote 当正文发出。
+ */
+export async function cnbRepairToolCallRound(
+  input: CnbRepairRoundInput,
+): Promise<CnbRepairRoundResult> {
+  const fail = (error: string): CnbRepairRoundResult => ({
+    ok: false,
+    calls: [],
+    thinkRem: "",
+    textRem: "",
+    usage: null,
+    saidSomething: false,
+    error,
+  });
+  const assistantRaw = input.rawOut.length > CNB_REPAIR_RAW_CAP_CHARS
+    ? "…[earlier output omitted]…\n" +
+      input.rawOut.slice(-CNB_REPAIR_RAW_CAP_CHARS)
+    : input.rawOut;
+  let built;
+  try {
+    built = cnbBuildUpstream({
+      model: input.model,
+      messages: [
+        ...(Array.isArray(input.messages) ? input.messages : []),
+        { role: "assistant", content: assistantRaw },
+        { role: "user", content: input.repairNote },
+      ],
+      tools: input.tools,
+    });
+  } catch (e: unknown) {
+    return fail(e instanceof Error ? e.message : String(e));
+  }
+  let resp: Response;
+  try {
+    resp = await cnbCallUpstream(built.upstream);
+  } catch (e: unknown) {
+    return fail(e instanceof Error ? e.message : String(e));
+  }
+  if (resp.status !== 200) {
+    let errBody = "";
+    try {
+      errBody = (await resp.text()).slice(0, 200);
+    } catch {}
+    return fail(`upstream ${resp.status}: ${errBody}`);
+  }
+  const thinkFilter = createLiveFilter();
+  const textFilter = createLiveFilter();
+  let usage: any = null;
+  try {
+    for await (const chunk of cnbIter(resp)) {
+      for (const ch of chunk.choices || []) {
+        const d = ch.delta || {};
+        if (d.reasoning_content) {
+          const out = thinkFilter.push(d.reasoning_content);
+          if (out) await input.onDelta({ reasoning_content: out });
+        }
+        if (d.content) {
+          const out = textFilter.push(d.content);
+          if (out) await input.onDelta({ content: out });
+        }
+      }
+      if (chunk.usage) usage = chunk.usage;
+    }
+  } catch (e: unknown) {
+    return fail(e instanceof Error ? e.message : String(e));
+  }
+  const r1 = cnbParseToolCalls(thinkFilter.state.full, input.tools, {
+    notes: false,
+  });
+  const r2 = cnbParseToolCalls(textFilter.state.full, input.tools, {
+    notes: false,
+  });
+  return {
+    ok: true,
+    calls: [...r1.calls, ...r2.calls],
+    thinkRem: r1.clean.slice(
+      commonPrefixLen(r1.clean, thinkFilter.state.emitted),
+    ),
+    textRem: r2.clean.slice(
+      commonPrefixLen(r2.clean, textFilter.state.emitted),
+    ),
+    usage,
+    saidSomething: [...r1.calls, ...r2.calls].length > 0 ||
+      thinkFilter.state.full.trim() !== "" ||
+      textFilter.state.full.trim() !== "",
+  };
+}
+
+/** 两轮 upstream 调用的用量合并：数值字段相加，缺失字段补齐，嵌套对象取后到者。 */
+export function sumCnbUsage(a: any, b: any): any {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  const out: any = { ...a };
+  for (const [k, v] of Object.entries(b)) {
+    if (typeof v === "number" && typeof out[k] === "number") {
+      out[k] = out[k] + v;
+    } else if (!(k in out)) out[k] = v;
+  }
+  return out;
+}
+
+/** 把非空片段用空行接起来——修复轮的产出（第二轮正文/反馈）接到第一轮之后。 */
+function joinParts(...parts: string[]): string {
+  return parts.filter((p) => p !== "").join("\n\n");
+}
+
+/**
+ * 判定并执行代理内修复轮。`attempted === false` 表示**没有触发**修复
+ * （第一轮已解析出调用，或根本没有工具意图）——调用方按原样继续。
+ * 触发时返回第二轮的产出；`note !== ""` 表示两轮全哑，调用方要把 note
+ * 当正文发出（旧行为兜底），否则反馈不出代理。
+ */
+async function cnbMaybeRepairJunkTurn(
+  r1: { junk: boolean; degenerated: boolean; diagnosis: string; calls: any[] },
+  r2: { junk: boolean; degenerated: boolean; diagnosis: string; calls: any[] },
+  opts: {
+    rawOut: string;
+    messages: any[];
+    model?: string;
+    tools?: any[];
+    onDelta: (delta: Record<string, unknown>) => Promise<void>;
+  },
+): Promise<{
+  attempted: boolean;
+  calls: any[];
+  think: string;
+  text: string;
+  usage: any;
+  note: string;
+}> {
+  const idle = {
+    attempted: false,
+    calls: [],
+    think: "",
+    text: "",
+    usage: null,
+    note: "",
+  };
+  if (r1.calls.length + r2.calls.length > 0) return idle;
+  if (!r1.junk && !r2.junk && !r1.degenerated && !r2.degenerated) return idle;
+  const diagnosis = r2.diagnosis || r1.diagnosis ||
+    "the tool call was not in the required shape";
+  const repairNote = (r1.junk || r2.junk)
+    ? cnbJunkFeedback(diagnosis)
+    : DEGENERATE_NOTE;
+  console.warn(
+    "[cnb] tool-call repair: re-asking upstream once (" +
+      diagnosis.slice(0, 160) + ")",
+  );
+  const repaired = await cnbRepairToolCallRound({ ...opts, repairNote });
+  if (!repaired.ok) {
+    console.warn(
+      "[cnb] tool-call repair: round 2 unavailable (" +
+        (repaired.error ?? "unknown") + ")",
+    );
+    return {
+      attempted: true,
+      calls: [],
+      think: "",
+      text: "",
+      usage: null,
+      note: repairNote,
+    };
+  }
+  console.warn(
+    repaired.calls.length
+      ? `[cnb] tool-call repair: round 2 produced ${repaired.calls.length} call(s)`
+      : "[cnb] tool-call repair: round 2 answered in plain text",
+  );
+  const saidSomething = repaired.saidSomething;
+  return {
+    attempted: true,
+    calls: repaired.calls,
+    think: repaired.thinkRem,
+    text: repaired.textRem,
+    usage: repaired.usage,
+    note: saidSomething ? "" : repairNote,
+  };
+}
+
 // ★ 双重嵌套 arguments：模型把参数对象又包了一层 ——
 // {"arguments": {"command": ...}, "description": ...}。拆开并合并外层多余键（内层优先）；
 // 值为字符串化 JSON 也解。★ 裸命令字符串变体：模型把命令本体直接塞进 arguments ——
@@ -1137,11 +1365,32 @@ const EMPTY_CALL_SHELL_RE =
 
 // 导出给 src/cnb.test.ts：整个垃圾语法路径只有经过这个入口才走得通，
 // 不导出就等于那批用例只能测诊断、测不了"清理后的正文到底是什么样"。
-export function cnbParseToolCalls(text: string, tools?: any[]) {
+//
+// opts.notes = false：不把反馈说明拼进 clean（诊断/落盘照旧）——调用方要走
+// **代理内修复轮**时用它，反馈改由调用方决定去向（进修复请求还是当正文），
+// 熔断计数（cnbJunkFeedback）也因此由调用方择机调用，这里不代增。
+export function cnbParseToolCalls(
+  text: string,
+  tools?: any[],
+  opts?: { notes?: boolean },
+): {
+  clean: string;
+  calls: any[];
+  junk: boolean;
+  degenerated: boolean;
+  diagnosis: string;
+} {
+  const notes = opts?.notes !== false;
   // ★ 常见短路：全文没有 "<" 且没有 "name": 键（tool_call/XYML/DSML/裸 JSON 全需要其一），
   // 直接原样返回，省掉全部归一化/扫描/清理（纯文本响应占大多数）
   if (!text.includes("<") && !/"name"\s*:/.test(text)) {
-    return { clean: text, calls: [] as any[] };
+    return {
+      clean: text,
+      calls: [] as any[],
+      junk: false,
+      degenerated: false,
+      diagnosis: "",
+    };
   }
   // DeepSeek 原生 DSML 标记 → XYML 归一化（含 invoke 混淆形式修正）
   text = normalizeDsml(normalizeInvokeConfusion(text));
@@ -1503,17 +1752,27 @@ export function cnbParseToolCalls(text: string, tools?: any[]) {
     clean = stripBareToolJson(clean, tools);
     clean = clean.trim();
     if (degenerated) {
-      clean = clean ? clean + "\n\n" + DEGENERATE_NOTE : DEGENERATE_NOTE;
+      if (notes) {
+        clean = clean ? clean + "\n\n" + DEGENERATE_NOTE : DEGENERATE_NOTE;
+      }
     } else if (junkToolSyntax) {
       // 第一版这里只有一句通用的 "invalid syntax"。模型不知道错在哪，于是每一轮都把
       // 同一种坏写法再写一遍 —— 用户实测单会话连续 13 次大输出回合全是这么来的
       // （输入 34 倍增长、99% token 花在重发）。现在附上**违反的具体那一条**，
       // 并且连续被拒时熔断成短版（cnbJunkFeedback），诊断仍然每轮都发。
-      const note = cnbJunkFeedback(junkDiagnosis);
-      clean = clean ? clean + "\n\n" + note : note;
+      if (notes) {
+        const note = cnbJunkFeedback(junkDiagnosis);
+        clean = clean ? clean + "\n\n" + note : note;
+      }
     }
   }
-  return { clean, calls };
+  return {
+    clean,
+    calls,
+    junk: junkToolSyntax,
+    degenerated,
+    diagnosis: junkDiagnosis,
+  };
 }
 
 // ---------- 流式工具标记过滤器 ----------
@@ -2749,7 +3008,22 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
         `[cnb] upstream ${resp.status}, retry ${i + 1}/${waits.length}`,
       );
       try {
-        await resp.text();
+        const drained = await resp.text();
+        // 最后一次尝试不再重试：必须把已读掉的正文**还原**回去。直接返回
+        // `last` 等于交出一个「身体已被喝干」的 Response——cnbGatedResponse
+        // 对已锁定的流 pipeTo 会静默拒绝，可读端永不闭合，调用方一句
+        // `resp.text()` 就永久挂起（测试实测：33 秒退避结束后整体卡死，
+        // 事件循环空转，连错误都吐不出来）。
+        if (i === waits.length - 1) {
+          const h = new Headers(resp.headers);
+          h.delete("content-encoding");
+          h.delete("content-length");
+          return new Response(drained, {
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: h,
+          });
+        }
       } catch {} // 排空响应体再重试
     } catch (e: any) {
       console.warn(
@@ -3757,6 +4031,50 @@ export function isReasoningStarvation(
 // 导出给 src/cnb.test.ts：压缩的判据（超预算才动、压缩后必须能过上游的
 // 1 MiB 线、尾部必须保留原文）只能对着它测。摘要写入器可注入，所以单测
 // 不打真上游。
+// ★ 压缩现场取证。「模型忘了任务」这类投诉的形态千奇百怪，光看一行 note
+// 经常推不出 inbox 里到底是什么——直接把进站消息逐条 breakdown（角色、
+// 字节、开头 80 字符）+ 压缩产物 breakdown + 摘要正文落盘。会话内容只落
+// 本地（.tmp- 不入库）。CNB_COMPACT_DUMP=off 关闭；无写权限时安静跳过。
+function cnbMessageBreakdown(messages: any[]) {
+  const encoder = new TextEncoder();
+  return (messages ?? []).map((m: any, i: number) => {
+    const text = typeof m?.content === "string"
+      ? m.content
+      : JSON.stringify(m?.content ?? "");
+    return {
+      i,
+      role: m?.role,
+      bytes: encoder.encode(JSON.stringify(m ?? null)).length,
+      head: text.slice(0, 80),
+    };
+  });
+}
+
+async function cnbDumpCompaction(
+  session: string,
+  payload: Record<string, unknown>,
+): Promise<string> {
+  if (Deno.env.get("CNB_COMPACT_DUMP") === "off") return "(dump disabled)";
+  try {
+    if (
+      Deno.permissions.querySync({ name: "write", path: "." }).state !==
+        "granted"
+    ) {
+      return "(dump skipped: no write permission)";
+    }
+  } catch {
+    return "(dump skipped: permission query unavailable)";
+  }
+  const safe = session.replace(/[^A-Za-z0-9_-]/g, "-").slice(-40) || "session";
+  const path = `.tmp-cnb-compact-${safe}.json`;
+  try {
+    await Deno.writeTextFile(path, JSON.stringify(payload));
+  } catch (e) {
+    return `(dump failed: ${e instanceof Error ? e.message : String(e)})`;
+  }
+  return path;
+}
+
 export async function maybeCompactCnb(
   body: any,
   session: string,
@@ -3962,11 +4280,48 @@ export async function maybeCompactCnb(
   })();
   const keyLabel = stateKey === "" ? "(none)" : stateKey;
 
+  // 取证（见 cnbDumpCompaction）：每个出口都落一份「进站 breakdown + 出站
+  // breakdown + 摘要正文 + 压缩状态」，同一个文件按会话覆盖，留最新一份。
+  const compactDump: Record<string, unknown> = {
+    at: new Date().toISOString(),
+    session: keyLabel,
+    bytesIn: bytes,
+    budget,
+    incoming: cnbMessageBreakdown(messages),
+  };
+  const dumpFinal = async (note: string) => {
+    const summaryMessage = (body.messages ?? []).find((m: any) =>
+      typeof m?.content === "string" &&
+      m.content.startsWith("[Conversation Summary]")
+    );
+    await cnbDumpCompaction(stateKey, {
+      ...compactDump,
+      note,
+      state: compactionState(stateKey) ?? null,
+      summary: summaryMessage ? String(summaryMessage.content) : "",
+      final: cnbMessageBreakdown(body.messages),
+    });
+  };
+
   // ★ 低水位：无论最终走的是摘要、摘要失败、还是跳过，收敛目标都一样。
   // 压在 100% 的后果是下一轮立刻又超、再压一次、再烧一次摘要（日志 84/84 全部如此）。
   // 80% 触发、60% 落地，给后面几轮的新消息留出余量。
   const watermark = Math.floor(budget * 0.8);
   const target = Math.floor(budget * 0.6);
+  // ★ 修剪预算（2026-10-24 取证实锤的遗忘根因）：60% 目标在「非消息开销
+  // （tools 定义等）本身就超过目标」时**不可达**——fallbackTruncate 里
+  // usable = 预算 − overhead ≤ 0，三道装箱循环一条都装不进，返回值只剩那条
+  // 99 字节的说明。实测：ZCode 会话 tools ≈ 826KB > 目标 609484B，模型每轮
+  // 只收到 "[context compaction] 早期消息已按体积上限截断。"，于是每轮都问
+  // 「你要我干什么」（.tmp-cnb-compact-*.json 里 final 恰好只有那一条）。
+  // 那时退而求其次：放弃 60% 的余量目标，改传「硬预算 − 余量」——消息能装
+  // 多少装多少，**会话必须活着**。注意 fallbackTruncate 收到的是**整个 body**
+  // 的预算、自己减 overhead，所以这里不能再扣一次 overhead。32KB 余量同时给
+  // 代理内修复轮（工具语法自愈要多发一轮，带 ≤16KB 原始输出）留出空间。
+  const trimBudget = (() => {
+    const hardFit = Math.max(0, budget - 32768);
+    return target - overheadBytes >= 65536 ? target : hardFit;
+  })();
 
   let compactNote = "";
   if (result.changed) {
@@ -3988,16 +4343,27 @@ export async function maybeCompactCnb(
     // 再压一次、再烧一次摘要。日志里 84/84 轮都是这个形态。所以超过 80% 就
     // 再截到 60%，让后面几轮都装得下。
     if (after > watermark) {
-      const truncated = fallbackTruncate(body.messages, target, overheadBytes);
+      const truncated = fallbackTruncate(
+        body.messages,
+        trimBudget,
+        overheadBytes,
+      );
       body.messages = truncated.messages;
       const final = new TextEncoder().encode(JSON.stringify(body)).length;
       compactNote +=
         ` | over watermark (${after}B > ${watermark}B), trimmed to ${final}B`;
+      // "(all messages dropped)" 这类后缀必须透出——「trimmed to XB」看着像
+      // 成功，实际可能一条消息都没留下（遗忘根因那次就是被这句挡住的）。
+      const truncSuffix = truncated.note
+        .replace("[compacted via truncation]", "").trim();
+      if (truncSuffix) compactNote += ` | ${truncSuffix}`;
       if (final > budget) {
         compactNote += ` | WARNING: still over budget (${budget}B)`;
       }
+      await dumpFinal(compactNote);
       return compactNote;
     }
+    await dumpFinal(compactNote);
     return compactNote;
   }
   // 摘要失败：降级成截断。**仍然要说一句**——静默丢历史比丢历史更糟。
@@ -4007,7 +4373,7 @@ export async function maybeCompactCnb(
     // 到实际体积之上，于是**一条消息都没删**，只多加 149 字节的说明。
     // 日志里因此有 `bytes 4121421 -> 4121570`（变大）与
     // `bytes 4296416 -> 4296565`。现在直接传字节预算，与上游同一把尺子。
-    const truncated = fallbackTruncate(messages, target, overheadBytes);
+    const truncated = fallbackTruncate(messages, trimBudget, overheadBytes);
     body.messages = truncated.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
     // 失败原因必须可见：日志里连续几十行都只有 "summary generation failed"，
@@ -4019,6 +4385,7 @@ export async function maybeCompactCnb(
       // 连截断都没压下来（例如单条 system 指令就超预算）。说出来，别假装成功。
       compactNote += ` | WARNING: still over budget (${budget}B)`;
     }
+    await dumpFinal(compactNote);
     return compactNote;
   }
 
@@ -4039,7 +4406,7 @@ export async function maybeCompactCnb(
   // 无论中间走的是摘要、还是哪一条捷径。截断是确定性的、不花钱、必然收敛。
   {
     const reason = result.skipped ? `: ${result.skipped}` : "";
-    const truncated = fallbackTruncate(messages, target, overheadBytes);
+    const truncated = fallbackTruncate(messages, trimBudget, overheadBytes);
     body.messages = truncated.messages;
     const after = new TextEncoder().encode(JSON.stringify(body)).length;
     compactNote = `${truncated.note} session=${keyLabel} ` +
@@ -4048,6 +4415,7 @@ export async function maybeCompactCnb(
       compactNote += ` | WARNING: still over budget (${budget}B)`;
     }
   }
+  await dumpFinal(compactNote);
   return compactNote;
 }
 
@@ -4164,18 +4532,49 @@ export async function handleCnb(path: string, request: Request, url: URL) {
       const msg: any = { role: "assistant" };
 
       if (hasTools) {
-        const r1 = cnbParseToolCalls(fullThink, p.data.tools);
-        const r2 = cnbParseToolCalls(fullText, p.data.tools);
-        const allCalls = [...r1.calls, ...r2.calls];
+        const r1 = cnbParseToolCalls(fullThink, p.data.tools, { notes: false });
+        const r2 = cnbParseToolCalls(fullText, p.data.tools, { notes: false });
+        let allCalls = [...r1.calls, ...r2.calls];
+        let thinkOut = r1.calls.length ? r1.clean : fullThink;
+        let contentOut = allCalls.length
+          ? (r2.calls.length ? r2.clean : fullText)
+          : fullText;
+
+        // ★ 代理内修复轮（与流式路径同一套编排，见 cnbMaybeRepairJunkTurn）。
+        // 走过修复轮时基底换成**清理后**的文本——raw fullText 里的坏标签
+        // 不该随内容发给客户端。
+        const repair = allCalls.length === 0 &&
+            (r1.junk || r2.junk || r1.degenerated || r2.degenerated)
+          ? await cnbMaybeRepairJunkTurn(r1, r2, {
+            rawOut: [fullThink, fullText].filter((s) => s.trim() !== "")
+              .join("\n\n"),
+            messages: p.data.messages,
+            model: p.data.model,
+            tools: p.data.tools,
+            onDelta: async () => {},
+          })
+          : {
+            attempted: false as const,
+            calls: [],
+            think: "",
+            text: "",
+            usage: null,
+            note: "",
+          };
+        if (repair.attempted) {
+          allCalls = repair.calls;
+          if (repair.usage) usage = sumCnbUsage(usage, repair.usage);
+          thinkOut = joinParts(r1.clean, repair.think);
+          contentOut = joinParts(r2.clean, repair.text, repair.note);
+        }
 
         if (allCalls.length) {
           msg.tool_calls = allCalls;
-          msg.content = (r2.calls.length ? r2.clean : fullText) || null;
+          msg.content = contentOut || null;
           finish = "tool_calls";
         } else {
-          msg.content = fullText;
+          msg.content = contentOut;
         }
-        const thinkOut = r1.calls.length ? r1.clean : fullThink;
         if (thinkOut) msg.reasoning_content = thinkOut;
       } else {
         msg.content = fullText;
@@ -4264,19 +4663,50 @@ export async function handleCnb(path: string, request: Request, url: URL) {
             if (chunk.usage) usage = chunk.usage;
           }
 
-          const r1 = cnbParseToolCalls(thinkFilter.state.full, p.data.tools);
-          const r2 = cnbParseToolCalls(textFilter.state.full, p.data.tools);
-          const allCalls = [...r1.calls, ...r2.calls];
+          const r1 = cnbParseToolCalls(thinkFilter.state.full, p.data.tools, {
+            notes: false,
+          });
+          const r2 = cnbParseToolCalls(textFilter.state.full, p.data.tools, {
+            notes: false,
+          });
+          let allCalls = [...r1.calls, ...r2.calls];
 
           // 尾段 = 清理后的全文 − 已实时发出的前缀（扣住的标记段 + 标记之后的正文）
-          const thinkRem = r1.clean.slice(
+          let thinkRem = r1.clean.slice(
             commonPrefixLen(r1.clean, thinkFilter.state.emitted),
           );
-          if (thinkRem) await emit({ reasoning_content: thinkRem });
-
-          const textRem = r2.clean.slice(
+          let textRem = r2.clean.slice(
             commonPrefixLen(r2.clean, textFilter.state.emitted),
           );
+
+          // ★ 代理内修复轮：有工具意图但解析不出任何调用时，别把「写错了」当
+          // 回合的结束语——那是死胡同（见 cnbMaybeRepairJunkTurn 的注释）。
+          // 反馈留给模型本身，对上游补问一次，第二轮续在同一响应里。
+          const repair = allCalls.length === 0
+            ? await cnbMaybeRepairJunkTurn(r1, r2, {
+              rawOut: [thinkFilter.state.full, textFilter.state.full]
+                .filter((s) => s.trim() !== "").join("\n\n"),
+              messages: p.data.messages,
+              model: p.data.model,
+              tools: p.data.tools,
+              onDelta: emit,
+            })
+            : {
+              attempted: false as const,
+              calls: [],
+              think: "",
+              text: "",
+              usage: null,
+              note: "",
+            };
+          if (repair.attempted) {
+            if (repair.calls.length) allCalls = repair.calls;
+            if (repair.usage) usage = sumCnbUsage(usage, repair.usage);
+            thinkRem = joinParts(thinkRem, repair.think);
+            textRem = joinParts(textRem, repair.text, repair.note);
+          }
+
+          if (thinkRem) await emit({ reasoning_content: thinkRem });
           if (textRem) await emit({ content: textRem });
 
           if (allCalls.length) {
