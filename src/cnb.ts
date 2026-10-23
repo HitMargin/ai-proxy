@@ -480,6 +480,58 @@ function normalizeDsml(text: string) {
     .replace(DSML_CALLS_CLOSE, "</|XYML|tool_calls>");
 }
 
+// ★ 2026-10-24：harness（ZCode/DSH）注入的 `gitStatus:` 快照段会触发渠道校验
+// 11128 —— 与身份指纹**两套判据**：身份指纹锚定消息开头；gitStatus 块放在消息
+// 中部照样拦（实测），且句子/单个字段/标题词单独发都不触发（N8/P1-Q6 全 200），
+// 是「块的整体形状」被匹配——只改样板句保留字段仍 400，整块换成一行 stub 200。
+// 这块内容自称「对话开始那一刻的快照、永不更新」，对模型价值本来就低；整块换成
+// 一行 stub（stub 含 gitStatus: 字样实测安全）。锚定 harness 的原文样板，避免
+// 误伤用户自己写的 "gitStatus:" 文本。
+const CNB_GITSTATUS_ANCHOR =
+  "gitStatus: This is the git status at the start of the conversation.";
+const CNB_GITSTATUS_STUB = "gitStatus: (snapshot omitted by proxy)";
+
+// ★ 2026-10-24（同日第二次）：DSH 桌面会话（"You are an AI agent powered by
+// DeepSeek Harness."）削头自愈后**仍然** 11128。真实 body 二分定位：触发的是
+// 「DeepSeek Harness + GUI 指代样板」的**组合**——
+//   · "DeepSeek Harness Web GUI whose URL..." 一句单独 → 200
+//   · 加上下一句 "When the user refers to \"this page\", \"this GUI\"..." → 400
+//   · 同一段把 "DeepSeek Harness" 换成 "DSH" → 200（其余一字不动）
+// 匹配窗口跨约 200 字符、与位置无关，是内容级模式匹配而不是开头锚定。
+// 修复：出站把品牌词统一改写成提示词里本来就在用的简称 "DSH"——语义零损失，
+// 且比「认指纹再删句」稳：不管组合窗口落在哪一段，品牌词没了模式就凑不齐。
+// 单独的头部身份句（"You are an AI agent powered by …"）仍由 cnbNeutraliseHead
+// 兜底（改名后是否被拦由 11128 实测说了算，削头逻辑照旧）。
+const CNB_HARNESS_BRAND = "DeepSeek Harness";
+const CNB_HARNESS_BRAND_NEUTRAL = "DSH";
+
+/** 出站文本的渠道校验预处理：剥 gitStatus 快照段 + 品牌词改写。 */
+export function cnbNeutraliseChannelMarkers(text: string): string {
+  return cnbStripGitStatus(text).replaceAll(
+    CNB_HARNESS_BRAND,
+    CNB_HARNESS_BRAND_NEUTRAL,
+  );
+}
+
+/**
+ * 把 harness 注入的 gitStatus 快照段换成一行 stub。
+ *
+ * 块的结束边界：下一个「空行 + 标题（# 或 ===）」处——字段与 Recent commits
+ * 之间也有空行，所以不能按第一个空行切；块内各段（字段/commit 行）都不含
+ * 标题行，harness 的其余分节都以 # / === 开头（工具说明由本代理追加，也是 ===）。
+ * 块在文本末尾时切到末尾。没找到锚点时原样返回。
+ */
+export function cnbStripGitStatus(text: string): string {
+  const start = text.indexOf(CNB_GITSTATUS_ANCHOR);
+  if (start < 0) return text;
+  let end = text.length;
+  const heading = /\n\n(?=#|===)/g;
+  heading.lastIndex = start;
+  const m = heading.exec(text);
+  if (m) end = m.index;
+  return text.slice(0, start) + CNB_GITSTATUS_STUB + text.slice(end);
+}
+
 function cnbBuildToolPrompt(tools: any[]) {
   const blocks: string[] = [], names: string[] = [];
   for (const t of tools) {
@@ -1583,7 +1635,7 @@ export function cnbHeadSample(body: any): string {
 /**
  * 渠道校验（errcode 11128）自愈：**删掉**第一条消息开头那段可识别文字。
  *
- * 判据全部来自直连上游的逐条对照（2026-10-20 / 10-21，只改一个变量）：
+ * 判据全部来自直连上游的逐条对照（2026-10-20 / 10-21 / 10-24，只改一个变量）：
  *
  *   | 请求                                                   | 结果        |
  *   | ------------------------------------------------------ | ----------- |
@@ -1591,6 +1643,15 @@ export function cnbHeadSample(body: any): string {
  *   | 同一段文字放在长文中间                                 | 200         |
  *   | 只出现在 user 消息                                     | 200         |
  *   | **删掉开头那 48 字符** / 换成别的文字                  | **200**     |
+ *   | 10-24 新增：指纹在**第二条 system 消息**的开头         | 400 / 11128 |
+ *   | 10-24 新增：同段文字在第二条 system 消息的中部         | 200         |
+ *   | 10-24 新增：指纹在 assistant 历史消息的开头            | 400 / 11128 |
+ *
+ * ★ 10-24 那三行推翻了「上游只看 transcript 第一条」的旧判据：检测面是
+ * **每一条** system/assistant 消息的字面开头（user 消息仍不在检测面上）。
+ * 这正是 f05811ec 会话每轮 11128 的成因——fallbackTruncate 的说明插到最前面
+ * 之后，带指纹的原 system prompt 变成了第二条，旧版自愈只削第一条（削的是
+ * 说明本身），重发照样被拦。
  *
  * 注意「挪开开头」这件事只有**真正改写开头**才有效：
  *
@@ -1604,7 +1665,8 @@ export function cnbHeadSample(body: any): string {
  * 代价只是第一条 system/assistant 消息少了开头几十个字符——它恰恰是那段
  * 客户端指纹，丢了没有任何信息损失（模型看到的仍是同一份指令的其余部分）。
  *
- * 只动第一条消息（上游只看开头）；它若是数组形态则动第一个 text 块。
+ * 动**每一条** system/assistant/developer 消息的开头（10-24 起上游逐条查开头，
+ * 见上面的判据表）；每条若是数组形态则动它的第一个非空 text 块。
  */
 // 没有任何句读可切时的兜底删除长度。实测切 1 个字符就够（"You are…" → "ou are…"
 // 上游就放行），但那只赌"检测锚定字面开头"这一条判据；多删一点是为上游换成
@@ -1639,36 +1701,56 @@ function cutHeadSentence(text: string): string {
   return text.slice(0, i) + text.slice(i + CNB_HEAD_DROP_CHARS);
 }
 
+// ★ 2026-10-24 重测：检测面从「transcript 第一条」扩大到「**每一条**
+// system/assistant 消息的字面开头」（指纹在第二条 system 开头 → 400；同一段
+// 文字在它中部 → 200；指纹在 assistant 历史消息开头 → 400；user 消息仍不测）。
+// 现实里指纹落在非第一条消息开头的两个来源：①fallbackTruncate 的说明插到最前
+// 面，把带指纹的原 system 挤成第二条（f05811ec 会话每轮 11128 的直接原因——
+// 旧版只削第一条，削的是 note，重发照样被拦）；②模型复读身份句进了 assistant
+// 历史。所以自愈必须削**每条**检测面消息的开头一句，而不是第一条。
 export function cnbNeutraliseHead(body: any): any | null {
   const msgs = body?.messages;
   if (!Array.isArray(msgs) || msgs.length === 0) return null;
   const cut = (text: string): string => cutHeadSentence(text);
   const next = msgs.slice();
+  let cutMessages = 0;
   for (let i = 0; i < next.length; i++) {
     const m = next[i];
     const role = String(m?.role ?? "").toLowerCase();
     if (role !== "system" && role !== "assistant" && role !== "developer") {
-      continue; // user 不在检测面上
+      continue; // user 不在检测面上（实测：指纹在 user 消息开头 → 200）
     }
     if (typeof m.content === "string") {
-      if (m.content.trim() === "") return null; // 空头部没法删
+      // 这条没有可削的开头：跳过它看下一条，而不是放弃整个自愈——
+      // 空的第一条 system 后面完全可能跟着带指纹的第二条。
+      if (m.content.trim() === "") continue;
+      // 纯工具调用消息（无正文）以 <tool_call> 开头：削第一句会把开标签削掉，
+      // XYML 结构从此对不上（闭合标签悬空）。指纹不会以这个标签开头，跳过。
+      if (m.content.trimStart().startsWith(TC_OPEN)) continue;
       next[i] = { ...m, content: cut(m.content) };
-      return { ...body, messages: next };
+      cutMessages++;
+      continue;
     }
     if (Array.isArray(m.content)) {
       const parts = m.content.slice();
+      let touched = false;
       for (let k = 0; k < parts.length; k++) {
         const p = parts[k];
         if (p?.type !== "text" || typeof p.text !== "string") continue;
         if (p.text.trim() === "") continue;
         parts[k] = { ...p, text: cut(p.text) };
+        touched = true;
+        break;
+      }
+      if (touched) {
         next[i] = { ...m, content: parts };
-        return { ...body, messages: next };
+        cutMessages++;
       }
       continue; // 这条没有可比对的文本，看下一条
     }
   }
-  return null;
+  // 一条都没削成（所有检测面消息都是空的/没有文本）：照原样承认改不了。
+  return cutMessages > 0 ? { ...body, messages: next } : null;
 }
 
 // ── 「学到的头部」：把 11128 自愈从「先挨一次 400 再整包重发」变成「首包就避开」──
@@ -1711,6 +1793,14 @@ export function cnbPreNeutraliseHead(body: any): any | null {
   if (!s || !cnbRejectedHeads.includes(s)) return null;
   return cnbNeutraliseHead(body);
 }
+
+/** 预削命中计数（日志节流用）：第 1 次与每 50 次输出一行，其余静默。 */
+export const cnbPreNeutraliseLogState = {
+  count: 0,
+  reset() {
+    this.count = 0;
+  },
+};
 
 // 导出给 src/cnb.test.ts：推理档位那一组断言（off 真的关掉思考、未知值报错
 // 而不是静默回落）只能对着这个函数的输出来测。它不发网络，纯构造请求体。
@@ -1948,6 +2038,18 @@ export function cnbBuildUpstream(openaiBody: any) {
     if (c == null) c = "";
     if (!multimodal) c = String(c);
 
+    // harness 注入的 gitStatus 快照段 + 品牌词组合都会触发上游渠道校验
+    // （见 cnbStripGitStatus / CNB_HARNESS_BRAND），出站前统一处理。
+    if (typeof c === "string") {
+      c = cnbNeutraliseChannelMarkers(c);
+    } else if (Array.isArray(c)) {
+      c = c.map((p: any) =>
+        p?.type === "text" && typeof p.text === "string"
+          ? { ...p, text: cnbNeutraliseChannelMarkers(p.text) }
+          : p
+      );
+    }
+
     // ─── assistant：保留 tool_calls，转成 XYML 文本 ───
     if (role === "assistant") {
       let body = c;
@@ -2016,7 +2118,10 @@ export function cnbBuildUpstream(openaiBody: any) {
   const tools = openaiBody.tools || [];
   const hasTools = tools.length > 0;
   if (hasTools) {
-    const prompt = cnbBuildToolPrompt(tools);
+    // 工具说明由客户端的 tools 定义拼成，描述里同样可能出现品牌词组合——
+    // 它是在消息映射**之后**追加的，必须在这里再处理一次，否则会把刚剥掉的
+    // 标记词从工具描述里带回来。
+    const prompt = cnbNeutraliseChannelMarkers(cnbBuildToolPrompt(tools));
     if (nudgedMsgs[0] && nudgedMsgs[0].role === "system") {
       // ★ 多模态守卫：system 的 content 可能是数组（含图片），不能直接字符串拼接，
       // 否则会变成 "[object Object]\n\n..."，既丢图又污染系统提示词。
@@ -2477,11 +2582,43 @@ function cnbUpstreamFail(status: number, errBody: string): Response {
   return cnbErr(status, "Upstream error", errBody.slice(0, 500));
 }
 
+// ★ 11128 判据漂移取证。判据已经漂了三次（10-18 / 10-20 / 10-21 / 10-24），每次
+// 重建现场都要靠「猜形状 → 造夹具 → 对不上 → 再猜」的往返。直接在失败现场把出站
+// body 落盘，离线二分触发点。文件含用户会话内容，只落在本地仓库（.tmp- 不入库）。
+async function dumpCnb11128Body(body: any, tag: string): Promise<string> {
+  // 测试套件会走到 11128 分支（假 fetch），不能往 cwd 写文件——用例里设 off。
+  if (Deno.env.get("CNB_11128_DUMP") === "off") return "(dump disabled)";
+  // 测试任务只开 --allow-env：没有写权限就安静跳过，不往日志里倒报错。
+  // 生产（deno run -A）写权限恒为 granted，不受影响。
+  try {
+    if (Deno.permissions.querySync({ name: "write", path: "." }).state !== "granted") {
+      return "(dump skipped: no write permission)";
+    }
+  } catch {
+    return "(dump skipped: permission query unavailable)";
+  }
+  const path = `.tmp-cnb-11128-${tag}.json`;
+  try {
+    await Deno.writeTextFile(
+      path,
+      JSON.stringify({
+        dumpedAt: new Date().toISOString(),
+        headSample: cnbHeadSample(body),
+        body,
+      }),
+    );
+  } catch (e) {
+    return `(dump failed: ${e instanceof Error ? e.message : String(e)})`;
+  }
+  return path;
+}
+
 // cnb 上游调用：瞬时 502/网络抖动时退避重试（境外出口 IP 偶发被 cnb 拒）
 async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
   // 可重新赋值：11128 自愈时会把删掉头部的 body 换进来重发。
   let upBody = _upBody;
-  // 11128 的修复方法只有一个：**把第一条消息开头那段可识别文字删掉**。
+  // 11128 的修复方法只有一个：**把检测面消息开头那段可识别文字删掉**
+  // （2026-10-24 起检测面是每条 system/assistant 消息，不只第一条）。
   // 靠加前缀/加空白都不可靠（见 cnbNeutraliseHead 的实测表），删除是唯一
   // 「无论上游怎么归一化都成立」的动作。只做一次。
   let headNeutralised = false;
@@ -2491,9 +2628,15 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
   if (pre) {
     upBody = pre;
     headNeutralised = true;
-    console.warn(
-      "[cnb] pre-neutralised a known-rejected head (saved one upload)",
-    );
+    // 命中是**每个请求都会发生的稳态**（记忆生效的证明，也是 10-22 设计的目的），
+    // 每次都打就是刷屏——头部没有变化、状态不会恢复，计数节流即可：
+    // 第 1 次打，之后每 50 次带累计数打一次。
+    const n = ++cnbPreNeutraliseLogState.count;
+    if (n === 1 || n % 50 === 0) {
+      console.warn(
+        `[cnb] pre-neutralised a known-rejected head (saved one upload; ×${n} so far)`,
+      );
+    }
   }
   const waits = [0, 500, 1500, 3500, 8000, 20000];
   let last: Response | null = null;
@@ -2539,6 +2682,8 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
           const before = cnbHeadSample(upBody);
           // ★ 记下来：下一轮同一头部在首包就不再白传（实测只有两个固定值）。
           cnbRememberRejectedHead(upBody);
+          // 取证：这具被拒的原始 body 是「判据又漂了」时的第一手证据。
+          const dumpPath = await dumpCnb11128Body(upBody, "attempt1");
           const neutralised = cnbNeutraliseHead(upBody);
           if (neutralised) {
             headNeutralised = true;
@@ -2547,11 +2692,16 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
             // 最后靠重放才猜到「头部是空 system，加前缀等于没加」。
             console.warn(
               "[cnb] upstream 400/11128 (channel verification) — retrying once " +
-                "with the detected head removed; head was " + before,
+                "with every checked message head removed; first head was " +
+                before + `; body dumped: ${dumpPath}`,
             );
             upBody = neutralised;
             continue;
           }
+          console.warn(
+            "[cnb] upstream 400/11128 but no cuttable head — passing through; " +
+              `body dumped: ${dumpPath}`,
+          );
         }
         // 不是 11128（或没有可加固的消息）：把已读掉的 body 还原成 Response 再
         // 透传，别丢诊断信息。★ headers 必须剔掉 content-encoding/length：
@@ -2567,6 +2717,29 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
       }
       // 4xx（除 429）是确定性的，重试无意义，直接透传
       if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+        // ★ 削头重发仍被拦时**不再静默透传**：静默的失败不可诊断——生产里
+        // 「每轮 11128」在日志里一行都没有，排查全靠猜。落盘 + 打一行。
+        if (headNeutralised) {
+          let errText = "";
+          try {
+            errText = await resp.text();
+          } catch {}
+          if (errText.includes("11128")) {
+            const dumpPath = await dumpCnb11128Body(upBody, "persist");
+            console.warn(
+              "[cnb] 11128 persisted after head removal — passing through; " +
+                `healed body dumped: ${dumpPath}`,
+            );
+          }
+          const h = new Headers(resp.headers);
+          h.delete("content-encoding");
+          h.delete("content-length");
+          return new Response(errText, {
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: h,
+          });
+        }
         return resp;
       }
       console.warn(
@@ -3623,10 +3796,8 @@ export async function maybeCompactCnb(
   // 用**实际编码后的字节数**估，而不是字符数：base64 图片一头就占掉大半个
   // 预算，字符数会把它算成 1/4（这正是 Zen 那边踩过的：估算跳过 image_url）。
   let bytes = 0;
-  let json = "";
   try {
-    json = JSON.stringify(body);
-    bytes = new TextEncoder().encode(json).length;
+    bytes = new TextEncoder().encode(JSON.stringify(body)).length;
   } catch {
     return "";
   }
@@ -3716,15 +3887,67 @@ export async function maybeCompactCnb(
     };
   });
 
+  // ★ 2026-10-24：摘要 prompt 的**总体积**上限。
+  //
+  // 上面的 600 字符截断只管「一条」，不管「多少条」：一个 10.8 MB、~1800 条的
+  // 会话，截完仍有 ~1.9 MB —— 摘要请求自己吃上游 413 [BODY_TOO_LARGE]
+  // （生产日志：summary ... status=413 ... limit 1.00MB），压缩从此每轮都降级成
+  // 截断，会话永远收敛不了；而且截断的说明插到最前面，正是把带指纹的原 system
+  // 挤成第二条、触发 11128 死循环的那一步（见 cnbNeutraliseHead 的 10-24 注）。
+  //
+  // 装箱方向：从**最靠近 headSplit 的那端**往回装（时间上最新、对摘要最有价值），
+  // 装不下的更早条目替换成一条短的省略占位。数组长度与下标**不能动**——
+  // compactIfNeeded 拿 tailSplit 切 head/tail，且压缩状态按「covered 下标 +
+  // 尾部指纹」判断能否增量；长度一变，covered 永远对不上，每轮退化成全量重算。
+  // 占位本身也占请求体积，所以先按条数把占位开销从预算里扣掉。
+  const summaryBudget = cnbIntSetting("CNB_SUMMARY_PROMPT_BYTES", 640 * 1024);
+  if (summaryBudget > 0 && headSplit > 0) {
+    const OMISSION = "(已省略)";
+    const omissionBytes = new TextEncoder().encode(
+      JSON.stringify({ role: "user", content: OMISSION }),
+    ).length + 1;
+    const headCount = Math.min(headSplit, forSummary.length);
+    // 先算占位开销（每条被挤掉的条目都会变成一条占位），再给真实内容装箱。
+    const packBudget = Math.max(
+      64 * 1024,
+      summaryBudget - headCount * omissionBytes,
+    );
+    const encoder = new TextEncoder();
+    let total = 0;
+    let keptFrom = headCount;
+    for (let i = headCount - 1; i >= 0; i--) {
+      let size = 0;
+      try {
+        size = encoder.encode(JSON.stringify(forSummary[i])).length + 1;
+      } catch {
+        size = 0; // 序列化不了的条目按 0 计，交给下游如实处理
+      }
+      if (total + size > packBudget) break;
+      total += size;
+      keptFrom = i;
+    }
+    if (keptFrom > 0) {
+      for (let j = 0; j < keptFrom; j++) {
+        forSummary[j] = { role: "user", content: OMISSION };
+      }
+      console.warn(
+        `[cnb] summary prompt packed: kept ${headCount - keptFrom}/` +
+          `${headCount} head messages within ${(summaryBudget / 1024) | 0} KiB ` +
+          `(older ones omitted; the summary call was hitting the upstream ` +
+          `1 MiB body limit on huge sessions)`,
+      );
+    }
+  }
+
   const result = await compactIfNeeded({
     messages: forSummary,
-    // ★ 这里**故意**让内部阈值必然通过。内部判据是 `JSON 字符数 / 4`，
-    // 而上游限的是**字节**：中文一字符三字节，于是一个 1.2 MiB 的中文会话
-    // 在内部估算里只有 ~100 K token，永远够不到阈值——压缩静默不触发，
-    // 上游照样 413。字节判据才是权威的，所以闸门由上面的 `bytes <= budget`
-    // 做，这里把 contextWindow 设成刚好低于估算值，让内部检查同意我的判断。
+    // ★ 2026-10-23 修：这里原来把 token 阈值伪造成「序列化字符数 / 4」——
+    // 那是把**字节域**的数额硬塞进 token 闸门，正是窗口落到 262k、每轮都
+    // 触发压缩的元凶。现在直接把上面的**字节预算**交给 compactIfNeeded，
+    // 并用 `contextWindow: 0` 声明「这里没有 token 窗口」，一个字也不换算。
     body,
-    contextWindow: Math.max(1, Math.floor(json.length / 4) + 4096 - 1),
+    contextWindow: 0,
+    budgetBytes: budget,
     maxOutputTokens: 4096,
     // Prefix only a real id. An empty one must stay empty: this string is the
     // key zen-compaction stores state under, and it only stores when the key is

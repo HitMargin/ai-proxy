@@ -17,6 +17,8 @@ import {
   cnbCallUpstream,
   cnbDiagnoseJunkSyntax,
   cnbForgetRejectedHeads,
+  cnbStripGitStatus,
+  cnbNeutraliseChannelMarkers,
   cnbGatedResponse,
   cnbJournalJunk,
   cnbJunkLogState,
@@ -829,6 +831,62 @@ Deno.test("a cnb transcript above the body budget is compacted", async () => {
   );
 });
 
+// ─── 摘要请求自己的体积必须有界（2026-10-24）───
+//
+// 生产事故：会话涨到 10.8 MB / ~1800 条时，每条头部消息截到 600 字符仍留下
+// ~1.9 MB 的摘要 prompt → 摘要请求自己吃上游 413 [BODY_TOO_LARGE] → 每轮都
+// 降级成截断 → 截断说明插到最前面，把带指纹的原 system 挤成第二条 → 撞上
+// 11128（旧自愈只削第一条）→ 会话永久卡死。装箱后摘要 prompt ≤ 预算，
+// 摘要能成功，会话才能收敛到增量更新路径。
+Deno.test("the summary prompt itself is packed under the upstream body limit", async () => {
+  resetCompactionStates();
+  const filler = "细".repeat(1200); // 每条都会被截到 600 字符
+  const messages: any[] = [{ role: "system", content: "sys" }];
+  for (let i = 0; i < 1800; i++) {
+    messages.push({ role: "user", content: "HEAD-" + i + "：" + filler });
+  }
+  messages.push({ role: "user", content: "最新一轮：只回答一个字：好" });
+  const body: any = { model: "deepseek-v4.1-flash", max_tokens: 32, messages };
+
+  let prompt = "";
+  const note = await maybeCompactCnb(body, "packed-session", async (p: string) => {
+    prompt = p;
+    return "## Objective\n- packed summary";
+  });
+  assert(note.includes("compacted via summary"), "summary must succeed: " + note);
+
+  const promptBytes = new TextEncoder().encode(prompt).length;
+  assert(
+    promptBytes < 1024 * 1024,
+    "the summary prompt itself must fit the upstream body limit, got " +
+      promptBytes,
+  );
+  assert(
+    promptBytes < 700 * 1024,
+    "the summary prompt must stay under the packing budget, got " + promptBytes,
+  );
+  assert(
+    prompt.includes("(已省略)"),
+    "the packed-out head messages must be visible as omissions",
+  );
+  assert(
+    !prompt.includes("HEAD-0："),
+    "the oldest head message must be the first thing dropped",
+  );
+  // 装箱从最靠近尾部的那端往回保留：靠近 headSplit 的真实内容必须在 prompt 里，
+  // 不能全是占位——占位摘要等于把这段历史白丢。
+  assert(
+    /HEAD-\d{3,4}：/.test(prompt),
+    "real head content must survive the packing, not only omissions",
+  );
+  assert(
+    body.messages.some((m: any) =>
+      typeof m.content === "string" && m.content.includes("最新一轮")
+    ),
+    "the newest turn must survive verbatim",
+  );
+});
+
 Deno.test("a transcript under the budget is left completely alone", async () => {
   // 对照组：没超限就不许动。缺了它，实现里「无条件压缩」也会让上一条通过。
   const body: any = {
@@ -1558,29 +1616,41 @@ Deno.test("unrelated JSON is still preserved next to the new detectors", () => {
 //   同段文字放长文中间             → 200
 //   **删掉开头 48 字符**           → 200   ← 只有这个动作不管上游怎么归一化都成立
 //   前面加空格/换行/零宽          → 200，但头部是 48 KB 空白时不成立（归一化后原地）
-Deno.test("cnb: cnbNeutraliseHead deletes the head of the first checked message", () => {
+Deno.test("cnb: cnbNeutraliseHead deletes the head of every checked message", () => {
   const FINGERPRINT = "You are an AI agent powered by DeepSeek Harness.";
   const rest = " This part must survive untouched.";
   const out = cnbNeutraliseHead({
     messages: [
       { role: "system", content: FINGERPRINT + rest },
-      { role: "user", content: "hi" },
+      // 2026-10-24 实测：检测面是**每一条** system/assistant 消息的开头，
+      // 不再只是第一条。这条就是 f05811ec 会话的形状——压缩说明插到最前面，
+      // 带指纹的原 system 被挤成第二条，旧版只削第一条于是永远修不好。
+      { role: "system", content: FINGERPRINT + " second" },
+      { role: "assistant", content: FINGERPRINT + " echoed" },
+      { role: "user", content: FINGERPRINT + " in user" },
     ],
   });
   assert(out, "must report a change");
-  const head = String(out!.messages[0].content);
+  const head0 = String(out!.messages[0].content);
   assert(
-    !head.includes(FINGERPRINT.slice(0, 20)),
+    !head0.includes(FINGERPRINT.slice(0, 20)),
     "the detected head must be gone, not merely prefixed",
   );
+  assert(head0.endsWith(rest), "the rest of the instruction must survive");
+  const head1 = String(out!.messages[1].content);
   assert(
-    head.endsWith(rest),
-    "the rest of the instruction must survive",
+    !head1.includes(FINGERPRINT.slice(0, 20)) && head1.endsWith("second"),
+    "the second system message's head must be cut too",
+  );
+  const head2 = String(out!.messages[2].content);
+  assert(
+    !head2.includes(FINGERPRINT.slice(0, 20)) && head2.endsWith("echoed"),
+    "an assistant history message whose head matches must be cut too",
   );
   assertEquals(
-    out!.messages[1].content,
-    "hi",
-    "only the first message is on the detection surface",
+    out!.messages[3].content,
+    FINGERPRINT + " in user",
+    "user messages are not on the detection surface and stay untouched",
   );
 });
 
@@ -1630,6 +1700,28 @@ Deno.test("cnb: cnbNeutraliseHead cuts past padding, arrays, and refuses an empt
     null,
     "an empty head must not claim a change",
   );
+
+  // 2026-10-24：空的第一条**不再放弃整个自愈**——跳过它继续看下一条。
+  // 空说明消息 + 带指纹的第二条，正是 fallbackTruncate 之后最常见的形状。
+  const FINGERPRINT = "You are an AI agent powered by DeepSeek Harness.";
+  const afterEmpty = cnbNeutraliseHead({
+    messages: [
+      { role: "system", content: "   " },
+      { role: "system", content: FINGERPRINT + "TAIL" },
+    ],
+  })!;
+  assert(afterEmpty, "an empty first message must not abort the sweep");
+  const secondHead = String(afterEmpty.messages[1].content);
+  assert(
+    !secondHead.includes(FINGERPRINT.slice(0, 20)) &&
+      secondHead.endsWith("TAIL"),
+    "the fingerprint behind an empty leading message must still be cut",
+  );
+  assertEquals(
+    String(afterEmpty.messages[0].content),
+    "   ",
+    "the empty message itself stays as it was",
+  );
 });
 
 // 端到端：自愈必须真的发生在**出站请求**上，而不是只通过函数单测。
@@ -1639,6 +1731,10 @@ Deno.test("cnb: a 400/11128 is retried once with the detected head removed", asy
   // 记忆化开启后，「首包原样」只在**没记过**这个头部时成立——先清空，
   // 否则本用例会变成测「首包就削」，丢掉它原本盯的「挨一下再重发」。
   cnbForgetRejectedHeads();
+  // 现场落盘是生产取证用的，测试不能往 cwd 写文件。
+  const hadDumpEnv = Deno.env.has("CNB_11128_DUMP");
+  const prevDumpEnv = hadDumpEnv ? Deno.env.get("CNB_11128_DUMP") : null;
+  Deno.env.set("CNB_11128_DUMP", "off");
   const realFetch = globalThis.fetch;
   const bodies: string[] = [];
   let chatCalls = 0;
@@ -1723,6 +1819,8 @@ Deno.test("cnb: a 400/11128 is retried once with the detected head removed", asy
     );
   } finally {
     globalThis.fetch = realFetch;
+    if (hadDumpEnv) Deno.env.set("CNB_11128_DUMP", prevDumpEnv ?? "");
+    else Deno.env.delete("CNB_11128_DUMP");
   }
 });
 
@@ -1730,6 +1828,118 @@ Deno.test("cnb: a 400/11128 is retried once with the detected head removed", asy
 //
 // 生产日志里 1198 次 11128 只对应两个固定头部，所以「先挨一次 400 再重发」
 // 是纯浪费：每轮白传 ~357 KB。记住样本后，首包就是已经削过的终态请求。
+// ── 2026-10-24：harness 注入的 gitStatus 快照段整段触发 11128（与身份指纹
+// 两套判据：不锚定开头、句子/字段单独都不拦、整块形状被匹配）。出站剥离是
+// 预防动作，锚定 harness 原文样板。
+Deno.test("cnb: cnbStripGitStatus removes the harness snapshot block and keeps the rest", () => {
+  const before = "# Harness\nYou are an agent.";
+  const block =
+    "gitStatus: This is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.\n\nCurrent branch: master\n\nMain branch (you will usually use this for PRs): master\n\nGit user: HitMargin\n\nStatus:\n(clean)\n\nRecent commits:\nd88728f 修：渲染完成后结算画面按键长时间无响应\n1747318 修：渲染完卡在关卡里";
+  const after = "\n\n# Tools\nUse them.";
+  const out = cnbStripGitStatus(before + "\n\n" + block + after);
+  assert(
+    !out.includes("Current branch") && !out.includes("Recent commits"),
+    "the whole block must be gone: fields alone still trip the check",
+  );
+  assert(
+    out.startsWith(before),
+    "content before the block must survive untouched",
+  );
+  assert(
+    out.endsWith(after),
+    "the next section after the block must survive untouched",
+  );
+  assert(
+    out.includes("snapshot omitted"),
+    "a one-line stub must remain so the model knows a snapshot existed",
+  );
+});
+
+Deno.test("cnb: cnbStripGitStatus strips a block that runs to the end of the text", () => {
+  const out = cnbStripGitStatus(
+    "Intro.\n\ngitStatus: This is the git status at the start of the conversation.\n\nCurrent branch: master",
+  );
+  assert(out.startsWith("Intro."), "content before the block must survive");
+  assert(
+    !out.includes("Current branch"),
+    "a trailing block has no heading after it and must be cut to the end",
+  );
+});
+
+Deno.test("cnb: cnbStripGitStatus leaves user-written gitStatus text alone", () => {
+  const text = "My notes: gitStatus: custom tracking for my repo.\n\nCurrent branch: dev";
+  assertEquals(
+    cnbStripGitStatus(text),
+    text,
+    "the harness boilerplate anchor must be required: arbitrary user text stays",
+  );
+});
+
+Deno.test("cnb: the heal never cuts a pure tool-call message", () => {
+  const out = cnbNeutraliseHead({
+    messages: [
+      { role: "system", content: "You are an AI agent powered by DeepSeek Harness." },
+      {
+        role: "assistant",
+        content: OPEN + "\n" +
+          '{"name":"pwsh","arguments":{"command":"ls"}}' + "\n" + CLOSE,
+      },
+    ],
+  });
+  assert(out, "the system fingerprint still gives the heal something to cut");
+  const a = String(out!.messages[1].content);
+  assert(
+    a.startsWith(OPEN),
+    "the tool-call opening tag must survive: cutting it would corrupt the XYML",
+  );
+  assert(
+    !String(out!.messages[0].content).includes("DeepSeek Harness"),
+    "the system head is still cut",
+  );
+});
+
+// ── 2026-10-24（晚）：DSH 会话削头后仍 11128——第二类内容级触发：
+// 「DeepSeek Harness + GUI 指代样板」的组合匹配（跨度约 200 字符、与位置无关）。
+// 修复 = 出站把品牌词改写成提示词本来就在用的简称 "DSH"。
+Deno.test("cnb: outbound preprocessing strips gitStatus and rewrites the harness brand", () => {
+  const GUI =
+    "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. " +
+    'When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.';
+  // gitStatus 块后面必须隔着分节标题：剥离的结束边界是「空行+标题」或文本末尾
+  // （生产里 harness 的 gitStatus 段后面总跟着其余分节），夹具要造出同款形状。
+  const out = cnbNeutraliseChannelMarkers(
+    "gitStatus: This is the git status at the start of the conversation.\n\nCurrent branch: master\n\n# GUI\n" + GUI,
+  );
+  assert(!out.includes("Current branch"), "the gitStatus block must be stripped");
+  assert(out.includes("# GUI"), "the following section must survive");
+  assert(!out.includes("DeepSeek Harness"), "the brand must be rewritten");
+  assert(
+    out.includes("DSH Web GUI") && out.includes("this page"),
+    "the sentence must survive with the neutral token in place",
+  );
+});
+
+Deno.test("cnb: the appended tool prompt is preprocessed too", () => {
+  const built: any = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: "hi" }],
+    tools: [{
+      function: {
+        name: "gui",
+        description: "Drive the DeepSeek Harness Web GUI.",
+        parameters: { type: "object", properties: {} },
+      },
+    }],
+  });
+  const up = built.upstream ?? built;
+  const first = String(up.messages[0].content);
+  assert(
+    !first.includes("DeepSeek Harness"),
+    "tool descriptions are appended after the message map and must not reintroduce the brand",
+  );
+  assert(first.includes("DSH Web GUI"), "the description must survive renamed");
+});
+
 Deno.test("cnb: a remembered head is stripped before the first upload", () => {
   cnbForgetRejectedHeads();
   const HEAD = "You are an AI agent powered by DeepSeek Harness.";
