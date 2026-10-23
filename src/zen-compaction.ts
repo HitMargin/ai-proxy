@@ -553,9 +553,7 @@ export async function compactIfNeeded(
       compactTokens: 0,
       messages: [],
       skipped: [
-        budgetBytes > 0
-          ? `body ${bodyBytes}B <= budget ${budgetBytes}B`
-          : "",
+        budgetBytes > 0 ? `body ${bodyBytes}B <= budget ${budgetBytes}B` : "",
         tokenGate ? `estimate ${estimate} <= threshold ${threshold}` : "",
       ].filter(Boolean).join(", "),
     };

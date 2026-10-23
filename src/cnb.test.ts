@@ -17,17 +17,17 @@ import {
   cnbCallUpstream,
   cnbDiagnoseJunkSyntax,
   cnbForgetRejectedHeads,
-  cnbStripGitStatus,
-  cnbNeutraliseChannelMarkers,
   cnbGatedResponse,
   cnbJournalJunk,
   cnbJunkLogState,
   type CnbJunkStore,
   cnbJunkStreak,
+  cnbNeutraliseChannelMarkers,
   cnbNeutraliseHead,
   cnbParseToolCalls,
   cnbPreNeutraliseHead,
   cnbRememberRejectedHead,
+  cnbStripGitStatus,
   deriveSessionKey,
   handleCnb,
   isReasoningStarvation,
@@ -849,11 +849,18 @@ Deno.test("the summary prompt itself is packed under the upstream body limit", a
   const body: any = { model: "deepseek-v4.1-flash", max_tokens: 32, messages };
 
   let prompt = "";
-  const note = await maybeCompactCnb(body, "packed-session", async (p: string) => {
-    prompt = p;
-    return "## Objective\n- packed summary";
-  });
-  assert(note.includes("compacted via summary"), "summary must succeed: " + note);
+  const note = await maybeCompactCnb(
+    body,
+    "packed-session",
+    async (p: string) => {
+      prompt = p;
+      return "## Objective\n- packed summary";
+    },
+  );
+  assert(
+    note.includes("compacted via summary"),
+    "summary must succeed: " + note,
+  );
 
   const promptBytes = new TextEncoder().encode(prompt).length;
   assert(
@@ -1867,7 +1874,8 @@ Deno.test("cnb: cnbStripGitStatus strips a block that runs to the end of the tex
 });
 
 Deno.test("cnb: cnbStripGitStatus leaves user-written gitStatus text alone", () => {
-  const text = "My notes: gitStatus: custom tracking for my repo.\n\nCurrent branch: dev";
+  const text =
+    "My notes: gitStatus: custom tracking for my repo.\n\nCurrent branch: dev";
   assertEquals(
     cnbStripGitStatus(text),
     text,
@@ -1878,7 +1886,10 @@ Deno.test("cnb: cnbStripGitStatus leaves user-written gitStatus text alone", () 
 Deno.test("cnb: the heal never cuts a pure tool-call message", () => {
   const out = cnbNeutraliseHead({
     messages: [
-      { role: "system", content: "You are an AI agent powered by DeepSeek Harness." },
+      {
+        role: "system",
+        content: "You are an AI agent powered by DeepSeek Harness.",
+      },
       {
         role: "assistant",
         content: OPEN + "\n" +
@@ -1908,9 +1919,13 @@ Deno.test("cnb: outbound preprocessing strips gitStatus and rewrites the harness
   // gitStatus 块后面必须隔着分节标题：剥离的结束边界是「空行+标题」或文本末尾
   // （生产里 harness 的 gitStatus 段后面总跟着其余分节），夹具要造出同款形状。
   const out = cnbNeutraliseChannelMarkers(
-    "gitStatus: This is the git status at the start of the conversation.\n\nCurrent branch: master\n\n# GUI\n" + GUI,
+    "gitStatus: This is the git status at the start of the conversation.\n\nCurrent branch: master\n\n# GUI\n" +
+      GUI,
   );
-  assert(!out.includes("Current branch"), "the gitStatus block must be stripped");
+  assert(
+    !out.includes("Current branch"),
+    "the gitStatus block must be stripped",
+  );
   assert(out.includes("# GUI"), "the following section must survive");
   assert(!out.includes("DeepSeek Harness"), "the brand must be rewritten");
   assert(

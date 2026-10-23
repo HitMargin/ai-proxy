@@ -2591,7 +2591,10 @@ async function dumpCnb11128Body(body: any, tag: string): Promise<string> {
   // 测试任务只开 --allow-env：没有写权限就安静跳过，不往日志里倒报错。
   // 生产（deno run -A）写权限恒为 granted，不受影响。
   try {
-    if (Deno.permissions.querySync({ name: "write", path: "." }).state !== "granted") {
+    if (
+      Deno.permissions.querySync({ name: "write", path: "." }).state !==
+        "granted"
+    ) {
       return "(dump skipped: no write permission)";
     }
   } catch {
@@ -3932,7 +3935,9 @@ export async function maybeCompactCnb(
       }
       console.warn(
         `[cnb] summary prompt packed: kept ${headCount - keptFrom}/` +
-          `${headCount} head messages within ${(summaryBudget / 1024) | 0} KiB ` +
+          `${headCount} head messages within ${
+            (summaryBudget / 1024) | 0
+          } KiB ` +
           `(older ones omitted; the summary call was hitting the upstream ` +
           `1 MiB body limit on huge sessions)`,
       );
