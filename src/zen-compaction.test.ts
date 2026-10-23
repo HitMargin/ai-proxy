@@ -170,6 +170,71 @@ Deno.test("compaction runs only past the threshold and rewrites the tail", async
   );
 });
 
+Deno.test("a byte-triggered compaction is never skipped as 'nothing to summarise'", async () => {
+  resetCompactionStates();
+  const messages = [
+    { role: "system", content: "sys" },
+    { role: "user", content: "u1" },
+    { role: "assistant", content: "a1" },
+    { role: "user", content: "u2" },
+  ];
+  const body = { messages };
+  const result = await compactIfNeeded({
+    messages,
+    body,
+    contextWindow: 0,
+    maxOutputTokens: 0,
+    budgetBytes: 10,
+    sessionId: "ses_bytes_only",
+    // keepTokens 大到 selectTail 认为「整段都塞得下」，正是线上那次 413 的形态。
+    config: { keepTokens: 1_000_000 },
+    writeSummary: async () => "## Objective\n- forced",
+  });
+  assert(
+    !(result.skipped ?? "").includes("nothing to summarise"),
+    "a body already proven oversized must not be skipped silently",
+  );
+  assert(result.changed, "the oversized body must still be compacted");
+  assert(
+    result.note.includes("compacted via summary"),
+    "compaction should report success rather than a bare skip",
+  );
+  assert(
+    body.messages.some((message: any) =>
+      typeof message.content === "string" &&
+      message.content.startsWith("[Conversation Summary]")
+    ),
+    "the forced split must still anchor a summary",
+  );
+  assertEqual(
+    body.messages[body.messages.length - 1].content,
+    "u2",
+    "the newest turn must survive the forced split",
+  );
+});
+
+Deno.test("a single oversized message defers to the caller's truncation", async () => {
+  resetCompactionStates();
+  const messages = [{ role: "user", content: "x".repeat(400) }];
+  const result = await compactIfNeeded({
+    messages,
+    body: { messages },
+    contextWindow: 0,
+    maxOutputTokens: 0,
+    budgetBytes: 10,
+    sessionId: "ses_single",
+    config: { keepTokens: 1_000_000 },
+    writeSummary: async () => {
+      throw new Error("must not be called");
+    },
+  });
+  assertEqual(result.changed, false);
+  assert(
+    (result.skipped ?? "").includes("caller must truncate"),
+    "the skip must name the only remaining remedy",
+  );
+});
+
 Deno.test("compaction leaves a transcript that fits untouched", async () => {
   resetCompactionStates();
   const messages = [{ role: "user", content: "hi" }];

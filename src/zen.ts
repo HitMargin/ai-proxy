@@ -31,6 +31,10 @@ const QUARTET_DONORS: Record<string, string[]> = { bash: ["pwsh"] };
 const SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const REQUEST_RE = /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
+// ★ 压缩的字节预算：贴着本地 body 闸门留 256 KiB 余量。上游 zen 的真实
+// 字节上限未知，这里只保证「压缩后的 body 不会被本地 MAX_BODY_BYTES 拦下」。
+// 压缩是安全网，预算贴近闸门是对的——逼太紧会白压掉本该保留的历史。
+const COMPACTION_BUDGET_BYTES = MAX_BODY_BYTES - 256 * 1024;
 
 type Json = Record<string, any>;
 
@@ -247,6 +251,7 @@ async function maybeCompactZen(
     body,
     contextWindow: limits.context,
     maxOutputTokens: limits.output,
+    budgetBytes: COMPACTION_BUDGET_BYTES,
     sessionId: session,
     config: {
       enabled: ENV.ZEN_COMPACTION !== "off",
@@ -264,7 +269,9 @@ async function maybeCompactZen(
       `[zen] ${result.note} session=${session} cost≈${result.compactTokens}`,
     );
   } else if (result.note === "summary-failed") {
-    const truncated = fallbackTruncate(messages, limits.context);
+    // ★ limits.context 是 **token** 数，曾经被直接当 budgetBytes 传进来
+    // （1,048,576 个 token → 1,048,576 字节，单位错位）。这里只传字节。
+    const truncated = fallbackTruncate(messages, COMPACTION_BUDGET_BYTES);
     body.messages = truncated.messages;
     console.warn(
       `[zen] ${truncated.note} session=${session} (summary generation failed: ${

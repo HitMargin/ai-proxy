@@ -411,8 +411,20 @@ export interface CompactInput {
   messages: any[];
   /** Whole request, only used for the size estimate. */
   body?: unknown;
+  /** 总 token 窗口。`0` = 不设 token 闸门（见 `budgetBytes`）。 */
   contextWindow: number;
   maxOutputTokens: number;
+  /**
+   * 由调用方按**字节**算好的 body 预算——上游硬限用的单位。
+   *
+   * 给了它就额外按 UTF-8 **真实字节数**判一次超限，且**绝不换算成 token**：
+   * 字节→token 没有正确常数（同一份 907,264 B 的 body，纯 ASCII 估算约
+   * 22.7 万 token，纯中文约 30.2 万——固定除数必然错 33%）。两个单位各自
+   * 在自己的尺子上判，任一超线即压缩。
+   *
+   * 与 `contextWindow` 是**或**关系：只给其一也行，两个都给则都要看。
+   */
+  budgetBytes?: number;
   sessionId: string;
   config?: Partial<CompactionConfig>;
   /**
@@ -488,13 +500,21 @@ export async function compactIfNeeded(
     };
   }
   const contextWindow = input.contextWindow;
-  if (contextWindow <= 0) {
+  // ★ 2026-10-23：字节预算与 token 窗口是**两条独立的触发线**，任一超线都压缩。
+  //
+  // 上游卡的是 body **字节**（cnb 实测 1,048,169 B 通过、1,049,193 B 直接
+  // 413 [BODY_TOO_LARGE]），而 token 只是伪单位。之前只留 token 闸门，中文
+  // 会话就能在“估算 100 K token”下把 body 顶到 1.2 MiB 再吃 413——压缩静默
+  // 不触发。所以调用方知道真实字节预算时，这里直接按字节判。
+  // `contextWindow: 0` = 该调用方没有 token 窗口，只关心字节，不是“别压缩”。
+  const budgetBytes = Math.max(0, Math.floor(input.budgetBytes ?? 0));
+  if (contextWindow <= 0 && budgetBytes <= 0) {
     return {
       changed: false,
       note: "",
       compactTokens: 0,
       messages: [],
-      skipped: "contextWindow <= 0",
+      skipped: "neither contextWindow nor budgetBytes is set",
     };
   }
   const messages = input.messages;
@@ -508,16 +528,36 @@ export async function compactIfNeeded(
     };
   }
 
-  const threshold = contextWindow -
-    Math.max(input.maxOutputTokens, config.buffer);
-  const estimate = estimateJsonTokens(input.body ?? { messages });
-  if (estimate <= threshold) {
+  // token 侧：窗口 <=0 时不构成约束，只算字节侧。
+  const tokenGate = contextWindow > 0;
+  const threshold = tokenGate
+    ? contextWindow - Math.max(input.maxOutputTokens, config.buffer)
+    : 0;
+  const bodyValue = input.body ?? { messages };
+  const estimate = tokenGate ? estimateJsonTokens(bodyValue) : 0;
+  let bodyBytes = 0;
+  if (budgetBytes > 0) {
+    try {
+      bodyBytes = utf8Bytes(JSON.stringify(bodyValue));
+    } catch {
+      // 序列化不了的 body 反正发不出去，别在这里替上游下判断。
+      bodyBytes = 0;
+    }
+  }
+  const overBytes = budgetBytes > 0 && bodyBytes > budgetBytes;
+  const overTokens = tokenGate && estimate > threshold;
+  if (!overBytes && !overTokens) {
     return {
       changed: false,
       note: "",
       compactTokens: 0,
       messages: [],
-      skipped: `estimate ${estimate} <= threshold ${threshold}`,
+      skipped: [
+        budgetBytes > 0
+          ? `body ${bodyBytes}B <= budget ${budgetBytes}B`
+          : "",
+        tokenGate ? `estimate ${estimate} <= threshold ${threshold}` : "",
+      ].filter(Boolean).join(", "),
     };
   }
 
@@ -529,7 +569,7 @@ export async function compactIfNeeded(
   );
   // 调用方给了字节口径的 split，就按它切：那是上游真正会看到的体积。
   const forcedSplit = input.tailSplit ?? 0;
-  const selection = forcedSplit > 0 && forcedSplit < serialized.length
+  let selection = forcedSplit > 0 && forcedSplit < serialized.length
     ? {
       head: [...serialized.slice(0, forcedSplit)],
       recent: [...serialized.slice(forcedSplit)],
@@ -542,13 +582,26 @@ export async function compactIfNeeded(
     // 整个 transcript 随之缩到 keepTokens 之下，于是这里判定“没有可压缩的
     // 部分”——但 body 仍远超字节上限。什么都不改、什么都不说，是这套逻辑里
     // 最坏的失败形态：上游 413，日志干净，看起来一切正常。
-    return {
-      changed: false,
-      note: "",
-      compactTokens: 0,
-      messages: [],
-      skipped: `nothing to summarise: keepTokens=${config.keepTokens} ` +
-        `already covers all ${serialized.length} messages`,
+    //
+    // ★ 2026-10-23：既然上面已经确认超线（overBytes / overTokens），这里就
+    // 不许再原样返回——那等于把同一场事故换个入口重演一遍。只剩一条消息时
+    // 确实无从压缩（调用方在 changed=false 之后会自己截断尾部），否则至少把
+    // 最后一条之外的全部交给摘要，保证“压缩必然收敛”。
+    if (serialized.length <= 1) {
+      return {
+        changed: false,
+        note: "",
+        compactTokens: 0,
+        messages: [],
+        skipped: `nothing to summarise: body holds a single message ` +
+          `(${serialized.length}); caller must truncate`,
+      };
+    }
+    const forced = serialized.length - 1;
+    selection = {
+      head: [...serialized.slice(0, forced)],
+      recent: [...serialized.slice(forced)],
+      split: forced,
     };
   }
 
