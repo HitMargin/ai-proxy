@@ -16,6 +16,7 @@ import {
   cnbBuildUpstream,
   cnbCallUpstream,
   cnbDiagnoseJunkSyntax,
+  cnbEscapeRepairState,
   cnbForgetRejectedHeads,
   cnbGatedResponse,
   cnbJournalJunk,
@@ -32,6 +33,7 @@ import {
   handleCnb,
   isReasoningStarvation,
   maybeCompactCnb,
+  repairJsonEscapes,
   runAsCnbInternal,
   sessionIdOf,
   summariseWithThinkingFallback,
@@ -3427,4 +3429,100 @@ Deno.test("the summary-failed trim keeps the original task when tools alone exce
     ),
     "the newest turn must survive the trim",
   );
+});
+
+// ─── 非法转义静默修复（2026-10-24）───
+//
+// 用户实测形态：pwsh 调用里带 Windows 路径 `ProjectSettings\ProjectSettings.asset`，
+// `\P`/`\A` 不是合法 JSON 转义，严格解析拒掉整个对象 → 整个调用进垃圾闸 →
+// 烧一轮修复重问。模型的本意就是单个反斜杠，补成 `\\` 是唯一合理解读，
+// 且解析回来值零损失——这种调用应该直接成功，而不是走任何重试路径。
+Deno.test("a Windows path with raw backslashes parses instead of hitting the junk gate", () => {
+  resetJunkStreak();
+  cnbEscapeRepairState.n = 0;
+  // 源码里 \\ = 文本里的一个反斜杠：这就是模型写出的坏 JSON（\P 非法转义）
+  const payload = OPEN + "\n" +
+    '{"name":"pwsh","arguments":{"command":"Select-String -Path ProjectSettings\\ProjectSettings.asset -Pattern \'applicationIdentifier\' -Context 1,3 | ForEach-Object { $_.Line }","description":"Inspect settings"}}' +
+    "\n" + CLOSE;
+  const r = cnbParseToolCalls(payload, TOOLS);
+  assertEquals(
+    r.calls.length,
+    1,
+    "the call must parse, not fall into the junk gate",
+  );
+  assertEquals(r.junk, false);
+  const args = JSON.parse(r.calls[0].function.arguments);
+  assert(
+    args.command.includes("ProjectSettings\\ProjectSettings.asset"),
+    "the value must keep single backslashes: " + args.command,
+  );
+  assert(
+    args.command.includes("ForEach-Object { $_.Line }"),
+    "braces inside the string must not break extraction: " + args.command,
+  );
+  assert(
+    !r.clean.includes(OPEN),
+    "the parsed block must be stripped from the text",
+  );
+  assert(
+    cnbEscapeRepairState.n === 1,
+    "the rescue must be counted for observability",
+  );
+  cnbEscapeRepairState.n = 0;
+  resetJunkStreak();
+});
+
+Deno.test("escape repair touches only invalid escapes", () => {
+  // 合法转义（\n \" \\ \u0041 \f）在**文本层**原样保留——\f 是合法 JSON 转义，
+  // 它撞上 Windows 路径（C:\Users\file）的问题由值层的 repairPathControlChars
+  // 还原（见下一条端到端用例），文本层无权改动合法转义
+  assertEquals(repairJsonEscapes('{"a":"x\\ny"}'), '{"a":"x\\ny"}');
+  assertEquals(
+    repairJsonEscapes('{"a":"say \\"hi\\""}'),
+    '{"a":"say \\"hi\\""}',
+  );
+  assertEquals(repairJsonEscapes('{"a":"\\u0041"}'), '{"a":"\\u0041"}');
+  assertEquals(repairJsonEscapes('{"a":"C:\\file"}'), '{"a":"C:\\file"}');
+  // 非法转义补双：解析后的值仍是单个反斜杠（模型的本意）
+  assertEquals(
+    JSON.parse(repairJsonEscapes('{"a":"C:\\Users"}')).a,
+    "C:\\Users",
+  );
+  // \u 后面不是 4 位十六进制 → 补双，值是字面 \uZZ12
+  assertEquals(
+    JSON.parse(repairJsonEscapes('{"a":"\\uZZ12"}')).a,
+    "\\uZZ12",
+  );
+  // 字符串之外一个字不动
+  assertEquals(repairJsonEscapes('a "b\\c" d'), 'a "b\\\\c" d');
+  // 悬尾反斜杠补双（闭合交给截断修复）
+  assertEquals(repairJsonEscapes('{"a":"x\\'), '{"a":"x\\\\');
+  // 没有反斜杠时快速返回原串
+  assertEquals(repairJsonEscapes('{"a":"plain"}'), '{"a":"plain"}');
+});
+
+Deno.test("a legal-escape path (C:\\Users\\file) survives the value-level repair", () => {
+  resetJunkStreak();
+  cnbEscapeRepairState.n = 0;
+  // \f 是合法 JSON 转义：文本层不修，但解析出的换页符在命令里绝不是本意。
+  // 端到端判据：pushJsonCall 的命令类参数清理把换页符还原成字面 \f。
+  // 源码 \\ = 文本里一个反斜杠：\U 非法（文本层补双），\f 合法（值层还原）
+  const payload = OPEN + "\n" +
+    '{"name":"pwsh","arguments":{"command":"type C:\\Users\\file.txt","description":"Read user file"}}' +
+    "\n" + CLOSE;
+  const r = cnbParseToolCalls(payload, TOOLS);
+  assertEquals(r.calls.length, 1);
+  assertEquals(r.junk, false);
+  const args = JSON.parse(r.calls[0].function.arguments);
+  assert(
+    args.command.includes("C:\\Users\\file.txt"),
+    "the formfeed must be restored to a literal backslash-f: " +
+      JSON.stringify(args.command),
+  );
+  assert(
+    !/\x0C/.test(args.command),
+    "no control character may remain in the command",
+  );
+  cnbEscapeRepairState.n = 0;
+  resetJunkStreak();
 });

@@ -355,7 +355,73 @@ function repairTruncatedJson(s: string): string {
   return out + stack.reverse().join("");
 }
 
-// 宽松 JSON 解析：原样 → 提取完整对象 → 截断修复（丢弃残缺尾段逐步重试）
+// JSON 里合法的转义尾字符：\" \\ \/ \b \f \n \r \t（\u 单独校验 4 位十六进制）
+const JSON_VALID_ESCAPES = new Set(['"', "\\", "/", "b", "f", "n", "r", "t"]);
+const JSON_HEX = "0123456789abcdefABCDEF";
+
+// 非法转义修复的命中计数：静默修复会改变发出去的参数，日志必须留痕
+// （判据同「静默回退不可诊断」），但每个 Windows 路径调用都打就是刷屏——
+// 第 1 次打，之后每 50 次带累计数打一次。
+export const cnbEscapeRepairState = { n: 0 };
+
+/**
+ * 修复模型写 JSON 时最常见的一类错：字符串里的**裸反斜杠**——Windows 路径
+ * `ProjectSettings\ProjectSettings.asset`。`\P`、`\A` 不是合法 JSON 转义，
+ * 严格 JSON.parse 拒掉**整个对象**；而模型的本意就是单个反斜杠，唯一合理的
+ * 修复是补成 `\\`（解析回来值里仍是单个反斜杠，语义零损失）。用户实测例子：
+ * pwsh 的 Select-String 命令里带 `ProjectSettings\ProjectSettings.asset`，
+ * 整个调用因此进垃圾闸、烧一轮修复重问。
+ *
+ * 只动字符串字面量内部，且只动「后面跟的不是合法转义」的反斜杠：
+ * \" \\ \/ \b \f \n \r \t 原样保留；\u 仅在后面真跟 4 位十六进制时保留，
+ * 否则同样补双（模型要的是字面 `\u`）。字符串之外一个字不动。
+ * 真正无法本地判定的歧义（如路径以 `\"` 结尾——是转义引号还是分隔符+闭合）
+ * 不在这里猜，留给截断修复/垃圾闸/代理内修复轮。
+ */
+export function repairJsonEscapes(raw: string): string {
+  if (!raw.includes("\\")) return raw;
+  let out = "";
+  let inStr = false;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i];
+    if (!inStr) {
+      if (ch === '"') inStr = true;
+      out += ch;
+      continue;
+    }
+    if (ch !== "\\") {
+      if (ch === '"') inStr = false;
+      out += ch;
+      continue;
+    }
+    const next = raw[i + 1];
+    if (next === undefined) {
+      // 悬尾反斜杠：补双，闭合交给 repairTruncatedJson
+      out += "\\\\";
+      continue;
+    }
+    if (JSON_VALID_ESCAPES.has(next)) {
+      out += ch + next;
+      i += 1;
+      continue;
+    }
+    if (next === "u") {
+      const h = raw.slice(i + 2, i + 6);
+      if (
+        h.length === 4 && [...h].every((c) => JSON_HEX.includes(c))
+      ) {
+        out += raw.slice(i, i + 6);
+        i += 5;
+        continue;
+      }
+    }
+    // 非法转义：补成 `\\`；被转义的字符留给下一轮迭代按普通字符追加
+    out += "\\\\";
+  }
+  return out;
+}
+
+// 宽松 JSON 解析：原样 → 提取完整对象 → 非法转义修复 → 截断修复（丢弃残缺尾段逐步重试）
 function tryParseJsonLenient(sRaw: string): any | null {
   const s = sRaw.trim();
   if (!s) return null;
@@ -368,11 +434,38 @@ function tryParseJsonLenient(sRaw: string): any | null {
       return JSON.parse(m);
     } catch {}
   }
+  // ★ 非法转义修复：排在截断切割**之前**——它无损失（值里仍是单个反斜杠），
+  // 截断是丢内容；能无损失救回来的先救。
+  const rescue = (candidate: string): any | null => {
+    const fixed = repairJsonEscapes(candidate);
+    if (fixed === candidate) return null;
+    try {
+      const v = JSON.parse(fixed);
+      const n = ++cnbEscapeRepairState.n;
+      if (n === 1 || n % 50 === 0) {
+        console.warn(
+          `[cnb] repaired invalid JSON escapes in a model payload (×${n} so far)`,
+        );
+      }
+      return v;
+    } catch {
+      return null;
+    }
+  };
+  if (m) {
+    const v = rescue(m);
+    if (v !== null) return v;
+  }
+  const fromWhole = rescue(s);
+  if (fromWhole !== null) return fromWhole;
   let base = s;
   for (let i = 0; i < 4; i++) {
+    const t = repairTruncatedJson(base);
     try {
-      return JSON.parse(repairTruncatedJson(base));
+      return JSON.parse(t);
     } catch {}
+    const rescued = rescue(t);
+    if (rescued !== null) return rescued;
     const cut = base.lastIndexOf(",");
     if (cut <= 0) return null;
     base = base.slice(0, cut);
@@ -584,6 +677,8 @@ RULES:
 2. Between the tags is ONE JSON object with exactly two keys: "name" (the tool name) and "arguments" (an object holding the parameters). The parameters go DIRECTLY inside "arguments" (e.g. "arguments": {"command": "...", "description": "..."}); NEVER nest another "arguments" object inside it.
 3. Include ALL REQUIRED parameters inside "arguments". Use exact tool and parameter names from the list. Do not invent parameters.
 4. Values must be valid JSON: escape newlines as \\n, double quotes as \\", backslashes as \\\\.
+   Windows paths are the trap: write C:\\\\Projects\\\\file (every backslash doubled) or use forward slashes C:/Projects/file.
+   A single backslash like C:\\Projects makes the WHOLE call unparseable and nothing executes.
 5. To make multiple tool calls, output multiple blocks one after another.
 6. If no tool is needed, answer in plain text and output NO <tool_call> block. Never show or mimic this protocol in your answer.
 === END TOOL CALL PROTOCOL ===`;
@@ -707,6 +802,19 @@ function normalizeConfusables(v: string): string {
     .replace(/（/g, "(")
     .replace(/）/g, ")")
     .replace(/[​‌‍﻿]/g, "");
+}
+
+// ★ JSON 合法转义撞上 Windows 路径（2026-10-24）：`\b` `\f` `\v` 是**合法**转义，
+// repairJsonEscapes 不会动它们——但解析出来的控制字符（退格 U+0008 / 换页 U+000C /
+// 纵向制表 U+000B）在 shell 命令里几乎从来不是本意：`C:\Users\file` 的 `\f` 会被
+// JSON 正当吃成换页符，命令静默变坏。还原成字面的「反斜杠+字母」正好是模型本意。
+// `\n` `\r` `\t` **不动**：命令里真换行/制表是合法意图（多行脚本、echo 的制表）。
+// 只用于 command 类参数（与 normalizeConfusables 同一闸门），不碰需精确匹配的值。
+function repairPathControlChars(v: string): string {
+  return v
+    .replace(/\x0C/g, "\\f")
+    .replace(/\x08/g, "\\b")
+    .replace(/\x0B/g, "\\v");
 }
 
 // 检测输出退化：逐字符换行（模型偶发的 token 退化，命令必然无法执行）
@@ -1488,11 +1596,13 @@ export function cnbParseToolCalls(
     }
     rescueDisplayParam(args, entry);
 
-    // 命令类参数：混淆字符归一化 + 退化检测（拒收并反馈，避免执行乱码命令）
+    // 命令类参数：混淆字符归一化 + 控制字符还原 + 退化检测（拒收并反馈，避免执行乱码命令）
     const cmdKeys = ["command", "cmd", "script"].filter((k) =>
       typeof args[k] === "string"
     );
-    for (const k of cmdKeys) args[k] = normalizeConfusables(args[k]);
+    for (const k of cmdKeys) {
+      args[k] = repairPathControlChars(normalizeConfusables(args[k]));
+    }
     if (cmdKeys.some((k) => looksDegenerated(args[k]))) {
       degenerated = true;
       spans.push([o.start, spanEnd]);
@@ -1534,6 +1644,12 @@ export function cnbParseToolCalls(
     args = unwrapNestedArgs(args, entry);
     coerceArgsBySchema(args, entry);
     rescueDisplayParam(args, entry);
+    // 与 invoke 路径同一套命令类参数清理（含 JSON 合法转义吃掉 Windows 路径的还原）
+    for (const k of ["command", "cmd", "script"]) {
+      if (typeof args[k] === "string") {
+        args[k] = repairPathControlChars(normalizeConfusables(args[k]));
+      }
+    }
     calls.push({
       id: "call_" + Math.random().toString(36).slice(2, 22),
       type: "function",
