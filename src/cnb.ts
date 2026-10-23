@@ -3862,87 +3862,58 @@ export async function maybeCompactCnb(
   );
   const tokenSplit = selectTail(serialized, keepTokens)?.split ?? 0;
   const headSplit = Math.max(byteSplit, tokenSplit);
+  // ★ 2026-10-24：任务消息的单条截断上限放宽到 2000 字符——任务描述经常
+  // 超过 600 字符（贴需求、贴报错），600 一刀切会把「要干什么」截掉半截。
+  // `<system-reminder>` 开头的是 harness 每轮重新注入的元数据，不算任务。
+  const userMsgChars = cnbIntSetting("CNB_COMPACTION_USER_MSG_CHARS", 2000);
   const forSummary = messages.map((m: any, i: number) => {
     if (i >= headSplit || !m || typeof m !== "object") return m;
-    if (typeof m.content === "string" && m.content.length > summaryMsgChars) {
+    const isTask = m.role === "user" &&
+      !(
+        typeof m.content === "string" &&
+        m.content.startsWith("<system-reminder")
+      );
+    const cap = isTask ? userMsgChars : summaryMsgChars;
+    if (typeof m.content === "string" && m.content.length > cap) {
       return {
         ...m,
-        content: m.content.slice(0, summaryMsgChars) +
+        content: m.content.slice(0, cap) +
           "\n[truncated for summary]",
       };
     }
-    // ★ 只截 `content` 是不够的。2026-10-19 实测：带 tool_calls 与 tool 结果的
-    // 会话，头部每条消息的 content 是 null，真正占体积的是
-    // `tool_calls[].function.arguments` 和 tool 消息的 content（那是另一条
-    // role，体积却一样大）。这些消息原样进了摘要 prompt，实测把 prompt 顶到
-    // 4.5 MB —— 是 CNB 1 MiB 上限的 4 倍，摘要请求必被截断成空壳。
-    //
-    // 判据：按**序列化后的实际体积**判断要不要截，而不是按某个字段的类型。
-    const size = serializeMessage(m).length;
-    if (size <= summaryMsgChars) return m;
-    // 整体仍按体积截：序列化后切到 summaryMsgChars，再作为纯文本塞回去。
-    // 丢掉 tool_calls 的结构没关系 —— 摘要只需要知道「做过什么」，不需要
-    // 能在摘要里重放工具调用。
-    return {
-      role: m.role,
-      content: serializeMessage(m).slice(0, summaryMsgChars) +
-        "\n[truncated for summary]",
-    };
+    if (!isTask) {
+      // ★ 只截 `content` 是不够的。2026-10-19 实测：带 tool_calls 与 tool 结果的
+      // 会话，头部每条消息的 content 是 null，真正占体积的是
+      // `tool_calls[].function.arguments` 和 tool 消息的 content（那是另一条
+      // role，体积却一样大）。这些消息原样进了摘要 prompt，实测把 prompt 顶到
+      // 4.5 MB —— 是 CNB 1 MiB 上限的 4 倍，摘要请求必被截断成空壳。
+      //
+      // 判据：按**序列化后的实际体积**判断要不要截，而不是按某个字段的类型。
+      const size = serializeMessage(m).length;
+      if (size <= cap) return m;
+      // 整体仍按体积截：序列化后切到 cap，再作为纯文本塞回去。
+      // 丢掉 tool_calls 的结构没关系 —— 摘要只需要知道「做过什么」，不需要
+      // 能在摘要里重放工具调用。
+      return {
+        role: m.role,
+        content: serializeMessage(m).slice(0, cap) +
+          "\n[truncated for summary]",
+      };
+    }
+    // 任务消息保持结构：摘要拿到「用户原话」比序列化残片有用得多。
+    return m;
   });
 
-  // ★ 2026-10-24：摘要 prompt 的**总体积**上限。
+  // ★ 2026-10-24：摘要 prompt 的**总体积**上限交给 compactIfNeeded 的
+  // summaryPromptBytes 在**上下文层**执行——按行装箱、保护任务线程（非
+  // reminder 的 user 消息）、从最旧的方向淘汰工具噪音。
   //
-  // 上面的 600 字符截断只管「一条」，不管「多少条」：一个 10.8 MB、~1800 条的
-  // 会话，截完仍有 ~1.9 MB —— 摘要请求自己吃上游 413 [BODY_TOO_LARGE]
-  // （生产日志：summary ... status=413 ... limit 1.00MB），压缩从此每轮都降级成
-  // 截断，会话永远收敛不了；而且截断的说明插到最前面，正是把带指纹的原 system
-  // 挤成第二条、触发 11128 死循环的那一步（见 cnbNeutraliseHead 的 10-24 注）。
-  //
-  // 装箱方向：从**最靠近 headSplit 的那端**往回装（时间上最新、对摘要最有价值），
-  // 装不下的更早条目替换成一条短的省略占位。数组长度与下标**不能动**——
-  // compactIfNeeded 拿 tailSplit 切 head/tail，且压缩状态按「covered 下标 +
-  // 尾部指纹」判断能否增量；长度一变，covered 永远对不上，每轮退化成全量重算。
-  // 占位本身也占请求体积，所以先按条数把占位开销从预算里扣掉。
+  // 为什么不在这里对 forSummary 装箱（第一版是这么做的）：那只能覆盖「新鲜
+  // 摘要」一条路，而增量路径（covered→split 的 delta）同样可能超限——48 步
+  // 的 agent 会话一轮就能新增几百 KB 工具输出，delta 超 1 MiB 照样 413 →
+  // 每轮降级截断 → 截断说明插最前 → 11128（见 cnbNeutraliseHead 的 10-24 注）。
+  // 在上下文层装箱则两条路一次覆盖。
   const summaryBudget = cnbIntSetting("CNB_SUMMARY_PROMPT_BYTES", 640 * 1024);
-  if (summaryBudget > 0 && headSplit > 0) {
-    const OMISSION = "(已省略)";
-    const omissionBytes = new TextEncoder().encode(
-      JSON.stringify({ role: "user", content: OMISSION }),
-    ).length + 1;
-    const headCount = Math.min(headSplit, forSummary.length);
-    // 先算占位开销（每条被挤掉的条目都会变成一条占位），再给真实内容装箱。
-    const packBudget = Math.max(
-      64 * 1024,
-      summaryBudget - headCount * omissionBytes,
-    );
-    const encoder = new TextEncoder();
-    let total = 0;
-    let keptFrom = headCount;
-    for (let i = headCount - 1; i >= 0; i--) {
-      let size = 0;
-      try {
-        size = encoder.encode(JSON.stringify(forSummary[i])).length + 1;
-      } catch {
-        size = 0; // 序列化不了的条目按 0 计，交给下游如实处理
-      }
-      if (total + size > packBudget) break;
-      total += size;
-      keptFrom = i;
-    }
-    if (keptFrom > 0) {
-      for (let j = 0; j < keptFrom; j++) {
-        forSummary[j] = { role: "user", content: OMISSION };
-      }
-      console.warn(
-        `[cnb] summary prompt packed: kept ${headCount - keptFrom}/` +
-          `${headCount} head messages within ${
-            (summaryBudget / 1024) | 0
-          } KiB ` +
-          `(older ones omitted; the summary call was hitting the upstream ` +
-          `1 MiB body limit on huge sessions)`,
-      );
-    }
-  }
 
   const result = await compactIfNeeded({
     messages: forSummary,
@@ -3953,6 +3924,7 @@ export async function maybeCompactCnb(
     body,
     contextWindow: 0,
     budgetBytes: budget,
+    summaryPromptBytes: summaryBudget,
     maxOutputTokens: 4096,
     // Prefix only a real id. An empty one must stay empty: this string is the
     // key zen-compaction stores state under, and it only stores when the key is

@@ -410,6 +410,51 @@ Deno.test("fallback truncation fills the byte budget, not a token-derived one", 
   assert(after <= budget, `and must not exceed it (got ${after})`);
 });
 
+// ★ 2026-10-24：截断装箱也是「最新的先装」——48 步 agent 会话里任务（首条
+// user 消息）比预算更老，照旧装箱必然被丢掉，模型收到的 transcript 就「只剩
+// 工具定义」（生产截图实测）。现在非 reminder 的 user 消息受保护，最老的那条
+// （= 原始任务）用剩余空间硬截也要留下；harness 注入的 <system-reminder> 不算
+// 任务，照常淘汰。
+Deno.test("fallback truncation keeps the original task even when it is older than the budget", () => {
+  const TASK = "TASK：修复渲染器时序问题，这是整个会话的原始请求。";
+  const messages: any[] = [
+    { role: "system", content: "sys" },
+    { role: "user", content: TASK },
+    {
+      role: "user",
+      content: "<system-reminder>harness metadata</system-reminder>",
+    },
+  ];
+  // 每条 assistant 噪音 2000 字节，堆到远超预算：单纯「最新先装」会把任务挤掉。
+  const spam = "噪".repeat(666);
+  for (let i = 0; i < 40; i += 1) {
+    messages.push({ role: "assistant", content: spam });
+  }
+  messages.push({ role: "user", content: "最新问题" });
+  const budget = 20000;
+  const out = fallbackTruncate(messages, budget);
+  const after = new TextEncoder().encode(JSON.stringify(out.messages)).length;
+  assert(
+    after <= budget,
+    `truncated body must fit the budget (got ${after})`,
+  );
+  const texts = out.messages.map((m: any) => String(m.content));
+  assert(
+    texts.some((t) => t.startsWith("TASK：修复渲染器")),
+    "the original task must survive truncation",
+  );
+  const spamKept = texts.filter((t) => t === spam).length;
+  assert(
+    spamKept < 20,
+    `the newest-first fill must still do the heavy lifting, kept ${spamKept}/40 spam`,
+  );
+  assertEqual(
+    out.messages[out.messages.length - 1].content,
+    "最新问题",
+    "the newest turn must still survive",
+  );
+});
+
 Deno.test("fallback truncation says so when even the note does not fit", () => {
   // 预算小到连说明都装不下：不能假装成功，note 必须标出来。
   const messages = [{ role: "user", content: "x".repeat(5000) }];

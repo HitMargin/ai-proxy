@@ -336,6 +336,70 @@ export function selectTailByBytes(
   return { split, bytes: used };
 }
 
+// ---------- 摘要上下文装箱：保护任务线程，淘汰工具噪音（2026-10-24）----------
+//
+// 生产事故：10.8 MB 会话的任务（首条 user 消息）在最老的区域，摘要请求超上游
+// 1 MiB 后装箱只保留最新的头部，任务被裁成「已省略」——摘要模型根本没见过它，
+// 重建出的 transcript 自然「只剩工具定义」，模型每轮都在问「你要我干什么」。
+//
+// 规则：
+//   · **保护** `[User]:` 开头、且不是 harness 注入的 `<system-reminder` 的行
+//     ——任务/目标几乎只出现在用户消息里；每条另设字符上限，防止用户粘贴的
+//     超大文件把预算吃光。
+//   · 其余行（工具结果 / assistant / harness reminder）从**最新**往回装，
+//     装不下的整体省略，只留一行计数说明——摘要模型据此知道前文有省略。
+//   · `previousRecent`（上一轮的尾部原文）排在最老的位置，装不下就省略：
+//     它本来就大致由上一份摘要代表。
+const SUMMARY_PROTECTED_USER_CHARS = 4000;
+const SUMMARY_PROMPT_RESERVE_BYTES = 4096;
+
+function isProtectedUserLine(line: string): boolean {
+  if (!line.startsWith("[User]:")) return false;
+  if (line.startsWith("[User]: <system-reminder")) return false;
+  return true;
+}
+
+export function packSummaryContext(
+  lines: readonly string[],
+  budgetBytes: number,
+): { lines: string[]; omitted: number } {
+  if (budgetBytes <= 0 || lines.length === 0) {
+    return { lines: [...lines], omitted: 0 };
+  }
+  const encoder = new TextEncoder();
+  const effective = Math.max(0, budgetBytes - SUMMARY_PROMPT_RESERVE_BYTES);
+  const out: string[] = new Array(lines.length);
+  let protectedBytes = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!isProtectedUserLine(line)) continue;
+    let kept = line;
+    if (kept.length > SUMMARY_PROTECTED_USER_CHARS) {
+      kept = kept.slice(0, SUMMARY_PROTECTED_USER_CHARS) + "…[clipped]";
+    }
+    out[i] = kept;
+    protectedBytes += encoder.encode(kept).length + 1;
+  }
+  let remaining = effective - protectedBytes;
+  let omitted = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (out[i] !== undefined) continue; // 已保护的行不动
+    const line = lines[i];
+    const size = encoder.encode(line).length + 1;
+    if (remaining - size < 0) {
+      omitted += 1;
+      continue;
+    }
+    remaining -= size;
+    out[i] = line;
+  }
+  const keptLines = out.filter((l): l is string => l !== undefined);
+  if (omitted > 0) {
+    keptLines.unshift(`(已省略 ${omitted} 条较早消息)`);
+  }
+  return { lines: keptLines, omitted };
+}
+
 export function buildSummaryPrompt(
   previousSummary: string,
   context: readonly string[],
@@ -425,6 +489,17 @@ export interface CompactInput {
    * 与 `contextWindow` 是**或**关系：只给其一也行，两个都给则都要看。
    */
   budgetBytes?: number;
+  /**
+   * 摘要 prompt 本身的字节预算（0/缺省 = 不设限）。
+   *
+   * ★ 2026-10-24 加。给定了就对**拼进摘要请求的上下文**做行级装箱：
+   * 保护任务线程（非 harness 注入的 user 消息），从最旧的方向淘汰工具噪音。
+   * 起因是生产会话把任务压丢了：10.8 MB 会话的任务在最老的区域，摘要请求
+   * 超 1 MiB 后，装箱只保留**最新**的头部——任务恰好落在被省略的那段里，
+   * 摘要模型根本没见过它，重建出的 transcript 自然「只剩工具定义」。
+   * 新鲜摘要与增量 delta 两条路都走这个装箱。
+   */
+  summaryPromptBytes?: number;
   sessionId: string;
   config?: Partial<CompactionConfig>;
   /**
@@ -643,10 +718,14 @@ export async function compactIfNeeded(
   // 走增量时**不能**再拼 previousRecent：它落在 [0, covered) 里，已经由
   // previousSummary 代表，而它又必然出现在本轮重发的完整历史中。实测它占
   // head 的 31%，等于每轮白送三成摘要成本。
-  const context = trustedCovered >= 0
-    ? (delta.length > 0 ? [delta.join("\n\n")] : [])
-    : [previousRecent, selection.head.join("\n\n")].filter((p) => p !== "");
-  if (previousSummary === "" && context.length === 0) {
+  //
+  // ★ 2026-10-24：上下文按「行」（每条消息一个序列化串）组装而不是先 join——
+  // 装箱要以消息为粒度淘汰，join 成一整块就再也拆不开了。
+  const contextLines = trustedCovered >= 0 ? [...delta] : [
+    ...(previousRecent !== "" ? [previousRecent] : []),
+    ...selection.head,
+  ];
+  if (previousSummary === "" && contextLines.length === 0) {
     return {
       changed: false,
       note: "",
@@ -655,6 +734,11 @@ export async function compactIfNeeded(
       skipped: "no head content and no previous summary",
     };
   }
+  const packed = packSummaryContext(
+    contextLines,
+    input.summaryPromptBytes ?? 0,
+  );
+  const context = packed.lines.length > 0 ? [packed.lines.join("\n\n")] : [];
 
   // 增量起点已经越过尾部边界 = 上一轮的摘要仍然完全覆盖，本轮没有新内容可
   // 总结。直接复用，**一次摘要调用都不发**（成本 0，而不是再花几万 token 把
@@ -806,6 +890,9 @@ export async function compactIfNeeded(
  * 字段是上游校验 schema 用的，缺了会被 400。非字符串正文（多模态）无从下手，
  * 能整条放下就放下，否则返回 undefined 让调用方按“没留下”处理。
  */
+// 截断路径里受保护 user 消息的单条字节上限（clipToRoom 按字节裁）。
+const SUMMARY_PROTECTED_USER_BYTES = 4000;
+
 function clipToRoom(message: any, room: number): any | undefined {
   if (room <= 0) return undefined;
   const encoder = new TextEncoder();
@@ -816,6 +903,10 @@ function clipToRoom(message: any, room: number): any | undefined {
       return 0;
     }
   };
+  // 本来就装得下的消息**原样返回**：调用方（任务保护）会对每条受保护消息
+  // 都调这里，不设快速路径的话，一条完全装得下的消息也会被强加「[truncated]」
+  // 后缀——既篡改了没被截的正文，也骗人以为截过。
+  if (sizeOf(message) + 1 <= room) return message;
   if (typeof message.content !== "string") {
     return sizeOf(message) + 1 <= room ? message : undefined;
   }
@@ -885,6 +976,47 @@ export function fallbackTruncate(
     used += cost;
   }
   const keptIndex = new Set(kept.map((entry) => entry.index));
+  // ★ 2026-10-24：任务线程保护。
+  //
+  // 下面的装箱是「最新的先装」——48 步的 agent 会话里，任务（首条 user 消息）
+  // 比预算更老，照旧装箱必然被丢掉，模型收到的 transcript 就「只剩工具定义」，
+  // 每轮都在问「你要我干什么」（生产截图实测）。规则：
+  //   · 非 harness 注入的 user 消息按每条 4000 字节 clipping 后**优先保留**，
+  //     从最新往旧装（近期的指令比更早的细节重要）；
+  //   · **最老的那条** user 消息（= 原始任务）无条件兜底保护，预算不够就
+  //     用剩余空间硬截；
+  //   · `<system-reminder>` 开头的不算任务——那是 harness 每轮重新注入的
+  //     元数据（AGENTS.md、skills 列表），丢了不丢信息。
+  const isTaskCandidate = (message: any): boolean => {
+    if (!message || typeof message !== "object" || message.role !== "user") {
+      return false;
+    }
+    const text = typeof message.content === "string" ? message.content : "";
+    return !text.startsWith("<system-reminder");
+  };
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (keptIndex.has(i) || !isTaskCandidate(messages[i])) continue;
+    const clipped = clipToRoom(messages[i], SUMMARY_PROTECTED_USER_BYTES);
+    if (clipped === undefined) continue;
+    const cost = costOf(clipped);
+    if (used + cost > usable) continue;
+    kept.push({ index: i, message: clipped });
+    keptIndex.add(i);
+    used += cost;
+  }
+  // 原始任务兜底：最老的那条任务消息，用剩余空间硬截也要留下。
+  const firstTaskIndex = messages.findIndex((m) => isTaskCandidate(m));
+  if (firstTaskIndex >= 0 && !keptIndex.has(firstTaskIndex)) {
+    const room = usable - used - 1;
+    if (room >= 256) {
+      const clipped = clipToRoom(messages[firstTaskIndex], room);
+      if (clipped !== undefined) {
+        kept.push({ index: firstTaskIndex, message: clipped });
+        keptIndex.add(firstTaskIndex);
+        used += costOf(clipped);
+      }
+    }
+  }
   // 再从尾部往回装：最近的对话最该留在模型眼前。
   for (let i = messages.length - 1; i >= 0 && used < usable; i -= 1) {
     if (keptIndex.has(i)) continue;

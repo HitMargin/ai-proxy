@@ -838,12 +838,19 @@ Deno.test("a cnb transcript above the body budget is compacted", async () => {
 // 降级成截断 → 截断说明插到最前面，把带指纹的原 system 挤成第二条 → 撞上
 // 11128（旧自愈只削第一条）→ 会话永久卡死。装箱后摘要 prompt ≤ 预算，
 // 摘要能成功，会话才能收敛到增量更新路径。
-Deno.test("the summary prompt itself is packed under the upstream body limit", async () => {
+Deno.test("the summary prompt packs tool spam but keeps the task thread", async () => {
   resetCompactionStates();
-  const filler = "细".repeat(1200); // 每条都会被截到 600 字符
+  // ★ 2026-10-24 重写：装箱的判据不再是「prompt 够小」而是「任务必须活着」。
+  // 生产事故：任务在最老的区域，装箱只留最新的头部 → 摘要模型根本没见过任务
+  // → 重建出的 transcript「只剩工具定义」，模型每轮都在问「你要我干什么」。
+  // 现在上下文层装箱保护非 reminder 的 user 消息，只淘汰工具噪音。
+  const filler = "细".repeat(1200); // assistant 每条被截到 600 字符
+  const TASK =
+    "TASK：修复 Spectrum 渲染器的时序问题，pin 卸载后 Won_Update 必须等真实时间追平。";
   const messages: any[] = [{ role: "system", content: "sys" }];
+  messages.push({ role: "user", content: TASK });
   for (let i = 0; i < 1800; i++) {
-    messages.push({ role: "user", content: "HEAD-" + i + "：" + filler });
+    messages.push({ role: "assistant", content: "SPAM-" + i + "：" + filler });
   }
   messages.push({ role: "user", content: "最新一轮：只回答一个字：好" });
   const body: any = { model: "deepseek-v4.1-flash", max_tokens: 32, messages };
@@ -873,18 +880,20 @@ Deno.test("the summary prompt itself is packed under the upstream body limit", a
     "the summary prompt must stay under the packing budget, got " + promptBytes,
   );
   assert(
-    prompt.includes("(已省略)"),
-    "the packed-out head messages must be visible as omissions",
+    prompt.includes("TASK：修复 Spectrum"),
+    "the original task must survive the packing — it is the whole point",
   );
   assert(
-    !prompt.includes("HEAD-0："),
-    "the oldest head message must be the first thing dropped",
+    prompt.includes("已省略"),
+    "the omitted tool spam must be visible as an omission",
   );
-  // 装箱从最靠近尾部的那端往回保留：靠近 headSplit 的真实内容必须在 prompt 里，
-  // 不能全是占位——占位摘要等于把这段历史白丢。
   assert(
-    /HEAD-\d{3,4}：/.test(prompt),
-    "real head content must survive the packing, not only omissions",
+    !prompt.includes("SPAM-2："),
+    "the oldest tool spam must be the first thing dropped",
+  );
+  assert(
+    /SPAM-\d{3,4}：/.test(prompt),
+    "recent tool spam must survive the packing, not only omissions",
   );
   assert(
     body.messages.some((m: any) =>

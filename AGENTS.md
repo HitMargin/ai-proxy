@@ -82,10 +82,18 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   一条不管总条数——10.8 MB / ~1800 条的会话截完仍有 ~1.9 MB，摘要请求自己吃
   `413 [BODY_TOO_LARGE]` → 每轮都降级成截断 → 截断说明插最前 → 指纹成第二条 → 11128 死循环
   （日志形态：`[cnb-gate] large body 2028978B` 就是摘要请求本身 + `[compacted via truncation]`
-  每轮重复）。现在 `CNB_SUMMARY_PROMPT_BYTES`（默认 640 KiB）给摘要 prompt 装箱：从最靠近
-  split 的一端往回保留，装不下的更早条目换成 `(已省略)` 占位——**forSummary 数组长度与下标
-  不能动**（compactIfNeeded 按 tailSplit 切 head/tail、按 covered 指纹判增量，长度一变每轮
-  退化成全量重算）。压缩 note 本身**不**触发 11128（10-24 实测 `[context compaction] …`
+  每轮重复）。现在 `CNB_SUMMARY_PROMPT_BYTES`（默认 640 KiB）交给
+  `compactIfNeeded` 的 `summaryPromptBytes` 在**上下文层**装箱（新鲜摘要与增量
+  delta 两条路一次覆盖；第一版对 forSummary 装箱只覆盖前者，delta 超限照样 413）。
+  **★ 装箱必须保护任务线程（2026-10-24 深夜，用户截图「模型每轮都在问你要我
+  干什么」）**：任务几乎只在 user 消息里，而装箱「最新的先装」必然把最老的任务
+  区裁成省略占位——摘要模型根本没见过任务。规则：非 `<system-reminder` 的 user
+  消息受保护（摘要路径每条截 4000 字符、截断路径 clipToRoom 4000 字节；cnb 的
+  forSummary 对任务消息单条上限放宽到 2000 字符 = `CNB_COMPACTION_USER_MSG_CHARS`），
+  只淘汰工具噪音；`fallbackTruncate` 同样保护，且**最老的那条任务消息**用剩余
+  空间硬截也要留下。`clipToRoom` 必须**先查「本来就装得下」**——任务保护会对
+  每条受保护消息都调它，没有快速路径的话，装得下的消息也会被强加 `[truncated]`
+  后缀（篡改正文）。压缩 note 本身**不**触发 11128（10-24 实测 `[context compaction] …`
   开头 200），别再去改 note 文案。
 
   **★ 2026-10-24 深夜：第三条判据——harness 的 gitStatus 快照段整体被拦（与指纹两套规则）**。
