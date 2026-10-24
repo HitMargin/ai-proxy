@@ -1064,6 +1064,12 @@ export interface CnbRepairRoundInput {
   rawOut: string;
   /** 反馈正文（cnbJunkFeedback 的产物或 DEGENERATE_NOTE）。 */
   repairNote: string;
+  /**
+   * 修复轮的 max_tokens。**第一轮是 finish_reason:"length" 死的必须给更大的**：
+   * Write 大文件的调用被客户端小上限掐断时，同样的上限只会把第二轮掐在同一个
+   * 地方，重问一万次也一样（JSON 永远闭合不了）。
+   */
+  maxTokens?: number;
   /** 第二轮的增量要原样续流进同一个响应；非流式调用方传空操作。 */
   onDelta: (delta: Record<string, unknown>) => Promise<void>;
 }
@@ -1110,6 +1116,7 @@ export async function cnbRepairToolCallRound(
         { role: "user", content: input.repairNote },
       ],
       tools: input.tools,
+      ...(input.maxTokens ? { max_tokens: input.maxTokens } : {}),
     });
   } catch (e: unknown) {
     return fail(e instanceof Error ? e.message : String(e));
@@ -1189,6 +1196,25 @@ function joinParts(...parts: string[]): string {
 }
 
 /**
+ * 修复轮的 max_tokens：只有第一轮被 `finish_reason:"length"` 掐死时才放大。
+ * Write 大文件的调用死在小上限上是常见形态（生产取证：Write 的 content 还没
+ * 写完 `</tool_call>` 就没了），同样的上限重问只会死在同一个地方——翻倍（下限
+ * 8192、封顶 120000，与 cnbBuildUpstream 的兜底同源）。其余情况不传，沿用客户端
+ * 自己的上限。
+ */
+export function cnbRepairMaxTokens(
+  clientMax: unknown,
+  wasLengthCut: boolean,
+): number | undefined {
+  if (!wasLengthCut) return undefined;
+  const n = typeof clientMax === "number" && Number.isFinite(clientMax) &&
+      clientMax > 0
+    ? clientMax
+    : 120000;
+  return Math.min(120000, Math.max(8192, n * 2));
+}
+
+/**
  * 判定并执行代理内修复轮。`attempted === false` 表示**没有触发**修复
  * （第一轮已解析出调用，或根本没有工具意图）——调用方按原样继续。
  * 触发时返回第二轮的产出；`note !== ""` 表示两轮全哑，调用方要把 note
@@ -1202,6 +1228,7 @@ async function cnbMaybeRepairJunkTurn(
     messages: any[];
     model?: string;
     tools?: any[];
+    maxTokens?: number;
     onDelta: (delta: Record<string, unknown>) => Promise<void>;
   },
 ): Promise<{
@@ -2428,6 +2455,18 @@ export function cnbBuildUpstream(openaiBody: any) {
     // ─── assistant：保留 tool_calls，转成 XYML 文本 ───
     if (role === "assistant") {
       let body = c;
+      // ★ 历史 replay 里剔掉我们自己注入过的 [proxy] 工具语法反馈（2026-10-24）。
+      // 那些反馈在修复轮出现之前是拼在助手正文末尾发给客户端的，客户端原样
+      // 回放进历史——模型把「[proxy] 你的调用语法错了」当成自己的话接着写
+      // （AGENTS.md 实错②「写进 transcript 的文字会被模型学走」的持续形态）。
+      // 反馈现在只活在修复轮请求里；历史里残留的旧 note 在出站时剔掉，
+      // 从第一个已知前缀剥到消息末尾（note 恒在正文末尾）。
+      if (typeof body === "string" && body.includes("[proxy] ")) {
+        body = body.replace(
+          /\n?\n\[proxy\] (?:Your previous tool call used an invalid syntax|Still the same invalid tool syntax|A tool call was rejected)[\s\S]*$/,
+          "",
+        );
+      }
       if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
         // JSON 协议：历史回放与提示词同构，模型看自己的历史就是正确示范
         const blocks = m.tool_calls.map((tc: any) => {
@@ -3379,10 +3418,12 @@ async function handleCnbResponses(request: Request): Promise<Response> {
     );
     const textParts: string[] = [], thinkParts: string[] = [];
     let usage: any = null;
+    let upFinish: string | null = null;
     try {
       for await (const chunk of cnbIter(upstreamResp)) {
         for (const ch of chunk.choices || []) {
           const d = ch.delta || {};
+          if (ch.finish_reason) upFinish = ch.finish_reason;
           if (d.content) textParts.push(d.content);
           if (d.reasoning_content) thinkParts.push(d.reasoning_content);
         }
@@ -3392,25 +3433,57 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       return cnbErr(502, "Stream read error", e.message);
     }
 
-    const r1 = cnbParseToolCalls(thinkParts.join(""), chatBody.tools);
-    const r2 = cnbParseToolCalls(textParts.join(""), chatBody.tools);
-    const allCalls = [...r1.calls, ...r2.calls];
+    const fullThink = thinkParts.join("");
+    const fullText = textParts.join("");
+    const r1 = cnbParseToolCalls(fullThink, chatBody.tools, { notes: false });
+    const r2 = cnbParseToolCalls(fullText, chatBody.tools, { notes: false });
+    let allCalls = [...r1.calls, ...r2.calls];
+
+    // ★ 代理内修复轮（见 cnbMaybeRepairJunkTurn）。DSH desktop 走 responses，
+    // 2026-10-24 生产取证：反馈不接修复轮时坏语法仍是「当正文发出 → 回合结束」。
+    const repair = allCalls.length === 0
+      ? await cnbMaybeRepairJunkTurn(r1, r2, {
+        rawOut: [fullThink, fullText].filter((s) => s.trim() !== "")
+          .join("\n\n"),
+        messages: chatBody.messages,
+        model: chatBody.model,
+        tools: chatBody.tools,
+        maxTokens: cnbRepairMaxTokens(
+          chatBody.max_tokens,
+          upFinish === "length",
+        ),
+        onDelta: async () => {},
+      })
+      : {
+        attempted: false as const,
+        calls: [],
+        think: "",
+        text: "",
+        usage: null,
+        note: "",
+      };
+    if (repair.attempted) {
+      allCalls = repair.calls;
+      if (repair.usage) usage = sumCnbUsage(usage, repair.usage);
+    }
+    const thinkOut = joinParts(r1.clean, repair.think);
+    const textOut = joinParts(r2.clean, repair.text, repair.note);
 
     const output: any[] = [];
-    if (r1.clean) {
+    if (thinkOut) {
       output.push({
         type: "reasoning",
         id: "rs_" + rand(),
-        summary: [{ type: "summary_text", text: r1.clean }],
+        summary: [{ type: "summary_text", text: thinkOut }],
       });
     }
-    if (r2.clean) {
+    if (textOut) {
       output.push({
         type: "message",
         id: "msg_" + rand(),
         status: "completed",
         role: "assistant",
-        content: [{ type: "output_text", text: r2.clean, annotations: [] }],
+        content: [{ type: "output_text", text: textOut, annotations: [] }],
       });
     }
     for (const c of allCalls) {
@@ -3504,6 +3577,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       const msgId = "msg_" + rand();
       let usage: any = null;
       let msgOI = 0;
+      let upFinish: string | null = null;
 
       const textFilter = createLiveFilter();
       const thinkFilter = createLiveFilter();
@@ -3512,6 +3586,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       for await (const chunk of cnbIter(upstreamResp)) {
         for (const ch of chunk.choices || []) {
           const d = ch.delta || {};
+          if (ch.finish_reason) upFinish = ch.finish_reason;
           if (d.reasoning_content) {
             const out = thinkFilter.push(d.reasoning_content);
             if (out) {
@@ -3571,16 +3646,103 @@ async function handleCnbResponses(request: Request): Promise<Response> {
         if (chunk.usage) usage = chunk.usage;
       }
 
-      const r1 = cnbParseToolCalls(thinkFilter.state.full, chatBody.tools);
-      const r2 = cnbParseToolCalls(textFilter.state.full, chatBody.tools);
-      const allCalls = [...r1.calls, ...r2.calls];
+      const r1 = cnbParseToolCalls(thinkFilter.state.full, chatBody.tools, {
+        notes: false,
+      });
+      const r2 = cnbParseToolCalls(textFilter.state.full, chatBody.tools, {
+        notes: false,
+      });
+      let allCalls = [...r1.calls, ...r2.calls];
+
+      // ★ 代理内修复轮（与 chat 路径同一套编排，见 cnbMaybeRepairJunkTurn）。
+      // 2026-10-24 生产取证：DSH desktop 走的就是 /responses，修复轮第一版只接
+      // 了 chat 两条路径，坏语法反馈照旧「当正文发给客户端 → 回合结束」（用户
+      // 实测「还是中断」）。这里把反馈留给模型本身：对上游补问一次，第二轮的
+      // 正文/调用续在同一个 response 里。
+      const repair = allCalls.length === 0
+        ? await cnbMaybeRepairJunkTurn(r1, r2, {
+          rawOut: [thinkFilter.state.full, textFilter.state.full]
+            .filter((s) => s.trim() !== "").join("\n\n"),
+          messages: chatBody.messages,
+          model: chatBody.model,
+          tools: chatBody.tools,
+          maxTokens: cnbRepairMaxTokens(
+            chatBody.max_tokens,
+            upFinish === "length",
+          ),
+          onDelta: async (delta) => {
+            if (delta.reasoning_content) {
+              if (!thinkOpened) {
+                thinkOpened = true;
+                await writeEvent("response.output_item.added", {
+                  output_index: 0,
+                  item: { type: "reasoning", id: rsId, summary: [] },
+                });
+                await writeEvent("response.reasoning_summary_part.added", {
+                  item_id: rsId,
+                  output_index: 0,
+                  summary_index: 0,
+                  part: { type: "summary_text", text: "" },
+                });
+              }
+              await writeEvent("response.reasoning_summary_text.delta", {
+                item_id: rsId,
+                output_index: 0,
+                summary_index: 0,
+                delta: delta.reasoning_content,
+              });
+            }
+            if (delta.content) {
+              if (!textOpened) {
+                textOpened = true;
+                msgOI = thinkOpened ? 1 : 0;
+                await writeEvent("response.output_item.added", {
+                  output_index: msgOI,
+                  item: {
+                    type: "message",
+                    id: msgId,
+                    status: "in_progress",
+                    role: "assistant",
+                    content: [],
+                  },
+                });
+                await writeEvent("response.content_part.added", {
+                  item_id: msgId,
+                  output_index: msgOI,
+                  content_index: 0,
+                  part: { type: "output_text", text: "", annotations: [] },
+                });
+              }
+              await writeEvent("response.output_text.delta", {
+                item_id: msgId,
+                output_index: msgOI,
+                content_index: 0,
+                delta: delta.content,
+              });
+            }
+          },
+        })
+        : {
+          attempted: false as const,
+          calls: [],
+          think: "",
+          text: "",
+          usage: null,
+          note: "",
+        };
+      if (repair.attempted) {
+        if (repair.calls.length) allCalls = repair.calls;
+        if (repair.usage) usage = sumCnbUsage(usage, repair.usage);
+      }
+      const thinkFull = joinParts(r1.clean, repair.think);
+      const textFull = joinParts(r2.clean, repair.text, repair.note);
 
       const finalOutput: any[] = [];
       let oi = 0;
 
       if (thinkOpened || r1.clean) {
-        const rem = r1.clean.slice(
-          commonPrefixLen(r1.clean, thinkFilter.state.emitted),
+        const rem = thinkFull.slice(
+          commonPrefixLen(thinkFull, thinkFilter.state.emitted),
         );
         if (rem) {
           await writeEvent("response.reasoning_summary_text.delta", {
@@ -3590,7 +3752,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
             delta: rem,
           });
         }
-        const think = r1.clean;
+        const think = thinkFull;
         await writeEvent("response.reasoning_summary_text.done", {
           item_id: rsId,
           output_index: 0,
@@ -3617,8 +3779,8 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       }
 
       if (textOpened || r2.clean) {
-        const rem = r2.clean.slice(
-          commonPrefixLen(r2.clean, textFilter.state.emitted),
+        const rem = textFull.slice(
+          commonPrefixLen(textFull, textFilter.state.emitted),
         );
         if (rem) {
           await writeEvent("response.output_text.delta", {
@@ -3628,7 +3790,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
             delta: rem,
           });
         }
-        const text = r2.clean;
+        const text = textFull;
         await writeEvent("response.output_text.done", {
           item_id: msgId,
           output_index: msgOI,

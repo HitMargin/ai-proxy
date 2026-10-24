@@ -1745,8 +1745,21 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   remainders——流式路径下第二轮正文早已实时发出，remainders 恒为空，按
   remainders 判断会把「已经说过了」误判成「什么都没说」再补一条 note；
   ③修复轮的基底用**清理后**的文本，raw fullText 里的坏标签不该随内容发给客户端
-  （非流式路径旧代码在零调用时原样发 raw）。Responses/messages 两条路径暂未接
-  修复轮（仍是旧行为）——harness 走的都是 chat completions。
+  （非流式路径旧代码在零调用时原样发 raw）。
+  **★ 2026-10-24 深夜补：四条路径都要接，漏一条就等于没接。** 第一版只接了
+  chat completions 两条，于是用户报「还是中断」——`grep -c "tool-call repair: re-asking"
+  $TEMP/ai-proxy.log` = **0**，因为 **DSH desktop 的 cnb 声明的是
+  `api: openai-responses`，走的是 `/responses`**（AGENTS.md 上面那条已记过这件事）。
+  现在 responses 流式/非流式各接一套（`onDelta` 映射成 `response.output_text.delta`
+  等事件，非流式传空操作），判据：**报「修了没用」时第一件事是 grep 修复轮日志
+  有没有出现，没有就是路径没接**，别去怀疑机制本身。
+  另两条同场补的：④**length 掐死的修复轮必须放大 `max_tokens`**
+  （`cnbRepairMaxTokens`：仅 `finish_reason:"length"` 时翻倍、下限 8192、封顶 120000）
+  ——Write 大文件的调用死在小上限上是常见形态（junk 日志实测：content 写到一半
+  `</tool_call>` 就没了），同样的上限重问只会死在同一个地方。⑤**历史 replay 剥掉
+  我们自己注入过的 `[proxy] …` 反馈**（`cnbBuildUpstream` 的 assistant 分支，从
+  第一个已知前缀剥到消息末尾）——修复轮出现之前的反馈是拼在助手正文里发给
+  客户端的，客户端回放进历史后模型把它当成自己的话接着写（实错②的持续形态）。
 
 - **cnb Windows 路径双保险：转义修复 + 控制字符还原（2026-10-24，用户实测
   `ProjectSettings\ProjectSettings.asset` 打死整个调用）**：模型把 Windows 路径的

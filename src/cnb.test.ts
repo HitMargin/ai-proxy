@@ -28,6 +28,7 @@ import {
   cnbParseToolCalls,
   cnbPreNeutraliseHead,
   cnbRememberRejectedHead,
+  cnbRepairMaxTokens,
   cnbStripGitStatus,
   deriveSessionKey,
   handleCnb,
@@ -3032,7 +3033,7 @@ const JUNK_OUT = "让我看看。" + "\n" + OPEN + "\n" +
 const GOOD_OUT = OPEN + "\n" +
   '{"name":"pwsh","arguments":{"command":"ls"}}' + "\n" + CLOSE;
 
-function sseChat(content: string): Response {
+function sseChat(content: string, finish = "stop"): Response {
   return new Response(
     "data: " +
       JSON.stringify({
@@ -3040,7 +3041,26 @@ function sseChat(content: string): Response {
       }) + "\n\n" +
       "data: " +
       JSON.stringify({
-        choices: [{ delta: {}, finish_reason: "stop" }],
+        choices: [{ delta: {}, finish_reason: finish }],
+      }) + "\n\n" +
+      "data: [DONE]\n\n",
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+}
+
+function sseChatThink(think: string, content = "", finish = "stop"): Response {
+  return new Response(
+    "data: " +
+      JSON.stringify({
+        choices: [{ delta: { reasoning_content: think }, finish_reason: null }],
+      }) + "\n\n" +
+      "data: " +
+      JSON.stringify({
+        choices: [{ delta: { content }, finish_reason: null }],
+      }) + "\n\n" +
+      "data: " +
+      JSON.stringify({
+        choices: [{ delta: {}, finish_reason: finish }],
       }) + "\n\n" +
       "data: [DONE]\n\n",
     { status: 200, headers: { "content-type": "text/event-stream" } },
@@ -3525,4 +3545,156 @@ Deno.test("a legal-escape path (C:\\Users\\file) survives the value-level repair
   );
   cnbEscapeRepairState.n = 0;
   resetJunkStreak();
+});
+
+// ─── /responses 也必须接修复轮（2026-10-24，用户「还是中断」的真相）───
+//
+// 生产取证：`grep -c "tool-call repair: re-asking"` = **0**。DSH desktop 的
+// cnb 声明的是 `api: openai-responses`，走的是 /responses；而修复轮第一版
+// 只接在 chat completions 两条路径上，responses 明确留了旧行为（把反馈当正文
+// 发出去 → 回合结束）。用户看到的「还是中断」就是这条旧路径。
+Deno.test("cnb: /responses repairs an unparseable call in-proxy (streaming)", async () => {
+  resetJunkStreak();
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    (call) => call === 1 ? sseChat(JUNK_OUT) : sseChat(GOOD_OUT),
+  );
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        input: [{ role: "user", content: "看看 x.ts" }],
+        tools: TOOLS,
+        max_output_tokens: 64,
+        stream: true,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/responses",
+      req,
+      new URL("http://cnb.local/cnb/v1/responses"),
+    );
+    assertEquals(resp.status, 200);
+    const text = await resp.text();
+    assertEquals(bodies.length, 2, "the proxy must re-ask upstream once");
+    const repair = JSON.parse(bodies[1]);
+    assert(
+      repair.messages.some((m: any) =>
+        m.role === "assistant" && String(m.content).includes(OPEN)
+      ),
+      "the repair request must carry the model's own raw output",
+    );
+    assert(
+      text.includes('"function_call"'),
+      "the repaired call must reach the client as a function_call item",
+    );
+    assert(
+      !text.includes("[proxy]"),
+      "the feedback note must never reach the client",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    resetJunkStreak();
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
+Deno.test("cnb: /responses repairs an unparseable call in-proxy (non-streaming)", async () => {
+  resetJunkStreak();
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    (call) => call === 1 ? sseChat(JUNK_OUT) : sseChat(GOOD_OUT),
+  );
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        input: [{ role: "user", content: "看看 x.ts" }],
+        tools: TOOLS,
+        max_output_tokens: 64,
+        stream: false,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/responses",
+      req,
+      new URL("http://cnb.local/cnb/v1/responses"),
+    );
+    assertEquals(resp.status, 200);
+    const out = await resp.json();
+    assertEquals(bodies.length, 2);
+    const calls = (out.output ?? []).filter((o: any) =>
+      o.type === "function_call"
+    );
+    assertEquals(calls.length, 1, "the repaired call must be in output");
+    assertEquals(calls[0].name, "pwsh");
+    const textItems = (out.output ?? []).filter((o: any) =>
+      o.type === "message"
+    );
+    const text = textItems.map((i: any) =>
+      (i.content ?? []).map((c: any) => c.text ?? "").join("")
+    ).join("");
+    assert(
+      !text.includes("[proxy]"),
+      "the note must not ride along with a repaired response",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    resetJunkStreak();
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
+// ─── 历史 replay 剥掉我们自己的 [proxy] 反馈（防复读）───
+//
+// 修复轮出现之前，反馈是拼在助手正文末尾发给客户端的；客户端把它回放进历史，
+// 模型于是把它当成自己的话接着写（AGENTS.md 实错②的持续形态）。出站时要剥掉。
+Deno.test("cnb: a replayed assistant message loses an injected [proxy] note", () => {
+  const built = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    messages: [
+      { role: "user", content: "看看 x.ts" },
+      {
+        role: "assistant",
+        content: "我先看看。\n\n" +
+          "[proxy] Your previous tool call used an invalid syntax that no " +
+          "client can parse, so it was NOT executed. Do NOT stop.",
+      },
+      { role: "user", content: "继续" },
+    ],
+    tools: TOOLS,
+  });
+  const asst = built.upstream.messages.find((m: any) => m.role === "assistant");
+  assert(asst, "the assistant message must survive");
+  assert(
+    !String(asst.content).includes("[proxy]"),
+    "the injected note must be stripped from replayed history: " +
+      String(asst.content),
+  );
+  assert(
+    String(asst.content).includes("我先看看。"),
+    "the model's own words must survive the strip",
+  );
+});
+
+Deno.test("cnb: repair max tokens only grows on a length cut", () => {
+  assertEquals(cnbRepairMaxTokens(120000, false), undefined);
+  assertEquals(cnbRepairMaxTokens(64, true), 8192);
+  assertEquals(cnbRepairMaxTokens(50000, true), 100000);
+  assertEquals(cnbRepairMaxTokens(100000, true), 120000);
+  assertEquals(cnbRepairMaxTokens(undefined, true), 120000);
 });
