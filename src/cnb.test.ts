@@ -3698,3 +3698,82 @@ Deno.test("cnb: repair max tokens only grows on a length cut", () => {
   assertEquals(cnbRepairMaxTokens(100000, true), 120000);
   assertEquals(cnbRepairMaxTokens(undefined, true), 120000);
 });
+
+// ─── /messages（Anthropic）也要吃到修复轮——靠自转发继承，必须端到端验证 ───
+//
+// handleCnbMessages 把请求转成 chat 形状后**调 handleCnb("/cnb/v1/chat/completions")**，
+// 修复轮在 chat 处理器里触发，Anthropic 转换层只负责把 OpenAI SSE 翻成 Anthropic
+// 事件流。风险点在**时序**：修复轮的 tool_calls 是在流末尾追加的普通 OpenAI
+// chunk，openAiStreamToAnthropic 若只认「先 tool_calls 后文本」或对迟到块处理有
+// 假设，tool_use 就到不了 Claude 形态的客户端——这条不测就等于没验证。
+Deno.test("cnb: an Anthropic Messages stream carries the repaired tool_use", async () => {
+  resetJunkStreak();
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    (call) => call === 1 ? sseChat(JUNK_OUT) : sseChat(GOOD_OUT),
+  );
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "test",
+      },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "看看 x.ts" }],
+        tools: [{
+          name: "pwsh",
+          description: "Run a command",
+          input_schema: {
+            type: "object",
+            properties: {
+              command: { type: "string" },
+              description: { type: "string" },
+            },
+            required: ["command"],
+          },
+        }],
+        stream: true,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/messages",
+      req,
+      new URL("http://cnb.local/cnb/v1/messages"),
+    );
+    assertEquals(resp.status, 200);
+    const text = await resp.text();
+    assertEquals(
+      bodies.length,
+      2,
+      "the repair round must fire via self-forward",
+    );
+    assert(
+      text.includes('"tool_use"'),
+      "the repaired call must arrive as an Anthropic tool_use block",
+    );
+    assert(
+      text.includes('"pwsh"'),
+      "the tool name must survive the conversion",
+    );
+    assert(
+      text.includes('"stop_reason":"tool_use"'),
+      "the stream must end with stop_reason tool_use",
+    );
+    assert(
+      !text.includes("[proxy]"),
+      "the feedback note must never reach the Anthropic client",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    resetJunkStreak();
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
