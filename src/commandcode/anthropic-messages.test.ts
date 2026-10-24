@@ -1,5 +1,6 @@
 import {
   anthropicMessagesToChat,
+  anthropicUsage,
   chatResponseToAnthropic,
   openAiStreamToAnthropic,
 } from "./anthropic-messages.ts";
@@ -240,4 +241,90 @@ Deno.test("OpenAI SSE converts to Anthropic Messages SSE", async () => {
     "tool stop reason was lost",
   );
   assert(text.includes("event: message_stop"), "missing message_stop");
+});
+
+// ─── usage 缓存映射（2026-10-24，cnb /messages「未缓存输入 0 / 缓存读取 0」）───
+//
+// 生产实测（cnb 流式尾帧原样）：上游把三种缓存形状**同时**报齐——
+// prompt_tokens_details.cached_tokens（OpenAI）、prompt_cache_hit_tokens
+// （DeepSeek）、cache_read_input_tokens / cache_creation_input_tokens（Anthropic
+// 原生）——旧转换层一个都不读，Claude 形态客户端的缓存记账恒为 0。
+Deno.test("anthropicUsage maps the real cnb tail frame, zeros stay absent", () => {
+  // 真实帧：全零缓存 → 输入=35（=miss），缓存键整个不出现（没说话≠断言没有）
+  const out = anthropicUsage({
+    prompt_tokens: 35,
+    completion_tokens: 16,
+    total_tokens: 51,
+    completion_tokens_details: { reasoning_tokens: 14 },
+    prompt_tokens_details: { reasoning_tokens: 0, cached_tokens: 0 },
+    prompt_cache_hit_tokens: 0,
+    prompt_cache_miss_tokens: 35,
+    cache_read_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    prompt_cache_write_tokens: 0,
+    cached_tokens: 0,
+  });
+  equal(out, { input_tokens: 35, output_tokens: 16 });
+});
+
+Deno.test("anthropicUsage prefers whichever cache dialect reports hits", () => {
+  // OpenAI 方言：cached_tokens 在 prompt_tokens_details 里
+  equal(
+    anthropicUsage({
+      prompt_tokens: 1000,
+      completion_tokens: 5,
+      prompt_tokens_details: { cached_tokens: 800 },
+    }),
+    { input_tokens: 200, output_tokens: 5, cache_read_input_tokens: 800 },
+  );
+  // DeepSeek 方言：hit + write
+  equal(
+    anthropicUsage({
+      prompt_tokens: 1000,
+      completion_tokens: 5,
+      prompt_cache_hit_tokens: 700,
+      prompt_cache_write_tokens: 100,
+    }),
+    {
+      input_tokens: 200,
+      output_tokens: 5,
+      cache_read_input_tokens: 700,
+      cache_creation_input_tokens: 100,
+    },
+  );
+  // Anthropic 原生方言（cnb 已直接给）
+  equal(
+    anthropicUsage({
+      prompt_tokens: 1000,
+      completion_tokens: 5,
+      cache_read_input_tokens: 900,
+    }),
+    { input_tokens: 100, output_tokens: 5, cache_read_input_tokens: 900 },
+  );
+  // 上游没报 usage：协议事实的 0，不造缓存字段
+  equal(anthropicUsage(undefined), { input_tokens: 0, output_tokens: 0 });
+});
+
+Deno.test("the final message_delta carries input and cache usage, not just output", async () => {
+  const upstream = new Response(
+    [
+      'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":4,"prompt_cache_hit_tokens":800,"prompt_cache_write_tokens":100}}\n\n',
+      "data: [DONE]\n\n",
+    ].join(""),
+    { status: 200 },
+  );
+  const response = openAiStreamToAnthropic(upstream, "deepseek/test");
+  const text = await response.text();
+  const deltaLine = text.split("\n").find((l) =>
+    l.startsWith("data: ") && l.includes('"message_delta"')
+  );
+  assert(deltaLine, "missing message_delta");
+  const usage = JSON.parse(deltaLine.slice(6)).usage;
+  equal(usage, {
+    input_tokens: 100,
+    output_tokens: 4,
+    cache_read_input_tokens: 800,
+    cache_creation_input_tokens: 100,
+  });
 });

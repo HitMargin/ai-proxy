@@ -346,11 +346,51 @@ export function chatResponseToAnthropic(
     content,
     stop_reason: stopReason(choice.finish_reason),
     stop_sequence: null,
-    usage: {
-      input_tokens: Number(usage.prompt_tokens ?? 0),
-      output_tokens: Number(usage.completion_tokens ?? 0),
-    },
+    usage: anthropicUsage(usage),
   };
+}
+
+/**
+ * OpenAI 系 usage → Anthropic usage。
+ *
+ * ★ 2026-10-24 修（cnb /messages「未缓存输入 0 / 缓存读取 0 全都是 0」）：
+ * 上游实测把**三种缓存形状同时报齐**——`prompt_tokens_details.cached_tokens`
+ * （OpenAI）、`prompt_cache_hit_tokens`（DeepSeek）、Anthropic 原生的
+ * `cache_read_input_tokens` / `cache_creation_input_tokens`——旧代码一个都没读，
+ * message_start 写死 0、message_delta 只映射 completion_tokens，Claude 形态
+ * 客户端的缓存记账永远是 0（同型病：插件侧「缓存 token 被整个丢掉」2026-10-02
+ * 已修过一次，这是换了个入口复发）。
+ *
+ * 语义注意：Anthropic 的 `input_tokens` 是**未缓存**输入，不含 cache 读写；
+ * 而 OpenAI 系 `prompt_tokens` 是全量（实测 cnb：prompt_tokens = hit + miss）。
+ * 所以 input = prompt − read − write，clamp 到 0。缓存字段**只在 >0 时输出**——
+ * 上游没报缓存是「没说话」，填 0 是「断言没有缓存」。
+ */
+export function anthropicUsage(
+  u: Record<string, unknown> | undefined,
+): Record<string, number> {
+  const num = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) ? v : 0;
+  const nested = isRecord(u?.prompt_tokens_details)
+    ? u.prompt_tokens_details
+    : {};
+  const prompt = num(u?.prompt_tokens);
+  const cacheRead = Math.max(
+    num(u?.cache_read_input_tokens),
+    num(u?.prompt_cache_hit_tokens),
+    num(nested.cached_tokens),
+  );
+  const cacheWrite = Math.max(
+    num(u?.cache_creation_input_tokens),
+    num(u?.prompt_cache_write_tokens),
+  );
+  const out: Record<string, number> = {
+    input_tokens: Math.max(0, prompt - cacheRead - cacheWrite),
+    output_tokens: num(u?.completion_tokens),
+  };
+  if (cacheRead > 0) out.cache_read_input_tokens = cacheRead;
+  if (cacheWrite > 0) out.cache_creation_input_tokens = cacheWrite;
+  return out;
 }
 
 function sseEvent(type: string, data: unknown): Uint8Array {
@@ -379,7 +419,11 @@ export function openAiStreamToAnthropic(
       const toolIndices = new Map<number, number>();
       const blocks: StreamBlock[] = [];
       let stop = "end_turn";
-      let outputTokens = 0;
+      // ★ 完整 usage 快照（不只是 completion_tokens）：input/cache 要在最终
+      // message_delta 里带给客户端——Anthropic SDK 会把 delta 的 usage 合并进
+      // message 对象，Claude 形态客户端从那里读缓存记账。message_start 时上游
+      // 还没报 usage（OpenAI 系在尾帧才给），那里保持 0 是协议事实不是丢失。
+      let lastUsage: Record<string, unknown> | undefined;
       const emit = (type: string, data: unknown) => {
         if (!cancelled) controller.enqueue(sseEvent(type, data));
       };
@@ -503,7 +547,7 @@ export function openAiStreamToAnthropic(
           stop = stopReason(choice.finish_reason);
         }
         if (isRecord(chunk.usage)) {
-          outputTokens = Number(chunk.usage.completion_tokens ?? outputTokens);
+          lastUsage = chunk.usage;
         }
       };
       try {
@@ -531,7 +575,9 @@ export function openAiStreamToAnthropic(
         emit("message_delta", {
           type: "message_delta",
           delta: { stop_reason: stop, stop_sequence: null },
-          usage: { output_tokens: outputTokens },
+          // 全量 usage（input + cache）：SDK 用 delta 的 usage 覆盖合并，
+          // 只发 output_tokens 的话缓存/输入记账就永远是 0。
+          usage: anthropicUsage(lastUsage),
         });
         emit("message_stop", { type: "message_stop" });
       } catch (error) {

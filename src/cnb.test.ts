@@ -3048,6 +3048,26 @@ function sseChat(content: string, finish = "stop"): Response {
   );
 }
 
+// 与生产 cnb 尾帧同形：usage（含三种缓存方言）挂在 finish 帧上
+function sseChatUsage(
+  content: string,
+  usage: Record<string, unknown>,
+): Response {
+  return new Response(
+    "data: " +
+      JSON.stringify({
+        choices: [{ delta: { content }, finish_reason: null }],
+      }) + "\n\n" +
+      "data: " +
+      JSON.stringify({
+        choices: [{ delta: {}, finish_reason: "stop" }],
+        usage,
+      }) + "\n\n" +
+      "data: [DONE]\n\n",
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
+}
+
 function sseChatThink(think: string, content = "", finish = "stop"): Response {
   return new Response(
     "data: " +
@@ -3773,6 +3793,68 @@ Deno.test("cnb: an Anthropic Messages stream carries the repaired tool_use", asy
   } finally {
     globalThis.fetch = realFetch;
     resetJunkStreak();
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
+// ─── /messages 的 usage 记账（2026-10-24，用户实测「未缓存输入 0 / 缓存读取 0 全都是 0」）───
+//
+// 生产实测 cnb 尾帧把三种缓存方言报齐（OpenAI cached_tokens / DeepSeek hit /
+// Anthropic 原生 cache_read_input_tokens），旧转换层只映射 completion_tokens，
+// message_start 写死 0——Claude 形态客户端的缓存与输入记账恒为 0。
+Deno.test("cnb: an Anthropic Messages stream reports input and cache usage", async () => {
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = stubCnbUpstream([], () =>
+    sseChatUsage("好的。", {
+      prompt_tokens: 12000,
+      completion_tokens: 64,
+      total_tokens: 12064,
+      prompt_tokens_details: { cached_tokens: 0, reasoning_tokens: 0 },
+      prompt_cache_hit_tokens: 10000,
+      prompt_cache_miss_tokens: 2000,
+      cache_read_input_tokens: 10000,
+      cache_creation_input_tokens: 0,
+      prompt_cache_write_tokens: 0,
+    }));
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "test" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        max_tokens: 64,
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/messages",
+      req,
+      new URL("http://cnb.local/cnb/v1/messages"),
+    );
+    assertEquals(resp.status, 200);
+    const text = await resp.text();
+    const deltaLine = text.split("\n").find((l) =>
+      l.startsWith("data: ") && l.includes('"message_delta"')
+    );
+    assert(deltaLine, "missing message_delta");
+    const usage = JSON.parse(deltaLine.slice(6)).usage;
+    assertEquals(usage.input_tokens, 2000, "uncached input must be reported");
+    assertEquals(usage.output_tokens, 64, "output must be reported");
+    assertEquals(
+      usage.cache_read_input_tokens,
+      10000,
+      "cache read must be reported (this was the user-visible zero)",
+    );
+    assert(
+      !("cache_creation_input_tokens" in usage),
+      "a zero cache write must stay absent, not asserted as 0",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
     if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
     else Deno.env.set("CNB_COMPACTION", prev);
   }

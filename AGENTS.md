@@ -1723,6 +1723,25 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   `src/cnb.test.ts` 25 个用例，用内存假件测（`deno task test` 只开
   `--allow-env`），计时与文件 IO 都注入。
 
+- **cnb /messages 的 usage 记账：三种缓存方言一个不读就是全 0（2026-10-24 修，
+  用户实测「未缓存输入 0 / 缓存读取 0 全都是 0」）**：`openAiStreamToAnthropic`
+  的 `message_start` 把 usage **写死成 0**、`message_delta` 只映射
+  `completion_tokens`——而生产实测 cnb 尾帧把**三种缓存形状同时报齐**
+  （`prompt_tokens_details.cached_tokens` OpenAI / `prompt_cache_hit_tokens`
+  DeepSeek / `cache_read_input_tokens`+`cache_creation_input_tokens` Anthropic
+  原生），一个没读，Claude 形态客户端（Claude Code 等）的输入与缓存记账恒为 0。
+  这是插件侧「缓存 token 被整个丢掉」（2026-10-02）的**换入口复发**——同一个病，
+  那次在插件层、这次在 Anthropic 转换层。修复：`anthropicUsage()`（共享转换层
+  `src/commandcode/anthropic-messages.ts`，commandcode 一并受益）读全三种方言、
+  取各最大值，`input_tokens` = prompt − read − write（**Anthropic 的 input 不含
+  缓存**，而 OpenAI 系 prompt_tokens 是全量：实测 cnb prompt = hit + miss），
+  全量 usage 放进最终 `message_delta`（Anthropic SDK 会把 delta 的 usage 合并进
+  message；`message_start` 时上游还没报 usage——OpenAI 系在尾帧才给——那里保持 0
+  是协议事实不是丢失）。**缓存字段只在 >0 时输出**：上游没报缓存是「没说话」，
+  填 0 是「断言没有缓存」（与插件层同一条纪律）。判据：**报「全都是 0」时先打一发
+  真实请求看尾帧 usage 原样**——上游报了而客户端显示 0，就是中间某层没读，按层
+  grep 映射代码；上游没报才是如实 0。
+
 - **cnb 代理内修复轮：坏语法的反馈必须「当场给模型」，不是「事后写给用户」（2026-10-24 修）**。
   上面 ①的反馈修好之后仍然治不了「**不会重试，直接就停止**」（用户 10-24 原话）：
   那段 `[proxy] Your previous tool call used an invalid syntax…` 是拼在**助手正文**后面
@@ -1752,7 +1771,10 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   `api: openai-responses`，走的是 `/responses`**（AGENTS.md 上面那条已记过这件事）。
   现在 responses 流式/非流式各接一套（`onDelta` 映射成 `response.output_text.delta`
   等事件，非流式传空操作），判据：**报「修了没用」时第一件事是 grep 修复轮日志
-  有没有出现，没有就是路径没接**，别去怀疑机制本身。
+  有没有出现，没有就是路径没接**，别去怀疑机制本身。`/messages`（Anthropic）靠
+  **自转发**继承修复轮（`handleCnbMessages` 转成 chat 后调 `handleCnb`），有端到端
+  用例钉着时序（修复轮的 tool_calls 是流末尾的迟到块，`openAiStreamToAnthropic`
+  必须把迟到块翻成 `tool_use` + `stop_reason:"tool_use"`）。
   另两条同场补的：④**length 掐死的修复轮必须放大 `max_tokens`**
   （`cnbRepairMaxTokens`：仅 `finish_reason:"length"` 时翻倍、下限 8192、封顶 120000）
   ——Write 大文件的调用死在小上限上是常见形态（junk 日志实测：content 写到一半
