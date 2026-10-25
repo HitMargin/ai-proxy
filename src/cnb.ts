@@ -18,6 +18,11 @@ import {
   readInspectedText,
   replayResponse,
 } from "./runtime/stream-normalizer.ts";
+import {
+  flattenMainBranchParen,
+  neutraliseChannelMarkers,
+  stripGitStatus,
+} from "./channel-neutralise.ts";
 
 // ============================================
 // cnb.cool 集成模块
@@ -574,110 +579,17 @@ function normalizeDsml(text: string) {
     .replace(DSML_CALLS_CLOSE, "</|XYML|tool_calls>");
 }
 
-// ★ 2026-10-24：harness（ZCode/DSH）注入的 `gitStatus:` 快照段会触发渠道校验
-// 11128 —— 与身份指纹**两套判据**：身份指纹锚定消息开头；gitStatus 块放在消息
-// 中部照样拦（实测），且句子/单个字段/标题词单独发都不触发（N8/P1-Q6 全 200），
-// 是「块的整体形状」被匹配——只改样板句保留字段仍 400，整块换成一行 stub 200。
-// 这块内容自称「对话开始那一刻的快照、永不更新」，对模型价值本来就低；整块换成
-// 一行 stub（stub 含 gitStatus: 字样实测安全）。锚定 harness 的原文样板，避免
-// 误伤用户自己写的 "gitStatus:" 文本。
-const CNB_GITSTATUS_ANCHOR =
-  "gitStatus: This is the git status at the start of the conversation.";
-const CNB_GITSTATUS_STUB = "gitStatus: (snapshot omitted by proxy)";
-
-// ★ 2026-10-25：找到了**最小触发串**，整块剥离因此有了一个必然后备。
+// ★ 2026-10-24 起：harness（ZCode/DSH）注入的 gitStatus 快照段、`Main branch`
+// 那行的括号说明、以及品牌词组合都会触发上游渠道校验 11128。清洗规则已提取到
+// `src/channel-neutralise.ts` —— 2026-10-25 实测确认 **workbuddy 上游的 11128
+// 触发串与 cnb 完全相同**（同一个身份句、同一行括号说明，改写成 DSH 简称后
+// 两边都变 200），所以判据写一处、两个渠道共用，避免两份实现漂开。
 //
-// 昨天（10-24）的定论是「整块形状被匹配」，依据是「句子/单个字段/标题词单独发
-// 都不触发」。今天用单变量二分打穿了这条：把完整真实块依次剥掉一个特征，
-// **只有剥掉 `Main branch` 那行的括号说明才变 200**，其余（去掉第二句 / 去掉
-// Git user / 去掉 Status / 去掉 Recent commits / 去掉 Current branch / 字段间
-// 不留空行 / 去掉 `gitStatus: ` 前缀）全部仍然 400：
-//
-//   | 请求（直连 cnb.cool，system 消息）                    | 结果      |
-//   | ---                                                  | ---       |
-//   | 完整真实 gitStatus 块                                 | 400/11128 |
-//   | 同上，只把括号说明去掉（`Main branch: master`）        | **200**   |
-//   | 只有一行 `Main branch (you will usually use this for PRs): master` | 400/11128 |
-//   | 同上，去掉 `Main branch` → 只留括号短语               | 200       |
-//   | 同上，`Main branch` 换成 `Note:`（组合不成立）         | 200       |
-//   | 该行放在正文中部（前面还有别的文字）                   | 400/11128 |
-//   | 该行放在 `user` 消息里                                | 200       |
-//   | 该行放在 `assistant` 历史里                           | 400/11128 |
-//
-// 反复 3 次全部命中（3/3 → 改写后 0/3），不是偶发。所以判据是
-// **`Main branch` + `(you will usually use this for PRs)` 这一行的组合**
-// ——正好是 `git status --porcelain=v2 --branch` 之后 harness 自己加的那句说明，
-// 也就是「它的 git 上下文注入器」这个身份特征。
-//
-// 为什么必须同时做「改写」而不只剥块：整块剥离锚定的是原文样板，**锚点不在
-// 就整段漏剥**。实测「锚点不在、括号还在」→ 400（S4a/M10），而这时代理会把
-// 400 原样透传给用户。改写这一行不依赖锚点，实测「锚点不在 + 已改写」→ 200。
-// 两次剥离都保留：块本来就没有信息价值（自称永不更新的快照），能整块剥掉最好
-// （省 token，且顺带消掉其它未知触发面）；改写是兜底网，专门对付「锚点漂了/
-// 被截断/换了措辞」的形态。
-const CNB_GITSTATUS_MAINBRANCH_PAREN =
-  /(Main branch) \(you will usually use this for PRs\)/g;
-const CNB_GITSTATUS_MAINBRANCH_FLAT = "$1";
-
-// ★ 2026-10-24（同日第二次）：DSH 桌面会话（"You are an AI agent powered by
-// DeepSeek Harness."）削头自愈后**仍然** 11128。真实 body 二分定位：触发的是
-// 「DeepSeek Harness + GUI 指代样板」的**组合**——
-//   · "DeepSeek Harness Web GUI whose URL..." 一句单独 → 200
-//   · 加上下一句 "When the user refers to \"this page\", \"this GUI\"..." → 400
-//   · 同一段把 "DeepSeek Harness" 换成 "DSH" → 200（其余一字不动）
-// 匹配窗口跨约 200 字符、与位置无关，是内容级模式匹配而不是开头锚定。
-// 修复：出站把品牌词统一改写成提示词里本来就在用的简称 "DSH"——语义零损失，
-// 且比「认指纹再删句」稳：不管组合窗口落在哪一段，品牌词没了模式就凑不齐。
-// 单独的头部身份句（"You are an AI agent powered by …"）仍由 cnbNeutraliseHead
-// 兜底（改名后是否被拦由 11128 实测说了算，削头逻辑照旧）。
-const CNB_HARNESS_BRAND = "DeepSeek Harness";
-const CNB_HARNESS_BRAND_NEUTRAL = "DSH";
-
-/** 出站文本的渠道校验预处理：剥 gitStatus 快照段 + 品牌词改写。 */
-export function cnbNeutraliseChannelMarkers(text: string): string {
-  return cnbFlattenMainBranchParen(
-    cnbStripGitStatus(text).replaceAll(
-      CNB_HARNESS_BRAND,
-      CNB_HARNESS_BRAND_NEUTRAL,
-    ),
-  );
-}
-
-/**
- * 把 `Main branch (you will usually use this for PRs)` 的括号说明去掉。
- *
- * 这一行是 11128 的**最小触发串**（见 CNB_GITSTATUS_MAINBRANCH_PAREN 上方）。
- * 它不依赖 gitStatus 块的锚点，所以是「锚点漂了/块被截断/换了措辞」时唯一的
- * 兜底。改写掉括号**语义零损失**（括号只是解释 Main branch 的用途），
- * 且实测从 3/3 命中变成 0/3。
- *
- * 幂等：已经改写的文本再跑一次不变（正则不再匹配）。
- */
-export function cnbFlattenMainBranchParen(text: string): string {
-  return text.replace(
-    CNB_GITSTATUS_MAINBRANCH_PAREN,
-    CNB_GITSTATUS_MAINBRANCH_FLAT,
-  );
-}
-
-/**
- * 把 harness 注入的 gitStatus 快照段换成一行 stub。
- *
- * 块的结束边界：下一个「空行 + 标题（# 或 ===）」处——字段与 Recent commits
- * 之间也有空行，所以不能按第一个空行切；块内各段（字段/commit 行）都不含
- * 标题行，harness 的其余分节都以 # / === 开头（工具说明由本代理追加，也是 ===）。
- * 块在文本末尾时切到末尾。没找到锚点时原样返回。
- */
-export function cnbStripGitStatus(text: string): string {
-  const start = text.indexOf(CNB_GITSTATUS_ANCHOR);
-  if (start < 0) return text;
-  let end = text.length;
-  const heading = /\n\n(?=#|===)/g;
-  heading.lastIndex = start;
-  const m = heading.exec(text);
-  if (m) end = m.index;
-  return text.slice(0, start) + CNB_GITSTATUS_STUB + text.slice(end);
-}
+// 这里保留旧名字作为薄包装：本文件内有多处调用点，单测也按这些名字断言。
+// 新增渠道请直接用 channel-neutralise 导出的函数。
+export const cnbStripGitStatus = stripGitStatus;
+export const cnbFlattenMainBranchParen = flattenMainBranchParen;
+export const cnbNeutraliseChannelMarkers = neutraliseChannelMarkers;
 
 function cnbBuildToolPrompt(tools: any[]) {
   const blocks: string[] = [], names: string[] = [];

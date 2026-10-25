@@ -34,6 +34,8 @@
  * 凭据（含 401 后静默续期）、目录解析、以及流内 11140 的窄判定。
  */
 
+import { neutraliseMessages } from "./channel-neutralise.ts";
+
 // ---------- 产品身份 ----------
 
 /** 中国版站点（含协议，用于拼请求 URL）。 */
@@ -1745,7 +1747,20 @@ export function buildChatBody(
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model,
-    messages,
+    // ★ 2026-10-25：`messages` 不能原样透传 —— 上游与 cnb 渠道用的是**同一套
+    // 11128 渠道校验**（报文逐字相同，连 displayTips 都一样）。实测 workbuddy
+    // 侧被拦的触发串与 cnb 完全一致：
+    //
+    //   | system 消息内容                                            | 结果      |
+    //   | --------------------------------------------------------- | --------- |
+    //   | `You are an AI agent powered by DeepSeek Harness.`         | 400/11128 |
+    //   | 同上把品牌词换成 `DSH` 简称                                 | **200**   |
+    //   | `Main branch (you will usually use this for PRs): master`  | 400/11128 |
+    //
+    // 清洗规则与 cnb 共用一份（src/channel-neutralise.ts）：剥 gitStatus 快照块、
+    // 改写 `Main branch` 那行的括号说明、品牌词改简称。**写两份必然漂开** ——
+    // 本项目已经在「同一形状各写一份读取器」上吃过亏（见 AGENTS.md kilo 那条）。
+    messages: neutraliseMessages(messages),
     stream: true,
     prompt_cache_key: sessionId,
   };

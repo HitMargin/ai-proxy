@@ -58,6 +58,7 @@ import {
   workBuddyAnonymousHeaders,
   workBuddyBareModelName,
   workBuddyBaseHeaders,
+  type WorkBuddyBodyOptions,
   workBuddyChatHeaders,
   workBuddyChatSignal,
   workBuddyCooldownRemaining,
@@ -2945,4 +2946,121 @@ Deno.test("chat→Responses 流：分帧跨块也要正确拼接", async () => {
     chatSseToResponsesSse(stream, "m", () => "resp_c", () => 1),
   );
   equal(out.includes('"text":"跨块"'), true);
+});
+
+// ── 2026-10-25：workbuddy 上游与 cnb 共用同一套 11128 渠道校验 ──
+//
+// 症状（用户报）：`ai-proxy /workbuddy/v1/chat/completions returned HTTP 400:
+// {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`，
+// 报错报文与 cnb 渠道**逐字相同**，连 displayTips 里那句「这次调用没通过渠道
+// 校验，可能不是官方客户端发出的」都一样。
+//
+// 实测确认两边触发串相同（各直连各自上游）：
+//   `You are an AI agent powered by DeepSeek Harness.`        → 两侧都 400/11128
+//   同上把品牌词换成 `DSH` 简称                                → 两侧都 200
+//   `Main branch (you will usually use this for PRs): master` → 两侧都 400/11128
+//
+// 所以清洗规则提取到 src/channel-neutralise.ts 一份、两边共用。下面钉住
+// **buildChatBody 真的套用了它**——清洗函数本身写对了、但没接进出站请求体，
+// 用户看到的仍然是同一个 400。
+
+Deno.test("出站清洗：buildChatBody 必须剥掉会触发 11128 的身份句与括号说明", () => {
+  const messages = [
+    {
+      role: "system",
+      content: "You are an AI agent powered by DeepSeek Harness. " +
+        'When the user refers to "this page", they mean this app.\n\n' +
+        "gitStatus: This is the git status at the start of the conversation.\n\n" +
+        "Current branch: master\n\n" +
+        "Main branch (you will usually use this for PRs): master",
+    },
+    { role: "user", content: "只回两个字：收到" },
+  ];
+  const body = buildChatBody(
+    "glm-5.3-flash",
+    messages,
+    "sess",
+    undefined,
+    {} as WorkBuddyBodyOptions,
+  );
+  const sent = JSON.stringify(body.messages);
+  // 三条触发串一条都不能漏
+  equal(
+    sent.includes("Main branch (you will usually use this for PRs)"),
+    false,
+    "the Main-branch parenthetical is the minimal 11128 trigger and must be gone",
+  );
+  equal(
+    sent.includes("gitStatus: This is the git status at the start"),
+    false,
+    "the gitStatus snapshot block must be replaced by the stub",
+  );
+  equal(
+    sent.includes("DeepSeek Harness"),
+    false,
+    "the brand phrase must be rewritten to the short form",
+  );
+  // 用户的话一个字都不能动
+  equal(
+    sent.includes("只回两个字：收到"),
+    true,
+    "user content must survive verbatim; only channel markers are neutralised",
+  );
+  // 结构也不能坏
+  const parsed = body.messages as Array<{ role: string }>;
+  equal(parsed.length, 2, "no message may be dropped");
+  equal(parsed[0].role, "system");
+  equal(parsed[1].role, "user");
+});
+
+Deno.test("出站清洗：多模态 content 数组里的文本也要清洗，图片原样保留", () => {
+  // 只处理字符串 content 会漏掉多模态那一条 —— 而漏掉的那条照样 400。
+  const image = {
+    type: "image_url",
+    image_url: { url: "data:image/png;base64,AAA" },
+  };
+  const messages = [{
+    role: "user",
+    content: [
+      {
+        type: "text",
+        text: "Main branch (you will usually use this for PRs): master",
+      },
+      image,
+    ],
+  }];
+  const body = buildChatBody(
+    "glm-5.3-flash",
+    messages,
+    "sess",
+    undefined,
+    {} as WorkBuddyBodyOptions,
+  );
+  const parts = (body.messages as any[])[0].content as any[];
+  equal(
+    String(parts[0].text).includes("you will usually use this for PRs"),
+    false,
+    "text parts must be neutralised too, not just string content",
+  );
+  equal(parts[1], image, "non-text parts must pass through untouched");
+});
+
+Deno.test("出站清洗：没有触发串的普通请求体逐字不变", () => {
+  // 清洗不能顺手改掉无关内容 —— 那等于篡改用户输入。
+  const messages = [
+    { role: "system", content: "You are a helpful assistant." },
+    { role: "user", content: "帮我看看 src/app.ts 第 42 行" },
+  ];
+  const body = buildChatBody(
+    "glm-5.3-flash",
+    messages,
+    "sess",
+    undefined,
+    {} as WorkBuddyBodyOptions,
+  );
+  equal(
+    body.messages,
+    messages,
+    "a request with no channel markers must be sent byte-for-byte as given",
+  );
 });
