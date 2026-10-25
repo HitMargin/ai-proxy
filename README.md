@@ -99,6 +99,9 @@ src/custom.ts              自定义供应商：来源合并、校验、出站�
 src/custom-handler.ts      /custom/v1 的列表聚合与推理转发
 src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度、Messages 转换与路由
 src/runtime/               响应体形状嗅探、流回放、abort/截断分类、目录健康登记
+scripts/checkin.ts         一键签到（TRAE + WorkBuddy，直连或经代理，幂等，退出码可靠）
+scripts/probes/            手动 smoke 探针（显式 --confirm-live 才会发真实请求）
+scripts/sync-commandcode-models.ps1  同步 CommandCode 模型清单
 dsh-plugin/               可选 DSH Host Provider 桥接插件（按渠道分组注册 + 设置面板 + 隧道开关）
 third_party/              移植来源的代码与许可说明（CommandCode Go provider）
 deepseek-sha3.wasm         DeepSeek PoW 原生求解器
@@ -720,6 +723,37 @@ deepseek-web / workbuddy / trae / openrouter / zlkpro 这几个成员加入聚�
 
 两个渠道有签到：**TRAE** 与 **WorkBuddy**。都是「查状态 → 领取」两段，都**幂等**（已签过则不发领取请求，返回 `alreadyClaimed: true`），都不在 `/v1` 聚合里——它们是账号动作，不是模型路由。
 
+### 一条命令签两个平台（推荐）
+
+```powershell
+deno task checkin
+```
+
+```
+签到  模式=直连上游
+────────────────────────────────────────────────────────────────
+✓ trae       今天已经签过
+✓ workbuddy  今天已经签过，连续 11 天（余额 1100）
+```
+
+**默认直连上游**：直接读两份凭据、自己续期、直接打上游，**不依赖代理解在跑**。签到是账号动作，把它绑在代理上会变成「代理没开就签不了」。
+
+常用参数：
+
+| 参数 | 作用 |
+|---|---|
+| `--dry-run` | 只看状态，不发领取请求 |
+| `--only=trae` / `--only=workbuddy` | 只跑一个平台 |
+| `--via-proxy` | 经本地代理（复用代理的续期与错误分类），需代理在跑 |
+| `--json` | 机器可读输出，便于自己写计划任务 |
+| `--base-url=…` | 配合 `--via-proxy` 改代理地址 |
+
+**退出码**：两个平台都成功才是 `0`；任一失败或未配置为 `1`；参数错为 `2`。所以它能直接放进 Windows 计划任务而不必解析输出——**绝不会出现「什么都没签却报成功」**，那会让人静默一个月不知道漏签。
+
+脚本不打印任何 token / cookie 值，只打印昵称、天数、积分。一个平台失败不影响另一个（两个都跑完再汇总）。
+
+### 也可以直接打代理
+
 ```powershell
 # 查看状态（账号 + 签到快照，只读）
 curl.exe http://127.0.0.1:8000/trae/v1/account
@@ -768,11 +802,31 @@ TRAE 的推理走 `trae-api-cn.mchost.guru`、签到与积分走 `api.trae.cn`�
 
 ### 想每天自动签
 
-默认要手动跑。可选方案（需要的话改代码，不是开关）：
+`deno task checkin` 已经可以直接放进计划任务（退出码可靠、无交互、不打印凭据）。**Windows 计划任务**最简单的一条：
 
-- **代理启动时签一次**：在 `main.ts` 起服务后调一次 `runDailyCheckin()`；缺点是代理不重启就不触发
-- **定时任务**：Windows 计划任务每天调一次 `curl.exe -X POST .../checkin`；最省事，且与代理生命周期解耦
-- **面板按钮**：`dsh-plugin/client.js` 加一个按钮打 `POST /workbuddy/v1/checkin`；适合不想记命令的场景
+```powershell
+# 每天 9:30 跑一次（PowerShell，注册一次即可）
+$action  = New-ScheduledTaskAction -Execute "deno" `
+  -Argument "task checkin" -WorkingDirectory "D:\Projects\ai-proxy"
+$trigger = New-ScheduledTaskTrigger -Daily -At 09:30
+Register-ScheduledTask -TaskName "ai-proxy-checkin" `
+  -Action $action -Trigger $trigger -Description "TRAE + WorkBuddy 每日签到"
+```
+
+验证：`Get-ScheduledTaskInfo -TaskName ai-proxy-checkin` 看 `LastTaskResult`（`0` 才是两个平台都签成功）。
+
+也可以用 `schtasks` 一行搞定（不需要管理员）：
+
+```powershell
+schtasks /create /tn "ai-proxy-checkin" /tr "deno task checkin" /sc daily /st 09:30
+```
+
+**注意**：计划任务的**工作目录必须是项目根**——脚本靠相对路径 `./trae-auth.json` / `./workbuddy-auth.json` 找凭据，cwd 不对会报「没有凭据」。
+
+其他方案：
+
+- **代理启动时签一次**：在 `main.ts` 起服务后调一次；缺点是代理不重启就不触发
+- **面板按钮**：`dsh-plugin/client.js` 加一个按钮打 `POST /workbuddy/v1/checkin`；只覆盖 WorkBuddy
 
 ---
 

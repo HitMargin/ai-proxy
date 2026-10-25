@@ -5,7 +5,8 @@
   },
   "tasks": {
     "check": "deno check main.ts worker.ts",
-    "test": "deno test --allow-env src/"
+    "test": "deno test --allow-env src/",
+    "checkin": "deno run --allow-env --allow-net --allow-read --allow-write scripts/checkin.ts"
   }
 }
 
