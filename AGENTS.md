@@ -1938,6 +1938,133 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   给小了会被思考吃光，界面上表现为「模型不说话」而不是「参数给小了」——兜底
   120000 远大于实测思考量，不会踩到。
 
+- **cnb 上游模型有没有变：怎么测（2026-10-25 重做，推翻两条旧判据）**。
+  这一轮把「上游模型清单」这件事查清了，且**昨天（10-24）留下的两条判据都是错的**：
+
+  **① 权威清单仍是 1 个模型，且它是「完整下发」不是「过滤后的子集」**：
+  `GET /api/version` → 取 `hash` → `GET /_next/data/<hash>/index.json` →
+  `pageProps.initialState.global.systemConfigManage.ai`（**匿名可用**，带不带登录
+  cookie 逐字节相同；hash 过期回 404）。今天 `models.length === 1`，
+  `deepseek-v4.1-flash` / `type: deepthink`。`models[]` 每项只有
+  `model/type/name/description`，**没有 `enabled`/`hidden`**。**仍不存在目录端点**
+  （`/v1/models`、`/.well-known/*models*` 是真 404）。
+  > **这条站有三套 catch-all**：`/api|/ai/*`、`/<slug>/-/*`、连 `sitemap.xml` 都是。
+  > **任何虚构路径都回 200 整页 HTML**，`/api|/ai` 的 POST 回 `428 实名认证`。
+  > 判据：**「扫到 200」在这里恒等于「什么都没扫到」**。另两个假线索：
+  > chunk 里的 `gpt-4*/claude-*` 是 **tiktoken 编码表**；`lE.HUN_YUAN`
+  > （`hunyuan-chat` 等）是**陈旧遗留常量**。
+
+  **② 推翻旧判据一：SSE 的 `model` 字段不是「回显」，是服务端常量**。
+  10-24 记的是「响应 model 是回显，所以不能当路由证据」。**方向反了**。决定性
+  对照：请求里**连 `model` 键都不存在**时，上游照样回 `"model":"deepseek-v4.1-flash"`
+  （`null`/`""`/300 个 `x`/中文/伪造名同理）。没有输入就没有东西可回显。
+  **所以它是有效且很强的路由证据**——但**经代理永远看不见**：`src/cnb.ts` 所有
+  响应构造都写 `upBody.model`/`p.data.model`（请求值副本），无处读上游帧的 `model`。
+  **推论：判断「上游是否换了后端」只能直连，不能经代理。**
+
+  **③ 推翻旧判据二：「伪造名也能出字」证明不了任何事**。71 个 id（含 6 个伪造名）
+  **71/71 全部 200 且出字**；空串/纯空白/300 字符/中文一视同仁。真正证明「名字不
+  改变后端」的两条硬证据：后端自报名恒为常量（②）+ **缓存命名空间共享**（冷发
+  `cache_hit=0` → 同 id 重发 512/162 → 换 `glm-5.3`/`claude-sonnet-4.5`/伪造名
+  **全部命中同样的 512/162**）。tokenizer 指纹（`prompt_tokens` 恒定）只能**证伪**。
+  > **明确禁用**：问模型「你是哪个模型」。同一 id 重复 4 次答案逐次不同
+  > （`temperature=0` 未被尊重），伪造 id 与真实 id 还能拿到相同答案。
+
+  **④ 错误码漂了：非法 effort 现在回 `11133`，不是 `11150`**。判据没变；
+  `src/cnb.ts` 与 `src/cnb.test.ts` 里 4 处注释写着 11150，**但没有一处代码按
+  11150 分支**，所以不影响行为——别照着注释去改逻辑。
+
+  **⑤ 11128 的最小触发串找到了（今天已修）**。10-24 的定论是「gitStatus 块的
+  整体形状被匹配」。今天单变量二分打穿：**只有剥掉
+  `Main branch (you will usually use this for PRs)` 那行的括号说明才变 200**；
+  去掉第二句 / Git user / Status / Recent commits / Current branch / 字段间空行 /
+  连 `gitStatus: ` 前缀都**仍然 400**。3/3 稳定命中、改写后 0/3。
+  「该行放 `user` 里 → 200；放 `assistant` 历史 → 400」与旧的角色作用域一致。
+  **修法：`cnbFlattenMainBranchParen()` 定点改写那个括号**（语义零损失），接在
+  `cnbNeutraliseChannelMarkers` 里，与整块剥离并存。**为什么要两层**：整块剥离
+  锚定原文样板，**锚点不在就整段漏剥**（换措辞/被截断），实测「锚点不在 + 括号还在」
+  → 400 且原样透传给用户；括号改写不依赖锚点。
+  > **判据：一个内容级门禁的修复，必须有「锚点缺失时仍然有效」的那一层。**
+
+- **cnb 上游模型清单：今天（2026-10-25）没有变更**。三条独立证据同向：权威 config
+  仍只有 `deepseek-v4.1-flash`；后端自报名仍是常量；缓存与 tokenizer 无换后端痕迹。
+  **作用域必须限定**：只对 `/ai/chat/completions` 成立。登录后首页
+  `dashboard.exploreNPCList` 暴露 cnb 自家 NPC 的 19 个真实模型 id
+  （`glm-5.3`/`kimi-k3`/`step-5-preview`/`hy4-preview`/`deepseek-v4-pro`…），
+  但 `npc_channel` 是 `oci` —— **另一条收费通道**，写进 `CNB_MODELS` 就是死控件。
+  另：用户 DSH web profile 在用的 `cnb/deepseek-v4-flash` 与 `cnb/deepseek-v4-pro`
+  **并不在代理 `/v1/models` 清单里**（靠聚合对任意 id 放行），且落到同一个后端。
+
+- **cnb 的 1.00MB 是网关硬限，接口层绕不过（2026-10-25 穷尽实测）；能做的只有让
+  body 变小**。上游原文：`413 [BODY_TOO_LARGE] Request body too large: 1.27MB,
+  limit 1.00MB`。**量的是单个 HTTP 请求体的解压后字节数**，不是 token、不是消息
+  条数、不是会话长度。边界：解压后 1000 KiB 通过 / 1100 KiB 413。
+  > **为什么它「看起来像会话大小限制」**：chat completions **无状态**，每轮都要把
+  > 整段历史重发一遍，所以 `请求体大小 == 会话历史大小`。两者相等是协议决定的。
+
+  **八条绕过路径全部封死**（每条都有真实请求与原始响应，勿重复验证）：
+
+  | 尝试 | 结果 |
+  | --- | --- |
+  | `Content-Encoding: gzip` | ❌ **解压后**才计量：原 2002 KiB 压到**只发 15 KiB 仍 413** |
+  | `deflate` / `br` / `zstd` | ❌ 同上 |
+  | `Transfer-Encoding: chunked`（64 KiB 小块） | ❌ 按**累计**计量 |
+  | 谎报 `Content-Length: 900k` 实发 1.5MB | ❌ 截断成 400 `Unterminated string` |
+  | HTTP/1.1 vs HTTP/2 | ❌ 都 413 |
+  | `previous_response_id` / `conversation_id` / `session_id` / `store` | ❌ **静默忽略**（200 但行为不变，塞 200 KB 也不报错） |
+  | `/<slug>/-/ai/chat/completions` 变体路径 | ❌ 同一限制 |
+  | `npc:go` 通道（docs 说支持 `contextWindow: 1m`） | ❌ 所有 `/ai/npc*` 回 `428 实名认证`，**无 HTTP API**，只能走 CI |
+
+  > 判据：**「压缩传输」不等于「压缩被计量的东西」**。网关先解码再量长，所以任何
+  > 传输入口都是徒劳——这类限制只能靠**减少内容**，不能靠改变编码。
+
+  **★ 一个必须澄清的误判：「砍 tools 比砍历史有效」在这条渠道上不成立。**
+  有队友实测后建议「826 KB tools 只剩 222 KB 给 messages，所以优先砍 tools」。
+  这条直觉在**别的渠道**成立，在 cnb 聊天端点上**不成立**，两条实测：
+  - `tools` 在 `/ai/chat/completions` 上撞的是 **403 门禁**（不是 413）：带任意
+    `tools` 字段一律 403（`msgs=50K + tools=0` → 200；`+tools=200KiB` → 403），
+    **与体积无关**。同 900 KiB：放 `messages` → 200，放 `tools` → 403。
+  - 因此 `src/cnb.ts` 的 `cnbBuildToolPrompt()` 早已把 `tools` 渲染成提示词文本，
+    **出站 body 里根本没有 `tools` 字段**（keys 只有
+    `model/messages/stream/max_tokens/enable_thinking/reasoning_effort`）。
+
+  真实会话的 `overhead`（= `bytesIn − Σmessages`，即 tools 说明 + model + stream）
+  只有 **89,919 B / 2.7 MB = 3.2%**，messages 占 **96.7%**。
+  > **判据：overhead 要用「body 减 messages」在真实会话上量，不能从别处的
+  > 「tools 定义 826 KB」推断。** 那个 826 KB 是 ZCode 会话发 `tools` 字段的场景，
+  > 换成 cnb（tools 已渲染进提示词）就不再是独立开销，而是算在 system 消息里。
+
+  **所以正确的省法：先折叠可再生的工具交互，最后才动对话（2026-10-25 实现）**。
+  真实会话按**可回收性**切开（2047 条 / 2.60 MiB）：
+
+  | 分组 | 条数 | 字节 | 占比 | 处置 |
+  | --- | --- | --- | --- | --- |
+  | `tool` 输出 | 760 | 1,417,746 | 51.6% | 折叠成 stub（留 400 字符开头） |
+  | `assistant` 的 `tool_calls` 参数 | 658 | 797,584 | 29.0% | 折叠成 `{"_elided":"工具名+关键字段"}` |
+  | `assistant` 正文（模型真说过的话） | 538 | 216,669 | 7.9% | **全保留** |
+  | `user`（任务线程） | 111 | 212,063 | 7.7% | **全保留** |
+  | `system` | 1 | 12,002 | 0.4% | 保留 |
+
+  **判据：`content === null` 且 head 为空的 assistant 就是纯 tool_calls 消息**——
+  这是把「工具交互」和「模型说的话」分开统计的唯一可靠办法；混在一起看会误以为
+  assistant 占 37% 体积是对话内容。
+  两层实现：`cnbStaleToolPrune()`（折旧 tool 输出，最近 N 条留原文）与
+  `cnbStaleToolCallPrune()`（折旧 tool_calls 参数，**工具名与 `id` 必须保留**否则
+  模型对不上号/tool 结果悬空），**都接在 `maybeCompactCnb` 里、写摘要之前**。
+  `CNB_PRUNE_KEEP_TOOLS` / `CNB_PRUNE_KEEP_TOOL_CALLS`（默认 12）/
+  `CNB_PRUNE_MIN_BYTES` / `CNB_PRUNE_MIN_ARGS_CHARS` 可调，设 0 关闭该层。
+  收敛就**直接返回、不写摘要**（note 带 `tool-only, no conversation loss`），
+  省掉那笔 cost≈3000-5000 token 的摘要调用。
+
+  **实测收益**：两层折叠回收 1,717 KiB → **0.94 MiB 进预算，user 与 assistant
+  正文一条不丢**（改动前必须从对话里压掉 1,690 KiB，对话丢弃量减少 100%）。
+  走真实 `maybeCompactCnb` 的端到端验证：1.69 MiB → 0.59 MiB，120/120 user、
+  120/120 assistant 正文、708 条 stub 的 `tool_call_id` 全部完好。
+  > 边界诚实说明：**这不是无限扩容**。折叠完仍超预算时（对话本身很长、或单条新近
+  > tool 输出巨大），摘要照旧会丢早期对话。要「永不遗忘」只能换有状态渠道
+  > （DeepSeek 网页端每轮只传增量）或把历史落盘让模型自己读——cnb 这条
+  > 无状态 + 1MB 的组合做不到。
+
 ## 行为规则
 
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。

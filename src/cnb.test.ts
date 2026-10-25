@@ -17,6 +17,7 @@ import {
   cnbCallUpstream,
   cnbDiagnoseJunkSyntax,
   cnbEscapeRepairState,
+  cnbFlattenMainBranchParen,
   cnbForgetRejectedHeads,
   cnbGatedResponse,
   cnbJournalJunk,
@@ -29,6 +30,8 @@ import {
   cnbPreNeutraliseHead,
   cnbRememberRejectedHead,
   cnbRepairMaxTokens,
+  cnbStaleToolCallPrune,
+  cnbStaleToolPrune,
   cnbStripGitStatus,
   deriveSessionKey,
   handleCnb,
@@ -1893,6 +1896,283 @@ Deno.test("cnb: cnbStripGitStatus leaves user-written gitStatus text alone", () 
     text,
     "the harness boilerplate anchor must be required: arbitrary user text stays",
   );
+});
+
+// ── 2026-10-25：11128 的**最小触发串**是 Main branch 那行的括号说明 ──
+//
+// 昨天记的是「整块形状被匹配」。今天单变量二分打穿了：只有剥掉
+// `Main branch (you will usually use this for PRs)` 的括号才变 200，其余
+// 特征（第二句/各字段/空行/`gitStatus: ` 前缀）剥掉都仍 400。
+// 整块剥离锚定原文样板，锚点不在就整段漏剥 → 实测 400 透传。
+// 所以补一层不依赖锚点的定点改写。
+Deno.test("cnb: cnbFlattenMainBranchParen defuses the minimal 11128 trigger", () => {
+  const tripwire =
+    "Current branch: master\n\nMain branch (you will usually use this for PRs): master\n\nStatus:\n(clean)";
+  const flat = cnbFlattenMainBranchParen(tripwire);
+  assertEquals(
+    flat.includes("you will usually use this for PRs"),
+    false,
+    "the parenthetical is what the upstream matches; it must be gone",
+  );
+  assertEquals(
+    flat,
+    "Current branch: master\n\nMain branch: master\n\nStatus:\n(clean)",
+    "only the parenthetical goes; the branch value and the rest stay verbatim",
+  );
+});
+
+Deno.test("cnb: cnbFlattenMainBranchParen is idempotent and leaves other text alone", () => {
+  const once = cnbFlattenMainBranchParen("Main branch: master");
+  assertEquals(once, "Main branch: master");
+  assertEquals(cnbFlattenMainBranchParen(once), once);
+  // 用户自己写的括号说明不在触发面上，不能动（锚定 Main branch 前缀）
+  const userText =
+    "Main branch picker (you will usually use this for PRs) - see docs";
+  assertEquals(cnbFlattenMainBranchParen(userText), userText);
+});
+
+// 关键回归：**锚点不在、括号还在**的形态（换措辞/块被截断/压缩后只剩字段）。
+// 这是整块剥离的盲区，也是本层存在的唯一理由——没有它就会 400 透传给用户。
+Deno.test("cnb: the neutraliser still defuses the tripwire when the block anchor is absent", () => {
+  const noAnchor =
+    "# Repository\n\nCurrent branch: master\n\nMain branch (you will usually use this for PRs): master\n\nGit user: x";
+  const out = cnbNeutraliseChannelMarkers(noAnchor);
+  assertEquals(
+    out.includes("you will usually use this for PRs"),
+    false,
+    "without this, an anchor-less snapshot passes through and upstream 400s it",
+  );
+  // 块剥离不认这段（没有锚点），所以字段必须原样保留——别顺手把内容也删了
+  assertEquals(out.includes("Current branch: master"), true);
+  assertEquals(out.includes("Git user: x"), true);
+});
+
+Deno.test("cnb: the brand rewrite alone is not enough once the tripwire is present", () => {
+  // 线上真实组合（身份句 + 品牌词 + gitStatus 块）：只改品牌词仍 400（实测 S5b），
+  // 品牌词 + 括号改写才 200（S5c）。这里钉住「两件事都得做」。
+  const combo = [
+    "You are an AI agent powered by DeepSeek Harness.",
+    "",
+    "gitStatus: This is the git status at the start of the conversation.",
+    "",
+    "Current branch: master",
+    "",
+    "Main branch (you will usually use this for PRs): master",
+  ].join("\n");
+  const out = cnbNeutraliseChannelMarkers(combo);
+  assertEquals(
+    out.includes("DeepSeek Harness"),
+    false,
+    "brand must be rewritten",
+  );
+  assertEquals(
+    out.includes("you will usually use this for PRs"),
+    false,
+    "the tripwire must be defused as well; either one alone still trips 400",
+  );
+  // 锚点在时整块会被剥掉（块本身无价值），所以这里不能断言括号行还在——
+  // 「括号改写」那层只在锚点缺失时才是唯一防线（见下一个测试）。
+  assertEquals(
+    out.includes("snapshot omitted"),
+    true,
+    "the block is still replaced by the stub when its anchor is present",
+  );
+});
+
+// ── 2026-10-25：会话体积的两块大头是**可再生的工具交互**，不是对话 ──
+//
+// 真实会话实测（2047 条 / 2.60 MiB）：tool 输出 51.6%、assistant 的
+// tool_calls 参数 29.0%、模型真正说过的话只有 7.9%、user 7.7%。
+// 所以在写摘要（会把 user/assistant 一起换掉）之前，先折叠这两块。
+// 这两组测试钉住的是：**折叠只发生在旧消息上，最近的与用户的话一条不动**。
+Deno.test("cnb: stale tool output is folded to a stub and recent ones are kept", () => {
+  const big = "扫描结果行\n".repeat(2000); // ~12 KB
+  const msgs = [];
+  for (let i = 0; i < 10; i++) {
+    msgs.push({
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: `c${i}`,
+        type: "function",
+        function: { name: "pwsh", arguments: `{"command":"scan ${i}"}` },
+      }],
+    });
+    msgs.push({ role: "tool", tool_call_id: `c${i}`, content: big });
+  }
+  const out = cnbStaleToolPrune(msgs, {
+    keepRecentTools: 3,
+    minBytes: 1024,
+  });
+  assertEquals(out.pruned, 7, "the 7 oldest tool results must be folded");
+  assertEquals(out.messages.length, msgs.length, "no message may be dropped");
+  // 最近 3 条原样
+  const toolIdx = out.messages
+    .map((m, i) => ({ m, i }))
+    .filter((x) => x.m.role === "tool");
+  for (const { m } of toolIdx.slice(-3)) {
+    assertEquals(m.content, big, "the most recent tool results stay verbatim");
+  }
+  // 旧的变成 stub，但仍能认出是哪次调用
+  const folded = out.messages.filter((m) =>
+    typeof m.content === "string" && m.content.includes("elided by proxy")
+  );
+  assertEquals(folded.length, 7);
+  assert(
+    folded.every((m) => m.tool_call_id && m.role === "tool"),
+    "the stub must keep role and tool_call_id or the transcript is malformed",
+  );
+  assert(
+    out.savedBytes > 60_000,
+    `folding must actually reclaim space (got ${out.savedBytes})`,
+  );
+});
+
+Deno.test("cnb: stale tool-call arguments are folded but the tool name survives", () => {
+  const args = JSON.stringify({
+    command:
+      `Get-ChildItem -Recurse -Filter *.shader | Select-Object -First 200 ${
+        "x".repeat(4000)
+      }`,
+  });
+  const msgs = [];
+  for (let i = 0; i < 8; i++) {
+    msgs.push({
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: `c${i}`,
+        type: "function",
+        function: { name: "pwsh", arguments: args },
+      }],
+    });
+    msgs.push({ role: "tool", tool_call_id: `c${i}`, content: "ok" });
+  }
+  const out = cnbStaleToolCallPrune(msgs, {
+    keepRecentToolCalls: 2,
+    minArgsChars: 256,
+  });
+  assertEquals(out.pruned, 6, "the 6 oldest calls must have their args folded");
+  const kept = out.messages.filter((m) => m.role === "assistant");
+  assertEquals(kept.length, 8, "no assistant message may be dropped");
+  // 最近 2 条参数原样
+  assertEquals(kept.at(-1)!.tool_calls[0].function.arguments, args);
+  assertEquals(kept.at(-2)!.tool_calls[0].function.arguments, args);
+  // 旧的：参数折叠了，但**工具名还在**（模型要能对上号）
+  const foldedArgs = kept[0].tool_calls[0].function.arguments;
+  assert(foldedArgs.length < 300, "folded args must be short");
+  assertEquals(
+    kept[0].tool_calls[0].function.name,
+    "pwsh",
+    "the tool name must survive: it is what lets the model match the result",
+  );
+  assert(
+    foldedArgs.includes("pwsh"),
+    "the hint must name the tool so the call is still identifiable",
+  );
+  // id 必须保留，否则 tool 结果悬空
+  assertEquals(kept[0].tool_calls[0].id, "c0");
+  assert(out.savedBytes > 20_000);
+});
+
+// 关键性质：**用户说的话永远不会被这两层动到**。这是「不再忘事」的底线。
+Deno.test("cnb: neither prune layer touches user or assistant prose", () => {
+  const userText = "把那个 shader 的 packoffset 残留清掉，别动别的。";
+  const prose = "好的，我先扫一遍再改。";
+  const msgs: any[] = [
+    { role: "system", content: "sys" },
+    { role: "user", content: userText },
+    { role: "assistant", content: prose },
+  ];
+  for (let i = 0; i < 30; i++) {
+    msgs.push({
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: `c${i}`,
+        type: "function",
+        function: {
+          name: "pwsh",
+          arguments: `{"command":"${"y".repeat(2000)}"}`,
+        },
+      }],
+    } as any);
+    msgs.push({
+      role: "tool",
+      tool_call_id: `c${i}`,
+      content: "z".repeat(8000),
+    });
+  }
+  let out = cnbStaleToolPrune(msgs, { keepRecentTools: 2, minBytes: 512 });
+  out = cnbStaleToolCallPrune(out.messages, {
+    keepRecentToolCalls: 2,
+    minArgsChars: 128,
+  });
+  const users = out.messages.filter((m) => m.role === "user");
+  const proseMsgs = out.messages.filter((m) =>
+    m.role === "assistant" && typeof m.content === "string" && m.content.length
+  );
+  assertEquals(
+    users.map((m) => m.content),
+    [userText],
+    "user messages are the task thread: they must survive verbatim",
+  );
+  assertEquals(
+    proseMsgs.map((m) => m.content),
+    [prose],
+    "the model's own words must survive; only tool plumbing is folded",
+  );
+});
+
+Deno.test("cnb: folding is a no-op when there is nothing old enough", () => {
+  const msgs = [
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{
+        id: "c0",
+        type: "function",
+        function: {
+          name: "pwsh",
+          arguments: `{"command":"${"q".repeat(3000)}"}`,
+        },
+      }],
+    },
+    { role: "tool", tool_call_id: "c0", content: "r".repeat(9000) },
+  ];
+  const a = cnbStaleToolPrune(msgs, { keepRecentTools: 5, minBytes: 256 });
+  assertEquals(a.pruned, 0);
+  assertEquals(
+    a.messages,
+    msgs,
+    "nothing prunable means the array is returned as-is",
+  );
+  const b = cnbStaleToolCallPrune(msgs, {
+    keepRecentToolCalls: 5,
+    minArgsChars: 64,
+  });
+  assertEquals(b.pruned, 0);
+  assertEquals(b.messages, msgs);
+});
+
+Deno.test("cnb: a pure tool-call message is never folded when it is the recent one", () => {
+  // 最近那条工具调用的参数必须能真的执行 —— 折叠旧的历史可以，折叠正在用的不行。
+  const live = `{"command":"Get-ChildItem -Filter *.md"}`;
+  const msgs = [{
+    role: "assistant",
+    content: null,
+    tool_calls: [{
+      id: "live",
+      type: "function",
+      function: { name: "pwsh", arguments: live },
+    }],
+  }];
+  const out = cnbStaleToolCallPrune(msgs, {
+    keepRecentToolCalls: 1,
+    minArgsChars: 1,
+  });
+  assertEquals(out.pruned, 0);
+  assertEquals(out.messages[0].tool_calls[0].function.arguments, live);
 });
 
 Deno.test("cnb: the heal never cuts a pure tool-call message", () => {

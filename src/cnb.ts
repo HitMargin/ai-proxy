@@ -585,6 +585,40 @@ const CNB_GITSTATUS_ANCHOR =
   "gitStatus: This is the git status at the start of the conversation.";
 const CNB_GITSTATUS_STUB = "gitStatus: (snapshot omitted by proxy)";
 
+// ★ 2026-10-25：找到了**最小触发串**，整块剥离因此有了一个必然后备。
+//
+// 昨天（10-24）的定论是「整块形状被匹配」，依据是「句子/单个字段/标题词单独发
+// 都不触发」。今天用单变量二分打穿了这条：把完整真实块依次剥掉一个特征，
+// **只有剥掉 `Main branch` 那行的括号说明才变 200**，其余（去掉第二句 / 去掉
+// Git user / 去掉 Status / 去掉 Recent commits / 去掉 Current branch / 字段间
+// 不留空行 / 去掉 `gitStatus: ` 前缀）全部仍然 400：
+//
+//   | 请求（直连 cnb.cool，system 消息）                    | 结果      |
+//   | ---                                                  | ---       |
+//   | 完整真实 gitStatus 块                                 | 400/11128 |
+//   | 同上，只把括号说明去掉（`Main branch: master`）        | **200**   |
+//   | 只有一行 `Main branch (you will usually use this for PRs): master` | 400/11128 |
+//   | 同上，去掉 `Main branch` → 只留括号短语               | 200       |
+//   | 同上，`Main branch` 换成 `Note:`（组合不成立）         | 200       |
+//   | 该行放在正文中部（前面还有别的文字）                   | 400/11128 |
+//   | 该行放在 `user` 消息里                                | 200       |
+//   | 该行放在 `assistant` 历史里                           | 400/11128 |
+//
+// 反复 3 次全部命中（3/3 → 改写后 0/3），不是偶发。所以判据是
+// **`Main branch` + `(you will usually use this for PRs)` 这一行的组合**
+// ——正好是 `git status --porcelain=v2 --branch` 之后 harness 自己加的那句说明，
+// 也就是「它的 git 上下文注入器」这个身份特征。
+//
+// 为什么必须同时做「改写」而不只剥块：整块剥离锚定的是原文样板，**锚点不在
+// 就整段漏剥**。实测「锚点不在、括号还在」→ 400（S4a/M10），而这时代理会把
+// 400 原样透传给用户。改写这一行不依赖锚点，实测「锚点不在 + 已改写」→ 200。
+// 两次剥离都保留：块本来就没有信息价值（自称永不更新的快照），能整块剥掉最好
+// （省 token，且顺带消掉其它未知触发面）；改写是兜底网，专门对付「锚点漂了/
+// 被截断/换了措辞」的形态。
+const CNB_GITSTATUS_MAINBRANCH_PAREN =
+  /(Main branch) \(you will usually use this for PRs\)/g;
+const CNB_GITSTATUS_MAINBRANCH_FLAT = "$1";
+
 // ★ 2026-10-24（同日第二次）：DSH 桌面会话（"You are an AI agent powered by
 // DeepSeek Harness."）削头自愈后**仍然** 11128。真实 body 二分定位：触发的是
 // 「DeepSeek Harness + GUI 指代样板」的**组合**——
@@ -601,9 +635,28 @@ const CNB_HARNESS_BRAND_NEUTRAL = "DSH";
 
 /** 出站文本的渠道校验预处理：剥 gitStatus 快照段 + 品牌词改写。 */
 export function cnbNeutraliseChannelMarkers(text: string): string {
-  return cnbStripGitStatus(text).replaceAll(
-    CNB_HARNESS_BRAND,
-    CNB_HARNESS_BRAND_NEUTRAL,
+  return cnbFlattenMainBranchParen(
+    cnbStripGitStatus(text).replaceAll(
+      CNB_HARNESS_BRAND,
+      CNB_HARNESS_BRAND_NEUTRAL,
+    ),
+  );
+}
+
+/**
+ * 把 `Main branch (you will usually use this for PRs)` 的括号说明去掉。
+ *
+ * 这一行是 11128 的**最小触发串**（见 CNB_GITSTATUS_MAINBRANCH_PAREN 上方）。
+ * 它不依赖 gitStatus 块的锚点，所以是「锚点漂了/块被截断/换了措辞」时唯一的
+ * 兜底。改写掉括号**语义零损失**（括号只是解释 Main branch 的用途），
+ * 且实测从 3/3 命中变成 0/3。
+ *
+ * 幂等：已经改写的文本再跑一次不变（正则不再匹配）。
+ */
+export function cnbFlattenMainBranchParen(text: string): string {
+  return text.replace(
+    CNB_GITSTATUS_MAINBRANCH_PAREN,
+    CNB_GITSTATUS_MAINBRANCH_FLAT,
   );
 }
 
@@ -4328,6 +4381,186 @@ function cnbMessageBreakdown(messages: any[]) {
   });
 }
 
+// ★ 2026-10-25：会话体积的真正大头是**工具输出**，不是对话。
+//
+// 实测（`.tmp-cnb-compact-session_219bc….json`，2008 条 / 2.7 MB）：
+//
+//   | role      | 条数 | 字节     | 占比 |
+//   | --------- | ---- | -------- | ---- |
+//   | tool      |  741 | 1,399,286 | 49% |
+//   | assistant | 1158 |   988,257 | 35% |
+//   | user      |  108 |   209,551 |  7% |
+//   | system    |    1 |    12,002 | <1% |
+//
+// 单条 tool 结果动辄 13~37 KB（shader 全量扫描、`git status`、文件清单）。
+// 这些内容的特点是 **用完即弃、且可重新取回**：模型要的是「扫出了什么结论」，
+// 不是 469 个 shader 路径的原文。
+//
+// 而在加这一层之前，唯一的收敛手段是 `compactIfNeeded`：它把**整段早期历史**
+// 换成一段摘要，于是 user/assistant 一起没了 —— 用户看到的就是「模型忘事」。
+// 顺序反过来才合理：**先扔可再生的工具噪音，对话主线尽量原样留着**。
+//
+// 判据：只有当工具输出自己就足以把 body 压进预算时，才动它；动完仍超预算，
+// 才交给摘要（摘要现在能保住更多对话，因为大头已经被搬走了）。
+
+/** 一条工具输出被折叠后保留的开头字符数。足够让模型认出「这是哪次调用」。 */
+const CNB_TOOL_STUB_HEAD_CHARS = 400;
+
+/**
+ * 把**较旧的**工具输出折叠成一行 stub，优先保留最近的几条原文。
+ *
+ * 只动 `role: "tool"` 的消息正文；`tool_calls` 的 arguments（在 assistant 消息
+ * 上）不动 —— 那是「做过什么」的骨架，体量也小得多。
+ *
+ * 返回新数组（不改入参）与被省略的字节数估计。
+ */
+export function cnbStaleToolPrune(
+  messages: any[],
+  opts: {
+    /** 保留末尾多少条 tool 消息原文（按 tool 消息计数，不是全部消息）。 */
+    keepRecentTools: number;
+    /** 只折叠序列化后超过这个字节数的 tool 消息；小结果留原样更省事。 */
+    minBytes: number;
+  },
+): { messages: any[]; pruned: number; savedBytes: number } {
+  const encoder = new TextEncoder();
+  const sizeOf = (m: any) => encoder.encode(JSON.stringify(m ?? null)).length;
+
+  // 找出所有可折叠的 tool 消息下标（从后往前数，留下最近 keepRecentTools 条）
+  const toolIdx: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]?.role === "tool") toolIdx.push(i);
+  }
+  if (toolIdx.length <= opts.keepRecentTools) {
+    return { messages, pruned: 0, savedBytes: 0 };
+  }
+  const prunable = new Set(
+    toolIdx.slice(0, toolIdx.length - opts.keepRecentTools),
+  );
+
+  let pruned = 0;
+  let savedBytes = 0;
+  const out = messages.map((m: any, i: number) => {
+    if (!prunable.has(i)) return m;
+    const before = sizeOf(m);
+    if (before < opts.minBytes) return m;
+
+    const text = typeof m?.content === "string"
+      ? m.content
+      : JSON.stringify(m?.content ?? "");
+    const head = text.slice(0, CNB_TOOL_STUB_HEAD_CHARS).replace(/\s+/g, " ");
+    const stub = {
+      ...m,
+      content:
+        `[tool output elided by proxy: ${before} bytes -> stub] ${head}…`,
+    };
+    const after = sizeOf(stub);
+    if (after >= before) return m; // 折叠反而更大就留着
+    pruned++;
+    savedBytes += before - after;
+    return stub;
+  });
+  return { messages: out, pruned, savedBytes };
+}
+
+/**
+ * 把**较旧的** `tool_calls[].function.arguments` 折叠成一句占位。
+ *
+ * ★ 2026-10-25 发现：这是第二块大头，体量几乎和工具输出相等。
+ *
+ * 真实会话实测（2047 条 / 2.60 MiB）里 assistant 占 1,005,796 B —— 但把它按
+ * `content === null` 切开就看清了：
+ *
+ *   | assistant 形态        | 条数 | 字节      |
+ *   | --------------------- | ---- | --------- |
+ *   | 纯 tool_calls（null） |  652 |   791,238 |
+ *   | 有正文                |  532 |   215,362 |
+ *
+ * 也就是说 **79% 的 assistant 体积是历史工具调用的参数原文**（`Get-ChildItem
+ * -Recurse -Filter *.shader` 这类命令串），模型真正说过的话只有 215 KiB。
+ *
+ * 历史参数的用途只有一个：让模型知道「这一轮我调用过什么」，以便把后面的
+ * tool 结果对上号。完整 JSON 参数是给**执行**用的，历史回放不需要它——
+ * 把 `arguments` 换成一个短摘要（工具名 + 关键字段）完全不损失语义。
+ *
+ * 与 `cnbStaleToolPrune` 的配套关系：tool 结果被折叠成 stub 之后，那轮调用的
+ * 完整参数更没用了（结果都只剩开头 400 字符了）。
+ */
+export function cnbStaleToolCallPrune(
+  messages: any[],
+  opts: {
+    /** 保留末尾多少条带 tool_calls 的 assistant 原文。 */
+    keepRecentToolCalls: number;
+    /** `arguments` 短于这个长度就不动（已经够小）。 */
+    minArgsChars: number;
+  },
+): { messages: any[]; pruned: number; savedBytes: number } {
+  const encoder = new TextEncoder();
+  const sizeOf = (m: any) => encoder.encode(JSON.stringify(m ?? null)).length;
+
+  const callIdx: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (
+      m?.role === "assistant" && Array.isArray(m.tool_calls) &&
+      m.tool_calls.length > 0
+    ) {
+      callIdx.push(i);
+    }
+  }
+  if (callIdx.length <= opts.keepRecentToolCalls) {
+    return { messages, pruned: 0, savedBytes: 0 };
+  }
+  const prunable = new Set(
+    callIdx.slice(0, callIdx.length - opts.keepRecentToolCalls),
+  );
+
+  let pruned = 0;
+  let savedBytes = 0;
+  const out = messages.map((m: any, i: number) => {
+    if (!prunable.has(i)) return m;
+    const before = sizeOf(m);
+    let changed = false;
+    const toolCalls = m.tool_calls.map((tc: any) => {
+      const args = tc?.function?.arguments;
+      if (typeof args !== "string" || args.length <= opts.minArgsChars) {
+        return tc;
+      }
+      changed = true;
+      // 留工具名 + 参数里的"关键字段"（命令首行/路径），够模型对上号即可。
+      const name = String(tc?.function?.name ?? "tool");
+      let hint = "";
+      try {
+        const parsed = JSON.parse(args);
+        const first = typeof parsed === "object" && parsed !== null
+          ? Object.entries(parsed).find(([, v]) => typeof v === "string")
+          : undefined;
+        if (first) {
+          const [k, v] = first as [string, string];
+          hint = ` ${k}=${v.replace(/\s+/g, " ").slice(0, 120)}`;
+        }
+      } catch {
+        hint = " " + args.replace(/\s+/g, " ").slice(0, 120);
+      }
+      return {
+        ...tc,
+        function: {
+          ...tc.function,
+          arguments: `{"_elided":"${name}${hint.replaceAll('"', "'")}"}`,
+        },
+      };
+    });
+    if (!changed) return m;
+    const next = { ...m, tool_calls: toolCalls };
+    const after = sizeOf(next);
+    if (after >= before) return m;
+    pruned++;
+    savedBytes += before - after;
+    return next;
+  });
+  return { messages: out, pruned, savedBytes };
+}
+
 async function cnbDumpCompaction(
   session: string,
   payload: Record<string, unknown>,
@@ -4402,6 +4635,82 @@ export async function maybeCompactCnb(
   }
   const budget = cnbIntSetting("CNB_BODY_BUDGET_BYTES", CNB_BODY_BUDGET_BYTES);
   if (bytes <= budget) return "";
+
+  // ★ 2026-10-25：**先扔可再生的工具噪音，再考虑摘要对话**。
+  //
+  // 这一层必须在写摘要之前：摘要会把整段早期历史换成一段文字，user/assistant
+  // 跟着一起消失（这就是「模型忘事」的直接原因）。而实测 49% 的体积是 tool
+  // 输出——它们用完即弃、且能重新跑一遍拿到，拿它们换回预算的代价最小。
+  //
+  // 策略：只折叠「除最近 N 条以外」的 tool 消息正文，每条留 400 字符开头让模型
+  // 认得出是哪次调用。折叠后**重新量体积**，若已经回到预算内就直接返回，一个
+  // 字的对话都不会丢。
+  const pruneKeepTools = cnbIntSetting("CNB_PRUNE_KEEP_TOOLS", 12);
+  const pruneMinBytes = cnbIntSetting("CNB_PRUNE_MIN_BYTES", 1024);
+  const pruneKeepCalls = cnbIntSetting("CNB_PRUNE_KEEP_TOOL_CALLS", 12);
+  if (
+    Array.isArray(body.messages) && (pruneKeepTools > 0 || pruneKeepCalls > 0)
+  ) {
+    let prunedCount = 0;
+    let savedTotal = 0;
+    const notes: string[] = [];
+
+    if (pruneKeepTools > 0) {
+      const r = cnbStaleToolPrune(body.messages, {
+        keepRecentTools: pruneKeepTools,
+        minBytes: pruneMinBytes,
+      });
+      if (r.pruned > 0) {
+        body.messages = r.messages;
+        prunedCount += r.pruned;
+        savedTotal += r.savedBytes;
+        notes.push(`${r.pruned} tool output(s)`);
+      }
+    }
+    // ★ 第二层：历史 tool_calls 的 arguments。实测占 assistant 体积的 79%。
+    // 必须在 tool 输出折叠之后做——两者覆盖的是同一批「旧工具交互」，
+    // 一起折叠才能把那一整段历史压成骨架。
+    if (pruneKeepCalls > 0) {
+      const r = cnbStaleToolCallPrune(body.messages, {
+        keepRecentToolCalls: pruneKeepCalls,
+        minArgsChars: cnbIntSetting("CNB_PRUNE_MIN_ARGS_CHARS", 256),
+      });
+      if (r.pruned > 0) {
+        body.messages = r.messages;
+        prunedCount += r.pruned;
+        savedTotal += r.savedBytes;
+        notes.push(`${r.pruned} tool-call arg(s)`);
+      }
+    }
+
+    if (prunedCount > 0) {
+      const afterPrune = new TextEncoder().encode(JSON.stringify(body)).length;
+      const pruneNote = `pruned ${notes.join(" + ")} ` +
+        `(~${savedTotal}B) bytes ${bytes} -> ${afterPrune}`;
+      if (afterPrune <= budget) {
+        // 足够收敛，不动对话。这是最理想的结果：模型看到的 user/assistant
+        // 文字一条不少，只是旧工具交互变成了骨架。
+        const note = `compacted ${pruneNote} (tool-only, no conversation loss)`;
+        await cnbDumpCompaction(
+          session !== "" ? `cnb:${session}` : (() => {
+            const d = deriveSessionKey(body.messages);
+            return d === "" ? "" : `cnb:${d}`;
+          })(),
+          {
+            at: new Date().toISOString(),
+            bytesIn: bytes,
+            budget,
+            note,
+            final: cnbMessageBreakdown(body.messages),
+          },
+        );
+        return note;
+      }
+      // 仍超预算：对话该压还得压，但此时要压的量已经小得多。
+      bytes = afterPrune;
+      body.__cnbPruneNote = pruneNote;
+    }
+  }
 
   // ★ 摘要请求自身的体积上限。
   //
