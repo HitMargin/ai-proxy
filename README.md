@@ -86,9 +86,11 @@ src/deepseek-gate.ts       DeepSeek 网页端串行闸与安全阀（冷却、�
 src/deepseek-responses.ts  DeepSeek 网页端 Responses API 转换
 src/deepseek-risk.ts       DeepSeek 网页端本地启发式风险打分
 src/trae.ts                TRAE 协议翻译、工具调用、思考档位、签到
-src/trae-account.ts        TRAE 凭据落盘、过期与续期、远端模型目录
-src/workbuddy.ts           WorkBuddy 凭据解析、目录/倍率/促销、请求体、错误分类、流内拦截
+src/trae-account.ts        TRAE 凭据落盘、过期与续期、远端模型目录、每日签到、积分余额
+src/workbuddy.ts           WorkBuddy 协议常量与纯函数层（凭据解析、目录/倍率/促销、请求体、错误分类、流内拦截、SSE 聚合）
 src/workbuddy-account.ts   WorkBuddy 凭据落盘、过期与续期、目录并集、可调性探测
+src/workbuddy-checkin.ts   WorkBuddy 每日签到：查状态、领取、确认
+src/channel-neutralise.ts  上游渠道校验（11128）出站清洗，cnb 与 workbuddy 共用
 src/zen.ts                 Zen 请求头补齐、Responses/Messages 转换、错误分类
 src/zen-catalog.ts         Zen 模型能力元数据（来自 models.dev）
 src/zen-compaction.ts      Zen 会话压缩
@@ -688,7 +690,9 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 | `/zen/v1` | opencode.ai/zen | 透传，默认 token `public`，仅保留 `-free` 模型 |
 | `/deepseek-web/v1` | chat.deepseek.com 网页聊天端 | 需要登录 Cookie，支持 Chat Completions 与 Responses |
 | `/trae/v1` | trae-api-cn.mchost.guru（推理）/ api.trae.cn（签到与积分） | 入站/出站协议翻译、工具调用、思考档位、账号状态与每日签到 |
-| `/workbuddy/v1` | www.workbuddy.cn | **自定义处理器**：文件凭据 + 401 自动续期重试 + 流内 11140 内容拦截；目录取自账号自身 |
+| `/workbuddy/v1` | www.workbuddy.cn | **自定义处理器**：文件凭据 + 401 自动续期重试 + 流内 11140 内容拦截 + 出站 11128 清洗；目录取自账号自身；Chat Completions / Responses / Anthropic Messages 三形态 |
+| `/trae/v1/checkin` | api.trae.cn | 每日签到（POST，幂等）；`/trae/v1/account` 同前缀返回余额与签到状态 |
+| `/workbuddy/v1/checkin` | www.workbuddy.cn | 每日签到（POST，幂等）；`/workbuddy/v1/account` 同前缀返回账号与签到状态 |
 | `/commandcode/v1` | CommandCode Go CLI 网关 | 模型发现、私有协议转换、多账号池、额度、Chat Completions 与 Responses |
 | `/openrouter/v1` | openrouter.ai | 透传 |
 | `/openrouter/v1/responses` | openrouter.ai | 透传 Responses API |
@@ -709,6 +713,66 @@ POST 时 model 写带前缀的 id（如 `cnb/deepseek-v4-pro`、`commandcode/dee
 deepseek-web / workbuddy / trae / openrouter / zlkpro 这几个成员加入聚合**不是为了让它们能被分发**（`/v1` 早就能分发），而是 **harness 的模型目录读的是这个聚合**（`adapter.listModels()`），不是插件那份独立清单——漏掉任何一个，就会出现「面板里有该渠道、选择器里一个模型都没有」。`openrouter` 在没配 key 时主动隐身（未鉴权的目录请求会回 401，列出来再 401 比不列更糟）。
 
 **模型列表**有 5 分钟内存缓存，并会在后台异步做健康探测（`testModel`，3 秒超时；200 可用，429/5xx 视为 degraded，401/403 才是 unavailable，网络失败保留为 unknown），在 Deno Deploy 上用 `EdgeRuntime.waitUntil` 挂起，不阻塞响应；加 `?health=true` 可强制同步探测。探测结果可通过 `GET /health` 查看。
+
+---
+
+## 每日签到
+
+两个渠道有签到：**TRAE** 与 **WorkBuddy**。都是「查状态 → 领取」两段，都**幂等**（已签过则不发领取请求，返回 `alreadyClaimed: true`），都不在 `/v1` 聚合里——它们是账号动作，不是模型路由。
+
+```powershell
+# 查看状态（账号 + 签到快照，只读）
+curl.exe http://127.0.0.1:8000/trae/v1/account
+curl.exe http://127.0.0.1:8000/workbuddy/v1/account
+
+# 签到（幂等，可重复执行）
+curl.exe -X POST http://127.0.0.1:8000/trae/v1/checkin
+curl.exe -X POST http://127.0.0.1:8000/workbuddy/v1/checkin
+```
+
+### 响应字段怎么读
+
+两个渠道的语义一致，字段名略有差异：
+
+| 字段 | TRAE | WorkBuddy | 说明 |
+|---|---|---|---|
+| 今天签没签 | `alreadyClaimed` | `alreadyClaimed` / `checkedIn` | 判断能不能领只看这一个 |
+| 本次实得积分 | `credits` | `credits` | 已签过时为 0 / 原值，不是报错 |
+| 连续天数 | — | `streakDays` | WorkBuddy 有连续奖励 |
+| 余额 | `balance.total` + `packs[]` | `totalCredits` | TRAE 按包列，含各自到期日 |
+| 服务端确认 | — | `confirmed` | **只信状态查询**，见下 |
+| 业务码 | `code`（0 成功） | — | TRAE 上游用它表达「已签过」 |
+
+### 两个渠道的接口与差异
+
+| | TRAE | WorkBuddy |
+|---|---|---|
+| 状态 | `POST api.trae.cn/trae/api/v2/ug/checkin_credits/status` | `POST www.workbuddy.cn/v2/billing/meter/checkin-activity-status` |
+| 领取 | `POST api.trae.cn/trae/api/v2/ug/checkin_credits/claim` | `POST www.workbuddy.cn/v2/billing/meter/daily-checkin` |
+| 请求体 | `{}` | `{}`（**领取不需要任何参数**） |
+| 领取响应含积分 | **否**，必须补查 status | **是**，`data.credit` |
+| 限流处理 | 9074 退避重试（默认 4 次 / 5s） | 无此错误码 |
+| 连续奖励 | 无 | 有（`is_streak_day` / `streak_bonus_credit`） |
+
+### ⚠️ 三个必须知道的判据
+
+**① 探测「领取」接口时不要发空 body。** 找 WorkBuddy 的 claim 路径时用了「空 body 诱发参数校验错误」来判存在性（参数错 ≠ 路由不存在），但 `daily-checkin` **没有参数**，空 body 就是一次真实领取：实测 `{}` 一发出，100 积分当场到账、`streak_days` 10→11。**副作用接口不能靠「轻量探测」确认存在性**——要么先读文档/前端源码，要么承认「探测即执行」并在用户同意后再发。
+
+**② `claimed ok` ≠ `confirmed`。** 领取接口回 `ok` 只说明那次 HTTP 调用成功了，**不说明服务端已把今天记进签到日期**。所以 `runDailyCheckin()` 领完会**再查一次状态**，判据是 `after.checkedIn`；WorkBuddy 的响应里 `confirmed` 就是这个值。TRAE 那边同理：它的 claim 响应根本不含积分，必须补查 status 才拿得到实际入账。
+
+**③ `active`（活动是否开放）与 `today_checked_in`（今天签没签）必须分开读。** 混成一个 `canClaim` 布尔的后果是：活动结束后面板显示「今天签过了」——而真相是「活动结束了，签不了了」，两种状态需要不同的提示。
+
+### 签到与推理是两条独立链路
+
+TRAE 的推理走 `trae-api-cn.mchost.guru`、签到与积分走 `api.trae.cn`，**主机不同、鉴权头不同、错误语义不同**；所以签到被限流不该让推理失败，反之亦然。WorkBuddy 主机相同但语义不同（签到会计积分、有连续天数、有活动窗口），因此也是独立模块（`src/workbuddy-checkin.ts`），只是复用 `src/workbuddy-account.ts` 的凭据读取与续期。
+
+### 想每天自动签
+
+默认要手动跑。可选方案（需要的话改代码，不是开关）：
+
+- **代理启动时签一次**：在 `main.ts` 起服务后调一次 `runDailyCheckin()`；缺点是代理不重启就不触发
+- **定时任务**：Windows 计划任务每天调一次 `curl.exe -X POST .../checkin`；最省事，且与代理生命周期解耦
+- **面板按钮**：`dsh-plugin/client.js` 加一个按钮打 `POST /workbuddy/v1/checkin`；适合不想记命令的场景
 
 ---
 

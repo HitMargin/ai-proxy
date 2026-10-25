@@ -2065,6 +2065,38 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   > （DeepSeek 网页端每轮只传增量）或把历史落盘让模型自己读——cnb 这条
   > 无状态 + 1MB 的组合做不到。
 
+- **WorkBuddy 有两条真实的上游链路：推理与签到（2026-10-25 实测）**。
+  签到接口（两条都确认存在，`body {}` 即可）：
+
+  | 用途 | 路径 | 响应关键字段 |
+  | --- | --- | --- |
+  | 状态（只读） | `POST /v2/billing/meter/checkin-activity-status` | `active`, `today_checked_in`, `streak_days`, `today_credit`, `checkin_dates[]`, `total_credits`, `start_time`/`end_time` |
+  | 领取 | `POST /v2/billing/meter/daily-checkin` | `credit`, `streak_days`, `is_streak_day` |
+
+  实现：`src/workbuddy-checkin.ts`，路由 `POST /workbuddy/v1/checkin` 与
+  `GET /workbuddy/v1/account`（后者内嵌只读签到快照）。TRAE 早就有同构的两条
+  （`POST /trae/v1/checkin` + `GET /trae/v1/account`，见 `src/trae-account.ts`），
+  但此前**没写进 README** —— 两个渠道现已一并成节。
+
+  > **实错：探测有副作用的接口不能发空 body**。找 claim 路径时按习惯用「空 body
+  > 诱发参数校验错误」判存在性（参数错 ≠ 路由不存在），但 `daily-checkin`
+  > **没有参数**，空 body 就是一次真实领取：`{}` 一发出，100 积分当场到账、
+  > `streak_days` 10→11、`checkin_dates` 多出当天。
+  > 判据：**副作用接口不能靠「轻量探测」确认存在性**——要么先读文档/前端源码，
+  > 要么承认「探测即执行」，在用户明确同意后再发。这条适用于任何「写」类端点。
+
+  **三条判据**（两条渠道都适用，写进了 README 的「每日签到」一节）：
+  ①**只信状态查询**：claim 回 `ok` 只说明那次 HTTP 调用成功，不说明服务端已把
+  今天记进 `checkin_dates`。所以领完必须再查一次状态，判据是 `after.checkedIn`
+  （WorkBuddy 的 `confirmed` 字段就是这个值）。TRAE 的 claim 响应**根本不含
+  积分**，必须补查 status 才拿得到实际入账 —— 同一个病的两种表现。
+  ②**`active` 与 `today_checked_in` 必须分开读**：混成一个 `canClaim` 布尔，
+  活动结束后面板会显示「今天签过了」，而真相是「活动结束了，签不了了」。
+  ③**幂等要落在真正生效的那一层**：`claimCheckin` 内部自己判断「已签就不发
+   claim」；`runDailyCheckin` 也判断了一次。**只测外层等于没测内层** —— 变异测试
+  里把 `claimCheckin` 的守卫改成 `if (false)`，走外层的那条断言依然全绿，是我
+  补了两条直测 `claimCheckin` 的用例才杀掉。
+
 ## 行为规则
 
 1. **文件为准**：涉及文件内容/行号/结构时，以本次工具读取结果为准；不要依赖会话记忆或压缩摘要里的旧行号。
