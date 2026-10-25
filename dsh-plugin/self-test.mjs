@@ -2652,6 +2652,62 @@ try {
     );
   }
 
+  // ── 模型标签槽位必须注册在比内置更低的 priority ──
+  //
+  // `conversation.input.model.label` 是 single 槽位：条目按 priority **升序**排、
+  // 最低的那条渲染，而**同 priority 再注册一次直接 throw**。内置的 1017 标签用默认
+  // 0，插件也用 0 → 抛出未捕获错误 → 渲染进程在加载循环里 OOM（2026-10-25 实测
+  // `crash-...-renderer.log`: `single slot "conversation.input.model.label" already
+  // has a registration at priority 0 (registered by ai-proxy-dsh-bridge)`）。
+  // 所以这里断言的是一件很具体的事：这个注册带有**负**的 priority。
+  {
+    const clientPath = path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      'client.js',
+    );
+    const source = fs.readFileSync(clientPath, 'utf8');
+    const slot = 'conversation.input.model.label';
+    const at = source.indexOf(`slots.inject('${slot}'`);
+    assert.ok(at > 0, `client.js must still decorate the ${slot} slot`);
+
+    // 取出这条注册的对象字面量：从 `register({` 到配对的 `}`。
+    const open = source.indexOf('register({', at);
+    assert.ok(open > at, `the ${slot} registration must be a plain object literal`);
+    const objStart = source.indexOf('{', open);
+    let depth = 0;
+    let objEnd = -1;
+    for (let i = objStart; i < source.length; i++) {
+      if (source[i] === '{') depth++;
+      else if (source[i] === '}') {
+        depth--;
+        if (depth === 0) { objEnd = i; break; }
+      }
+    }
+    assert.ok(objEnd > objStart, `could not delimit the ${slot} registration options`);
+    const options = source.slice(objStart, objEnd + 1);
+
+    const match = options.match(/priority:\s*([A-Za-z_$][\w$]*|-?\d+)/);
+    assert.ok(
+      match,
+      `the ${slot} registration must set an explicit priority: at the default 0 it ` +
+      'collides with the shipped 1017 label and throws, which takes the renderer down',
+    );
+    let value = match[1];
+    if (!/^-?\d+$/.test(value)) {
+      // 常量形式：把 `const NAME = <number>` 找出来。
+      const constMatch = source.match(
+        new RegExp(`const\\s+${value.replace(/\$/g, '\\$')}\\s*=\\s*(-?\\d+)`),
+      );
+      assert.ok(constMatch, `priority constant ${value} must be a numeric literal`);
+      value = constMatch[1];
+    }
+    assert.ok(
+      Number(value) < 0,
+      `${slot} must register below the shipped label's priority 0 (got ${value}): ` +
+      'a same-priority registration throws and kills the renderer',
+    );
+  }
+
   // ── 自定义供应商：填 → 保存 → 重开 ──
   //
   // 前端此前**零测试覆盖**，同一块 UI 连着出过三次事故（TDZ、hydration 守卫、空数组

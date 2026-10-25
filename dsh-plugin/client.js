@@ -1637,9 +1637,14 @@ window.__ModuleLoader__.load({
       return h('div', { className: 'apx' }, hero, tabs, body)
     }
 
-    // The input model label slot is `single`: whatever is registered last wins and
-    // the shipped 1017 label is shadowed outright. So this component has to keep
-    // the 1017 mark alive itself, then add the free mark for the cnb channel.
+    // The input model label slot is `single`: entries sort by priority ascending and
+    // the lowest one renders, and a same-priority second registration THROWS
+    // ("single slot ... already has a registration"). The shipped 1017 label sits at
+    // the default 0, so shadowing it means registering below 0 — at 0 this plugin
+    // takes the whole renderer down with an uncaught error. Because the 1017 label is
+    // shadowed outright, this component has to keep that mark alive itself, then add
+    // the free mark for the cnb channel.
+    const MODEL_LABEL_PRIORITY = -1
     const MODEL_LABEL_1017 = 'DeepSeek-V4.1-Flash'
 
     function ModelLabel(props) {
@@ -1679,7 +1684,7 @@ window.__ModuleLoader__.load({
         label: () => t('nav'), locale: NS,
       }, () => h(Panel, { t })))
       ctx.slots.inject('conversation.input.model.label', () => ctx.slots.register({
-        name: 'conversation.input.model.label', locale: NS,
+        name: 'conversation.input.model.label', locale: NS, priority: MODEL_LABEL_PRIORITY,
       }, ModelLabel))
     }
 
