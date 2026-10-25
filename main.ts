@@ -79,6 +79,7 @@ import {
   type WorkBuddyModel,
   workBuddyTruncationError,
 } from "./src/workbuddy.ts";
+import { fetchCheckinState, runDailyCheckin } from "./src/workbuddy-checkin.ts";
 import {
   fetchWorkBuddyModels,
   isWorkBuddyUsable,
@@ -853,6 +854,64 @@ async function handleWorkBuddy(
     }
   }
 
+  // ★ 2026-10-25：签到。与 trae 的两条路由同构（account 里带签到状态快照，
+  // checkin 只负责「领」），但字段按 workbuddy 的真实响应：
+  //   POST /v2/billing/meter/checkin-activity-status  → 状态（只读）
+  //   POST /v2/billing/meter/daily-checkin            → 领取（**无参数，发一次就真领**）
+  //
+  // 为什么不把 claim 塞进 /account：GET 有副作用是不可接受的（面板每 10 秒轮询
+  // 一次 /account，那会变成每 10 秒签一次到）。动作必须走 POST。
+  if (path === "/workbuddy/v1/checkin" && request.method === "POST") {
+    const credential = await readWorkBuddyCredential(
+      WORKBUDDY_ROOT,
+      workBuddyStore.read,
+    );
+    if (credential === undefined) {
+      return jsonResponse({
+        configured: false,
+        error:
+          "no WorkBuddy credential. run: deno run -A .tmp-workbuddy-login.ts (opens a browser)",
+      }, 409);
+    }
+    try {
+      // 凭据可能已过期 —— 签到走的是同一个站点，和推理一样的续期规则。
+      const refreshed = await refreshWorkBuddyIfNeeded(
+        WORKBUDDY_ROOT,
+        credential,
+      );
+      const usable = refreshed ?? credential;
+      // runDailyCheckin 内部会**先查状态再决定发不发 claim**，所以「今天已领」
+      // 不会多打一次请求，也不会把已有积分当天重复领（服务端也会拒）。
+      const outcome = await runDailyCheckin(usable);
+      if (outcome.claim && !outcome.claim.ok) {
+        console.warn(
+          `[workbuddy] check-in failed: code=${outcome.claim.code} ${outcome.claim.message}`,
+        );
+      }
+      return jsonResponse({
+        ok: outcome.claim === null ? true : outcome.claim.ok,
+        alreadyClaimed: outcome.claim === null ||
+          outcome.claim.alreadyClaimed === true,
+        message: outcome.claim === null
+          ? "already checked in today"
+          : outcome.claim.message,
+        // 本次实得积分。claim 响应里有它，不需要补查（与 trae 那条不同：
+        // trae 的 claim 不回积分，必须再查 status）。
+        credits: outcome.claim?.credits ?? 0,
+        streakDays: outcome.after.streakDays,
+        totalCredits: outcome.after.totalCredits,
+        // **只信状态查询**：claim 回 ok 不代表服务端已把今天记进 checkin_dates。
+        confirmed: outcome.confirmed,
+        checkedIn: outcome.after.checkedIn,
+        checkinDates: outcome.after.checkinDates,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[workbuddy] check-in error:", message);
+      return jsonResponse({ ok: false, error: message }, 502);
+    }
+  }
+
   if (path === "/workbuddy/v1/account" && request.method === "GET") {
     const credential = await readWorkBuddyCredential(
       WORKBUDDY_ROOT,
@@ -865,6 +924,15 @@ async function handleWorkBuddy(
           "no WorkBuddy credential. run: deno run -A .tmp-workbuddy-login.ts (opens a browser)",
       }, 409);
     }
+    // 签到状态**只读**地嵌进来（面板要显示「今天签没签、连续几天」）。失败
+    // 不致命：让 `checkinKnown:false` 说清是没查到，而不是伪造一份零值。
+    const checkin = await fetchCheckinState(credential).catch((error) => {
+      console.warn(
+        "[workbuddy] checkin status failed:",
+        error instanceof Error ? error.message : error,
+      );
+      return undefined;
+    });
     return jsonResponse({
       configured: true,
       nickname: credential.nickname ?? "",
@@ -877,6 +945,8 @@ async function handleWorkBuddy(
       usable: isWorkBuddyUsable(credential),
       models: workBuddyCatalog.models.length,
       catalogKnown: workBuddyCatalog.models.length > 0,
+      checkin: checkin ?? null,
+      checkinKnown: checkin !== undefined,
       // 令牌本身绝不出现在这里：这个响应会被渲染进面板，而截图只差一次按键。
     });
   }
