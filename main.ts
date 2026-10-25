@@ -24,7 +24,16 @@ import {
 import { envBackedStore } from "./src/credential-source.ts";
 import { DedupedWarn } from "./src/deduped-warn.ts";
 import { CNB_MODELS, handleCnb } from "./src/cnb.ts";
-import { readJsonBodyLimited } from "./src/deepseek-responses.ts";
+import {
+  chatToResponses,
+  readJsonBodyLimited,
+  responsesToChatBody,
+} from "./src/deepseek-responses.ts";
+import {
+  anthropicMessagesToChat,
+  chatResponseToAnthropic,
+  openAiStreamToAnthropic,
+} from "./src/commandcode/anthropic-messages.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
 import { fetchZenModels, handleZen } from "./src/zen.ts";
 import {
@@ -51,6 +60,7 @@ import {
   aggregateWorkBuddySse,
   buildChatBody,
   CHAT_COMPLETIONS_PATH,
+  chatSseToResponsesSse,
   classifyWorkBuddyChatFailure,
   guardWorkBuddyStream,
   isWorkBuddyExpired,
@@ -58,6 +68,8 @@ import {
   sendWorkBuddyChat,
   toWorkBuddyModelCard,
   WORKBUDDY_ENDPOINT,
+  WORKBUDDY_FORWARD_HEADERS,
+  workBuddyBareModelName,
   workBuddyChatHeaders,
   type WorkBuddyChatPlan,
   workBuddyChatSignal,
@@ -677,6 +689,150 @@ async function postWorkBuddyChat(
   });
 }
 
+/**
+ * 把 `/responses` 或 `/messages` 的请求体转成 chat 请求，再**自转发**给本渠道的
+ * `/chat/completions`。
+ *
+ * ★ 2026-10-25 修：`/v1/responses` 与 `/v1/messages` 对 workbuddy 一律 404。
+ *
+ * 症状（实测）：`POST /v1/responses {model:"workbuddy/glm-5.3"}` → 404；
+ * 同一时刻 `POST /v1/chat/completions` → 200 正常出字。对照同一台的其它渠道：
+ * cnb 200、zen 400（是参数错不是路由错）、kilo 404。根因是 `handleWorkBuddy`
+ * 只认 `/workbuddy/v1/chat/completions` 一条路径，其余全部落到函数末尾那句
+ * `Unknown WorkBuddy route` 的 404。
+ *
+ * 后果不是小事：**DSH 桌面走的就是 `/responses`**，所以 workbuddy 在桌面端
+ * 完全不可用，而 `/health` 与 `/v1/models` 都显示正常——正是本项目那条
+ * 「渠道在列表里、但走不通」的典型形态。
+ *
+ * 修法**不重写一套 chat 管线**，而是自转发：转换后把请求打回本进程的
+ * `/workbuddy/v1/chat/completions`，于是那里已有的全部保护（token 过期自动
+ * refresh + 重试、限流退避、11140 内容拒收识别、SSE 聚合、截断检测、用量记账）
+ * 自动继承。cnb 的 `/messages` 用的就是这个手法，理由一样：**另起一个调用点
+ * 就等于开一条没有这些保护的路**（见 src/cnb.ts 的同名注释）。
+ *
+ * 转换层直接复用已有实现，不再写第三份：
+ *   · `/responses` → `responsesToChatBody()`（src/deepseek-responses.ts）
+ *   · `/messages`  → `anthropicMessagesToChat()` + `chatToResponses` 的反向
+ *     （src/commandcode/anthropic-messages.ts，带 20 个单测）
+ */
+async function forwardWorkBuddyAsChat(
+  kind: "responses" | "messages",
+  request: Request,
+  rawBody: Record<string, any>,
+): Promise<Response> {
+  // 裸名：本渠道 chat 端点是严格白名单，喂 `workbuddy/x` 会稳定撞
+  // `Unknown WorkBuddy model`（判据见 src/workbuddy.ts 的同名函数）。
+  const bareModel = workBuddyBareModelName(rawBody?.model);
+
+  let chatBody: Record<string, any>;
+  try {
+    if (kind === "responses") {
+      chatBody = responsesToChatBody({ ...rawBody, model: bareModel }) as any;
+    } else {
+      const converted = anthropicMessagesToChat({
+        ...rawBody,
+        model: bareModel,
+      });
+      if (!converted.ok) {
+        return jsonResponse(
+          {
+            error: {
+              type: "invalid_request_error",
+              message: String((converted as any).message ?? "bad request"),
+            },
+          },
+          400,
+        );
+      }
+      chatBody = converted.body as any;
+    }
+  } catch (e) {
+    return jsonResponse(
+      {
+        error: {
+          type: "invalid_request_error",
+          message: e instanceof Error ? e.message : String(e),
+        },
+      },
+      400,
+    );
+  }
+
+  const inner = new URL(request.url);
+  inner.pathname = "/workbuddy/v1/chat/completions";
+  inner.search = "";
+  const headers = new Headers();
+  headers.set("Content-Type", "application/json");
+  for (const name of WORKBUDDY_FORWARD_HEADERS) {
+    const value = request.headers.get(name);
+    if (value) headers.set(name, value);
+  }
+  const chatResponse = await handleWorkBuddy(
+    inner.pathname,
+    new Request(inner.toString(), {
+      method: "POST",
+      headers,
+      body: JSON.stringify(chatBody),
+      signal: request.signal,
+    }),
+  );
+
+  // ── 把 chat 响应翻译回调用方要的形状 ──
+  if (kind === "responses") {
+    if (chatBody.stream === true) {
+      if (!chatResponse.ok) return chatResponse;
+      return new Response(
+        chatSseToResponsesSse(chatResponse.body!, bareModel),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "text/event-stream; charset=utf-8",
+            "Cache-Control": "no-cache",
+            "Access-Control-Allow-Origin": "*",
+          },
+        },
+      );
+    }
+    const text = await chatResponse.text().catch(() => "");
+    if (!chatResponse.ok) return new Response(text, chatResponse);
+    let payload: any = null;
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = null;
+    }
+    if (!payload) {
+      return jsonResponse(
+        { error: { message: "upstream returned non-JSON" } },
+        502,
+      );
+    }
+    return jsonResponse(chatToResponses(payload, bareModel, rawBody));
+  }
+
+  // Anthropic Messages
+  if (chatBody.stream === true) {
+    if (!chatResponse.ok) return chatResponse;
+    return openAiStreamToAnthropic(chatResponse, bareModel);
+  }
+  const text = await chatResponse.text().catch(() => "");
+  if (!chatResponse.ok) return new Response(text, chatResponse);
+  let payload: any = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = null;
+  }
+  if (!payload) {
+    return jsonResponse({
+      type: "error",
+      error: { type: "api_error", message: "upstream returned non-JSON" },
+    }, 502);
+  }
+  return jsonResponse(chatResponseToAnthropic(payload, bareModel));
+}
+
 async function handleWorkBuddy(
   path: string,
   request: Request,
@@ -723,6 +879,26 @@ async function handleWorkBuddy(
       catalogKnown: workBuddyCatalog.models.length > 0,
       // 令牌本身绝不出现在这里：这个响应会被渲染进面板，而截图只差一次按键。
     });
+  }
+
+  // ★ 2026-10-25：`/responses` 与 `/messages` 两条路。DSH 桌面走 /responses，
+  // 此前这里一律落到函数末尾的 `Unknown WorkBuddy route` 404 —— 渠道在
+  // /v1/models 里看得见、真实请求却走不通。
+  if (
+    (path === "/workbuddy/v1/responses" ||
+      path === "/workbuddy/v1/messages") &&
+    request.method === "POST"
+  ) {
+    const parsed = await readJsonBodyLimited(request);
+    if (!parsed.ok) {
+      return jsonResponse({ error: parsed.message }, parsed.status);
+    }
+    const kind = path.endsWith("/responses") ? "responses" : "messages";
+    return await forwardWorkBuddyAsChat(
+      kind,
+      request,
+      (parsed.value ?? {}) as Record<string, any>,
+    );
   }
 
   if (path === "/workbuddy/v1/chat/completions" && request.method === "POST") {

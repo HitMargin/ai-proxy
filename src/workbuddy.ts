@@ -2211,3 +2211,225 @@ export function guardWorkBuddyStream(
     },
   });
 }
+
+// ============================================
+// /responses 与 /messages 的自转发转换层
+// ============================================
+//
+// ★ 2026-10-25 修：`POST /v1/responses {model:"workbuddy/…"}` 与
+// `POST /v1/messages` 对 workbuddy 一律 **404**，而同一时刻
+// `/v1/chat/completions` 正常出字。根因是 `handleWorkBuddy` 只认
+// `/workbuddy/v1/chat/completions` 一条路径，其余落到函数末尾那句
+// `Unknown WorkBuddy route` 的 404。
+//
+// 后果不小：**DSH 桌面走的就是 `/responses`**，所以 workbuddy 在桌面端完全
+// 不可用，而 `/v1/models` 与 `/health` 都显示正常 —— 正是本项目那条
+// 「渠道在列表里、但走不通」的典型形态。
+//
+// 修法不重写一套 chat 管线，而是**自转发**：转换后打回本进程的
+// `/workbuddy/v1/chat/completions`，让那里已有的全部保护（token 过期自动
+// refresh + 重试、限流退避、11140 内容拒收识别、SSE 聚合、截断检测、用量记账）
+// 自动继承。cnb 的 `/messages` 用的就是这个手法，理由一样：**另起一个调用点
+// 就等于开一条没有这些保护的路**（见 src/cnb.ts 的同名注释）。
+//
+// 这一段放在 src/ 而不是 main.ts，是因为 `deno task test` 只跑 src/ ——
+// 留在 main.ts 就等于永远测不到（同 postWorkBuddyChat 的判据）。
+
+/**
+ * 从聚合前缀形状的模型名里取出本渠道要用的裸名。
+ *
+ * 为什么必须剥：本渠道的 chat 端点是**严格白名单** —— 它拿 requested 去 catalog
+ * 里 `find(entry => entry.id === requested)`，找不到就 400 `Unknown WorkBuddy
+ * model`。所以自转发若把 `workbuddy/glm-5.3` 原样喂进去，会稳定撞那句 400，
+ * 而错误信息看起来像「模型不存在」，完全指不到真正的原因。
+ */
+export function workBuddyBareModelName(model: unknown): string {
+  const raw = typeof model === "string" ? model : "";
+  const PREFIX = "workbuddy/";
+  return raw.startsWith(PREFIX) ? raw.slice(PREFIX.length) : raw;
+}
+
+/** 自转发时要保留的入站请求头（其余一律不带：本渠道凭据是登录态文件）。 */
+export const WORKBUDDY_FORWARD_HEADERS = [
+  "authorization",
+  "x-api-key",
+  "x-session-id",
+  "x-conversation-id",
+] as const;
+
+/**
+ * 把 Responses API 的流（chat SSE 形状）翻成 Responses SSE 事件流。
+ *
+ * 单纯换形状：`choices[0].delta.content` → `response.output_text.delta`，
+ * 收尾补 `output_text.done` / `output_item.done` / `response.completed`。
+ *
+ * **终止帧不可省**：本项目「Zen 截断检测」那条立下的规矩是 —— 缺终止帧就等于
+ * `stream_cut`，客户端会把「被掐断」当成「正常说完」。所以即使一行正文都没出，
+ * 也要发 `response.completed`。
+ */
+export function chatSseToResponsesSse(
+  upstream: ReadableStream<Uint8Array>,
+  model: string,
+  newId: () => string = () => "resp_" + crypto.randomUUID().replaceAll("-", ""),
+  now: () => number = () => Math.floor(Date.now() / 1000),
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  return new ReadableStream({
+    async start(controller) {
+      const reader = upstream.getReader();
+      const responseId = newId();
+      const createdAt = now();
+      let buffer = "";
+      let started = false;
+      let fullText = "";
+      const msgId = "msg_" + responseId;
+
+      const emit = (obj: Record<string, unknown>) => {
+        controller.enqueue(
+          encoder.encode(
+            `event: ${obj.type}\ndata: ${JSON.stringify(obj)}\n\n`,
+          ),
+        );
+      };
+      // 早开流与晚开流都要能收尾：客户端可能只看到 response.created 就断了。
+      const ensureStarted = () => {
+        if (started) return;
+        started = true;
+        emit({
+          type: "response.created",
+          response: {
+            id: responseId,
+            object: "response",
+            created_at: createdAt,
+            model,
+            status: "in_progress",
+            output: [],
+          },
+        });
+        emit({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: { type: "message", id: msgId, role: "assistant", content: [] },
+        });
+        emit({
+          type: "response.content_part.added",
+          item_id: msgId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+      };
+
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") continue;
+            let frame: Record<string, unknown>;
+            try {
+              frame = JSON.parse(data);
+            } catch {
+              continue;
+            }
+            if (frame?.error) {
+              ensureStarted();
+              emit({
+                type: "response.failed",
+                response: {
+                  id: responseId,
+                  status: "failed",
+                  error: frame.error,
+                },
+              });
+              continue;
+            }
+            const choice =
+              (frame?.choices as Array<Record<string, unknown>> | undefined)
+                ?.[0];
+            const delta = choice?.delta as Record<string, unknown> | undefined;
+            const piece = typeof delta?.content === "string"
+              ? delta.content
+              : "";
+            if (!piece) continue;
+            ensureStarted();
+            fullText += piece;
+            emit({
+              type: "response.output_text.delta",
+              item_id: msgId,
+              output_index: 0,
+              content_index: 0,
+              delta: piece,
+            });
+          }
+        }
+        ensureStarted();
+        emit({
+          type: "response.output_text.done",
+          item_id: msgId,
+          output_index: 0,
+          content_index: 0,
+          text: fullText,
+        });
+        emit({
+          type: "response.output_item.done",
+          output_index: 0,
+          item: {
+            type: "message",
+            id: msgId,
+            role: "assistant",
+            status: "completed",
+            content: [{ type: "output_text", text: fullText, annotations: [] }],
+          },
+        });
+        emit({
+          type: "response.completed",
+          response: {
+            id: responseId,
+            object: "response",
+            created_at: createdAt,
+            model,
+            status: "completed",
+            output: [{
+              type: "message",
+              id: msgId,
+              role: "assistant",
+              status: "completed",
+              content: [{
+                type: "output_text",
+                text: fullText,
+                annotations: [],
+              }],
+            }],
+          },
+        });
+      } catch (e) {
+        // 流读崩了也要给终止帧，否则客户端把「读到一半断掉」当成正常结束。
+        try {
+          emit({
+            type: "response.failed",
+            response: {
+              id: responseId,
+              status: "failed",
+              error: { message: e instanceof Error ? e.message : String(e) },
+            },
+          });
+        } catch { /* controller 已关 */ }
+      } finally {
+        try {
+          controller.close();
+        } catch { /* 已关 */ }
+      }
+    },
+    cancel(reason) {
+      // 客户端走了就取消上游，否则内容没人要、credit 却照算。
+      return upstream.cancel(reason).catch(() => undefined);
+    },
+  });
+}

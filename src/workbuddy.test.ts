@@ -11,6 +11,7 @@ import {
   aggregateWorkBuddySse,
   buildChatBody,
   buildCredential,
+  chatSseToResponsesSse,
   classifyWorkBuddyChatFailure,
   credentialExpiresAtMs,
   displayNameForModel,
@@ -52,8 +53,10 @@ import {
   trialModelIds,
   tripWorkBuddyCircuit,
   WORKBUDDY_CHAT_TIMEOUT_MS,
+  WORKBUDDY_FORWARD_HEADERS,
   WORKBUDDY_PASSTHROUGH_FIELDS,
   workBuddyAnonymousHeaders,
+  workBuddyBareModelName,
   workBuddyBaseHeaders,
   workBuddyChatHeaders,
   workBuddyChatSignal,
@@ -2796,4 +2799,150 @@ Deno.test("正常结束的流不得被取消（cancel 只属于拦截与客户�
   // 同样是平台吞掉：流已 done，cancel 到不了源的钩子，所以这条只保证「没有在
   // 自然结束时提前 break 出循环」（那种情况源还开着、钩子会翻，会被抓到）。
   equal(cancelled, false, "自然读到 done 的流被多取消了一次");
+});
+
+// ── 2026-10-25：/responses 与 /messages 原先对 workbuddy 一律 404 ──
+//
+// 症状：`POST /v1/responses {model:"workbuddy/glm-5.3"}` → 404，而同一时刻
+// `/v1/chat/completions` 正常出字；DSH 桌面走的正是 /responses，于是这个渠道
+// 在桌面端完全不可用，而 /v1/models 与 /health 都显示正常。
+// 根因：handleWorkBuddy 只认 /workbuddy/v1/chat/completions 一条路径。
+// 修法：自转发（见 src/workbuddy.ts 的注释）。下面钉住修法里两个**会静默出错**
+// 的点，以及终止帧不可省这条规矩。
+
+Deno.test("自转发：聚合前缀的模型名必须剥掉 workbuddy/ 前缀", () => {
+  // 本渠道 chat 端点拿 requested 去 catalog 里 === 查找，找不到就 400
+  // `Unknown WorkBuddy model`。若把 `workbuddy/glm-5.3` 原样喂进去，报错文案
+  // 会指向「模型不存在」，完全指不到真正的原因（前缀没剥）。
+  equal(workBuddyBareModelName("workbuddy/glm-5.3"), "glm-5.3");
+  equal(workBuddyBareModelName("workbuddy/hy3"), "hy3");
+  // 已经剥过、或从本渠道自己的前缀进来，都不能再动
+  equal(workBuddyBareModelName("glm-5.3"), "glm-5.3");
+  // 只剥**前缀**，不剥正文里的斜杠（模型 id 自身可能带斜杠）
+  equal(workBuddyBareModelName("workbuddy/a/b"), "a/b");
+  // 非字符串/缺失一律给空串，不要变成 "undefined" 字符串
+  equal(workBuddyBareModelName(undefined), "");
+  equal(workBuddyBareModelName(null), "");
+  equal(workBuddyBareModelName(42), "");
+});
+
+Deno.test("自转发：只带身份/会话头，不把入站凭据送给本渠道", () => {
+  // 本渠道凭据是登录态文件（access_token），不是入站 key。转发无关头等于把
+  // 客户端凭据散布到内部调用上。
+  const names = WORKBUDDY_FORWARD_HEADERS as readonly string[];
+  equal(names.includes("authorization"), true);
+  equal(names.includes("x-session-id"), true);
+  // 这些绝不能进白名单
+  for (
+    const banned of ["cookie", "host", "content-length", "accept-encoding"]
+  ) {
+    equal(
+      names.includes(banned),
+      false,
+      `${banned} must not be forwarded on the self-call`,
+    );
+  }
+});
+
+/** 把一串 chat SSE 帧拼成 ReadableStream，供下面的转换测试用。 */
+function chatSseStream(frames: string[]): ReadableStream<Uint8Array> {
+  const enc = new TextEncoder();
+  return new ReadableStream({
+    start(controller) {
+      for (const f of frames) controller.enqueue(enc.encode(f));
+      controller.close();
+    },
+  });
+}
+
+async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const dec = new TextDecoder();
+  let out = "";
+  for await (const chunk of stream) out += dec.decode(chunk, { stream: true });
+  return out;
+}
+
+Deno.test("chat→Responses 流：正文被翻成 output_text.delta 并聚合成完整文本", async () => {
+  const stream = chatSseStream([
+    `data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n`,
+    `data: {"choices":[{"delta":{"content":"你"}}]}\n\n`,
+    `data: {"choices":[{"delta":{"content":"好"}}]}\n\n`,
+    `data: [DONE]\n\n`,
+  ]);
+  const out = await readAll(
+    chatSseToResponsesSse(stream, "glm-5.3", () => "resp_fixed", () => 1),
+  );
+  equal(out.includes("response.created"), true);
+  equal(out.includes("response.output_text.delta"), true);
+  equal(out.includes('"delta":"你"'), true);
+  equal(out.includes('"text":"你好"'), true, "deltas must aggregate");
+  equal(out.includes("response.completed"), true);
+  equal(out.includes('"model":"glm-5.3"'), true);
+});
+
+Deno.test("chat→Responses 流：一个字都没出也必须发 response.completed", async () => {
+  // 缺终止帧 = 客户端把「被掐断」当「正常说完」（本项目 Zen 截断检测那条立的规矩）。
+  const out = await readAll(
+    chatSseToResponsesSse(
+      chatSseStream([`data: [DONE]\n\n`]),
+      "glm-5.3",
+      () => "resp_x",
+      () => 1,
+    ),
+  );
+  equal(out.includes("response.completed"), true);
+});
+
+Deno.test("chat→Responses 流：上游 error 帧变成 response.failed", async () => {
+  const out = await readAll(
+    chatSseToResponsesSse(
+      chatSseStream([
+        `data: {"error":{"code":"boom","message":"upstream died"}}\n\n`,
+        `data: [DONE]\n\n`,
+      ]),
+      "glm-5.3",
+      () => "resp_y",
+      () => 1,
+    ),
+  );
+  equal(out.includes("response.failed"), true);
+  equal(out.includes("upstream died"), true);
+});
+
+Deno.test("chat→Responses 流：坏帧被跳过而不是让整条流炸掉", async () => {
+  // 实测上游偶发把非 JSON 塞进 data: 行；一条坏帧不该毁掉整轮。
+  const out = await readAll(
+    chatSseToResponsesSse(
+      chatSseStream([
+        `data: {not json\n\n`,
+        `: heartbeat\n\n`,
+        `data: {"choices":[{"delta":{"content":"好"}}]}\n\n`,
+        `data: [DONE]\n\n`,
+      ]),
+      "glm-5.3",
+      () => "resp_z",
+      () => 1,
+    ),
+  );
+  equal(out.includes('"text":"好"'), true);
+  equal(out.includes("response.completed"), true);
+});
+
+Deno.test("chat→Responses 流：分帧跨块也要正确拼接", async () => {
+  // 真实上游的 SSE 不保证一次 read 就是一整帧；解码器必须留在循环外累积。
+  const enc = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(enc.encode(`data: {"choices":[{"delta":{"cont`));
+      controller.enqueue(enc.encode(`ent":"跨"}}]}\n\ndata: {"choices"`));
+      controller.enqueue(
+        enc.encode(`:[{"delta":{"content":"块"}}]}\n\ndata: [DONE]\n\n`),
+      );
+      controller.close();
+    },
+  });
+  const out = await readAll(
+    chatSseToResponsesSse(stream, "m", () => "resp_c", () => 1),
+  );
+  equal(out.includes('"text":"跨块"'), true);
 });
