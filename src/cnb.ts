@@ -3314,31 +3314,6 @@ function responsesUsage(u: any) {
 }
 
 /**
- * 「思考把额度吃光」之后该重发什么。
- *
- * 2026-10-26 实测的饥饿带（同一 prompt、只改 max_tokens、每组 8 次真调）：
- *
- *   max_tokens=1024 → 3/8 正文为空   ← clampOutputBudget 的下限 MIN_OUTPUT_TOKENS
- *   max_tokens=1280 → 2/8
- *   max_tokens=1536 → 3/8
- *   max_tokens=1792 → 2/8
- *   max_tokens=2048 → 0/8
- *   max_tokens=3072 → 0/8
- *
- * 成因：cnb 的思考 token **计入 max_tokens**（completion = reasoning + 正文），
- * 而同一 prompt 的思考量在 351~1808 token 之间波动——**预算落在波动带里就有概率
- * 一个字正文都不出**。这就是「有概率把答案包进思维」的全部机制，不是模型随机跑偏。
- *
- * 补救只做一件事：**放大输出上限，不动思考档**。理由：
- *   ① 复用 cnbRepairMaxTokens——「被 length 掐死就翻倍」这条判据在修复轮里已经
- *      跑了一个多月（下限 8192、封顶 120000），没有理由为同一个现象另造一套；
- *   ② 不关思考。关掉思考是摘要路径的选择（那条路只要一段压缩文本），而主回答
- *      是用户要看的正文，把用户的思考档悄悄换掉等于换了个模型。
- *
- * 放不上去时返回 null（上限已经 ≥ 封顶），调用方据此放弃重试、如实上报——
- * 比拿同一个上限再撞一次诚实。
- */
-/**
  * 「正文为空、答案全在思维里」之后该重发什么。
  *
  * 线上投诉的原话是「有概率把要展示给用户的正文包裹进思维里」，截图那轮显示
@@ -3395,6 +3370,100 @@ export function cnbAnswerBuriedInThinking(
   toolCallCount: number,
 ): boolean {
   return content.trim() === "" && reasoningChars > 0 && toolCallCount === 0;
+}
+
+/** 补救的结果：第二轮的正文/思维，以及它自己的 finish。 */
+export interface CnbBurialRescueResult {
+  attempted: boolean;
+  text: string;
+  thinking: string;
+  finish: string | null;
+  usage: any;
+}
+
+/**
+ * 执行一次「关思维重发」，供六个入口共用。
+ *
+ * 抽出来的理由不是好看：这个动作有五个入口（/chat ×2、/responses ×2、
+ * /messages 走 chat 转发），第一版把四十行重试代码各抄了一遍，于是
+ * 「第二轮要不要合并 usage」「失败要不要吞掉」这类判据有五个副本，
+ * 改一处漏四处只是时间问题。现在只有这一份。
+ *
+ * 三条不容商量的行为：
+ *   ① **只试一次**。第二轮还是空的就认输——无限重试会在每次失败时都烧掉
+ *      两份思考额度；
+ *   ② **失败不抛**。补救是兜底，兜底挂掉不该把第一轮的思维（用户唯一的
+ *      诊断线索）一起弄丢，所以 catch 里只记一行日志、返回 attempted=false；
+ *   ③ **只在真的拿到正文时才 report ok**。第二轮回思考但正文仍空，
+ *      对用户等于没救到，调用方应保持第一轮结果。
+ */
+async function cnbRescueBuriedAnswer(
+  upBody: any,
+  reasonChars: number,
+  finish: string | null,
+): Promise<CnbBurialRescueResult> {
+  const failed = {
+    attempted: false,
+    text: "",
+    thinking: "",
+    finish,
+    usage: null,
+  } as CnbBurialRescueResult;
+  const rescueBody = cnbBuriedAnswerRescueBody(upBody);
+  if (!rescueBody) return failed;
+
+  console.warn(
+    `[cnb] answer buried in thinking (finish=${finish}, ` +
+      `reasoning=${reasonChars} chars, no content) — retrying once with ` +
+      `thinking off (max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
+  );
+
+  let retryResp: Response;
+  try {
+    retryResp = await cnbCallUpstream(rescueBody);
+  } catch (e: any) {
+    console.warn(`[cnb] burial rescue failed: ${e?.message || e}`);
+    return failed;
+  }
+  if (retryResp.status !== 200) {
+    console.warn(
+      `[cnb] burial rescue got ${retryResp.status}; keeping first attempt`,
+    );
+    return failed;
+  }
+
+  const tParts: string[] = [], kParts: string[] = [];
+  let retryFinish: string | null = null;
+  let retryUsage: any = null;
+  try {
+    for await (const chunk of cnbIter(retryResp)) {
+      for (const ch of chunk.choices || []) {
+        const d = ch.delta || {};
+        if (ch.finish_reason) retryFinish = ch.finish_reason;
+        if (d.content) tParts.push(d.content);
+        if (d.reasoning_content) kParts.push(d.reasoning_content);
+      }
+      if (chunk.usage) retryUsage = chunk.usage;
+    }
+  } catch (e: any) {
+    console.warn(`[cnb] burial rescue read failed: ${e?.message || e}`);
+    return failed;
+  }
+
+  const retryText = tParts.join("");
+  if (retryText.trim() === "") {
+    console.warn(
+      "[cnb] burial rescue produced no content either; keeping first attempt",
+    );
+    return failed;
+  }
+  return {
+    attempted: true,
+    text: retryText,
+    thinking: kParts.join(""),
+    finish: retryFinish,
+    usage: retryUsage,
+  };
 }
 
 /**
@@ -3552,43 +3621,16 @@ async function handleCnbResponses(request: Request): Promise<Response> {
     if (
       cnbAnswerBuriedInThinking(textOut, fullThink.length, allCalls.length)
     ) {
-      const rescueBody = cnbBuriedAnswerRescueBody(upBody);
-      if (rescueBody) {
-        console.warn(
-          `[cnb] answer buried in thinking (finish=${upFinish}, ` +
-            `reasoning=${fullThink.length} chars, no content) — retrying once with thinking off ` +
-            `(max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
-        );
-        try {
-          const retryResp = await cnbCallUpstream(rescueBody);
-          if (retryResp.status === 200) {
-            const tParts: string[] = [], kParts: string[] = [];
-            let retryFinish: string | null = null;
-            for await (const chunk of cnbIter(retryResp)) {
-              for (const ch of chunk.choices || []) {
-                const d = ch.delta || {};
-                if (ch.finish_reason) retryFinish = ch.finish_reason;
-                if (d.content) tParts.push(d.content);
-                if (d.reasoning_content) kParts.push(d.reasoning_content);
-              }
-              if (chunk.usage) usage = sumCnbUsage(usage, chunk.usage);
-            }
-            const retryText = tParts.join("");
-            // 只有真的产出了正文才采纳；否则保留第一轮的思考，别把诊断信息也弄丢。
-            if (retryText.trim() !== "") {
-              textOut = retryText;
-              thinkOut = joinParts(thinkOut, kParts.join(""));
-              upFinish = retryFinish ?? "stop";
-            } else {
-              console.warn(
-                "[cnb] starvation rescue produced no content either; reporting the first attempt",
-              );
-            }
-          }
-        } catch (e: any) {
-          // 补救失败不该把原本能返回的思考也弄丢。
-          console.warn(`[cnb] starvation rescue failed: ${e?.message || e}`);
-        }
+      const rescue = await cnbRescueBuriedAnswer(
+        upBody,
+        fullThink.length,
+        upFinish,
+      );
+      if (rescue.attempted) {
+        textOut = rescue.text;
+        thinkOut = joinParts(thinkOut, rescue.thinking);
+        upFinish = rescue.finish ?? "stop";
+        if (rescue.usage) usage = sumCnbUsage(usage, rescue.usage);
       }
     }
 
@@ -3900,41 +3942,16 @@ async function handleCnbResponses(request: Request): Promise<Response> {
           allCalls.length,
         )
       ) {
-        const rescueBody = cnbBuriedAnswerRescueBody(upBody);
-        if (rescueBody) {
-          console.warn(
-            `[cnb] answer buried in thinking (finish=${upFinish}, ` +
-              `reasoning=${thinkFilter.state.full.length} chars, no content) — ` +
-              `retrying once with thinking off (max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
-          );
-          try {
-            const retryResp = await cnbCallUpstream(rescueBody);
-            if (retryResp.status === 200) {
-              const tParts: string[] = [], kParts: string[] = [];
-              let retryFinish: string | null = null;
-              for await (const chunk of cnbIter(retryResp)) {
-                for (const ch of chunk.choices || []) {
-                  const d = ch.delta || {};
-                  if (ch.finish_reason) retryFinish = ch.finish_reason;
-                  if (d.content) tParts.push(d.content);
-                  if (d.reasoning_content) kParts.push(d.reasoning_content);
-                }
-                if (chunk.usage) usage = sumCnbUsage(usage, chunk.usage);
-              }
-              const retryText = tParts.join("");
-              if (retryText.trim() !== "") {
-                textFull = retryText;
-                thinkFull = joinParts(thinkFull, kParts.join(""));
-                upFinish = retryFinish ?? "stop";
-              } else {
-                console.warn(
-                  "[cnb] starvation rescue produced no content either; reporting the first attempt",
-                );
-              }
-            }
-          } catch (e: any) {
-            console.warn(`[cnb] starvation rescue failed: ${e?.message || e}`);
-          }
+        const rescue = await cnbRescueBuriedAnswer(
+          upBody,
+          thinkFilter.state.full.length,
+          upFinish,
+        );
+        if (rescue.attempted) {
+          textFull = rescue.text;
+          thinkFull = joinParts(thinkFull, rescue.thinking);
+          upFinish = rescue.finish ?? "stop";
+          if (rescue.usage) usage = sumCnbUsage(usage, rescue.usage);
         }
       }
 
@@ -5382,47 +5399,19 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           (msg.tool_calls ?? []).length,
         )
       ) {
-        const rescueBody = cnbBuriedAnswerRescueBody(upBody);
-        if (rescueBody) {
-          console.warn(
-            `[cnb] answer buried in thinking (finish=${finish}, ` +
-              `reasoning=${fullThink.length} chars, no content) — retrying once with thinking off ` +
-              `(max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
+        const rescue = await cnbRescueBuriedAnswer(
+          upBody,
+          fullThink.length,
+          finish,
+        );
+        if (rescue.attempted) {
+          msg.content = rescue.text;
+          msg.reasoning_content = joinParts(
+            String(msg.reasoning_content ?? ""),
+            rescue.thinking,
           );
-          try {
-            const retryResp = await cnbCallUpstream(rescueBody);
-            if (retryResp.status === 200) {
-              const tParts: string[] = [], kParts: string[] = [];
-              let retryFinish: string | null = null;
-              let retryUsage: any = null;
-              for await (const chunk of cnbIter(retryResp)) {
-                for (const ch of chunk.choices || []) {
-                  const d = ch.delta || {};
-                  if (ch.finish_reason) retryFinish = ch.finish_reason;
-                  if (d.content) tParts.push(d.content);
-                  if (d.reasoning_content) kParts.push(d.reasoning_content);
-                }
-                if (chunk.usage) retryUsage = chunk.usage;
-              }
-              const retryText = tParts.join("");
-              if (retryText.trim() !== "") {
-                msg.content = retryText;
-                const moreThink = kParts.join("");
-                msg.reasoning_content = joinParts(
-                  String(msg.reasoning_content ?? ""),
-                  moreThink,
-                );
-                finish = retryFinish ?? "stop";
-                if (retryUsage) usage = sumCnbUsage(usage, retryUsage);
-              } else {
-                console.warn(
-                  "[cnb] starvation rescue produced no content either; reporting the first attempt",
-                );
-              }
-            }
-          } catch (e: any) {
-            console.warn(`[cnb] starvation rescue failed: ${e?.message || e}`);
-          }
+          finish = rescue.finish ?? "stop";
+          if (rescue.usage) usage = sumCnbUsage(usage, rescue.usage);
         }
       }
 
@@ -5495,47 +5484,18 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           if (
             cnbAnswerBuriedInThinking(streamedText, streamedThink.length, 0)
           ) {
-            const rescueBody = cnbBuriedAnswerRescueBody(upBody);
-            if (rescueBody) {
-              console.warn(
-                `[cnb] answer buried in thinking (finish=${finish}, ` +
-                  `reasoning=${streamedThink.length} chars, no content) — retrying once ` +
-                  `(max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
-              );
-              try {
-                const retryResp = await cnbCallUpstream(rescueBody);
-                if (retryResp.status === 200) {
-                  const tParts: string[] = [], kParts: string[] = [];
-                  let retryFinish: string | null = null;
-                  let retryUsage: any = null;
-                  for await (const chunk of cnbIter(retryResp)) {
-                    for (const ch of chunk.choices || []) {
-                      const d = ch.delta || {};
-                      if (ch.finish_reason) retryFinish = ch.finish_reason;
-                      if (d.content) tParts.push(d.content);
-                      if (d.reasoning_content) kParts.push(d.reasoning_content);
-                    }
-                    if (chunk.usage) retryUsage = chunk.usage;
-                  }
-                  const retryText = tParts.join("");
-                  if (retryText.trim() !== "") {
-                    if (kParts.length) {
-                      await emit({ reasoning_content: kParts.join("") });
-                    }
-                    await emit({ content: retryText });
-                    finish = retryFinish ?? "stop";
-                    if (retryUsage) usage = retryUsage;
-                  } else {
-                    console.warn(
-                      "[cnb] starvation rescue produced no content either; reporting the first attempt",
-                    );
-                  }
-                }
-              } catch (e: any) {
-                console.warn(
-                  `[cnb] starvation rescue failed: ${e?.message || e}`,
-                );
+            const rescue = await cnbRescueBuriedAnswer(
+              upBody,
+              streamedThink.length,
+              finish,
+            );
+            if (rescue.attempted) {
+              if (rescue.thinking) {
+                await emit({ reasoning_content: rescue.thinking });
               }
+              await emit({ content: rescue.text });
+              finish = rescue.finish ?? "stop";
+              if (rescue.usage) usage = rescue.usage;
             }
           }
         } else {
@@ -5616,45 +5576,16 @@ export async function handleCnb(path: string, request: Request, url: URL) {
               allCalls.length,
             )
           ) {
-            const rescueBody = cnbBuriedAnswerRescueBody(upBody);
-            if (rescueBody) {
-              console.warn(
-                `[cnb] answer buried in thinking (finish=${finish}, ` +
-                  `reasoning=${thinkFilter.state.full.length} chars, no content) — ` +
-                  `retrying once with thinking off (max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
-              );
-              try {
-                const retryResp = await cnbCallUpstream(rescueBody);
-                if (retryResp.status === 200) {
-                  const tParts: string[] = [], kParts: string[] = [];
-                  let retryFinish: string | null = null;
-                  let retryUsage: any = null;
-                  for await (const chunk of cnbIter(retryResp)) {
-                    for (const ch of chunk.choices || []) {
-                      const d = ch.delta || {};
-                      if (ch.finish_reason) retryFinish = ch.finish_reason;
-                      if (d.content) tParts.push(d.content);
-                      if (d.reasoning_content) kParts.push(d.reasoning_content);
-                    }
-                    if (chunk.usage) retryUsage = chunk.usage;
-                  }
-                  const retryText = tParts.join("");
-                  if (retryText.trim() !== "") {
-                    thinkRem = joinParts(thinkRem, kParts.join(""));
-                    textRem = retryText;
-                    finish = retryFinish ?? "stop";
-                    if (retryUsage) usage = retryUsage;
-                  } else {
-                    console.warn(
-                      "[cnb] starvation rescue produced no content either; reporting the first attempt",
-                    );
-                  }
-                }
-              } catch (e: any) {
-                console.warn(
-                  `[cnb] starvation rescue failed: ${e?.message || e}`,
-                );
-              }
+            const rescue = await cnbRescueBuriedAnswer(
+              upBody,
+              thinkFilter.state.full.length,
+              finish,
+            );
+            if (rescue.attempted) {
+              thinkRem = joinParts(thinkRem, rescue.thinking);
+              textRem = rescue.text;
+              finish = rescue.finish ?? "stop";
+              if (rescue.usage) usage = rescue.usage;
             }
           }
 
