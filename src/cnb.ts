@@ -3313,6 +3313,57 @@ function responsesUsage(u: any) {
   };
 }
 
+/**
+ * 「思考把额度吃光」之后该重发什么。
+ *
+ * 2026-10-26 实测的饥饿带（同一 prompt、只改 max_tokens、每组 8 次真调）：
+ *
+ *   max_tokens=1024 → 3/8 正文为空   ← clampOutputBudget 的下限 MIN_OUTPUT_TOKENS
+ *   max_tokens=1280 → 2/8
+ *   max_tokens=1536 → 3/8
+ *   max_tokens=1792 → 2/8
+ *   max_tokens=2048 → 0/8
+ *   max_tokens=3072 → 0/8
+ *
+ * 成因：cnb 的思考 token **计入 max_tokens**（completion = reasoning + 正文），
+ * 而同一 prompt 的思考量在 351~1808 token 之间波动——**预算落在波动带里就有概率
+ * 一个字正文都不出**。这就是「有概率把答案包进思维」的全部机制，不是模型随机跑偏。
+ *
+ * 补救只做一件事：**放大输出上限，不动思考档**。理由：
+ *   ① 复用 cnbRepairMaxTokens——「被 length 掐死就翻倍」这条判据在修复轮里已经
+ *      跑了一个多月（下限 8192、封顶 120000），没有理由为同一个现象另造一套；
+ *   ② 不关思考。关掉思考是摘要路径的选择（那条路只要一段压缩文本），而主回答
+ *      是用户要看的正文，把用户的思考档悄悄换掉等于换了个模型。
+ *
+ * 放不上去时返回 null（上限已经 ≥ 封顶），调用方据此放弃重试、如实上报——
+ * 比拿同一个上限再撞一次诚实。
+ */
+export function cnbStarvationRescueBody(upBody: any): any | null {
+  const current = typeof upBody?.max_tokens === "number"
+    ? upBody.max_tokens
+    : 0;
+  const bumped = cnbRepairMaxTokens(current || undefined, true);
+  // bumped <= current 说明已经在封顶附近，重发只会撞同一堵墙。
+  if (!bumped || bumped <= current) return null;
+  return { ...upBody, max_tokens: bumped };
+}
+
+/**
+ * 上游的 `finish_reason` 是否意味着「这一轮没说完」。
+ *
+ * `/responses` 之前一律按 `completed` 收尾，于是**被额度截断和被思考饿死
+ * 在客户端看来都跟正常说完一模一样**。2026-10-26 实测取证：正文 0 字、
+ * 思考 3291 字、`status:"completed"`、`incomplete_details:null`——用户在
+ * 屏幕上只看到一段思维，而接口说这轮成功了。
+ *
+ * 判据与 `deepseek-responses.ts` 保持同一张表，别让两个渠道对同一个
+ * `finish_reason` 给出不同结论。
+ */
+export function cnbFinishMeansIncomplete(finishReason: string | null): boolean {
+  return ["length", "max_tokens", "content_filter", "refusal"]
+    .includes(String(finishReason ?? ""));
+}
+
 function responsesShell(id: string, createdAt: number, model: string, rb: any) {
   return (status: string, output: any[], error: any = null) => ({
     id,
@@ -3320,7 +3371,9 @@ function responsesShell(id: string, createdAt: number, model: string, rb: any) {
     created_at: createdAt,
     status,
     error,
-    incomplete_details: null,
+    // `null` 是「没有截断」的正常值，但被截断时要能放 {reason}——推断成字面量
+    // null 的话，调用方一个赋值都写不进去。
+    incomplete_details: null as null | { reason: string },
     instructions: rb.instructions ?? null,
     max_output_tokens: rb.max_output_tokens ?? null,
     model,
@@ -3431,8 +3484,65 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       allCalls = repair.calls;
       if (repair.usage) usage = sumCnbUsage(usage, repair.usage);
     }
-    const thinkOut = joinParts(r1.clean, repair.think);
-    const textOut = joinParts(r2.clean, repair.text, repair.note);
+    let thinkOut = joinParts(r1.clean, repair.think);
+    let textOut = joinParts(r2.clean, repair.text, repair.note);
+
+    // ★ 思考饿死补救援（2026-10-26）。
+    //
+    // 形态：正文 0 字、finish=length、思考很多——思考 token 计入 max_tokens，
+    // 预算被它吃光。实测饥饿带 1024~1792（各组 8 次真调），2048 起不再复现。
+    //
+    // 这里**只在这种情况下重发一次**，且只放大输出上限、不动思考档（见
+    // cnbStarvationRescueBody 的注释）。只试一次：第二轮仍饿死说明思考量确实
+    // 远超封顶，再撞没有意义，如实把第一轮的结果发出去。
+    //
+    // 为什么不在 cnbBuildUpstream 里把调用方的 max_tokens 直接抬到下限：那条路
+    // 会静默改写调用方声明的预算（"max_tokens: 4096" 实际发 8192），既有契约
+    // 测试 `a caller-supplied max_tokens must survive verbatim` 明确禁止。
+    // 重发是「失败了再补救」，不是「悄悄换掉你的参数」。
+    if (
+      textOut.trim() === "" && upFinish === "length" &&
+      fullThink.trim() !== "" && allCalls.length === 0
+    ) {
+      const rescueBody = cnbStarvationRescueBody(upBody);
+      if (rescueBody) {
+        console.warn(
+          `[cnb] answer starved by thinking (finish=length, ` +
+            `reasoning=${fullThink.length} chars, no content) — retrying once ` +
+            `with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+        );
+        try {
+          const retryResp = await cnbCallUpstream(rescueBody);
+          if (retryResp.status === 200) {
+            const tParts: string[] = [], kParts: string[] = [];
+            let retryFinish: string | null = null;
+            for await (const chunk of cnbIter(retryResp)) {
+              for (const ch of chunk.choices || []) {
+                const d = ch.delta || {};
+                if (ch.finish_reason) retryFinish = ch.finish_reason;
+                if (d.content) tParts.push(d.content);
+                if (d.reasoning_content) kParts.push(d.reasoning_content);
+              }
+              if (chunk.usage) usage = sumCnbUsage(usage, chunk.usage);
+            }
+            const retryText = tParts.join("");
+            // 只有真的产出了正文才采纳；否则保留第一轮的思考，别把诊断信息也弄丢。
+            if (retryText.trim() !== "") {
+              textOut = retryText;
+              thinkOut = joinParts(thinkOut, kParts.join(""));
+              upFinish = retryFinish ?? "stop";
+            } else {
+              console.warn(
+                "[cnb] starvation rescue produced no content either; reporting the first attempt",
+              );
+            }
+          }
+        } catch (e: any) {
+          // 补救失败不该把原本能返回的思考也弄丢。
+          console.warn(`[cnb] starvation rescue failed: ${e?.message || e}`);
+        }
+      }
+    }
 
     const output: any[] = [];
     if (thinkOut) {
@@ -3462,7 +3572,31 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       });
     }
 
-    const resp = shell("completed", output);
+    // ★ 被截断就不许报 completed（2026-10-26）。
+    //
+    // 之前这一行恒为 `shell("completed", output)`，于是「正文 0 字、思考 3291 字、
+    // finish=length」在客户端看来与正常说完完全一样：`status:"completed"`、
+    // `incomplete_details:null`。用户屏幕上只剩一段思维，接口却宣称成功——
+    // 这正是「答案被包进思维」最难诊断的地方。
+    //
+    // 判据与 deepseek-responses.ts 同一张表（cnbFinishMeansIncomplete），
+    // 免得两个渠道对同一个 finish_reason 给出相反结论。
+    const incomplete = cnbFinishMeansIncomplete(upFinish);
+    const outputStatus = incomplete ? "incomplete" : "completed";
+    const resp = shell(incomplete ? "incomplete" : "completed", output);
+    if (incomplete) {
+      resp.incomplete_details = {
+        reason: upFinish === "content_filter" || upFinish === "refusal"
+          ? "content_filter"
+          : "max_output_tokens",
+      };
+      // message / reasoning 块自己也有 status，别让它们还说 completed。
+      for (const item of output) {
+        if (item.type === "message" || item.type === "reasoning") {
+          item.status = outputStatus;
+        }
+      }
+    }
     if (usage) resp.usage = responsesUsage(usage);
     return new Response(JSON.stringify(resp), {
       headers: {
@@ -3699,8 +3833,59 @@ async function handleCnbResponses(request: Request): Promise<Response> {
         if (repair.calls.length) allCalls = repair.calls;
         if (repair.usage) usage = sumCnbUsage(usage, repair.usage);
       }
-      const thinkFull = joinParts(r1.clean, repair.think);
-      const textFull = joinParts(r2.clean, repair.text, repair.note);
+      let thinkFull = joinParts(r1.clean, repair.think);
+      let textFull = joinParts(r2.clean, repair.text, repair.note);
+
+      // ★ 思考饿死补救援（流式版，2026-10-26）。
+      //
+      // 与非流式版同一判据、同一条补救济（见 cnbStarvationRescueBody），区别只在
+      // 「什么时候发」：流式路径的思考**已经实时流给客户端了**，撤不回来；但正文
+      // 一个字节都还没发（textOpened 仍是 false），所以补救是把第二轮的正文补进
+      // 同一个 message item——用户从「只有思维、没有答案」变成「思维 + 答案」。
+      //
+      // 不重发整个 response（那会在客户端留下两段思维），也不提前缓冲（那会把
+      // 流式变非流式，思考的第一秒就看不到）。
+      if (
+        textFull.trim() === "" && upFinish === "length" &&
+        thinkFilter.state.full.trim() !== "" && allCalls.length === 0
+      ) {
+        const rescueBody = cnbStarvationRescueBody(upBody);
+        if (rescueBody) {
+          console.warn(
+            `[cnb] answer starved by thinking (finish=length, ` +
+              `reasoning=${thinkFilter.state.full.length} chars, no content) — ` +
+              `retrying once with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+          );
+          try {
+            const retryResp = await cnbCallUpstream(rescueBody);
+            if (retryResp.status === 200) {
+              const tParts: string[] = [], kParts: string[] = [];
+              let retryFinish: string | null = null;
+              for await (const chunk of cnbIter(retryResp)) {
+                for (const ch of chunk.choices || []) {
+                  const d = ch.delta || {};
+                  if (ch.finish_reason) retryFinish = ch.finish_reason;
+                  if (d.content) tParts.push(d.content);
+                  if (d.reasoning_content) kParts.push(d.reasoning_content);
+                }
+                if (chunk.usage) usage = sumCnbUsage(usage, chunk.usage);
+              }
+              const retryText = tParts.join("");
+              if (retryText.trim() !== "") {
+                textFull = retryText;
+                thinkFull = joinParts(thinkFull, kParts.join(""));
+                upFinish = retryFinish ?? "stop";
+              } else {
+                console.warn(
+                  "[cnb] starvation rescue produced no content either; reporting the first attempt",
+                );
+              }
+            }
+          } catch (e: any) {
+            console.warn(`[cnb] starvation rescue failed: ${e?.message || e}`);
+          }
+        }
+      }
 
       const finalOutput: any[] = [];
       let oi = 0;
@@ -3743,7 +3928,33 @@ async function handleCnbResponses(request: Request): Promise<Response> {
         oi = 1;
       }
 
-      if (textOpened || r2.clean) {
+      // ★ 条件里必须有 textFull：饿死时 textOpened=false 且 r2.clean=""（第一轮正文
+      // 一个字都没有），只有补救把 textFull 换成了新正文。少了这一项，救援翻盘的
+      // 正文会被这个 if 静默吞掉——正是上面那条流式用例抓出来的。
+      if (textOpened || r2.clean || textFull.trim() !== "") {
+        // 救援翻盘时 textOpened 还是 false：客户端从没收到过这个 message item 的
+        // 开启事件，直接发 delta 就是一个悬空的 item（Responses 客户端会丢掉它，
+        // 甚至报协议错）。所以这里补开流事件——顺序与正常开流完全一致。
+        if (!textOpened) {
+          textOpened = true;
+          msgOI = thinkOpened ? 1 : 0;
+          await writeEvent("response.output_item.added", {
+            output_index: msgOI,
+            item: {
+              type: "message",
+              id: msgId,
+              status: "in_progress",
+              role: "assistant",
+              content: [],
+            },
+          });
+          await writeEvent("response.content_part.added", {
+            item_id: msgId,
+            output_index: msgOI,
+            content_index: 0,
+            part: { type: "output_text", text: "", annotations: [] },
+          });
+        }
         const rem = textFull.slice(
           commonPrefixLen(textFull, textFilter.state.emitted),
         );
@@ -3821,9 +4032,33 @@ async function handleCnbResponses(request: Request): Promise<Response> {
         }
       }
 
-      const final = shell("completed", finalOutput);
+      // ★ 被截断就不许报 completed（2026-10-26，与非流式同一判据）。
+      // 流式路径尤其要紧：客户端本来就在看一段只有思维的长流，
+      // 最后那帧 response.completed 是它判断「这轮成功了」的唯一依据。
+      const streamIncomplete = cnbFinishMeansIncomplete(upFinish);
+      if (streamIncomplete) {
+        for (const item of finalOutput) {
+          if (item.type === "message" || item.type === "reasoning") {
+            item.status = "incomplete";
+          }
+        }
+      }
+      const final = shell(
+        streamIncomplete ? "incomplete" : "completed",
+        finalOutput,
+      );
+      if (streamIncomplete) {
+        final.incomplete_details = {
+          reason: upFinish === "content_filter" || upFinish === "refusal"
+            ? "content_filter"
+            : "max_output_tokens",
+        };
+      }
       if (usage) final.usage = responsesUsage(usage);
-      await writeEvent("response.completed", { response: final });
+      await writeEvent(
+        streamIncomplete ? "response.incomplete" : "response.completed",
+        { response: final },
+      );
     } catch (e: any) {
       try {
         await writeEvent("response.failed", {
@@ -5080,6 +5315,63 @@ export async function handleCnb(path: string, request: Request, url: URL) {
         if (fullThink) msg.reasoning_content = fullThink;
       }
 
+      // ★ 思考饿死补救援（chat 非流式版，2026-10-26）。
+      //
+      // 与 /responses 两条路径同一判据、同一条补救济（cnbStarvationRescueBody），
+      // 这里只是把翻盘的正文写回 msg。三个入口都要接：线上投诉来自 DSH 桌面
+      // （/responses 流式），但 chat 非流式的饿死率实测同样存在（1024 时 4/10），
+      // 只修一条等于把问题挪到别的客户端。
+      //
+      // 条件里的 allCalls 判定用 msg.tool_calls：有工具调用时正文为空是正常的
+      // （模型就是在调工具），那不是饿死，不能重发。
+      if (
+        !msg.tool_calls && String(msg.content ?? "").trim() === "" &&
+        finish === "length" && fullThink.trim() !== ""
+      ) {
+        const rescueBody = cnbStarvationRescueBody(upBody);
+        if (rescueBody) {
+          console.warn(
+            `[cnb] answer starved by thinking (finish=length, ` +
+              `reasoning=${fullThink.length} chars, no content) — retrying once ` +
+              `with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+          );
+          try {
+            const retryResp = await cnbCallUpstream(rescueBody);
+            if (retryResp.status === 200) {
+              const tParts: string[] = [], kParts: string[] = [];
+              let retryFinish: string | null = null;
+              let retryUsage: any = null;
+              for await (const chunk of cnbIter(retryResp)) {
+                for (const ch of chunk.choices || []) {
+                  const d = ch.delta || {};
+                  if (ch.finish_reason) retryFinish = ch.finish_reason;
+                  if (d.content) tParts.push(d.content);
+                  if (d.reasoning_content) kParts.push(d.reasoning_content);
+                }
+                if (chunk.usage) retryUsage = chunk.usage;
+              }
+              const retryText = tParts.join("");
+              if (retryText.trim() !== "") {
+                msg.content = retryText;
+                const moreThink = kParts.join("");
+                msg.reasoning_content = joinParts(
+                  String(msg.reasoning_content ?? ""),
+                  moreThink,
+                );
+                finish = retryFinish ?? "stop";
+                if (retryUsage) usage = sumCnbUsage(usage, retryUsage);
+              } else {
+                console.warn(
+                  "[cnb] starvation rescue produced no content either; reporting the first attempt",
+                );
+              }
+            }
+          } catch (e: any) {
+            console.warn(`[cnb] starvation rescue failed: ${e?.message || e}`);
+          }
+        }
+      }
+
       const resp: any = {
         id: id || "chatcmpl-" + Date.now(),
         object: "chat.completion",
@@ -5121,6 +5413,8 @@ export async function handleCnb(path: string, request: Request, url: URL) {
       try {
         // ─── 无 tools：逐 chunk 直通，每个 delta 立即转发 ───
         if (!hasTools) {
+          let streamedText = "";
+          let streamedThink = "";
           for await (const chunk of cnbIter(upstreamResp!)) {
             if (chatId == null) {
               chatId = chunk.id || "chatcmpl-" + Date.now();
@@ -5131,11 +5425,65 @@ export async function handleCnb(path: string, request: Request, url: URL) {
               const d = ch.delta || {};
               if (d.role) await emit({ role: d.role });
               if (d.reasoning_content) {
+                streamedThink += d.reasoning_content;
                 await emit({ reasoning_content: d.reasoning_content });
               }
-              if (d.content) await emit({ content: d.content });
+              if (d.content) {
+                streamedText += d.content;
+                await emit({ content: d.content });
+              }
             }
             if (chunk.usage) usage = chunk.usage;
+          }
+
+          // ★ 思考饿死补救援（chat 流式、无 tools 版，2026-10-26）。
+          // 思考已经流给客户端了、撤不回来；正文一个字节都没发，所以补发正文即可。
+          if (
+            streamedText.trim() === "" && finish === "length" &&
+            streamedThink.trim() !== ""
+          ) {
+            const rescueBody = cnbStarvationRescueBody(upBody);
+            if (rescueBody) {
+              console.warn(
+                `[cnb] answer starved by thinking (finish=length, ` +
+                  `reasoning=${streamedThink.length} chars, no content) — retrying once ` +
+                  `with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+              );
+              try {
+                const retryResp = await cnbCallUpstream(rescueBody);
+                if (retryResp.status === 200) {
+                  const tParts: string[] = [], kParts: string[] = [];
+                  let retryFinish: string | null = null;
+                  let retryUsage: any = null;
+                  for await (const chunk of cnbIter(retryResp)) {
+                    for (const ch of chunk.choices || []) {
+                      const d = ch.delta || {};
+                      if (ch.finish_reason) retryFinish = ch.finish_reason;
+                      if (d.content) tParts.push(d.content);
+                      if (d.reasoning_content) kParts.push(d.reasoning_content);
+                    }
+                    if (chunk.usage) retryUsage = chunk.usage;
+                  }
+                  const retryText = tParts.join("");
+                  if (retryText.trim() !== "") {
+                    if (kParts.length) {
+                      await emit({ reasoning_content: kParts.join("") });
+                    }
+                    await emit({ content: retryText });
+                    finish = retryFinish ?? "stop";
+                    if (retryUsage) usage = retryUsage;
+                  } else {
+                    console.warn(
+                      "[cnb] starvation rescue produced no content either; reporting the first attempt",
+                    );
+                  }
+                }
+              } catch (e: any) {
+                console.warn(
+                  `[cnb] starvation rescue failed: ${e?.message || e}`,
+                );
+              }
+            }
           }
         } else {
           // ─── 有 tools：正文/思考实时流出；疑似工具标记的部分扣住，流结束后统一解析 ───
@@ -5203,6 +5551,55 @@ export async function handleCnb(path: string, request: Request, url: URL) {
             if (repair.usage) usage = sumCnbUsage(usage, repair.usage);
             thinkRem = joinParts(thinkRem, repair.think);
             textRem = joinParts(textRem, repair.text, repair.note);
+          }
+
+          // ★ 思考饿死补救援（chat 流式、有 tools 版，2026-10-26）。
+          // 与无 tools 分支同一判据。这里的 textRem 是「还没发出去的正文本」，
+          // 饿死时它为空；补救援把第二轮正文塞进去，下面照常发出。
+          if (
+            textRem.trim() === "" && finish === "length" &&
+            thinkFilter.state.full.trim() !== "" && allCalls.length === 0
+          ) {
+            const rescueBody = cnbStarvationRescueBody(upBody);
+            if (rescueBody) {
+              console.warn(
+                `[cnb] answer starved by thinking (finish=length, ` +
+                  `reasoning=${thinkFilter.state.full.length} chars, no content) — ` +
+                  `retrying once with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+              );
+              try {
+                const retryResp = await cnbCallUpstream(rescueBody);
+                if (retryResp.status === 200) {
+                  const tParts: string[] = [], kParts: string[] = [];
+                  let retryFinish: string | null = null;
+                  let retryUsage: any = null;
+                  for await (const chunk of cnbIter(retryResp)) {
+                    for (const ch of chunk.choices || []) {
+                      const d = ch.delta || {};
+                      if (ch.finish_reason) retryFinish = ch.finish_reason;
+                      if (d.content) tParts.push(d.content);
+                      if (d.reasoning_content) kParts.push(d.reasoning_content);
+                    }
+                    if (chunk.usage) retryUsage = chunk.usage;
+                  }
+                  const retryText = tParts.join("");
+                  if (retryText.trim() !== "") {
+                    thinkRem = joinParts(thinkRem, kParts.join(""));
+                    textRem = retryText;
+                    finish = retryFinish ?? "stop";
+                    if (retryUsage) usage = retryUsage;
+                  } else {
+                    console.warn(
+                      "[cnb] starvation rescue produced no content either; reporting the first attempt",
+                    );
+                  }
+                }
+              } catch (e: any) {
+                console.warn(
+                  `[cnb] starvation rescue failed: ${e?.message || e}`,
+                );
+              }
+            }
           }
 
           if (thinkRem) await emit({ reasoning_content: thinkRem });

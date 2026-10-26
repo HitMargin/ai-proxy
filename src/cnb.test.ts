@@ -17,6 +17,7 @@ import {
   cnbCallUpstream,
   cnbDiagnoseJunkSyntax,
   cnbEscapeRepairState,
+  cnbFinishMeansIncomplete,
   cnbFlattenMainBranchParen,
   cnbForgetRejectedHeads,
   cnbGatedResponse,
@@ -32,6 +33,7 @@ import {
   cnbRepairMaxTokens,
   cnbStaleToolCallPrune,
   cnbStaleToolPrune,
+  cnbStarvationRescueBody,
   cnbStripGitStatus,
   deriveSessionKey,
   handleCnb,
@@ -4132,6 +4134,513 @@ Deno.test("cnb: an Anthropic Messages stream reports input and cache usage", asy
     assert(
       !("cache_creation_input_tokens" in usage),
       "a zero cache write must stay absent, not asserted as 0",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 思考饿死（2026-10-26 线上投诉「cnb 有概率把输出给用户看的内容包裹进思维里」）
+//
+// 实测机制：cnb 的思考 token **计入 max_tokens**（completion = reasoning + 正文），
+// 同一 prompt 的思考量在 351~1808 token 之间波动，所以当输出上限落进这个波动带
+// （实测 1024~1792，各组 8 次真调）时，**有概率一个字正文都不出**、正文全在
+// reasoning_content 里、finish_reason=length。2048 起不再复现。
+//
+// 两个独立缺陷，各有一条用例：
+//   ① `/responses` 把这轮报成 status:"completed" + incomplete_details:null，
+//      客户端无法把「被饿死」与「正常说完」区分开；
+//   ② 没有任何补救——摘要路径早就有「关思考重发一次」，主回答路径没有。
+// ─────────────────────────────────────────────────────────────────────────────
+
+Deno.test("cnb: a length cut is reported as incomplete, not completed", () => {
+  // 判据必须与 deepseek-responses.ts 同一张表。这条钉住的是「被截断不许报成功」。
+  for (const f of ["length", "max_tokens", "content_filter", "refusal"]) {
+    assertEquals(
+      cnbFinishMeansIncomplete(f),
+      true,
+      `finish_reason=${f} means the turn did not finish`,
+    );
+  }
+  for (const f of ["stop", "tool_calls", null, "", "end_turn"]) {
+    assertEquals(
+      cnbFinishMeansIncomplete(f),
+      false,
+      `finish_reason=${f} is a normal end`,
+    );
+  }
+});
+
+Deno.test("cnb: the starvation rescue grows the cap but never shrinks it", () => {
+  // 只放大。调用方要 393216 时不该被压回去——压小是另一种静默改参。
+  assertEquals(
+    cnbStarvationRescueBody({ max_tokens: 1024 })?.max_tokens,
+    8192,
+    "1024 is inside the measured starvation band; the rescue must clear it",
+  );
+  assertEquals(
+    cnbStarvationRescueBody({ max_tokens: 2048 })?.max_tokens,
+    8192,
+    "2048 does not starve today, but the rescue floor is the same as the repair floor",
+  );
+  // 已经很大：不动（拿同一个上限重撞一次没有意义，null 让调用方如实上报）。
+  assertEquals(
+    cnbStarvationRescueBody({ max_tokens: 120000 }),
+    null,
+    "at the ceiling there is nothing left to raise",
+  );
+  assertEquals(
+    cnbStarvationRescueBody({ max_tokens: 200000 }),
+    null,
+    "never lower a caller budget that is already above the ceiling",
+  );
+  // 其余字段必须原样带过去：重发的是同一份请求，只换上限。
+  const rescued = cnbStarvationRescueBody({
+    max_tokens: 1024,
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: "hi" }],
+    enable_thinking: true,
+    reasoning_effort: "high",
+  });
+  assertEquals(rescued?.model, "deepseek-v4.1-flash");
+  assertEquals(rescued?.enable_thinking, true);
+  assertEquals(
+    rescued?.reasoning_effort,
+    "high",
+    "the rescue must not silently change the caller's thinking rung",
+  );
+});
+
+Deno.test("cnb: a starved /responses turn is retried once with a bigger cap", async () => {
+  // 第一轮：只有思考、finish=length（线上取证的确切形状）。
+  // 第二轮：给出正文。断言「用户终于看到了答案」，且只重试一次。
+  const realFetch = globalThis.fetch;
+  const bodies: any[] = [];
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/") && !url.includes("/ai/chat/completions")) {
+      // CSRF 引导页
+      return Promise.resolve(
+        new Response(
+          `<html><script>window.csrftoken = "0123456789abcdef0123456789abcdef"</script></html>`,
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/html",
+              "set-cookie": "csrfkey=1234567890; Path=/",
+            },
+          },
+        ),
+      );
+    }
+    if (url.includes("/ai/chat/completions")) {
+      const sent = JSON.parse(String(init?.body ?? "{}"));
+      bodies.push(sent);
+      const starved = bodies.length === 1;
+      const chunk = starved
+        ? {
+          id: "c1",
+          created: 1,
+          choices: [{
+            index: 0,
+            delta: { reasoning_content: "让我想想。".repeat(200) },
+            finish_reason: null,
+          }],
+          usage: {
+            prompt_tokens: 10,
+            completion_tokens: 1024,
+            total_tokens: 1034,
+            completion_tokens_details: { reasoning_tokens: 1024 },
+          },
+        }
+        : {
+          id: "c2",
+          created: 2,
+          choices: [{
+            index: 0,
+            delta: { content: "不能。" },
+            finish_reason: null,
+          }],
+          usage: {
+            prompt_tokens: 10,
+            completion_tokens: 200,
+            total_tokens: 210,
+            completion_tokens_details: { reasoning_tokens: 150 },
+          },
+        };
+      const end = {
+        id: starved ? "c1" : "c2",
+        created: 1,
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: starved ? "length" : "stop",
+        }],
+      };
+      const sse = `data: ${JSON.stringify(chunk)}\n\ndata: ${
+        JSON.stringify(end)
+      }\n\ndata: [DONE]\n\n`;
+      return Promise.resolve(
+        new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
+  }) as typeof fetch;
+
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        input: [{ role: "user", content: "工程里能用 UMM 安装吗？" }],
+        max_output_tokens: 1024,
+        stream: false,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/responses",
+      req,
+      new URL(req.url),
+    );
+    assertEquals(resp.status, 200);
+    const json = await resp.json();
+
+    // ① 只重试一次
+    assertEquals(
+      bodies.length,
+      2,
+      "a starved turn is retried exactly once",
+    );
+    // ② 第二轮的上限确实放大了
+    assert(
+      bodies[1].max_tokens > bodies[0].max_tokens,
+      `the rescue must raise the cap (first=${bodies[0].max_tokens}, retry=${
+        bodies[1].max_tokens
+      })`,
+    );
+    // ③ 思考档没被悄悄换掉
+    assertEquals(
+      bodies[1].reasoning_effort,
+      bodies[0].reasoning_effort,
+      "the rescue must not change the caller's thinking rung",
+    );
+    // ④ 用户终于看到了正文
+    let text = "";
+    for (const item of json.output ?? []) {
+      if (item.type === "message") {
+        for (const c of item.content ?? []) text += c.text ?? "";
+      }
+    }
+    assertEquals(
+      text.trim(),
+      "不能。",
+      "the rescued content must be what the user sees",
+    );
+    // ⑤ 救回来之后就不该再声称 incomplete
+    assertEquals(
+      json.status,
+      "completed",
+      "a rescued turn genuinely completed",
+    );
+    assertEquals(json.incomplete_details, null);
+  } finally {
+    globalThis.fetch = realFetch;
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
+Deno.test("cnb: a still-starved /responses turn reports incomplete instead of completed", async () => {
+  // 两轮都饿死：不许谎报成功，也不许无限重试。用户至少能从 status 看出这轮没说完。
+  const realFetch = globalThis.fetch;
+  const bodies: any[] = [];
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/") && !url.includes("/ai/chat/completions")) {
+      return Promise.resolve(
+        new Response(
+          `<html><script>window.csrftoken = "0123456789abcdef0123456789abcdef"</script></html>`,
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/html",
+              "set-cookie": "csrfkey=1234567890; Path=/",
+            },
+          },
+        ),
+      );
+    }
+    if (url.includes("/ai/chat/completions")) {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      const chunk = {
+        id: "c",
+        created: 1,
+        choices: [{
+          index: 0,
+          delta: { reasoning_content: "想。".repeat(500) },
+          finish_reason: null,
+        }],
+      };
+      const end = {
+        id: "c",
+        created: 1,
+        choices: [{ index: 0, delta: {}, finish_reason: "length" }],
+        usage: {
+          prompt_tokens: 5,
+          completion_tokens: 8192,
+          total_tokens: 8197,
+          completion_tokens_details: { reasoning_tokens: 8192 },
+        },
+      };
+      const sse = `data: ${JSON.stringify(chunk)}\n\ndata: ${
+        JSON.stringify(end)
+      }\n\ndata: [DONE]\n\n`;
+      return Promise.resolve(
+        new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
+  }) as typeof fetch;
+
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        input: [{ role: "user", content: "到底能不能" }],
+        max_output_tokens: 1024,
+        stream: false,
+      }),
+    });
+    const resp = await handleCnb("/cnb/v1/responses", req, new URL(req.url));
+    assertEquals(resp.status, 200);
+    const json = await resp.json();
+    assertEquals(
+      bodies.length,
+      2,
+      "the rescue is bounded to one retry, never a loop",
+    );
+    assertEquals(
+      json.status,
+      "incomplete",
+      "a turn with no content must not claim completed",
+    );
+    assertEquals(
+      json.incomplete_details?.reason,
+      "max_output_tokens",
+      "the client must be told why it is incomplete",
+    );
+    // 思考不能因为正文是空就被丢掉：那是用户唯一的诊断线索。
+    const hasReasoning = (json.output ?? []).some((i: any) =>
+      i.type === "reasoning"
+    );
+    assert(hasReasoning, "the thinking block must survive a failed rescue");
+  } finally {
+    globalThis.fetch = realFetch;
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
+Deno.test("cnb: a starved streaming /responses turn still delivers the answer", async () => {
+  // DSH 桌面走的是**流式** /responses，这是线上投诉的确切路径。
+  // 流式的补救形状与非流式不同：思维已经实时流给客户端、撤不回来，
+  // 但正文还没发，所以第二轮把正文补进同一个 message item。
+  const realFetch = globalThis.fetch;
+  const bodies: any[] = [];
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/") && !url.includes("/ai/chat/completions")) {
+      return Promise.resolve(
+        new Response(
+          `<html><script>window.csrftoken = "0123456789abcdef0123456789abcdef"</script></html>`,
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/html",
+              "set-cookie": "csrfkey=1234567890; Path=/",
+            },
+          },
+        ),
+      );
+    }
+    if (url.includes("/ai/chat/completions")) {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      const starved = bodies.length === 1;
+      const mid = {
+        id: "c",
+        created: 1,
+        choices: [{
+          index: 0,
+          delta: starved
+            ? { reasoning_content: "想。".repeat(400) }
+            : { content: "不能。" },
+          finish_reason: null,
+        }],
+      };
+      const end = {
+        id: "c",
+        created: 1,
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: starved ? "length" : "stop",
+        }],
+      };
+      const sse = `data: ${JSON.stringify(mid)}\n\ndata: ${
+        JSON.stringify(end)
+      }\n\ndata: [DONE]\n\n`;
+      return Promise.resolve(
+        new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
+  }) as typeof fetch;
+
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        input: [{ role: "user", content: "工程里能用 UMM 安装吗？" }],
+        max_output_tokens: 1024,
+        stream: true,
+      }),
+    });
+    const resp = await handleCnb("/cnb/v1/responses", req, new URL(req.url));
+    assertEquals(resp.status, 200);
+    const sse = await resp.text();
+
+    assertEquals(bodies.length, 2, "a starved stream is retried exactly once");
+    assert(
+      bodies[1].max_tokens > bodies[0].max_tokens,
+      "the streaming rescue must raise the cap too",
+    );
+    // 正文必须真的到达客户端——这是用户唯一能在屏幕上看到的东西。
+    assert(
+      sse.includes("不能。"),
+      "the rescued answer must reach the client as output_text",
+    );
+    // 救回来之后是正常完成。
+    assert(
+      sse.includes("event: response.completed"),
+      "a rescued stream completes normally",
+    );
+    assert(
+      !sse.includes("event: response.incomplete"),
+      "a rescued stream must not also claim incomplete",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
+Deno.test("cnb: a still-starved streaming /responses turn emits response.incomplete", async () => {
+  // 两轮都饿死：客户端必须收到 response.incomplete，而不是 response.completed。
+  // 这正是线上最难诊断的形态——屏幕只有思维，接口说这轮成功了。
+  const realFetch = globalThis.fetch;
+  const bodies: any[] = [];
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/") && !url.includes("/ai/chat/completions")) {
+      return Promise.resolve(
+        new Response(
+          `<html><script>window.csrftoken = "0123456789abcdef0123456789abcdef"</script></html>`,
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/html",
+              "set-cookie": "csrfkey=1234567890; Path=/",
+            },
+          },
+        ),
+      );
+    }
+    if (url.includes("/ai/chat/completions")) {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      const mid = {
+        id: "c",
+        created: 1,
+        choices: [{
+          index: 0,
+          delta: { reasoning_content: "想。".repeat(400) },
+          finish_reason: null,
+        }],
+      };
+      const end = {
+        id: "c",
+        created: 1,
+        choices: [{ index: 0, delta: {}, finish_reason: "length" }],
+        usage: {
+          prompt_tokens: 5,
+          completion_tokens: 8192,
+          total_tokens: 8197,
+          completion_tokens_details: { reasoning_tokens: 8192 },
+        },
+      };
+      const sse = `data: ${JSON.stringify(mid)}\n\ndata: ${
+        JSON.stringify(end)
+      }\n\ndata: [DONE]\n\n`;
+      return Promise.resolve(
+        new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
+  }) as typeof fetch;
+
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        input: [{ role: "user", content: "到底能不能" }],
+        max_output_tokens: 1024,
+        stream: true,
+      }),
+    });
+    const resp = await handleCnb("/cnb/v1/responses", req, new URL(req.url));
+    const sse = await resp.text();
+    assertEquals(bodies.length, 2, "bounded to one retry, never a loop");
+    assert(
+      sse.includes("event: response.incomplete"),
+      "a still-starved stream must announce incomplete",
+    );
+    assert(
+      !sse.includes("event: response.completed"),
+      "it must not also claim the turn completed",
+    );
+    assert(
+      sse.includes("max_output_tokens"),
+      "the client must be told the reason",
     );
   } finally {
     globalThis.fetch = realFetch;
