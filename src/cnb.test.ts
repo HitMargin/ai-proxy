@@ -13,7 +13,9 @@ import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
   CNB_BODY_BUDGET_BYTES,
   CNB_MODELS,
+  cnbAnswerBuriedInThinking,
   cnbBuildUpstream,
+  cnbBuriedAnswerRescueBody,
   cnbCallUpstream,
   cnbDiagnoseJunkSyntax,
   cnbEscapeRepairState,
@@ -33,7 +35,6 @@ import {
   cnbRepairMaxTokens,
   cnbStaleToolCallPrune,
   cnbStaleToolPrune,
-  cnbStarvationRescueBody,
   cnbStripGitStatus,
   deriveSessionKey,
   handleCnb,
@@ -4174,44 +4175,77 @@ Deno.test("cnb: a length cut is reported as incomplete, not completed", () => {
   }
 });
 
-Deno.test("cnb: the starvation rescue grows the cap but never shrinks it", () => {
-  // 只放大。调用方要 393216 时不该被压回去——压小是另一种静默改参。
-  assertEquals(
-    cnbStarvationRescueBody({ max_tokens: 1024 })?.max_tokens,
-    8192,
-    "1024 is inside the measured starvation band; the rescue must clear it",
-  );
-  assertEquals(
-    cnbStarvationRescueBody({ max_tokens: 2048 })?.max_tokens,
-    8192,
-    "2048 does not starve today, but the rescue floor is the same as the repair floor",
-  );
-  // 已经很大：不动（拿同一个上限重撞一次没有意义，null 让调用方如实上报）。
-  assertEquals(
-    cnbStarvationRescueBody({ max_tokens: 120000 }),
-    null,
-    "at the ceiling there is nothing left to raise",
-  );
-  assertEquals(
-    cnbStarvationRescueBody({ max_tokens: 200000 }),
-    null,
-    "never lower a caller budget that is already above the ceiling",
-  );
-  // 其余字段必须原样带过去：重发的是同一份请求，只换上限。
-  const rescued = cnbStarvationRescueBody({
+Deno.test("cnb: the burial rescue turns thinking off and raises a tiny cap", () => {
+  // 补救的**唯一**动作是关思维。放大预算是次要的，而且只在下限过小时才抬。
+  // 为什么必须关思维而不是只放大：截图那轮是 finish=stop（模型自己把成品答案
+  // 写在思维里就收工），预算根本没被吃光，放大预算对那种形态完全无效。
+  const rescued = cnbBuriedAnswerRescueBody({
     max_tokens: 1024,
     model: "deepseek-v4.1-flash",
     messages: [{ role: "user", content: "hi" }],
     enable_thinking: true,
     reasoning_effort: "high",
   });
-  assertEquals(rescued?.model, "deepseek-v4.1-flash");
-  assertEquals(rescued?.enable_thinking, true);
   assertEquals(
-    rescued?.reasoning_effort,
-    "high",
-    "the rescue must not silently change the caller's thinking rung",
+    rescued?.enable_thinking,
+    false,
+    "the rescue must switch thinking off - that is what makes an answer appear",
   );
+  assertEquals(
+    "reasoning_effort" in (rescued ?? {}),
+    false,
+    'upstream answers 400 code 11150 to reasoning_effort:"off", so the key must be gone entirely',
+  );
+  // 其余字段原样带过去：重发的是同一份请求。静默改写调用方的 model/messages 会
+  // 让「补救」变成「换了个问题」。
+  assertEquals(rescued?.model, "deepseek-v4.1-flash");
+  assertEquals(rescued?.messages, [{ role: "user", content: "hi" }]);
+  // 过小的上限抬到修复轮下限；已经够大的不动。
+  assertEquals(
+    cnbBuriedAnswerRescueBody({ max_tokens: 1024 })?.max_tokens,
+    8192,
+    "a 64-token cap would truncate the answer we just rescued",
+  );
+  assertEquals(
+    cnbBuriedAnswerRescueBody({ max_tokens: 393216 })?.max_tokens,
+    393216,
+    "never touch a cap that is already generous",
+  );
+  // 坏输入不炸：补救失败不该把原本能返回的思维也弄丢。
+  assertEquals(cnbBuriedAnswerRescueBody(null), null);
+  assertEquals(cnbBuriedAnswerRescueBody("nope"), null);
+});
+
+Deno.test("cnb: burial means empty content + thinking + no tool calls", () => {
+  // 三条缺一不可。最容易被写错的是第三条：**空正文 + 工具调用是正常回合**
+  // （模型就是在调工具），把它当"埋进思维"去重发会打乱一次正常的工具回合。
+  assertEquals(
+    cnbAnswerBuriedInThinking("", 1234, 0),
+    true,
+    "empty content, plenty of thinking, no tools -> the user sees nothing",
+  );
+  assertEquals(
+    cnbAnswerBuriedInThinking("  \n ", 500, 0),
+    true,
+    "whitespace-only content is still no content",
+  );
+  assertEquals(
+    cnbAnswerBuriedInThinking("", 1234, 1),
+    false,
+    "an empty body with a tool call is a normal tool turn, not a burial",
+  );
+  assertEquals(
+    cnbAnswerBuriedInThinking("不能。", 1234, 0),
+    false,
+    "visible content means the user got their answer",
+  );
+  assertEquals(
+    cnbAnswerBuriedInThinking("", 0, 0),
+    false,
+    "no thinking either: upstream just refused to answer, replacing the rung will not help",
+  );
+  // 不判 finish_reason —— 这是本轮修的漏洞：截图那轮是 finish=stop。
+  // 判据里根本没有 finish 参数，所以 length 和 stop 都会被救。
 });
 
 Deno.test("cnb: a starved /responses turn is retried once with a bigger cap", async () => {
@@ -4320,18 +4354,23 @@ Deno.test("cnb: a starved /responses turn is retried once with a bigger cap", as
       2,
       "a starved turn is retried exactly once",
     );
-    // ② 第二轮的上限确实放大了
+    // ② 第二轮确实关掉了思维（这才是让答案出现的原因，不是放大上限）
+    assertEquals(
+      bodies[1].enable_thinking,
+      false,
+      "the rescue must switch thinking off on the retry",
+    );
+    assertEquals(
+      "reasoning_effort" in bodies[1],
+      false,
+      'reasoning_effort must be dropped entirely: upstream 400s on "off"',
+    );
+    // ③ 过小的上限被抬到修复轮下限
     assert(
-      bodies[1].max_tokens > bodies[0].max_tokens,
-      `the rescue must raise the cap (first=${bodies[0].max_tokens}, retry=${
+      bodies[1].max_tokens >= 8192,
+      `a 1024 cap would truncate the rescued answer (got ${
         bodies[1].max_tokens
       })`,
-    );
-    // ③ 思考档没被悄悄换掉
-    assertEquals(
-      bodies[1].reasoning_effort,
-      bodies[0].reasoning_effort,
-      "the rescue must not change the caller's thinking rung",
     );
     // ④ 用户终于看到了正文
     let text = "";
@@ -4533,9 +4572,10 @@ Deno.test("cnb: a starved streaming /responses turn still delivers the answer", 
     const sse = await resp.text();
 
     assertEquals(bodies.length, 2, "a starved stream is retried exactly once");
-    assert(
-      bodies[1].max_tokens > bodies[0].max_tokens,
-      "the streaming rescue must raise the cap too",
+    assertEquals(
+      bodies[1].enable_thinking,
+      false,
+      "the streaming rescue must switch thinking off too",
     );
     // 正文必须真的到达客户端——这是用户唯一能在屏幕上看到的东西。
     assert(
@@ -4641,6 +4681,126 @@ Deno.test("cnb: a still-starved streaming /responses turn emits response.incompl
     assert(
       sse.includes("max_output_tokens"),
       "the client must be told the reason",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
+Deno.test("cnb: an answer buried with finish=stop is rescued too (the reported shape)", async () => {
+  // ★ 用户截图那一轮的形态：界面显示「已完成」，即 finish_reason=stop，
+  // 但正文一个字都没有，成品答案全在 thinking 里。
+  //
+  // 上一版补救只判 finish==="length"，**完全盖不到这一种**——这是本轮修的漏洞。
+  // 判据必须是「正文空 + 有思维 + 无工具调用」，与 finish_reason 无关。
+  const realFetch = globalThis.fetch;
+  const bodies: any[] = [];
+  globalThis.fetch = ((input: any, init?: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/") && !url.includes("/ai/chat/completions")) {
+      return Promise.resolve(
+        new Response(
+          `<html><script>window.csrftoken = "0123456789abcdef0123456789abcdef"</script></html>`,
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/html",
+              "set-cookie": "csrfkey=1234567890; Path=/",
+            },
+          },
+        ),
+      );
+    }
+    if (url.includes("/ai/chat/completions")) {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      const first = bodies.length === 1;
+      // 第一轮：思考里有完整答案，正文空，finish=stop（**不是 length**）。
+      const chunk = first
+        ? {
+          id: "c1",
+          created: 1,
+          choices: [{
+            index: 0,
+            delta: {
+              reasoning_content:
+                "So: UMM needs doorstop at process start. In the editor there is no doorstop. " +
+                "Let me give the flat answer. 不能。UMM 靠 doorstop 在 player 进程启动时注入，编辑器没有这个入口。",
+            },
+            finish_reason: null,
+          }],
+        }
+        : {
+          id: "c2",
+          created: 2,
+          choices: [{
+            index: 0,
+            delta: { content: "不能。" },
+            finish_reason: null,
+          }],
+        };
+      const end = {
+        id: first ? "c1" : "c2",
+        created: 1,
+        // ★ 关键：两轮都是 stop。第一轮 stop 但正文为空 —— 正是被投诉的形态。
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      };
+      const sse = `data: ${JSON.stringify(chunk)}\n\ndata: ${
+        JSON.stringify(end)
+      }\n\ndata: [DONE]\n\n`;
+      return Promise.resolve(
+        new Response(sse, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    }
+    return Promise.resolve(new Response("{}", { status: 404 }));
+  }) as typeof fetch;
+
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        input: [{ role: "user", content: "工程里能用 UMM 安装吗？" }],
+        max_output_tokens: 393216,
+        stream: false,
+      }),
+    });
+    const resp = await handleCnb("/cnb/v1/responses", req, new URL(req.url));
+    assertEquals(resp.status, 200);
+    const json = await resp.json();
+
+    assertEquals(
+      bodies.length,
+      2,
+      "an answer buried with finish=stop must still be retried",
+    );
+    assertEquals(
+      bodies[1].enable_thinking,
+      false,
+      "and the retry must have thinking off",
+    );
+    assertEquals(
+      "reasoning_effort" in bodies[1],
+      false,
+      "reasoning_effort must be dropped entirely",
+    );
+    let text = "";
+    for (const item of json.output ?? []) {
+      if (item.type === "message") {
+        for (const c of item.content ?? []) text += c.text ?? "";
+      }
+    }
+    assertEquals(
+      text.trim(),
+      "不能。",
+      "the user must finally see the answer",
     );
   } finally {
     globalThis.fetch = realFetch;

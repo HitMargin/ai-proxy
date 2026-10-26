@@ -3338,14 +3338,63 @@ function responsesUsage(u: any) {
  * 放不上去时返回 null（上限已经 ≥ 封顶），调用方据此放弃重试、如实上报——
  * 比拿同一个上限再撞一次诚实。
  */
-export function cnbStarvationRescueBody(upBody: any): any | null {
-  const current = typeof upBody?.max_tokens === "number"
-    ? upBody.max_tokens
-    : 0;
-  const bumped = cnbRepairMaxTokens(current || undefined, true);
-  // bumped <= current 说明已经在封顶附近，重发只会撞同一堵墙。
-  if (!bumped || bumped <= current) return null;
-  return { ...upBody, max_tokens: bumped };
+/**
+ * 「正文为空、答案全在思维里」之后该重发什么。
+ *
+ * 线上投诉的原话是「有概率把要展示给用户的正文包裹进思维里」，截图那轮显示
+ * **已完成**（finish=stop），而我的复现只拿到 finish=length 那一种形态。两种形态
+ * 都真实存在，必须一次覆盖：
+ *
+ *   A. finish=length —— 思考把 max_tokens 吃光。实测饥饿带（同 prompt、只改
+ *      max_tokens、每组 8 次真调）：1024→3/8、1280→2/8、1536→3/8、1792→2/8、
+ *      2048→0/8、3072→0/8。插件的 MIN_OUTPUT_TOKENS 正好是 1024。
+ *   B. finish=stop —— 模型自己把成品答案写在思维里就收工，正文一个字不留，
+ *      接口还说这轮成功了。**这一种我复现不出来**（7 档 × 多次、带/不带工具、
+ *      用真实会话的压缩上下文回放，共 40+ 次全部正常），但截图取证确凿。
+ *
+ * 因此补救不能用「只放大预算」——那只治 A，对 B 无效（B 的预算根本没被吃光）。
+ * 唯一同时覆盖两者的动作是**关掉思维重发**：
+ *   实测 enable_thinking:false 且不带 reasoning_effort 时，思考字符恒为 0、
+ *   正文必然产出（同一 prompt 多次真调全部有正文）。没有思维就无从「把答案
+ *   包进思维」，也不需要跟预算抢额度。
+ *
+ * 代价是这一轮失去思考档。这是**失败后的补救**，不是常态：正常请求完全不受
+ * 影响，只有「用户本来什么都看不到」时才付出这个代价——比一片空白强。
+ *
+ * 关思维时必须**完全不带 reasoning_effort**：上游对 `reasoning_effort:"off"`
+ * 直接 400 code 11150（见 cnbBuildUpstream 里那张表）。
+ */
+export function cnbBuriedAnswerRescueBody(upBody: any): any | null {
+  if (!upBody || typeof upBody !== "object") return null;
+  const next = { ...upBody };
+  delete next.reasoning_effort;
+  next.enable_thinking = false;
+  // 顺手把过小的上限抬到修复轮的下限：关掉思维后正文一般装得下，但没必要让
+  // 一个 64 的上限把小答案也截断（那种截断同样是「用户看不到完整答案」）。
+  if (typeof next.max_tokens === "number") {
+    const bumped = cnbRepairMaxTokens(next.max_tokens, true);
+    if (bumped && bumped > next.max_tokens) next.max_tokens = bumped;
+  }
+  return next;
+}
+
+/**
+ * 「正文是空的，但思维里有一堆东西，而且没有工具调用」——这就是用户投诉的形态。
+ *
+ * 三条缺一不可：
+ *   ① 正文为空（不是"短"，是空）——否则用户看得到答案，无需补救；
+ *   ② 有思维——否则不是"包进思维"，关思维也没用（上游就是不肯给正文）；
+ *   ③ 没有工具调用——空正文 + 工具调用是**正常工作**（模型就是在调工具），
+ *      补救会把一次正常的工具回合打乱。
+ *
+ * **不判 finish_reason**：A（length）和 B（stop）都是这个症状，判 finish 就漏掉 B。
+ */
+export function cnbAnswerBuriedInThinking(
+  content: string,
+  reasoningChars: number,
+  toolCallCount: number,
+): boolean {
+  return content.trim() === "" && reasoningChars > 0 && toolCallCount === 0;
 }
 
 /**
@@ -3493,7 +3542,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
     // 预算被它吃光。实测饥饿带 1024~1792（各组 8 次真调），2048 起不再复现。
     //
     // 这里**只在这种情况下重发一次**，且只放大输出上限、不动思考档（见
-    // cnbStarvationRescueBody 的注释）。只试一次：第二轮仍饿死说明思考量确实
+    // cnbBuriedAnswerRescueBody 的注释）。只试一次：第二轮仍饿死说明思考量确实
     // 远超封顶，再撞没有意义，如实把第一轮的结果发出去。
     //
     // 为什么不在 cnbBuildUpstream 里把调用方的 max_tokens 直接抬到下限：那条路
@@ -3501,15 +3550,14 @@ async function handleCnbResponses(request: Request): Promise<Response> {
     // 测试 `a caller-supplied max_tokens must survive verbatim` 明确禁止。
     // 重发是「失败了再补救」，不是「悄悄换掉你的参数」。
     if (
-      textOut.trim() === "" && upFinish === "length" &&
-      fullThink.trim() !== "" && allCalls.length === 0
+      cnbAnswerBuriedInThinking(textOut, fullThink.length, allCalls.length)
     ) {
-      const rescueBody = cnbStarvationRescueBody(upBody);
+      const rescueBody = cnbBuriedAnswerRescueBody(upBody);
       if (rescueBody) {
         console.warn(
-          `[cnb] answer starved by thinking (finish=length, ` +
-            `reasoning=${fullThink.length} chars, no content) — retrying once ` +
-            `with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+          `[cnb] answer buried in thinking (finish=${upFinish}, ` +
+            `reasoning=${fullThink.length} chars, no content) — retrying once with thinking off ` +
+            `(max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
         );
         try {
           const retryResp = await cnbCallUpstream(rescueBody);
@@ -3838,7 +3886,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
 
       // ★ 思考饿死补救援（流式版，2026-10-26）。
       //
-      // 与非流式版同一判据、同一条补救济（见 cnbStarvationRescueBody），区别只在
+      // 与非流式版同一判据、同一条补救济（见 cnbBuriedAnswerRescueBody），区别只在
       // 「什么时候发」：流式路径的思考**已经实时流给客户端了**，撤不回来；但正文
       // 一个字节都还没发（textOpened 仍是 false），所以补救是把第二轮的正文补进
       // 同一个 message item——用户从「只有思维、没有答案」变成「思维 + 答案」。
@@ -3846,15 +3894,18 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       // 不重发整个 response（那会在客户端留下两段思维），也不提前缓冲（那会把
       // 流式变非流式，思考的第一秒就看不到）。
       if (
-        textFull.trim() === "" && upFinish === "length" &&
-        thinkFilter.state.full.trim() !== "" && allCalls.length === 0
+        cnbAnswerBuriedInThinking(
+          textFull,
+          thinkFilter.state.full.length,
+          allCalls.length,
+        )
       ) {
-        const rescueBody = cnbStarvationRescueBody(upBody);
+        const rescueBody = cnbBuriedAnswerRescueBody(upBody);
         if (rescueBody) {
           console.warn(
-            `[cnb] answer starved by thinking (finish=length, ` +
+            `[cnb] answer buried in thinking (finish=${upFinish}, ` +
               `reasoning=${thinkFilter.state.full.length} chars, no content) — ` +
-              `retrying once with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+              `retrying once with thinking off (max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
           );
           try {
             const retryResp = await cnbCallUpstream(rescueBody);
@@ -5317,7 +5368,7 @@ export async function handleCnb(path: string, request: Request, url: URL) {
 
       // ★ 思考饿死补救援（chat 非流式版，2026-10-26）。
       //
-      // 与 /responses 两条路径同一判据、同一条补救济（cnbStarvationRescueBody），
+      // 与 /responses 两条路径同一判据、同一条补救济（cnbBuriedAnswerRescueBody），
       // 这里只是把翻盘的正文写回 msg。三个入口都要接：线上投诉来自 DSH 桌面
       // （/responses 流式），但 chat 非流式的饿死率实测同样存在（1024 时 4/10），
       // 只修一条等于把问题挪到别的客户端。
@@ -5325,15 +5376,18 @@ export async function handleCnb(path: string, request: Request, url: URL) {
       // 条件里的 allCalls 判定用 msg.tool_calls：有工具调用时正文为空是正常的
       // （模型就是在调工具），那不是饿死，不能重发。
       if (
-        !msg.tool_calls && String(msg.content ?? "").trim() === "" &&
-        finish === "length" && fullThink.trim() !== ""
+        cnbAnswerBuriedInThinking(
+          String(msg.content ?? ""),
+          fullThink.length,
+          (msg.tool_calls ?? []).length,
+        )
       ) {
-        const rescueBody = cnbStarvationRescueBody(upBody);
+        const rescueBody = cnbBuriedAnswerRescueBody(upBody);
         if (rescueBody) {
           console.warn(
-            `[cnb] answer starved by thinking (finish=length, ` +
-              `reasoning=${fullThink.length} chars, no content) — retrying once ` +
-              `with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+            `[cnb] answer buried in thinking (finish=${finish}, ` +
+              `reasoning=${fullThink.length} chars, no content) — retrying once with thinking off ` +
+              `(max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
           );
           try {
             const retryResp = await cnbCallUpstream(rescueBody);
@@ -5439,15 +5493,14 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           // ★ 思考饿死补救援（chat 流式、无 tools 版，2026-10-26）。
           // 思考已经流给客户端了、撤不回来；正文一个字节都没发，所以补发正文即可。
           if (
-            streamedText.trim() === "" && finish === "length" &&
-            streamedThink.trim() !== ""
+            cnbAnswerBuriedInThinking(streamedText, streamedThink.length, 0)
           ) {
-            const rescueBody = cnbStarvationRescueBody(upBody);
+            const rescueBody = cnbBuriedAnswerRescueBody(upBody);
             if (rescueBody) {
               console.warn(
-                `[cnb] answer starved by thinking (finish=length, ` +
+                `[cnb] answer buried in thinking (finish=${finish}, ` +
                   `reasoning=${streamedThink.length} chars, no content) — retrying once ` +
-                  `with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+                  `(max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
               );
               try {
                 const retryResp = await cnbCallUpstream(rescueBody);
@@ -5557,15 +5610,18 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           // 与无 tools 分支同一判据。这里的 textRem 是「还没发出去的正文本」，
           // 饿死时它为空；补救援把第二轮正文塞进去，下面照常发出。
           if (
-            textRem.trim() === "" && finish === "length" &&
-            thinkFilter.state.full.trim() !== "" && allCalls.length === 0
+            cnbAnswerBuriedInThinking(
+              textRem,
+              thinkFilter.state.full.length,
+              allCalls.length,
+            )
           ) {
-            const rescueBody = cnbStarvationRescueBody(upBody);
+            const rescueBody = cnbBuriedAnswerRescueBody(upBody);
             if (rescueBody) {
               console.warn(
-                `[cnb] answer starved by thinking (finish=length, ` +
+                `[cnb] answer buried in thinking (finish=${finish}, ` +
                   `reasoning=${thinkFilter.state.full.length} chars, no content) — ` +
-                  `retrying once with max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens}`,
+                  `retrying once with thinking off (max_tokens ${upBody.max_tokens} → ${rescueBody.max_tokens})`,
               );
               try {
                 const retryResp = await cnbCallUpstream(rescueBody);
