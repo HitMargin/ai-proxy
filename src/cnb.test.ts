@@ -4808,3 +4808,74 @@ Deno.test("cnb: an answer buried with finish=stop is rescued too (the reported s
     else Deno.env.set("CNB_COMPACTION", prev);
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 孤立的 DSML 残骸泄漏成正文（2026-10-26，用户第三次截图）
+//
+// 用户看到的是这一整行被当成回答发了出来：
+//   <tool_call> {"name":"read","arguments":{...}} </tool_call> </｜｜DSML｜｜_call>
+// 其中前面那个 <tool_call> 块解析器认得，但末尾的 `</｜｜DSML｜｜_call>` **不是
+// 合法标签**（`_call` 既不是 calls/invoke/parameter），六条归一化正则一条都
+// 匹配不上，于是原样留在 clean 里发给了用户。
+//
+// 更隐蔽的一条：`∣`（U+2223 DIVIDES）视觉上与全角竖线几乎一样，但不在旧的
+// `[｜|]` 字符类里 —— 实测把它**紧跟在完整工具块后面**也照样泄漏。模型采样出
+// 哪种竖线纯属运气，所以字符集要一次收全。
+// ─────────────────────────────────────────────────────────────────────────────
+
+Deno.test("cnb: a stray DSML closer never reaches the user", () => {
+  const tools = [{
+    type: "function",
+    function: { name: "read", parameters: { type: "object", properties: {} } },
+  }];
+  // 四种竖线写法，单独出现与跟在工具块后面，都必须被剥掉。
+  const bars = ["｜｜", "||", "∣∣", "ǀǀ"];
+  for (const b of bars) {
+    const alone = `</${b}DSML${b}_call>`;
+    assertEquals(
+      cnbParseToolCalls(alone, tools, { notes: false }).clean,
+      "",
+      `a bare closer (${b}) must be stripped, not shown as the answer`,
+    );
+    const after =
+      `<tool_call> {"name":"read","arguments":{}} </tool_call> ${alone}`;
+    assertEquals(
+      cnbParseToolCalls(after, tools, { notes: false }).clean,
+      "",
+      `a closer after a tool block (${b}) must be stripped too`,
+    );
+  }
+});
+
+Deno.test("cnb: stripping DSML residue must not eat ordinary prose", () => {
+  const tools = [{
+    type: "function",
+    function: { name: "read", parameters: { type: "object", properties: {} } },
+  }];
+  // 过度清理比泄漏更难发现：用户会看到自己的回答被莫名其妙删掉一段。
+  const keep: [string, string][] = [
+    [
+      "这个 DSML 格式我不认识，得查一下文档。",
+      "mentions the word DSML without a marker",
+    ],
+    ["用 <div> 和 </div> 包起来就行。", "ordinary angle brackets"],
+    ["表格里写 a|b 表示或。", "a single pipe is not a marker"],
+  ];
+  for (const [text, why] of keep) {
+    assertEquals(
+      cnbParseToolCalls(text, tools, { notes: false }).clean,
+      text,
+      `must leave untouched: ${why}`,
+    );
+  }
+  // 残骸被删、正文留下 —— 两条都不能丢。
+  assertEquals(
+    cnbParseToolCalls(
+      `<tool_call> {"name":"read","arguments":{}} </tool_call> 我读一下 </｜｜DSML｜｜_call>`,
+      tools,
+      { notes: false },
+    ).clean,
+    "我读一下",
+    "the residue goes, the sentence stays",
+  );
+});

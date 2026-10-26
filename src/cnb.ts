@@ -544,6 +544,21 @@ function parseToolCallPayload(payload: string): any[] {
 // 现在改成两侧各 1~2 根、且允许竖线与 DSML 之间夹空格。**注意量词必须写成
 // `{1,2}` 而不是 `+`**：`+` 会把正文里相邻的竖线一起吃掉（如 `a||b|DSML|`）。
 const DSML_TOK = String.raw`[｜|]{1,2}\s*DSML\s*[｜|]{1,2}`;
+// ★ 2026-10-26：**孤立残骸**专用。
+//
+// 实测（用户第三次截图）：模型把工具块发完后，又吐了一个没有开标签对应的
+// 收尾标记 —— `<tool_call> {...} </tool_call> </｜｜DSML｜｜_call>`。那个
+// `_call` 不是 `calls`/`invoke`/`parameter`，上面六条正则一条都匹配不上，
+// 于是**原样当正文发给用户**。
+//
+// 竖线字符集必须比上面那个宽：实测把 ∣（U+2223 DIVIDES，视觉上几乎一样）
+// 喂给 `[｜|]` 时，**跟在完整工具块后面也照样泄漏**，因为该字符根本不在类里。
+// 模型采样出哪种竖线纯属运气，所以这里一次收全四种近似字符。
+const DSML_BAR = String.raw`[｜|∣ǀ]`;
+const DSML_TOK_LOOSE = String.raw`${DSML_BAR}{1,2}\s*DSML\s*${DSML_BAR}{1,2}`;
+// 长得像 DSML 标记就整体删掉：`<`/`</` + 竖线 + DSML + 任意尾串 + `>`。
+// 这是协议标记，任何情况下都不该出现在给用户看的正文里。
+const DSML_RESIDUE = new RegExp(`</?${DSML_TOK_LOOSE}[^>]{0,40}>`, "gi");
 const DSML_PARAM = new RegExp(
   `<${DSML_TOK}\\s*parameter\\s+name="([^"]+)"([^>]*)>([\\s\\S]*?)</${DSML_TOK}\\s*parameter\\b[^>]*>`,
   "gi",
@@ -576,7 +591,12 @@ function normalizeDsml(text: string) {
     .replace(DSML_INVOKE_OPEN, "<|XYML|invoke $1>")
     .replace(DSML_INVOKE_CLOSE, "</|XYML|invoke>")
     .replace(DSML_CALLS_OPEN, "<|XYML|tool_calls>")
-    .replace(DSML_CALLS_CLOSE, "</|XYML|tool_calls>");
+    .replace(DSML_CALLS_CLOSE, "</|XYML|tool_calls>")
+    // ★ 最后一步：把**还剩下的** DSML 形状文本删掉（见 DSML_RESIDUE 的注释）。
+    // 必须放在归一化之后：前面六条把合法标记转成了 XYML，这里收的是它们认不出
+    // 的残骸（`_call`、带散文的标签、未知 tag 名）。放在最前面的话，先把合法
+    // 开标签删了，后面就配不上对，整块参数会当成正文漏出去。
+    .replace(DSML_RESIDUE, "");
 }
 
 // ★ 2026-10-24 起：harness（ZCode/DSH）注入的 gitStatus 快照段、`Main branch`
