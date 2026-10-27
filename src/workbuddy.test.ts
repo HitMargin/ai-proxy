@@ -2970,6 +2970,15 @@ Deno.test("出站清洗：buildChatBody 必须剥掉会触发 11128 的身份句
       role: "system",
       content: "You are an AI agent powered by DeepSeek Harness. " +
         'When the user refers to "this page", they mean this app.\n\n' +
+        // 2026-10-27 判据第五次漂移：harness 的「@ 前缀记号」两句连排。
+        // 这一对在 workbuddy 上游独立实测过（同串 400、换行 200），所以它必须
+        // 走同一条清洗 —— 只修 cnb 等于只修一半。
+        // ⚠️ 必须放在 gitStatus 块**之前**：块的剥离范围是「锚点 → 下一个空行+
+        // 标题或文本末尾」，写进块里会被整块剥掉，这条断言就变成恒真（第一版
+        // 就是这么写的，测试红在「第二句必须还在」上——是它救的场）。
+        "Tokens prefixed with @ are paths the user explicitly referenced. " +
+        "Relative paths resolve from the workspace root; absolute paths " +
+        "identify files or directories on the host.\n\n" +
         "gitStatus: This is the git status at the start of the conversation.\n\n" +
         "Current branch: master\n\n" +
         "Main branch (you will usually use this for PRs): master",
@@ -2999,6 +3008,18 @@ Deno.test("出站清洗：buildChatBody 必须剥掉会触发 11128 的身份句
     sent.includes("DeepSeek Harness"),
     false,
     "the brand phrase must be rewritten to the short form",
+  );
+  equal(
+    sent.includes(
+      "Tokens prefixed with @ are paths the user explicitly referenced.",
+    ),
+    false,
+    "the @-token pair is the same 11128 tripwire on this upstream (measured 2026-10-27)",
+  );
+  equal(
+    sent.includes("Relative paths resolve from the workspace root"),
+    true,
+    "only the first sentence of that pair is reworded — the rest must survive",
   );
   // 用户的话一个字都不能动
   equal(

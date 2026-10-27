@@ -1756,6 +1756,8 @@ export function buildChatBody(
     //   | `You are an AI agent powered by DeepSeek Harness.`         | 400/11128 |
     //   | 同上把品牌词换成 `DSH` 简称                                 | **200**   |
     //   | `Main branch (you will usually use this for PRs): master`  | 400/11128 |
+    //   | 「@ 前缀记号」两句连排（2026-10-27 判据五）                | 400/11128 |
+    //   | 同上，中间换成换行（对照）                                  | **200**   |
     //
     // 清洗规则与 cnb 共用一份（src/channel-neutralise.ts）：剥 gitStatus 快照块、
     // 改写 `Main branch` 那行的括号说明、品牌词改简称。**写两份必然漂开** ——

@@ -1982,6 +1982,66 @@ Deno.test("cnb: the brand rewrite alone is not enough once the tripwire is prese
   );
 });
 
+// ── 2026-10-27：判据第五次漂移 —— harness 的「@ 前缀记号」两句**逐字连排**被拦 ──
+//
+// 现场：DSH 桌面会话每一轮 400/11128，**削头自愈跑过之后仍然 400**（所以不再是
+// 「消息开头指纹」），真实出站 body 离线二分到 `messages[0]`（29 KB 的 system）
+// 单独一条就 400，再二分到这两句话**用一个空格连排**。单变量判定表见
+// `src/channel-neutralise.ts` 的 `ATPATH_TOKENS` 注释；workbuddy 侧同一天实测
+// 同形（同一串 400、换成换行 200）。
+const ATPATH_F1 =
+  "Tokens prefixed with @ are paths the user explicitly referenced.";
+const ATPATH_F2 =
+  "Relative paths resolve from the workspace root; absolute paths identify files or directories on the host.";
+
+Deno.test("cnb: the @-token boilerplate pair is defused and its meaning survives", () => {
+  const para = ATPATH_F1 + " " + ATPATH_F2 +
+    " A trailing slash marks a directory: list it when its contents matter.";
+  const out = cnbNeutraliseChannelMarkers(para);
+  assertEquals(
+    out.includes(ATPATH_F1 + " " + ATPATH_F2),
+    false,
+    "upstream stores this exact single-space pair; it must be gone",
+  );
+  assertEquals(
+    out.includes(ATPATH_F1),
+    false,
+    "rewording the first sentence is enough to break every literal that contains it",
+  );
+  assertEquals(
+    out.includes("@-prefixed token"),
+    true,
+    "the meaning (@ marks a path the user referenced) must survive the rewording",
+  );
+  assertEquals(
+    out.includes("Relative paths resolve from the workspace root"),
+    true,
+    "only the first sentence moves; the rest of the paragraph stays verbatim",
+  );
+  assertEquals(
+    out.includes("A trailing slash marks a directory"),
+    true,
+  );
+  // 清洗每个请求都跑：必须幂等，否则第二轮的文本会被反复改写。
+  assertEquals(cnbNeutraliseChannelMarkers(out), out);
+});
+
+Deno.test("cnb: a lone @-token sentence is left alone — only the blocked pair is rewritten", () => {
+  // 判据是「两句连排」：第一句单独发实测 200（cnb 与 workbuddy 都是）。所以单发
+  // 时不该改动任何人的原文 —— 把 lookahead 去掉的变异会被这条杀掉。
+  assertEquals(cnbNeutraliseChannelMarkers(ATPATH_F1), ATPATH_F1);
+  const surrounding = "前一句。" + ATPATH_F1 + " 后一句。";
+  assertEquals(cnbNeutraliseChannelMarkers(surrounding), surrounding);
+});
+
+Deno.test("cnb: the @-token pair is defused even when the sentences are separated by a newline", () => {
+  // 上游只认「空一格」那一种，换行实测就是 200；清洗按 `\s+` 认，两种都改写，
+  // 免得上游哪天把归一化收紧。
+  const out = cnbNeutraliseChannelMarkers(ATPATH_F1 + "\n\n" + ATPATH_F2);
+  assertEquals(out.includes(ATPATH_F1), false);
+  assertEquals(out.includes("@-prefixed token"), true);
+});
+
 // ── 2026-10-25：会话体积的两块大头是**可再生的工具交互**，不是对话 ──
 //
 // 真实会话实测（2047 条 / 2.60 MiB）：tool 输出 51.6%、assistant 的

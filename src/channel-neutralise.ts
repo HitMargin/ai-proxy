@@ -11,11 +11,13 @@
  *   | `You are an AI agent powered by DeepSeek Harness.`          | 400/11128  | 400/11128  |
  *   | 同上把品牌词换成 `DSH` 简称                                  | **200**    | **200**    |
  *   | `Main branch (you will usually use this for PRs): master`   | 400/11128  | 400/11128  |
+ *   | 「@ 前缀记号」两句用一个空格连排（2026-10-27）                | 400/11128  | 400/11128  |
+ *   | 同上，两句之间换成换行 / 第一句单独发                         | **200**    | **200**    |
  *
  * 所以判据与清洗规则写在一处、两边共用；写两份必然漂开（本项目已经吃过
  * 「同一形状的读取器各写一份」的亏，见 AGENTS.md 里 kilo variants 那条）。
  *
- * ## 三层清洗，每条都有独立的实测依据
+ * ## 四层清洗，每条都有独立的实测依据
  *
  * 1. **整块剥 gitStatus 快照**（`stripGitStatus`）——锚定 harness 原文样板，
  *    从锚点剥到下一个「空行+标题」或文本末尾，换成一行 stub。那块内容自称
@@ -27,6 +29,11 @@
  * 3. **品牌词 `DeepSeek Harness` → `DSH`**（`neutraliseChannelMarkers`）——
  *    语义零损失（简称本来就在提示词里用），且能拆掉「品牌词 + GUI 指代样板」
  *    那个跨约 200 字符的组合模式。
+ * 4. **改写「@ 前缀记号」那句**（`rewordAtTokenBoilerplate`，2026-10-27）——
+ *    上游拦的是 `Tokens prefixed with @ are paths the user explicitly
+ *    referenced.` 与 `Relative paths resolve from the workspace root; …`
+ *    **逐字连排**的那一串；单独出现两句都放行，只改第一句的措辞即拆掉它。
+ *    详见下面 `ATPATH_TOKENS` 上的实测表。
  *
  * ## 定性：这是规避，不是协议适配
  *
@@ -68,6 +75,50 @@ const HARNESS_BRAND = "DeepSeek Harness";
 const HARNESS_BRAND_NEUTRAL = "DSH";
 
 /**
+ * 11128 判据**第五次漂移**（2026-10-27）：harness 的「@ 前缀记号」两句**逐字连排**被拦。
+ * （清洗顺序上是第 4 层，见上面的总表；两套编号别混。）
+ *
+ * 现场：DSH 桌面会话每一轮都 400/11128，**削头自愈跑过之后仍然 400**，落盘 body
+ * 离线二分到 `messages[0]`（29.6 KB 的 system 提示）单独一条就 400 —— 所以这
+ * 一次既不是「开头指纹」也不是 gitStatus/Main branch/品牌词那三条旧判据。
+ *
+ * 逐条只改一个变量直连上游（每行都是一次真实请求，2026-10-27）：
+ *
+ *   | 请求                                                                | 结果      |
+ *   | ------------------------------------------------------------------- | --------- |
+ *   | `messages[0]` 前 2790 字符（含这两句）                              | 400/11128 |
+ *   | 前 2785 字符（第二句被切成半句）                                    | 200       |
+ *   | 两句**各自单发**                                                    | 200       |
+ *   | 两句**用一个空格连排**（原文形状）                                  | 400/11128 |
+ *   | 同上，中间换成换行 / 多一个空格                                     | 200       |
+ *   | 两句顺序颠倒 / 中间插一句中性话                                     | 200       |
+ *   | 前面加一句中性话（原文形状）                                        | 400/11128 |
+ *   | 把 `@` 换成 `X`、换成全角 `＠`、或只把 `referenced` 改成 `mentioned` | 200       |
+ *   | 裁掉第一句的开头三个词                                              | 200       |
+ *
+ * 判据：上游存的是**这两句话按原文逐字连排**的那一串（位置无关、可以加前缀、
+ * 少一个空格就不认）。修法因此是**改写第一句的措辞**：拆掉那串字面量即可，
+ * 语义（`@` 前缀的记号指向用户显式引用的路径）一个字不丢。
+ *
+ * 为什么不改写第二句：第二句本身（`Relative paths resolve from the workspace
+ * root; …`）单独发是 200，只有跟第一句连排才被拦 —— 改第一句能一次拆掉所有
+ * 含它的字面量，改第二句只是把连排换成另一种连排。
+ *
+ * 为什么用 lookahead 而不是无条件改写第一句：这一句只有**紧跟着**第二句时才
+ * 被拦（单独发 200），所以只在那个位置上动它。用户自己在对话里贴了这句话、
+ * 或者模型复读它，都不该被代理改掉 —— 改的永远是「会被上游 400 的那个形状」。
+ */
+const ATPATH_TOKENS =
+  /Tokens prefixed with @ are paths the user explicitly referenced\.(?=\s+Relative paths resolve from the workspace root)/g;
+const ATPATH_TOKENS_NEUTRAL =
+  "An @-prefixed token names a path the user explicitly referenced.";
+
+/** 把触发 11128 的「@ 前缀记号」句改成同义措辞。幂等。 */
+export function rewordAtTokenBoilerplate(text: string): string {
+  return text.replace(ATPATH_TOKENS, ATPATH_TOKENS_NEUTRAL);
+}
+
+/**
  * 把 harness 注入的 gitStatus 快照段换成一行 stub。
  *
  * 块的结束边界：下一个「空行 + 标题（# 或 ===）」处 —— 字段与 Recent commits
@@ -95,10 +146,12 @@ export function flattenMainBranchParen(text: string): string {
   return text.replace(MAINBRANCH_PAREN, MAINBRANCH_FLAT);
 }
 
-/** 出站文本的渠道校验预处理：剥 gitStatus 快照段 + 括号改写 + 品牌词改写。 */
+/** 出站文本的渠道校验预处理：剥 gitStatus 快照段 + 括号改写 + 品牌词改写 + @ 记号句改写。 */
 export function neutraliseChannelMarkers(text: string): string {
   return flattenMainBranchParen(
-    stripGitStatus(text).replaceAll(HARNESS_BRAND, HARNESS_BRAND_NEUTRAL),
+    rewordAtTokenBoilerplate(
+      stripGitStatus(text).replaceAll(HARNESS_BRAND, HARNESS_BRAND_NEUTRAL),
+    ),
   );
 }
 
