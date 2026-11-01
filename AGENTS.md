@@ -1051,6 +1051,33 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   0.13**）、`qwen3.8-max` x1.5、`kimi-k3`
   x1.83。**判据：`is_invisible_to_user === true`
   的条目要在建目录阶段就滤掉**——它们会出现在 `/v3/config` 里但用户侧调不通。
+  （⚠️ ③ 的倍率数值是 10-02 快照，**2026-11-01 已实测漂移**——`glm-5.3-flash`
+  已从 x0.06 涨到 0.08，见下面「TRAE 倍率表会漂」那条。）
+- **TRAE 积分真实会被扣，「看起来不扣」是进账掩盖了消耗（2026-11-01 实测）**：
+  用户报「用 TRAE 的模型不会花掉积分」。对照实验：查 `GET /trae/v1/account`
+  拍余额快照（2247.4）→ 真实发一次 64 max_tokens 的 `glm-5.3-flash` → 15 秒后再查
+  （2244.33），**一次小请求扣 3.07，落账 15 秒内可见**。为什么肉眼看不见：
+  ①**进账远大于消耗**——每天签到 +100、每月登录 +500，而总余额 2200+ 里大半是
+  没到期的未来积分包（17 个 11-16 后到期的包一动未动），总数字长期只涨不跌；
+  ②**扣的是最早到期的包**（本次快照如此）——11-06/11-10 三个包已 100/100 耗尽，
+  正在烧 11-11 那个，盯别的包或只看总额看不见；③便宜模型单次只扣几个积分；
+  ④**落账是异步的**，「发完立刻查」可能撞上未到账窗口。**判据：判断一个计费
+  体系扣不扣钱，唯一方法是前后各拍一次余额快照、中间真实调一次——
+  「看总额没变」不构成证据，进账和消耗在同一个数字里叠加。** 想盯消耗：
+  看 `balance.packs[].used` 里**最早到期且 remaining>0** 的那个包在不在涨。
+- **TRAE 倍率表会漂，且 `/trae/v1/models` 不吐倍率（2026-11-01 实测目录）**：
+  10-02 表里 `glm-5.3-flash` x0.06，今天实测已涨到 **0.08**——「最便宜」因此换人：
+  **0.06 三方并列 = `mimo-v2.6-flash`（solo_agent_remote）/ `Doubao-Seed-Code` /
+  `deepseek-v4.1-flash`（solo_agent）**；0.08 glm-5.3-flash、qwen3.8-flash；
+  0.09 minimax-m3.1-flash；0.15 mimo-v2.6-pro；0.2 Doubao-Seed-2.1-Turbo；
+  1.83 kimi-k3 最贵。**倍率是快照不是恒定值**（与免费档下架、11128 判据漂移
+  同类），要当下值就调导出的 `fetchTraeCatalog`（src/trae.ts，只读零消耗）
+  自己拉，别照抄本文任何一张历史表。**`/trae/v1/models` 看不到任何价格**：
+  内部 `TraeModel` 带着 `creditsRate`（`readCreditsRate`，src/trae.ts:261
+  解析自 `display_contact_config`），但对外序列化 `toModelCard`
+  （src/trae.ts:1094）把它丢了——面板、harness、任何客户端都只能看到能力字段。
+  **判据：内部结构里有的字段不等于对外 API 有——「面板上为什么看不到 X」
+  先查序列化函数丢没丢。**
 - **SOLO 的正文字段叫 `response`，不是 `content`（2026-10-02
   抓包）**：`event:output` 的真实形状是
   `{"response":"正文增量","reasoning_content":"思考增量","tool_calls":null,"multimodal_contents":null,"phase":null}`——**没有
