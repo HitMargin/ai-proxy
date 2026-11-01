@@ -206,6 +206,20 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   >
   > **定性：仍是规避，不是协议适配。** 只赌「检测锚定消息字面开头」；上游改成任意位置匹配就
   > 失效，届时重新实测边界再改判据，别照抄本段。
+- **cnb 工具块的「第二泄漏面」：救援轮与无 tools 请求（2026-11-01）**：DSML 解析
+  （`normalizeDsml` + `DSML_RESIDUE`）只覆盖「正文会进 `cnbParseToolCalls`」的路径，
+  而有两条路径**从来没进过解析**：①思考饿死救援 `cnbRescueBuriedAnswer` 把第二轮
+  当**纯文本**原样返回——第二轮是完整模型回合，第一轮被思考吞掉的调用意图经常在
+  这里以 `<｜｜DSML｜｜ calls>` 块出现（用户实测整块泄漏；参数还带 `string="false"`
+  属性，`normalizeDsml` 本身认得）；②**没声明 tools 的请求**（流式逐 chunk 直通、
+  非流式 `msg.content = fullText`）从不过滤。修法：救援函数加 `tools` 参数、返回
+  `{text: 干净正文, calls}`（/responses ×2、/chat ×2、/messages 共 5 个调用点全部
+  合并 calls；**无 tools 的调用点丢弃 calls**——协议里没有工具位，发 tool_calls
+  是违约）；无 tools 流式分支补同一道 `createLiveFilter` 扣留 + 流结束解析（饿死
+  判据改用**过滤后**正文：整轮只吐了个工具块的回合也算「没有正文」，要救）。
+  判据：**「解析器挂在哪」要按「正文从哪个出口出去」排查，不能只盯解析函数**——
+  解析器是对的，出口绕过它就等于没有；新加一个正文出口（救援、直通、兜底）时，
+  必须回答「这里的文本过不过 `cnbParseToolCalls`」。
 - **DeepSeek 网页端**：`/deepseek-web/v1` 已支持自动登录凭证、PoW
   WASM、THINK/RESPONSE SSE 解析、OpenAI SSE、工具调用、图片 data URL 上传到
   `ref_file_ids`、Chat Completions、Responses API 和 `off/low/high/max`

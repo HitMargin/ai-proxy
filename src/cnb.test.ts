@@ -4939,3 +4939,216 @@ Deno.test("cnb: stripping DSML residue must not eat ordinary prose", () => {
     "the residue goes, the sentence stays",
   );
 });
+
+// ─── 2026-11-01：完整的 <｜｜DSML｜｜ calls> 块泄漏进正文（用户截图）───
+//
+// 形态：调用方声明了 tools，第一轮被思考吞掉（burial rescue 触发），**第二轮**
+// 把工具调用以 DSML 块吐出来。当时救援把第二轮当纯文本原样发 → 用户看到整个
+// `<｜｜DSML｜｜ calls>` 块。两处一起修：
+//   ① 救援轮过 cnbParseToolCalls（text=干净正文，块进 calls，调用方合并）；
+//   ② 没声明 tools 的分支本来就不过滤，也补上同一道（调用丢弃，正文剥块）。
+const DSML_EXEC_BLOCK = `<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="exec_command">
+<｜｜DSML｜｜ parameter name="arguments" string="false">{"cmd": "Get-Partition | Select-Object DiskNumber", "workdir": "C:\\\\Users"}</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>`;
+
+const EXEC_TOOLS = [{
+  type: "function",
+  function: {
+    name: "exec_command",
+    description: "Run a shell command",
+    parameters: { type: "object", properties: { cmd: { type: "string" } } },
+  },
+}];
+
+function sseBuriedThen(
+  think: string,
+  rescue: Response,
+): (call: number) => Response {
+  return (call) => call === 1 ? sseChatThink(think) : rescue;
+}
+
+async function collectSse(resp: Response): Promise<any[]> {
+  const text = await resp.text();
+  return text.split("\n")
+    .filter((l) => l.startsWith("data: ") && !l.includes("[DONE]"))
+    .map((l) => JSON.parse(l.slice(6)));
+}
+
+Deno.test("cnb: a DSML tool block emitted by the rescue round becomes a tool_call, not prose", async () => {
+  resetJunkStreak();
+  cnbForgetRejectedHeads();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    sseBuriedThen("想。".repeat(300), sseChat(DSML_EXEC_BLOCK)),
+  );
+  Deno.env.set("CNB_11128_DUMP", "off");
+  try {
+    const resp = await postRepair(repairRequestBody(true));
+    assertEquals(resp.status, 200);
+    const chunks = await collectSse(resp);
+    // ① 只重试一次（断言必须在读完流之后：处理协程随读取推进）
+    assertEquals(bodies.length, 2, "the burial rescue re-asks once");
+
+    // ① 协议标记一个字都不能漏进正文
+    const content = chunks
+      .map((c) => c.choices?.[0]?.delta?.content ?? "")
+      .join("");
+    assertEquals(
+      content.includes("DSML"),
+      false,
+      "the DSML markup must never reach the client as content",
+    );
+    // ② 工具调用以标准 tool_calls 增量到达
+    const nameChunk = chunks.find(
+      (c) => c.choices?.[0]?.delta?.tool_calls?.[0]?.function?.name,
+    );
+    assertEquals(
+      nameChunk?.choices[0].delta.tool_calls[0].function.name,
+      "exec_command",
+      "the rescued tool call must be emitted as a tool_call",
+    );
+    const argsChunk = chunks.find(
+      (c) =>
+        String(c.choices?.[0]?.delta?.tool_calls?.[0]?.function?.arguments)
+          .includes("Get-Partition"),
+    );
+    assert(argsChunk, "the arguments must arrive as a tool_call delta");
+    // ③ 回合以 tool_calls 收尾
+    const tail = chunks[chunks.length - 1];
+    assertEquals(
+      tail.choices[0].finish_reason,
+      "tool_calls",
+      "a round that ends in a tool call must say so",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    Deno.env.delete("CNB_11128_DUMP");
+  }
+});
+
+Deno.test("cnb: a DSML tool block in a tools-less stream is stripped, calls dropped", async () => {
+  resetJunkStreak();
+  cnbForgetRejectedHeads();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    () => sseChat("好的。" + DSML_EXEC_BLOCK),
+  );
+  Deno.env.set("CNB_11128_DUMP", "off");
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // 注意：没有 tools 字段
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        messages: [{ role: "user", content: "看看磁盘" }],
+        max_tokens: 64,
+        stream: true,
+      }),
+    });
+    const resp = await postRepair(req);
+    assertEquals(resp.status, 200);
+    const chunks = await collectSse(resp);
+    const content = chunks
+      .map((c) => c.choices?.[0]?.delta?.content ?? "")
+      .join("");
+    assertEquals(
+      content.includes("好的。"),
+      true,
+      "the prose around the block must survive",
+    );
+    assertEquals(
+      content.includes("DSML"),
+      false,
+      "the DSML markup must be stripped even with no tools declared",
+    );
+    assertEquals(
+      content.includes("exec_command"),
+      false,
+      "the tool call payload must not leak as text either",
+    );
+    assertEquals(
+      chunks.some((c) => c.choices?.[0]?.delta?.tool_calls),
+      false,
+      "a tools-less client must never receive tool_calls",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    Deno.env.delete("CNB_11128_DUMP");
+  }
+});
+
+Deno.test("cnb: a DSML tool block from the rescue round reaches non-stream as tool_calls", async () => {
+  resetJunkStreak();
+  cnbForgetRejectedHeads();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    sseBuriedThen("想。".repeat(300), sseChat(DSML_EXEC_BLOCK)),
+  );
+  Deno.env.set("CNB_11128_DUMP", "off");
+  try {
+    const resp = await postRepair(repairRequestBody(false));
+    assertEquals(resp.status, 200);
+    const json = await resp.json();
+    const msg = json.choices[0].message;
+    assertEquals(
+      String(msg.content ?? "").includes("DSML"),
+      false,
+      "no markup in the non-stream content",
+    );
+    assertEquals(msg.tool_calls?.[0]?.function?.name, "exec_command");
+    assert(
+      String(msg.tool_calls[0].function.arguments).includes("Get-Partition"),
+      "the arguments must carry the command",
+    );
+    assertEquals(json.choices[0].finish_reason, "tool_calls");
+  } finally {
+    globalThis.fetch = realFetch;
+    Deno.env.delete("CNB_11128_DUMP");
+  }
+});
+
+Deno.test("cnb: a DSML tool block in a tools-less non-stream answer is stripped", async () => {
+  resetJunkStreak();
+  cnbForgetRejectedHeads();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    () => sseChat("好的。" + DSML_EXEC_BLOCK),
+  );
+  Deno.env.set("CNB_11128_DUMP", "off");
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        messages: [{ role: "user", content: "看看磁盘" }],
+        max_tokens: 64,
+        stream: false,
+      }),
+    });
+    const resp = await postRepair(req);
+    assertEquals(resp.status, 200);
+    const json = await resp.json();
+    const msg = json.choices[0].message;
+    assertEquals(msg.content, "好的。", "prose survives, block goes");
+    assertEquals(
+      msg.tool_calls,
+      undefined,
+      "a tools-less client must not receive tool_calls",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    Deno.env.delete("CNB_11128_DUMP");
+  }
+});

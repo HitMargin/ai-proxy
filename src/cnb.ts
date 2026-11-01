@@ -3395,7 +3395,14 @@ export function cnbAnswerBuriedInThinking(
 /** 补救的结果：第二轮的正文/思维，以及它自己的 finish。 */
 export interface CnbBurialRescueResult {
   attempted: boolean;
+  /** 第二轮的**干净**正文（工具块已剥掉）；调用块不会出现在这里。 */
   text: string;
+  /**
+   * 第二轮解析出的工具调用。第二轮本身就是一个完整模型回合——第一轮被思考
+   * 吞掉的调用意图，关掉思考后经常在这里顺畅吐出来。**调用方没声明 tools 时
+   * 必须丢弃而不是转发**（协议里没有工具位，发 tool_calls 是违约）。
+   */
+  calls: any[];
   thinking: string;
   finish: string | null;
   usage: any;
@@ -3416,15 +3423,25 @@ export interface CnbBurialRescueResult {
  *      诊断线索）一起弄丢，所以 catch 里只记一行日志、返回 attempted=false；
  *   ③ **只在真的拿到正文时才 report ok**。第二轮回思考但正文仍空，
  *      对用户等于没救到，调用方应保持第一轮结果。
+ *
+ * ★ ④（2026-11-01）**第二轮必须过工具解析**。第二轮是一个完整模型回合，完全
+ *    可能不回正文、回一个 DSML/XYML 工具块——第一轮被思考吞掉的调用意图，
+ *    关掉思考后反而在这里顺畅吐了出来。用户实测：救援把整个 `<｜｜DSML｜｜
+ *    calls>` 块当正文发给了用户（模型名 exec_command，参数还带着
+ *    `string="false"` 属性）。所以 `text` 永远是解析后的**干净**正文，调用块
+ *    从 `calls` 走；`tools` 由调用方传入（upBody 是 cnb 的文本协议，工具清单
+ *    烤在提示词里，字段上没有）。
  */
 async function cnbRescueBuriedAnswer(
   upBody: any,
   reasonChars: number,
   finish: string | null,
+  tools?: any[],
 ): Promise<CnbBurialRescueResult> {
   const failed = {
     attempted: false,
     text: "",
+    calls: [] as any[],
     thinking: "",
     finish,
     usage: null,
@@ -3477,9 +3494,14 @@ async function cnbRescueBuriedAnswer(
     );
     return failed;
   }
+  // ★ 第二轮过同一道工具解析（见上面 docstring ④）：text=干净正文，块进 calls。
+  // 「拿到正文」的判定仍按**原始**文本——只回了工具块的轮次也算救到了，
+  // 调用方把 calls 发出去就是这一轮的产出。
+  const parsed = cnbParseToolCalls(retryText, tools, { notes: false });
   return {
     attempted: true,
-    text: retryText,
+    text: parsed.clean,
+    calls: parsed.calls,
     thinking: kParts.join(""),
     finish: retryFinish,
     usage: retryUsage,
@@ -3645,10 +3667,14 @@ async function handleCnbResponses(request: Request): Promise<Response> {
         upBody,
         fullThink.length,
         upFinish,
+        chatBody.tools,
       );
       if (rescue.attempted) {
         textOut = rescue.text;
         thinkOut = joinParts(thinkOut, rescue.thinking);
+        // ★ 救援轮的工具调用要并进 output（第一轮被思考吞掉的调用，关思维后
+        // 在这里回来了）——不合并 = 调用丢失 + 第二轮白跑。
+        if (rescue.calls.length) allCalls.push(...rescue.calls);
         upFinish = rescue.finish ?? "stop";
         if (rescue.usage) usage = sumCnbUsage(usage, rescue.usage);
       }
@@ -3966,10 +3992,13 @@ async function handleCnbResponses(request: Request): Promise<Response> {
           upBody,
           thinkFilter.state.full.length,
           upFinish,
+          chatBody.tools,
         );
         if (rescue.attempted) {
           textFull = rescue.text;
           thinkFull = joinParts(thinkFull, rescue.thinking);
+          // ★ 救援轮的工具调用并进 allCalls（4085 行的 function_call 输出靠它）。
+          if (rescue.calls.length) allCalls.push(...rescue.calls);
           upFinish = rescue.finish ?? "stop";
           if (rescue.usage) usage = sumCnbUsage(usage, rescue.usage);
         }
@@ -5399,7 +5428,11 @@ export async function handleCnb(path: string, request: Request, url: URL) {
         }
         if (thinkOut) msg.reasoning_content = thinkOut;
       } else {
-        msg.content = fullText;
+        // ★ 调用方没声明 tools，模型仍可能吐 DSML/XYML 工具块（cnb 后端自己的
+        // 脚手架会教唆它）——2026-11-01 用户实测：整个 `<｜｜DSML｜｜ calls>`
+        // 块原样出现在正文里。这里没有工具位可发，解析出的调用只能丢弃，
+        // 正文一律发**干净**文本。
+        msg.content = cnbParseToolCalls(fullText).clean;
         if (fullThink) msg.reasoning_content = fullThink;
       }
 
@@ -5423,6 +5456,7 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           upBody,
           fullThink.length,
           finish,
+          p.data.tools,
         );
         if (rescue.attempted) {
           msg.content = rescue.text;
@@ -5431,6 +5465,12 @@ export async function handleCnb(path: string, request: Request, url: URL) {
             rescue.thinking,
           );
           finish = rescue.finish ?? "stop";
+          // ★ 救援轮的工具调用并回消息（调用方声明了 tools 才有工具位可发）。
+          if (hasTools && rescue.calls.length) {
+            msg.tool_calls = rescue.calls;
+            if (!msg.content) msg.content = null;
+            finish = "tool_calls";
+          }
           if (rescue.usage) usage = sumCnbUsage(usage, rescue.usage);
         }
       }
@@ -5475,9 +5515,15 @@ export async function handleCnb(path: string, request: Request, url: URL) {
 
       try {
         // ─── 无 tools：逐 chunk 直通，每个 delta 立即转发 ───
+        // ★ 但「直通」不等于「生吃」：调用方没声明 tools，模型仍可能吐
+        // DSML/XYML 工具块（cnb 后端自己的脚手架会教唆它）——2026-11-01 用户
+        // 实测：整个 `<｜｜DSML｜｜ calls>` 块原样流进正文。所以正文过同一道
+        // 扣留滤网：疑似工具标记的开头之后全部扣住，流结束统一解析，**只发
+        // 干净正文**；解析出的调用丢弃（协议里没有工具位，发 tool_calls 违约）。
         if (!hasTools) {
           let streamedText = "";
           let streamedThink = "";
+          const textFilter = createLiveFilter();
           for await (const chunk of cnbIter(upstreamResp!)) {
             if (chatId == null) {
               chatId = chunk.id || "chatcmpl-" + Date.now();
@@ -5492,15 +5538,29 @@ export async function handleCnb(path: string, request: Request, url: URL) {
                 await emit({ reasoning_content: d.reasoning_content });
               }
               if (d.content) {
-                streamedText += d.content;
-                await emit({ content: d.content });
+                const out = textFilter.push(d.content);
+                if (out) {
+                  streamedText += out;
+                  await emit({ content: out });
+                }
               }
             }
             if (chunk.usage) usage = chunk.usage;
           }
+          // 扣住的尾段：干净正文补发出去（多数请求没有工具块，这里是空串）
+          const rPlain = cnbParseToolCalls(textFilter.state.full);
+          const plainRem = rPlain.clean.slice(
+            commonPrefixLen(rPlain.clean, textFilter.state.emitted),
+          );
+          if (plainRem) {
+            streamedText += plainRem;
+            await emit({ content: plainRem });
+          }
 
           // ★ 思考饿死补救援（chat 流式、无 tools 版，2026-10-26）。
           // 思考已经流给客户端了、撤不回来；正文一个字节都没发，所以补发正文即可。
+          // 判据用**过滤后**的正文：整轮只吐了个工具块的回合， cleaned 为空，
+          // 同样算「没有正文」，也要救——不能把裸标记当正文发出去就算交代了。
           if (
             cnbAnswerBuriedInThinking(streamedText, streamedThink.length, 0)
           ) {
@@ -5513,7 +5573,8 @@ export async function handleCnb(path: string, request: Request, url: URL) {
               if (rescue.thinking) {
                 await emit({ reasoning_content: rescue.thinking });
               }
-              await emit({ content: rescue.text });
+              if (rescue.text) await emit({ content: rescue.text });
+              // rescue.calls：调用方没声明 tools，没有工具位可发——丢弃。
               finish = rescue.finish ?? "stop";
               if (rescue.usage) usage = rescue.usage;
             }
@@ -5600,12 +5661,16 @@ export async function handleCnb(path: string, request: Request, url: URL) {
               upBody,
               thinkFilter.state.full.length,
               finish,
+              p.data.tools,
             );
             if (rescue.attempted) {
               thinkRem = joinParts(thinkRem, rescue.thinking);
               textRem = rescue.text;
+              // ★ 救援轮的工具调用并进 allCalls（下面的 tool_call 增量靠它；
+              // 2026-11-01 用户实测：不合并 = 调用丢失，DSML 块原样漏进正文）。
+              if (rescue.calls.length) allCalls.push(...rescue.calls);
               finish = rescue.finish ?? "stop";
-              if (rescue.usage) usage = rescue.usage;
+              if (rescue.usage) usage = sumCnbUsage(usage, rescue.usage);
             }
           }
 
