@@ -1085,17 +1085,20 @@ cnb 会拦「非官方客户端」：`400 {"code":11128,"msg":"Illegal API invoc
 
 ### 4. 可靠性
 
-- `cnbCallUpstream` 按 `[0, 500, 1500, 3500, 8000, 20000]` ms 退避重试；
+- `cnbCallUpstream` 对 5xx/网络失败按 `[0, 500, 1500, 3500, 8000, 20000]` ms 退避重试；429 不跟随这张 5xx 退避表，而是读取上游 `Retry-After`（秒数或 HTTP 日期），在冷却结束后的下一次真正发送前放行。`Retry-After` 缺失或非法时使用 `CNB_RATE_LIMIT_COOLDOWN_MS`（默认 1 秒），单次最长等待由 `CNB_RATE_LIMIT_MAX_MS` 封顶（默认 5 分钟）。
+- 默认摘要与用户流共用同一把串行闸，把 CNB 上游负载压到 1 个在途请求；这是降低 429 的保守策略，并非已证实上游存在“严格并发上限=1”。确认账号允许后才可设 `CNB_ALLOW_SUMMARY_PARALLEL=1` 恢复摘要并行。
 - 网络层失败会刷新 CSRF 会话再试；4xx（429 除外）默认视为确定性错误直接透传，**唯一例外是 `400 + errcode 11128`**（渠道校验），见 1.6 节；
 - 上游**只支持流式**：`stream:false` 会拿到 `400 code 11101 "Non-stream chat request is currently not supported"`，所以非流式的调用方由代理聚合 SSE 后返回；
 - `cnbCall` 带 **30 秒无响应头超时**——cnb 偶发无限挂起，中止后交给退避重试（只罩到响应头返回，不限流式生成总时长）；
-- **串行闸**：cnb 网页会话按 cookie 归属，多客户端并发共用一个 cookie 会互踩（曾观测到跨会话内容泄漏）。所有 cnb 上游调用同一时刻只放行一个，锁持有到**响应流真正消费完**（流结束/出错/消费方取消/2 分钟无数据/10 分钟硬安全阀任一条件释放），日志以 `[cnb-gate] fp=...` 记录排队与释放（fp 为会话指纹，重叠且 fp 不同即跨会话并发）；
+- **串行闸**：cnb 网页会话按 cookie 归属，多客户端并发共用一个 cookie 会互踩（曾观测到跨会话内容泄漏）。默认所有 CNB 上游调用（包括内部摘要）共享同一把串行闸，同一时刻最多 1 个在途请求。锁持有到**响应流真正消费完**（流结束/出错/消费方取消/2 分钟无数据/10 分钟硬安全阀任一条件释放），日志以 `[cnb-gate] fp=...` 记录排队与释放（fp 为会话指纹，重叠且 fp 不同即跨会话并发）；
 - **请求体大小不做本地预检，交给上游判**：cnb 对 >1 MiB 的请求体回 `413 [BODY_TOO_LARGE]`（实测：1.000 MiB 通过、1.050 MiB 起拒绝）。这里**曾有一道 `>1MiB 直接本地回 413` 的闸，已拆掉**——它比上游还严，会拦掉上游本来会接受的请求（实测一个 1060926 字节的请求被本地拒死，而那个尺寸上游很可能接受）。现在只写一行 `[cnb-gate] large body … sending anyway` 日志，由上游自己判，用户拿到的是上游原文而不是我们猜的线。
 
 ### 5. 其它
 
 - **可用模型**：只发布 `deepseek-v4.1-flash`——上游把**所有**模型名都路由到同一个后端（响应里一律回 `"model":"deepseek-v4.1-flash"`），`deepseek-v4-flash` / `-pro` 只是会被静默重定向的旧名，留着它们会在选择器里造出一个假的等级；
 - **视觉**：`user` / `system` 消息中的 `image_url` 块会被保留为多模态数组，而不是被折叠成纯文本（`src/cnb.ts` 中保留了这次修复的注释）；
+- **图片去重**：完全相同的 inline data URL 只保留最新一次出现；更早的重复图换成可解释占位符，避免附件在客户端历史里每轮重复上传；
+- **隐藏接口边界（2026-11-04 审计）**：前端页面配置只声明 `deepseek-v4.1-flash`；候选的 `/ai/models`、会话/历史、上传和图片生成路径实测都是 Next.js `Page not found`。唯一确认的 AI API 仍是 `/ai/chat/completions`，直接传 OpenAI `tools` 会被上游拒绝（`403 Agent calls are not allowed in this scenario`）；
 - **思考强度**：`enable_thinking` 默认 `true`；客户端要 `off` / `none` 时**关掉思考**（`enable_thinking:false` 且**不**发 `reasoning_effort`——上游把 `reasoning_effort:"off"` 判成非法档位，回 `400 code 11150`）；其余档位 `minimal` / `low` / `medium` / `high` / `max` / `xhigh` 逐个真调过，默认 `high`，未知值报错而不是静默回落；
 - **输出上限**：客户端不给 `max_tokens` 时默认 `120000`——**不按模型名分档**（上游只会路由到同一个后端，见上面「可用模型」）；预算含思考 token（completion = reasoning + 正文），实测思考最多吃掉约一半，所以默认值调得远高于预期正文长度；
 

@@ -669,6 +669,34 @@ RULES:
 === END TOOL CALL PROTOCOL ===`;
 }
 
+/**
+ * Replay an assistant tool call in the exact JSON dialect the system prompt
+ * teaches. Invalid serialized arguments are passed through as a JSON string
+ * instead of being silently replaced with `{}`, otherwise the next upstream
+ * round sees a syntactically valid call whose required parameters vanished.
+ */
+function cnbReplayToolCall(tc: any): string {
+  const fn = tc?.function || {};
+  const name = String(fn.name || "unknown");
+  let args: any = fn.arguments ?? {};
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args || "{}");
+    } catch {
+      // Replaying an object whose malformed JSON is "repaired" into `{}` would
+      // erase the very path/command that identifies the historical call. The
+      // upstream sees a string and can still recover the original evidence.
+      return `<tool_call>\n${
+        JSON.stringify({ name, arguments: args || "" })
+      }\n</tool_call>`;
+    }
+  }
+  if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
+  return `<tool_call>\n${
+    JSON.stringify({ name, arguments: args })
+  }\n</tool_call>`;
+}
+
 function buildToolSchemaMap(tools?: any[]) {
   const map = new Map<
     string,
@@ -2228,21 +2256,36 @@ export function cnbBuildUpstream(openaiBody: any) {
     const raw = Number(Deno.env.get("CNB_IMAGE_BUDGET_BYTES"));
     return Number.isFinite(raw) && raw > 0 ? raw : 256 * 1024;
   })();
+  const imageEncoder = new TextEncoder();
+  const imageSizeCache = new Map<string, number>();
   const imageBytes = (block: any): number => {
     const url = typeof block?.image_url === "string"
       ? block.image_url
       : block?.image_url?.url;
-    return typeof url === "string" ? new TextEncoder().encode(url).length : 0;
+    if (typeof url !== "string") return 0;
+    const cached = imageSizeCache.get(url);
+    if (cached !== undefined) return cached;
+    const size = imageEncoder.encode(url).length;
+    imageSizeCache.set(url, size);
+    return size;
   };
   // 从最新往回累加，标出留在预算内的那几张
   const keptImageSlots = new Set<string>();
   {
     let used = 0;
+    const seenImageUrls = new Set<string>();
     for (let i = rawMsgs.length - 1; i >= 0; i--) {
       const content = rawMsgs[i]?.content;
       if (!Array.isArray(content)) continue;
       for (let j = content.length - 1; j >= 0; j--) {
         if (content[j]?.type !== "image_url") continue;
+        const url = typeof content[j]?.image_url === "string"
+          ? content[j].image_url
+          : content[j]?.image_url?.url;
+        if (typeof url === "string") {
+          if (seenImageUrls.has(url)) continue;
+          seenImageUrls.add(url);
+        }
         const cost = imageBytes(content[j]);
         // 第一张无条件留：一张都不发的话，用户"刚发的图"就消失了，
         // 那是比 413 更糟的结果（他看不到任何图，却没有任何提示）。
@@ -2352,6 +2395,13 @@ export function cnbBuildUpstream(openaiBody: any) {
     }
   }
 
+  const toolCallNames = new Map<string, string>();
+  for (const m of rawMsgs) {
+    for (const tc of m?.tool_calls ?? []) {
+      if (tc?.id) toolCallNames.set(tc.id, tc.function?.name || "unknown");
+    }
+  }
+
   let msgIndex = -1;
   const msgs = rawMsgs.map((m: any) => {
     msgIndex++;
@@ -2454,21 +2504,7 @@ export function cnbBuildUpstream(openaiBody: any) {
       }
       if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
         // JSON 协议：历史回放与提示词同构，模型看自己的历史就是正确示范
-        const blocks = m.tool_calls.map((tc: any) => {
-          const fn = tc.function || {};
-          const name = fn.name || "unknown";
-          let args: any = {};
-          try {
-            args = typeof fn.arguments === "string"
-              ? JSON.parse(fn.arguments || "{}")
-              : (fn.arguments || {});
-          } catch {
-            args = {};
-          }
-          return `<tool_call>\n${
-            JSON.stringify({ name, arguments: args })
-          }\n</tool_call>`;
-        }).join("\n");
+        const blocks = m.tool_calls.map(cnbReplayToolCall).join("\n");
 
         body = body ? `${body}\n${blocks}` : blocks;
       }
@@ -2478,7 +2514,11 @@ export function cnbBuildUpstream(openaiBody: any) {
     // ─── tool：工具结果 → user 文本 ───
     if (role === "tool") {
       const tcid = m.tool_call_id || "unknown";
-      const nm = m.name ? ` name=${m.name}` : "";
+      // Prefer the call's own name. Some clients omit `name` on tool results;
+      // losing it makes parallel calls indistinguishable in history.
+      const callName = toolCallNames.get(tcid);
+      const name = m.name || callName;
+      const nm = name ? ` name=${name}` : "";
       return { role: "user", content: `[Tool Result id=${tcid}${nm}]\n${c}` };
     }
 
@@ -2766,15 +2806,125 @@ let cnbGate: Promise<void> = Promise.resolve();
  *
  * 为什么**不是**“摘要不占闸”：cnb 上游对并发敏感（串行闸存在的原因），
  * 完全不限并发会把正常请求也拖下水。所以是**各自串行**：摘要内部一次只跑
- * 一个，但不挡住用户流；用户流内部一次只跑一个，也不被摘要挡住。两者的
- * 代价是同一时刻最多 2 个在途请求——这是有意的取舍，因为摘要只在超预算时
- * 才发生，而它卡住主队列的影响是全局的。
+ * 一个，但不挡住用户流；用户流内部一次只跑一个，也不被摘要挡住。
+ *
+ * ★ 2026-11-03：用户观察到多轮对话同时进行会连续 429。同一 CSRF 对的两个
+ * 小请求可以并发成功，说明这不是“每一条并发都必拒”；尚未证明存在严格并发
+ * 上限。但当前双队列会把“摘要请求 + 用户请求”叠成 2 个上游生成，而 429 后
+ * 排队请求还会继续撞同一窗口。因此默认改成一个保守的单并发策略：`serialOnly`
+ * 让摘要和用户流共享 `cnbGate`。只有显式设置
+ * `CNB_ALLOW_SUMMARY_PARALLEL=1` 才恢复下面的双队列模式。
  */
 let cnbSummaryGate: Promise<void> = Promise.resolve();
 
 interface CnbGateOptions {
-  /** 摘要等内部调用走独立闸，不占用户请求的队首。 */
+  /** 标记摘要等内部调用；默认仍共用主闸，环境变量放行时才走独立队列。 */
   internal?: boolean;
+}
+
+/**
+ * 429 后由上游 Retry-After 驱动的全局冷却。
+ *
+ * 串行闸只能保证「同一时刻一个请求」，不能保证「单位时间请求数」不超限。
+ * 一旦某个请求被上游限流，排队的请求仍应立即停住；否则每个排队的请求都会
+ * 先吃一次 429，再把窗口续长。
+ *
+ * 实测（2026-11-03）只足以确认：同一 CSRF 对的两个小请求可以并发成功，
+ * 所以它不是严格的“同会话并发必拒”；真实触发条件是账号/IP 的单位时间
+ * 请求窗口，还是更重的请求会触发并发限制，目前尚未分清。因此默认全局
+ * 串行只作为降低 429 的保守策略，不能写成“上游硬并发上限=1”。一旦某条
+ * 请求收到 429，用户流与摘要流仍共用这个截止时间，避免排队请求继续撞窗口。
+ */
+let cnbRateLimitedUntil = 0;
+
+function cnbRetryAfterMs(raw: string | null, now = Date.now()): number | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    return Math.max(0, Math.ceil(Number(trimmed) * 1000));
+  }
+  const at = Date.parse(trimmed);
+  if (!Number.isFinite(at)) return null;
+  return Math.max(0, at - now);
+}
+
+function cnbRateLimitDefaultMs(): number {
+  const raw = Number(Deno.env.get("CNB_RATE_LIMIT_COOLDOWN_MS") ?? 1_000);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1_000;
+}
+
+function cnbRateLimitMaxMs(): number {
+  const raw = Number(Deno.env.get("CNB_RATE_LIMIT_MAX_MS") ?? 5 * 60_000);
+  return Number.isFinite(raw) && raw > 0 ? raw : 5 * 60_000;
+}
+
+function cnbTripRateLimit(
+  status: number,
+  retryAfter: string | null,
+  now = Date.now(),
+): number {
+  if (status !== 429) return 0;
+  const advertised = cnbRetryAfterMs(retryAfter, now);
+  const backoff = cnbRateLimitDefaultMs();
+  const cap = cnbRateLimitMaxMs();
+  const cooldown = Math.min(
+    cap,
+    Math.max(backoff, advertised ?? 0),
+  );
+  const until = now + cooldown;
+  if (until <= cnbRateLimitedUntil) {
+    const remaining = Math.max(0, cnbRateLimitedUntil - now);
+    if (remaining <= 0) return 0;
+    console.warn(
+      `[cnb] upstream 429 repeated; existing cnb cooldown still has ${remaining}ms`,
+    );
+    return remaining;
+  }
+  cnbRateLimitedUntil = Math.max(cnbRateLimitedUntil, until);
+  const waitMs = cnbRateLimitedUntil - now;
+  if (waitMs <= 0) return 0;
+  console.warn(
+    `[cnb] upstream 429 — pausing all cnb calls for ${waitMs}ms` +
+      (advertised === null
+        ? " (no usable Retry-After)"
+        : advertised > cap
+        ? ` (Retry-After ${advertised}ms capped to ${cap}ms)`
+        : ` (Retry-After ${advertised}ms)`),
+  );
+  return waitMs;
+}
+
+function cnbResetRateLimit(): void {
+  cnbRateLimitedUntil = 0;
+}
+
+/** 测试专用：清空冷却，避免一个用例的 429 污染下一个用例。 */
+export function cnbResetRateLimitForTest(): void {
+  cnbResetRateLimit();
+}
+
+/** 429 冷却的内部测试缝：不发请求，只验证时间边界与状态转换。 */
+export function cnbRateLimitTestHooks(now = Date.now()) {
+  return {
+    trip: (status: number, retryAfter: string | null) =>
+      cnbTripRateLimit(status, retryAfter, now),
+    retryAfterMs: (retryAfter: string | null) =>
+      cnbRetryAfterMs(retryAfter, now),
+    retryAfterMsFor: (retryAfter: string | null, at: number) =>
+      cnbRetryAfterMs(retryAfter, at),
+    until: () => cnbRateLimitedUntil,
+    reset: cnbResetRateLimit,
+  };
+}
+
+async function cnbWaitForRateLimit(): Promise<void> {
+  while (true) {
+    const waitMs = cnbRateLimitedUntil - Date.now();
+    if (waitMs <= 0) return;
+    const sliceMs = Math.min(250, waitMs);
+    await new Promise((resolve) => setTimeout(resolve, sliceMs));
+  }
 }
 
 /**
@@ -2896,6 +3046,11 @@ export async function cnbCallUpstream(
     );
   }
   const fp = cnbFingerprint(upBody);
+  const internal = options.internal === true ||
+    cnbInternalScope.getStore() === true;
+  // 当前观测是并发会显著放大 429，而不是每个并发都确定失败。默认仍让摘要
+  // 和用户流共用一把锁；只有明确确认账号/上游允许时才恢复两条队列并行。
+  const serialOnly = Deno.env.get("CNB_ALLOW_SUMMARY_PARALLEL") !== "1";
   // 串行闸的两条慢日志阈值。cnb 上游单次生成实测 30 秒上下，闸又是串行的，
   // 所以「等 30~50 秒」是**正常**的竞争结果、不是故障。默认值取在正常量级
   // 之上，只有真正卡住（闸被吊、上游挂起）才会记；两个都可用环境变量调。
@@ -2906,12 +3061,10 @@ export async function cnbCallUpstream(
   // 内部摘要调用走独立队列：既不排在用户请求后面（那样摘要会等到用户流
   // 结束才动，一次超预算请求就要串两轮完整生成），也不把用户请求堵在它
   // 后面（那正是日志里那批 190 秒等待的来源）。
-  const internal = options.internal === true ||
-    cnbInternalScope.getStore() === true;
-  const prev = internal ? cnbSummaryGate : cnbGate;
+  const prev = serialOnly ? cnbGate : internal ? cnbSummaryGate : cnbGate;
   let release!: () => void;
   const opened = new Promise<void>((r) => (release = r));
-  if (internal) cnbSummaryGate = opened;
+  if (internal && !serialOnly) cnbSummaryGate = opened;
   else cnbGate = opened;
   let released = false;
   let t0 = 0;
@@ -2933,6 +3086,15 @@ export async function cnbCallUpstream(
   };
   const queuedAt = Date.now();
   await prev;
+  const holdStart = cnbRateLimitedUntil > Date.now() ? Date.now() : 0;
+  if (holdStart) {
+    console.warn(
+      `[cnb-gate] fp=${fp} holding ${
+        internal ? "summary" : "user"
+      } slot during 429 cooldown`,
+    );
+    await cnbWaitForRateLimit();
+  }
   const waited = Date.now() - queuedAt;
   // ★ t0 与安全阀都从「真的拿到闸」才开始计时。
   // 2026-10-21 修：原来两者都写在 `await prev` 之前，于是 `held` = 排队 + 持有，
@@ -3117,7 +3279,7 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
           headers: h,
         });
       }
-      // 4xx（除 429）是确定性的，重试无意义，直接透传
+      // 4xx（除 429）是确定性的，重试无意义，直接透传。
       if (resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
         // ★ 削头重发仍被拦时**不再静默透传**：静默的失败不可诊断——生产里
         // 「每轮 11128」在日志里一行都没有，排查全靠猜。落盘 + 打一行。
@@ -3147,6 +3309,9 @@ async function cnbCallUpstreamInner(_upBody: any): Promise<Response> {
       console.warn(
         `[cnb] upstream ${resp.status}, retry ${i + 1}/${waits.length}`,
       );
+      if (resp.status === 429) {
+        cnbTripRateLimit(429, resp.headers.get("retry-after"));
+      }
       try {
         const drained = await resp.text();
         // 最后一次尝试不再重试：必须把已读掉的正文**还原**回去。直接返回
@@ -3240,6 +3405,7 @@ function responsesToChat(rb: any) {
     content: [{ type: "input_text", text: String(rb.input ?? "") }],
   }];
 
+  const toolCallNames = new Map<string, string>();
   for (const item of items) {
     if (!item || typeof item !== "object") continue;
     const t = item.type || "message";
@@ -3267,11 +3433,13 @@ function responsesToChat(rb: any) {
       }
       messages.push({ role, content });
     } else if (t === "function_call") {
+      const callId = item.call_id || item.id || "call_unknown";
+      toolCallNames.set(callId, item.name || "unknown");
       messages.push({
         role: "assistant",
         content: "",
         tool_calls: [{
-          id: item.call_id || item.id || "call_unknown",
+          id: callId,
           type: "function",
           function: {
             name: item.name || "unknown",
@@ -3282,9 +3450,11 @@ function responsesToChat(rb: any) {
         }],
       });
     } else if (t === "function_call_output") {
+      const callId = item.call_id || item.id || "call_unknown";
       messages.push({
         role: "tool",
-        tool_call_id: item.call_id || "call_unknown",
+        tool_call_id: callId,
+        name: toolCallNames.get(callId),
         content: typeof item.output === "string"
           ? item.output
           : JSON.stringify(item.output ?? ""),

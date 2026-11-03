@@ -68,6 +68,41 @@ Deno.test("Anthropic Messages request converts text, images, and tools", () => {
   equal(result.body.tool_choice, "auto");
 });
 
+Deno.test("Anthropic tool_result keeps its call id", () => {
+  const result = anthropicMessagesToChat({
+    model: "deepseek/test",
+    max_tokens: 64,
+    messages: [
+      { role: "user", content: "look" },
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "call_a", name: "read", input: {} },
+          { type: "tool_use", id: "call_b", name: "grep", input: {} },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_a",
+            content: "file body",
+          },
+          { type: "tool_result", tool_use_id: "call_b", content: "matches" },
+        ],
+      },
+    ],
+  });
+  assert(result.ok, "the message must convert");
+  if (!result.ok) return;
+  const tools = result.body.messages.filter((m: any) => m.role === "tool");
+  equal(tools.length, 2);
+  equal(tools[0].tool_call_id, "call_a");
+  equal(tools[1].tool_call_id, "call_b");
+  equal(tools[1].content, "matches");
+});
+
 Deno.test("Anthropic Messages request rejects unsupported stateless fields", () => {
   const missingTokens = anthropicMessagesToChat({
     model: "deepseek/test",

@@ -31,8 +31,10 @@ import {
   cnbNeutraliseHead,
   cnbParseToolCalls,
   cnbPreNeutraliseHead,
+  cnbRateLimitTestHooks,
   cnbRememberRejectedHead,
   cnbRepairMaxTokens,
+  cnbResetRateLimitForTest,
   cnbStaleToolCallPrune,
   cnbStaleToolPrune,
   cnbStripGitStatus,
@@ -1066,7 +1068,12 @@ Deno.test("two large images do not both survive - the older one is dropped", () 
 
 Deno.test("many small images survive together - the budget is bytes, not count", () => {
   // 对照组：按张数丢会把这 20 张砍到 2 张。按字节丢应该留下 10 张以上。
-  const many = Array.from({ length: 20 }, () => sizedImage(20 * 1024));
+  const many = Array.from({ length: 20 }, (_, i) => ({
+    type: "image_url",
+    image_url: {
+      url: "data:image/png;base64," + "A".repeat(20 * 1024) + ":" + i,
+    },
+  }));
   const up = cnbBuildUpstream(sizedHistory(many)).upstream;
   const { images } = countImages(up);
   assert(
@@ -1076,6 +1083,18 @@ Deno.test("many small images survive together - the budget is bytes, not count",
   );
   const bytes = new TextEncoder().encode(JSON.stringify(up)).length;
   assert(bytes < 1048576, "body must fit, got " + bytes);
+});
+
+Deno.test("identical images are deduplicated to their newest occurrence", () => {
+  const same = sizedImage(40 * 1024);
+  const up = cnbBuildUpstream(sizedHistory([same, same, same])).upstream;
+  const { images, placeholders } = countImages(up);
+  assertEquals(images, 1, "the same bytes must not be uploaded repeatedly");
+  assertEquals(
+    placeholders,
+    2,
+    "older duplicates must remain visible as removed-image placeholders",
+  );
 });
 
 Deno.test("an oversized image in history is demoted rather than refused", () => {
@@ -3362,6 +3381,290 @@ Deno.test("cnb: a request that queued behind another does not report the queue w
   }
 });
 
+Deno.test("cnb: Retry-After accepts seconds, HTTP dates, and rejects junk", () => {
+  const H = cnbRateLimitTestHooks();
+  H.reset();
+  assertEquals(H.retryAfterMs("2"), 2_000);
+  assertEquals(H.retryAfterMs("0.25"), 250);
+  assertEquals(H.retryAfterMs(null), null);
+  assertEquals(H.retryAfterMs(""), null);
+  assertEquals(H.retryAfterMs("not a duration"), null);
+
+  const now = Date.parse("Wed, 21 Oct 2015 07:28:00 GMT");
+  assertEquals(
+    H.retryAfterMsFor("Wed, 21 Oct 2015 07:28:03 GMT", now),
+    3_000,
+  );
+
+  H.trip(200, "30");
+  assertEquals(H.until(), 0, "a non-429 must not start the cooldown");
+});
+
+Deno.test("cnb: a 429 chooses the later cooldown and never shortens it", () => {
+  const now = 1_000_000;
+  const H = cnbRateLimitTestHooks(now);
+  H.reset();
+  const envBefore = Deno.env.get("CNB_RATE_LIMIT_COOLDOWN_MS");
+  const maxBefore = Deno.env.get("CNB_RATE_LIMIT_MAX_MS");
+  Deno.env.set("CNB_RATE_LIMIT_COOLDOWN_MS", "1000");
+  Deno.env.set("CNB_RATE_LIMIT_MAX_MS", "60000");
+  try {
+    assertEquals(H.trip(429, "5"), 5_000);
+    assertEquals(
+      H.trip(429, "1"),
+      5_000,
+      "a shorter advertised delay must not cut an active cooldown",
+    );
+    assertEquals(
+      H.trip(429, "120"),
+      60_000,
+      "the configured ceiling caps absurd Retry-After values",
+    );
+    H.reset();
+    assertEquals(
+      H.trip(429, null),
+      1_000,
+      "a 429 without Retry-After still needs a shared pause",
+    );
+  } finally {
+    H.reset();
+    if (envBefore === undefined) {
+      Deno.env.delete("CNB_RATE_LIMIT_COOLDOWN_MS");
+    } else {
+      Deno.env.set("CNB_RATE_LIMIT_COOLDOWN_MS", envBefore);
+    }
+    if (maxBefore === undefined) Deno.env.delete("CNB_RATE_LIMIT_MAX_MS");
+    else Deno.env.set("CNB_RATE_LIMIT_MAX_MS", maxBefore);
+  }
+});
+
+Deno.test("cnb: a 429 pauses the next queued request before it reaches upstream", async () => {
+  const realFetch = globalThis.fetch;
+  const realWarn = console.warn;
+  const chatAt: number[] = [];
+  let firstAt = 0;
+  const retryAfter = 1;
+  const envBefore = Deno.env.get("CNB_RATE_LIMIT_COOLDOWN_MS");
+  const maxBefore = Deno.env.get("CNB_RATE_LIMIT_MAX_MS");
+  Deno.env.set("CNB_RATE_LIMIT_COOLDOWN_MS", "0");
+  Deno.env.set("CNB_RATE_LIMIT_MAX_MS", "5000");
+  cnbResetRateLimitForTest();
+  console.warn = () => {};
+  globalThis.fetch = ((input: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      chatAt.push(Date.now());
+      if (chatAt.length === 1) {
+        firstAt = Date.now();
+        return Promise.resolve(
+          new Response(JSON.stringify({ error: "slow down" }), {
+            status: 429,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": String(retryAfter),
+            },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n' +
+            "data: [DONE]\n\n",
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "a".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567890; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+  const body = () => ({
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: "hi" }],
+    stream: true,
+    max_tokens: 16,
+  });
+  // 429 的上游循环会立刻用到第二个请求；先让第一个请求跑进冷却，
+  // 再把真正排队的第三个调用挂上去，断言它不会在冷却前开火。
+  try {
+    const first = runAsCnbInternal(() => cnbCallUpstream(body()));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const second = cnbCallUpstream(body());
+    // User requests hold the main gate through cooldown. The summary stream
+    // must be consumed and cancelled first so the main gate can be acquired.
+    const one = await first;
+    await one.body?.cancel().catch(() => {});
+    const two = await second;
+    await two.body?.cancel().catch(() => {});
+    assert(chatAt.length >= 3, "both client requests must reach upstream");
+    assert(
+      chatAt[2] - firstAt >= retryAfter * 1000 - 150,
+      `queued request fired before Retry-After: ${chatAt[2] - firstAt}ms`,
+    );
+    assert(
+      chatAt.length >= 2,
+      "the first request must hit the 429 and the next request must follow",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    console.warn = realWarn;
+    cnbResetRateLimitForTest();
+    if (envBefore === undefined) {
+      Deno.env.delete("CNB_RATE_LIMIT_COOLDOWN_MS");
+    } else {
+      Deno.env.set("CNB_RATE_LIMIT_COOLDOWN_MS", envBefore);
+    }
+    if (maxBefore === undefined) Deno.env.delete("CNB_RATE_LIMIT_MAX_MS");
+    else Deno.env.set("CNB_RATE_LIMIT_MAX_MS", maxBefore);
+  }
+});
+
+Deno.test("cnb: a 429 response keeps its body for the caller", async () => {
+  const realFetch = globalThis.fetch;
+  const realWarn = console.warn;
+  const original = JSON.stringify({
+    error: "rate limited",
+    message: "CNB 429 probe",
+  });
+  const before = Deno.env.get("CNB_RATE_LIMIT_COOLDOWN_MS");
+  Deno.env.set("CNB_RATE_LIMIT_COOLDOWN_MS", "0");
+  cnbResetRateLimitForTest();
+  console.warn = () => {};
+  globalThis.fetch = ((input: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      return Promise.resolve(
+        new Response(original, {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": "0",
+          },
+        }),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "a".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567890; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+  try {
+    const resp = await cnbCallUpstream({
+      model: "deepseek-v4.1-flash",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+      max_tokens: 16,
+    });
+    assertEquals(resp.status, 429);
+    assertEquals(await resp.text(), original);
+    assert(resp.headers.get("content-length") === null);
+  } finally {
+    globalThis.fetch = realFetch;
+    console.warn = realWarn;
+    cnbResetRateLimitForTest();
+    if (before === undefined) {
+      Deno.env.delete("CNB_RATE_LIMIT_COOLDOWN_MS");
+    } else {
+      Deno.env.set("CNB_RATE_LIMIT_COOLDOWN_MS", before);
+    }
+  }
+});
+
+Deno.test("cnb: summaries share the user gate by default", async () => {
+  const realFetch = globalThis.fetch;
+  const before = Deno.env.get("CNB_ALLOW_SUMMARY_PARALLEL");
+  const events: string[] = [];
+  let releaseFirst!: () => void;
+  globalThis.fetch = ((input: any) => {
+    const url = String(input);
+    if (url.includes("cnb.cool/ai/chat/completions")) {
+      events.push("chat");
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          releaseFirst = () => {
+            try {
+              controller.close();
+            } catch {
+              // The consumer may have already cancelled the mocked upstream.
+            }
+          };
+          controller.enqueue(
+            new TextEncoder().encode(
+              'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+            ),
+          );
+        },
+      });
+      return Promise.resolve(
+        new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    }
+    return Promise.resolve(
+      new Response(
+        '<script>window.csrftoken = "' + "a".repeat(32) + '";</script>',
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html",
+            "set-cookie": "csrfkey=1234567890; Path=/",
+          },
+        },
+      ),
+    );
+  }) as typeof fetch;
+  Deno.env.delete("CNB_ALLOW_SUMMARY_PARALLEL");
+  cnbResetRateLimitForTest();
+  const body = () => ({
+    model: "deepseek-v4.1-flash",
+    messages: [{ role: "user", content: "hi" }],
+    stream: true,
+    max_tokens: 16,
+  });
+  try {
+    const user = await cnbCallUpstream(body());
+    const summaryP = runAsCnbInternal(() => cnbCallUpstream(body()));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assertEquals(
+      events.length,
+      1,
+      "the internal call must wait for the user stream to release the gate",
+    );
+    releaseFirst?.();
+    await user.body?.cancel().catch(() => {});
+    const summary = await summaryP;
+    await summary.body?.cancel().catch(() => {});
+    assertEquals(
+      events.length,
+      2,
+      "the internal call runs after the gate opens",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    if (before === undefined) Deno.env.delete("CNB_ALLOW_SUMMARY_PARALLEL");
+    else Deno.env.set("CNB_ALLOW_SUMMARY_PARALLEL", before);
+  }
+});
+
 // ─── 代理内修复轮（2026-10-24）───
 //
 // 坏语法反馈原来是拼在助手正文后面发给客户端的——那是一个**已经结束的回合**，
@@ -3820,6 +4123,65 @@ Deno.test("the summary-failed trim keeps the original task when tools alone exce
 // `\P`/`\A` 不是合法 JSON 转义，严格解析拒掉整个对象 → 整个调用进垃圾闸 →
 // 烧一轮修复重问。模型的本意就是单个反斜杠，补成 `\\` 是唯一合理解读，
 // 且解析回来值零损失——这种调用应该直接成功，而不是走任何重试路径。
+Deno.test("cnb: an invalid historical tool call is not silently emptied", () => {
+  const malformed = '{"command":"Get-Item C:\\Projects\\x.ps1"}';
+  const up = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    messages: [
+      { role: "user", content: "run it" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call_bad",
+          type: "function",
+          function: { name: "pwsh", arguments: malformed },
+        }],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_bad",
+        content: "ok",
+      },
+    ],
+    tools: TOOLS,
+  }).upstream;
+  const assistant = up.messages.find((m: any) => m.role === "assistant");
+  assert(
+    String(assistant.content).includes("Projects"),
+    "the original argument must survive replay instead of collapsing to {}",
+  );
+});
+
+Deno.test("cnb: an unnamed tool result recovers the tool name from its call", () => {
+  const up = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    messages: [
+      { role: "user", content: "run it" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call_named",
+          type: "function",
+          function: { name: "pwsh", arguments: "{}" },
+        }],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_named",
+        content: "ok",
+      },
+    ],
+    tools: TOOLS,
+  }).upstream;
+  const result = up.messages.at(-1);
+  assert(
+    String(result.content).includes("name=pwsh"),
+    "the paired call's name must survive into the tool-result transcript",
+  );
+});
+
 Deno.test("a Windows path with raw backslashes parses instead of hitting the junk gate", () => {
   resetJunkStreak();
   cnbEscapeRepairState.n = 0;
@@ -3916,6 +4278,62 @@ Deno.test("a legal-escape path (C:\\Users\\file) survives the value-level repair
 // cnb 声明的是 `api: openai-responses`，走的是 /responses；而修复轮第一版
 // 只接在 chat completions 两条路径上，responses 明确留了旧行为（把反馈当正文
 // 发出去 → 回合结束）。用户看到的「还是中断」就是这条旧路径。
+Deno.test("cnb: /responses carries the function name into tool-result history", async () => {
+  const prev = Deno.env.get("CNB_COMPACTION");
+  Deno.env.set("CNB_COMPACTION", "off");
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(bodies, () => sseChat("ok"));
+  try {
+    const req = new Request("http://cnb.local/cnb/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "deepseek-v4.1-flash",
+        input: [
+          {
+            type: "function_call",
+            call_id: "call_a",
+            name: "pwsh",
+            arguments: "{}",
+          },
+          {
+            type: "function_call_output",
+            call_id: "call_a",
+            output: "ok",
+          },
+          {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "reply ok" }],
+          },
+        ],
+        max_output_tokens: 16,
+        stream: false,
+      }),
+    });
+    const resp = await handleCnb(
+      "/cnb/v1/responses",
+      req,
+      new URL("http://cnb.local/cnb/v1/responses"),
+    );
+    assertEquals(resp.status, 200);
+    await resp.text();
+    const sent = JSON.parse(bodies[0]);
+    assert(
+      sent.messages.some((m: any) =>
+        m.role === "user" &&
+        String(m.content).includes("name=pwsh")
+      ),
+      "the Responses result must inherit its paired call's tool name",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    if (prev === undefined) Deno.env.delete("CNB_COMPACTION");
+    else Deno.env.set("CNB_COMPACTION", prev);
+  }
+});
+
 Deno.test("cnb: /responses repairs an unparseable call in-proxy (streaming)", async () => {
   resetJunkStreak();
   const prev = Deno.env.get("CNB_COMPACTION");

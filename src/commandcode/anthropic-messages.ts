@@ -139,9 +139,9 @@ export function anthropicMessagesToChat(input: unknown):
     }
     const content = raw.content;
     const blocks = Array.isArray(content) ? content : [content];
+    const toolResults: Array<{ id: string; content: string }> = [];
     const textParts: Json[] = [];
     const toolCalls: Json[] = [];
-    const toolResults: Array<{ id: string; content: string }> = [];
     for (const block of blocks) {
       if (typeof block === "string" || !isRecord(block)) {
         const text = textFromBlocks(block);
@@ -188,6 +188,9 @@ export function anthropicMessagesToChat(input: unknown):
     if (toolCalls.length > 0) {
       messages.push({ role: "assistant", content: "", tool_calls: toolCalls });
     }
+    // Keep the call id in the text shadow produced for CNB: cnbBuildUpstream
+    // recovers the name from role:"tool".tool_call_id, and the id is also the
+    // only reliable link when calls run in parallel.
     for (const result of toolResults) {
       messages.push({
         role: "tool",
