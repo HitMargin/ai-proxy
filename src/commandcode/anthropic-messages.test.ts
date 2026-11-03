@@ -96,7 +96,9 @@ Deno.test("Anthropic tool_result keeps its call id", () => {
   });
   assert(result.ok, "the message must convert");
   if (!result.ok) return;
-  const tools = result.body.messages.filter((m: any) => m.role === "tool");
+  const tools = result.body.messages.filter(
+    (m: Record<string, unknown>) => m.role === "tool",
+  );
   equal(tools.length, 2);
   equal(tools[0].tool_call_id, "call_a");
   equal(tools[1].tool_call_id, "call_b");
