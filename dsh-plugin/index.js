@@ -238,6 +238,7 @@ const KNOWN_CHANNELS = [
   'workbuddy',
   'zen',
   'zlkpro',
+  'zaiPlan',
 ];
 
 const DEFAULT_HIDDEN_CHANNELS = [
@@ -268,6 +269,7 @@ export const CHANNEL_GROUPS = {
   'ai-proxy-workbuddy': { channel: 'workbuddy', label: 'WorkBuddy' },
   'ai-proxy-zen': { channel: 'zen', label: 'Zen' },
   'ai-proxy-zlkpro': { channel: 'zlkpro', label: 'ZLK Pro' },
+  'ai-proxy-zaiPlan': { channel: 'zaiPlan', label: 'Z.ai Start Plan' },
   // One group for every user-added upstream. Registering one provider per vendor
   // is impossible without a Host restart: the Host builds its catalog once per
   // generation and this map is read at `apply()` time, so a vendor added in the
@@ -392,6 +394,7 @@ const CHANNEL_ROUTES = [
   // so a call would be sent to the aggregate with a vendor id the proxy cannot
   // resolve - a 404 for a model the panel just offered.
   { prefix: 'custom', basePath: '/custom/v1' },
+  { prefix: 'zaiPlan', basePath: '/zai-plan/v1' },
 ];
 
 function blockReasonFor(modelId) {
@@ -3598,6 +3601,7 @@ export const PROBE_CHANNELS = [
   'trae',
   'zlkpro',
   'custom',
+  'zaiPlan',
 ];
 
 function cleanProbeRequest(values) {

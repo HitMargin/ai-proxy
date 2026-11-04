@@ -9,6 +9,7 @@
 3. **私有 CLI 网关**：CommandCode Go（移植 `dsh-cmdgo-provider` 的模型筛选、网关协议、多账号池与额度读取）与 WorkBuddy 中国版（文件凭据 + 自动续期 + 流内内容拦截）
 4. **Anthropic Messages**：`/commandcode/v1/messages` 做 OpenAI ⇄ Messages 双向转换（原先的 `/anthropic/v1` 与 `/gemini/v1` 已下线，见下方说明）
 5. **任意自填的 OpenAI 兼容上游**：面板里填名字 + 地址 + key 即可，**不用改代码、不用重启**
+6. **Z.ai Start Plan**：`/zai-plan/v1` 把 ZCode 桌面端每日 300M tokens 的 GLM-5.3-Flash 额度接进来——凭据走官方 device-flow 登录（本地 `zcode-bridge` 网关自持 plan JWT），协议转换在 `src/zai-plan.ts`；出口必须经用户的代理（WAF 按出口 IP 与客户端形态区别对待，见 AGENTS.md「Z.ai Start Plan 渠道」）
 
 > 同一份 `main.ts` 可以跑在 **Deno Deploy**、**本地 Deno**、**Cloudflare Workers** 三种环境。
 
@@ -97,7 +98,10 @@ src/zen-compaction.ts      Zen 会话压缩
 src/zen-egress.ts          Zen 出口代理轮换
 src/custom.ts              自定义供应商：来源合并、校验、出站头、路由解析
 src/custom-handler.ts      /custom/v1 的列表聚合与推理转发
+src/zai-plan.ts            Z.ai Start Plan：ZCode 凭据解密、本地 zcode-bridge 网关对接、OpenAI↔Anthropic 转换（含思考与工具）
 src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度、Messages 转换与路由
+tools/zai-plan-relay/      Start Plan 侦察工具链：CDP 监听、netlog/tracing 捕获、捕获转发代理、探针（.mjs/.go）
+tools/zcode-bridge/        第三方 zcode-bridge 网关（azrinaldi/zcode-bridge）的本地安装位（二进制不入库）
 src/runtime/               响应体形状嗅探、流回放、abort/截断分类、目录健康登记
 scripts/checkin.ts         一键签到（TRAE + WorkBuddy，直连或经代理，幂等，退出码可靠）
 scripts/probes/            手动 smoke 探针（显式 --confirm-live 才会发真实请求）

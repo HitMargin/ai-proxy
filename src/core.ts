@@ -347,6 +347,20 @@ export const providers: Record<string, any> = {
     filterModels: null,
     customHandler: "custom",
   },
+  // Z.ai Start Plan（ZCode 桌面端每日 300M tokens 的 GLM-5.3-Flash）。凭据来自
+  // ZCode 的本地 credentials.json（解密 zcodejwttoken），上游是 Anthropic 协议
+  // 且必须经用户代理出口（WAF 按出口 IP 区别对待，见 AGENTS.md），因此全部
+  // 路径由 handleZaiPlan 服务；baseUrl 与 workbuddy 同理只是占位。
+  zaiPlan: {
+    prefix: "/zai-plan/v1",
+    baseUrl: "https://zcode.z.ai/api/v1/zcode-plan",
+    auth: { type: "none" },
+    pathRewrite: (path: string) => path.replace(/^\/zai-plan\/v1/, ""),
+    endpoints: { models: "/models", chat: "/chat/completions" },
+    adapter: adapters.passthrough,
+    filterModels: null,
+    customHandler: "zai-plan",
+  },
 };
 
 // ---------- 健康检查 ----------

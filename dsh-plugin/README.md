@@ -27,6 +27,7 @@ DSH 中的 `ai-proxy` Provider 会从本地代理读取完整模型目录：
 - `tokenharbor/*`：TokenHarbor 通道（可用时）；
 - `trae/*`：TRAE 通道（账号目录，附账号状态与每日签到）；
 - `workbuddy/*`：WorkBuddy 中国版通道（账号目录）。**需要先运行 `deno run -A .tmp-workbuddy-login.ts` 抓取凭据**——凭据是仓库根目录的 `workbuddy-auth.json`，没有它代理答 502，插件因此在文件存在之前不把这个渠道放进面板和选择器。这不是「渠道不可用」，而是「还没配置」：面板的渠道开关里它照常可见，开关也照常管用。
+- `zaiPlan/*`：Z.ai Start Plan（ZCode 桌面端每日 300M tokens 的 GLM-5.3-Flash）。**依赖本地 `tools/zcode-bridge/zcode-bridge.exe` 网关**：先运行一次 `zcode-bridge.exe login`（浏览器批准 device-flow），再保持 `zcode-bridge.exe` 常驻（默认监听 `127.0.0.1:20131`）——代理把请求转给它，认证/WAF/额度由它处理。bridge 不在时该渠道答 502 并说明原因；plan JWT 过期（约每日）重跑一次 `login` 即可，与每日份额同节奏。
 
 以下渠道不进入模型列表，即使旧会话仍缓存着这些 ID，调用也会立刻以 `CONFIG_DISABLED` 拒绝，不会消耗一轮请求：
 

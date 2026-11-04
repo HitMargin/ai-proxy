@@ -369,6 +369,108 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   可作单账号兜底，OAuth key 存入已忽略的
   `commandcode-accounts.json`。公开模型目录实测 51 个 Go 模型（31
   个图像模型）；尚未用真实 CommandCode 凭据验证推理，需有 key 后实测。
+- **Z.ai Start Plan 渠道（2026-11-04 深夜侦察，未完成——差一个认证头）**：用户 ZCode
+  桌面端自带的 Start Plan（ZCODE GLOBAL BUILD）每天发 300M tokens 的
+  GLM-5.3-Flash（09:00 重置，面板余额接口
+  `zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.17.2`），想接进
+  ai-proxy。逆向到的事实（全部实测验证）：
+
+  **凭据层（已完全打通）**：ZCode 桌面端把凭据存在
+  `~/.zcode/v2/credentials.json`（注意真实 home 由 setting.json 的
+  `dataBaseDir` 决定，本机是 `D:\.zcode`，C 盘那份是旧副本但 token 相同），
+  值格式 `enc:v1:<b64url(iv12)>.<b64url(tag16)>.<b64url(ct)>`，AES-256-GCM，
+  key = `sha256("zcode-credential-fallback:${platform()}:${homedir()}:${username}")`
+  （`ZCODE_CREDENTIAL_SECRET` env 可覆盖；platform 映射 win32；除非设过该 env
+  否则当前用户上下文即可解）。`zcodejwttoken`（255 字符 JWT，**无 exp 声明**，
+  2026-10-23 签发长期有效）、`oauth:zai:access_token`（api.z.ai 用）、
+  `project-key-location:v1:...`（org/proj/apiKeyId，individual coding plan
+  用的，Start Plan 不需要）。Start Plan 的认证在 asar `resolveCurrent`
+  里写死：`planKind==="start-plan"` → `apiKey = zcodeJwtToken` 原样，不走
+  project token / accountScope（那是 individual/team plan 的机关，我们全绕了一遍：
+  `POST api.z.ai/api/biz/v1/organization/<org>/projects/<proj>/api_keys/<id>/access_tokens`
+  换 5h 的 `token_use:"project_access"` JWT——用它打 coding 端点也是 429/1113，
+  Start Plan 配额根本不在 api.z.ai 侧）。
+
+  **端点层（已确认）**：模型网关 = `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`
+  （Anthropic 协议，404 与 401 的差别证明路由存在）；OpenAI 形状
+  `/api/v1/zcode-plan/chat/completions` 不存在（404）。provider 定义在
+  `D:\.zcode\.zcode\v2\runtime\provider\windows-x86_64\<ver>\endpoint-*/zcode-builtin.json`
+  （providerId `account:zai-start-plan`，模型 GLM-5.3-Flash/GLM-5.2/GLM-5-Turbo，
+  entitlement capability 只有 `model:glm-5.3-flash`）。
+
+  **传输层（四条路全证伪）**：ESA 边缘（阿里云，server=ESA，logid 格式）对
+  POST /messages 有 bot 判定：系统 Node → Bearer 405 `3012 unusual activity`
+  / x-api-key 401 空 body；Go+utls Chrome_133 → 一样；Windows curl
+  (Schannel) → GET billing 都 401；headless Edge CDP 页面上下文（真
+  Chromium 栈）→ x-api-key 过 WAF 到 401、Bearer 仍 405（**Bearer 形状本身被
+  WAF 拦，与客户端无关**）。TLS/UA/cookie（主 session + coding-plan 分区
+  两个罐都搬过）/版本号全部排除，401 不是过期（JWT 无 exp）。
+
+  **观测层（全部试过，各有死因）**：`--log-net-log` 只记主进程默认网络
+  上下文（只有 client/configs、event/report 等 3 个 URL）；CDP
+  `--remote-debugging-port` 的 target 列表（1 page + 3 workers）不含宿主
+  发起的模型调用；CDP `Tracing.start` devtools.network 类别同样只抓默认
+  上下文；env 覆盖三连全部失败——`ZCODE_ENDPOINT_ORIGIN` cmd 内 set 传不进
+  宿主（宿主子进程环境由登录 shell 重建）、User 级变量被脚本链的旧环境块
+  屏蔽、**写进 `~/.bash_profile` 的 export 实测能进 webview 的 URL 解析**
+  （webview GET / 打到了本地监听器）但宿主自己的 API 调用仍走真实 origin；
+  `NODE_OPTIONS=--inspect` 被 Electron 打包熔断拦掉（9229 不开）。
+
+  **进程归属（netstat 实测）**：模型调用由 `zcode.cjs app-server`
+  （`Electron.exe zcode.cjs app-server --stdio`，runtime="electron-node"，
+  Electron 内嵌 Node 24.21 + BoringSSL）**直连 TLS** 发出，不经过
+  NetworkService（netstat 150 采样：app-server 独立连接）。用
+  `ELECTRON_RUN_AS_NODE=1 ZCode.exe probe.mjs` 在同一运行时上重放 = 401/405
+  依旧 → 差的不是 TLS，是 `zcode-agent-service` "provider runtime headers
+  已应用" 里那组我们没复刻全的头。
+
+  **★ 2026-11-04 深夜：线路打通 + 渠道建成 + WAF 状态性封锁（全部实测）**：
+  ①**认证定案**：模型网关只认 `Authorization: Bearer <zcodejwttoken>`；x-api-key 形状被
+  WAF 单独拦成 401 空体；oauth token/apiKeyId 都不行。完整指纹头含 `x-zcode-agent: glm`
+  （此前所有探针都漏了它）与**真实会话 id** 的 `x-session-id`——头清单的权威来源是
+  `~/.zcode/cli/rollout/model-io-<sessionId>.jsonl` 的 `request.headers`（modelIoFullRetention
+  开关在设置里，默认模式也会记 request.headers 但**永远不含认证头**——认证头是宿主桥接在
+  发出前才加的，任何 model-io/netlog/CDP 都看不到）。
+  ②**出口 IP 是判据**：家宽直连 + Bearer → 405 3012；经 Clash(127.0.0.1:7897) 出口 → 200。
+  TLS 指纹无关（curl/Schannel 经代理同样 200）。业务错以 HTTP 200 + JSON 包裹
+  （`{"code":1005,"msg":"exceed quota limit"}`），**必须按 content-type 分流**，否则 1005 会掉进
+  SSE 转换器变成含糊的 stream cut。
+  ③**渠道已建成**：`src/zai-plan.ts`（凭据解密热加载 + 手写 CONNECT 隧道[已废]→
+  **spawn curl.exe 传输**[见④] + OpenAI↔Anthropic 双向转换含工具 + Anthropic SSE→OpenAI
+  chunks + 非流式聚合 + 错误分类），注册五处齐全，测试 12/12、全套件 606/606 绿，
+  /zai-plan/v1/models 与 /health 实测 live。
+  ④**传输层定案：spawn curl.exe 而非 Deno TLS**——Deno rustls 的 ClientHello 被 WAF
+  TLS 指纹直拒（SSL handshake abort / 3012）；curl(Schannel) 走同一代理 200。副作用：
+  curl 自解 chunked（自研 dechunkStream 保留为直连后备+测试覆盖，注意块尺寸是 16 进制、
+  每块后有 CRLF——两处都翻过车）。
+  ⑤**但 WAF 是状态性的，且当晚收紧**：昨晚 curl+代理+Bearer=200，今晚同请求=405 3012
+  常驻；换 Clash 节点无效；Edge(Chromium 156)+桌面 cookie 副本+代理 → 3012；.NET h2 →
+  TLS 握手直接被拒。而桌面自己的流量（Chromium 152 + 长连老 h2 连接 + 其 session cookie）
+  一直畅通 → **封锁绑定在「桌面那台 established 连接」上，不是可重放的头集合**。
+  判据：当 3012 常驻时，不要再调头——是 WAF 状态，等窗口或改走桌面管线。
+  ⑥**下一步**：(a) 挂定时探针等 3012 窗口重开（昨晚就开过）；(b) 终极保证路径 =
+  逆向 app-server(stdio) 协议驱动桌面管线——但注意 spawn 独立 app-server 时无桌面
+  宿主，account provider 可能同样 "Select a model"，先做一个决定性实验：**关桌面 →
+  spawn `ZCode.exe zcode.cjs -p --user-data-dir=<桌面 profile 副本>` → 若出字则该架构成立**
+  （需 2 分钟桌面停机窗口）。已知障碍：桌面开着时第二实例静默退出（单实例锁不分
+  user-data-dir）；RUN_AS_NODE 模式 account provider 不注册（Select a model）。
+
+    **下一步（按性价比）**：① 打开 ZCode 设置里的 `modelIoFullRetentionEnabled`
+  （完整模型 I/O 保留）+ 发一句话 → 看
+  `model-io-<sessionId>.jsonl`（脱敏只打码图片 data URL，`tea`/`xuo` 函数）
+  是否含请求头；② hosts+本地 CA MITM（需管理员；ZCode 自带的
+  `~/.zcode/v2/certs/zcode-network-ca` 未装入系统信任库，自带 CA 路线存疑，
+  装用户级 Root 后 Electron 是否认待测）；③ 全局抓包工具（Proxifier/wintun
+  层）对 app-server 进程做 TLS 终结。捕获工具链已就绪：
+  `tools/zai-plan-relay/`（cdp-watch.mjs 实时监听、trace-capture.mjs 浏览器级
+  tracing、relay-capture.mjs 捕获+转发代理、capture-listener.mjs、
+  inspect-patch.mjs、probe*.go/mjs 全系列、launch 脚本在
+  `%TEMP%\start-zcode-*.cmd`）。**判据：拿到一次真实模型调用的完整请求头
+  （尤其认证头的名字和值），剩下的 sidecar（Edge CDP 传输已过 WAF）+ 渠道
+  注册就是纯执行；不要再用「猜头部组合」的方式测试——已证伪的变体：
+  x-api-key/oauth token/apiKeyId 三种凭据 × bearer/x-api-key 两种形状 ×
+  全套 attribution 头 + 双 cookie 罐 + 四种传输栈。**
+
 - **可用通道**：`/v1` 聚合入口的 kilo 系模型（**2026-10-05
   复核**：`kilo/stepfun/step-3.7-flash:free` 实测正常出流；同一天
   `kilo/deepseek/deepseek-v4-flash-0731:free` 已下架，上游回

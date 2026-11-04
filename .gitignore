@@ -22,6 +22,7 @@ ai-proxy-dsh-bridge-*.tgz
 
 # --- big local binaries ---
 cloudflared.exe
+tools/zcode-bridge/zcode-bridge.exe
 
 # --- captured page snapshots / scratch ---
 page.html
@@ -78,3 +79,5 @@ custom-providers.local.json
 custom-providers.*.local.json
 # 样例必须能被提交，否则没有可照抄的形状；示例里只有占位符，没有真 key。
 !custom-providers.example.json
+.tmp-listener.log
+.tmp-*.ps1

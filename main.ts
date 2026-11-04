@@ -80,6 +80,7 @@ import {
   workBuddyTruncationError,
 } from "./src/workbuddy.ts";
 import { fetchCheckinState, runDailyCheckin } from "./src/workbuddy-checkin.ts";
+import { handleZaiPlan } from "./src/zai-plan.ts";
 import {
   fetchWorkBuddyModels,
   isWorkBuddyUsable,
@@ -307,6 +308,9 @@ const V1_AGGREGATE_MEMBERS = [
   // then 401. Its listing is a fixed 17 upstream models, so being a member is the
   // only thing that puts them in the harness catalog.
   "zlkpro",
+  // zai-plan 的目录是静态单模型（entitlement 只发了 glm-5.3-flash），不进聚合
+  // 就永远不出现在 harness 选择器里 —— 与上面每一条成员同理。
+  "zaiPlan",
   // custom joins for exactly the same reason every other channel does: the harness
   // catalog is built from this aggregate, so a channel absent here is a channel the
   // picker cannot see no matter what the panel shows. One static segment carries
@@ -2010,6 +2014,7 @@ export async function handler(request: Request): Promise<Response> {
         // User-added upstreams. One entry, however many vendors are configured -
         // the probe asks for the channel, and the channel is `custom`.
         custom: "custom",
+        zaiPlan: "zaiPlan",
       };
       const prefix = channelPrefixes[provider];
       if (!prefix) {
@@ -2138,6 +2143,9 @@ export async function handler(request: Request): Promise<Response> {
     }
     if (provider.customHandler === "custom") {
       return await handleCustom(path, request, ENV);
+    }
+    if (provider.customHandler === "zai-plan") {
+      return await handleZaiPlan(path, request);
     }
 
     const baseUrl = provider.baseUrl;
