@@ -4364,7 +4364,7 @@ Deno.test("cnb: an unnamed tool result recovers the tool name from its call", ()
         tool_calls: [{
           id: "call_named",
           type: "function",
-          function: { name: "pwsh", arguments: "{}" },
+          function: { name: "pwsh", arguments: '{"command":"ls"}' },
         }],
       },
       {
@@ -4457,6 +4457,79 @@ Deno.test("cnb: compaction does not preserve leaked XYML history", async () => {
   assert(
     !String(assistant.content).includes("XYML"),
     "compaction must clean leaked wrappers: " + assistant.content,
+  );
+});
+
+Deno.test("cnb: impossible historical tool calls do not pollute the next turn", () => {
+  const up = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    messages: [
+      { role: "user", content: "read files" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "call_good",
+            type: "function",
+            function: {
+              name: "exec_command",
+              arguments: '{"cmd":"Get-Item AGENT.md"}',
+            },
+          },
+          {
+            id: "call_bad",
+            type: "function",
+            function: {
+              name: "exec_command",
+              arguments: '{"arguments":""}',
+            },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_good",
+        name: "exec_command",
+        content: "ok",
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_bad",
+        name: "exec_command",
+        content: "failed to parse function arguments: missing field `cmd`",
+      },
+      { role: "user", content: "continue" },
+    ],
+    tools: [{
+      type: "function",
+      function: {
+        name: "exec_command",
+        parameters: {
+          type: "object",
+          properties: { cmd: { type: "string" } },
+          required: ["cmd"],
+        },
+      },
+    }],
+  }).upstream;
+  const assistant = up.messages.find((m: any) => m.role === "assistant");
+  assert(
+    String(assistant.content).includes("Get-Item AGENT.md"),
+    "the valid call must survive",
+  );
+  assert(
+    !String(assistant.content).includes('{"arguments":""}'),
+    "the impossible call must be dropped: " + assistant.content,
+  );
+  const toolText = up.messages
+    .filter((m: any) => m.role === "user")
+    .map((m: any) => String(m.content))
+    .join("\n");
+  assert(toolText.includes("ok"), "the valid result must survive");
+  assert(
+    !toolText.includes("missing field"),
+    "the impossible result must be dropped: " + toolText,
   );
 });
 

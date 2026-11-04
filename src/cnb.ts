@@ -2364,6 +2364,83 @@ function cnbCleanAssistantHistory(body: string, tools?: any[]): string {
   }).clean;
 }
 
+/**
+ * A long agent transcript can accumulate assistant calls that were structurally
+ * invalid (for example `{"arguments":""}` when `cmd` is required). Keeping them
+ * makes the model study its own dead ends and repeat the same plan. Drop calls
+ * that cannot run, plus their paired failure results.
+ */
+function cnbSanitiseToolCallHistory(messages: any[], tools?: any[]): any[] {
+  if (!Array.isArray(messages) || messages.length === 0) return messages;
+  const requiredByTool = new Map<string, string[]>();
+  for (const tool of tools ?? []) {
+    const fn = tool?.function;
+    if (typeof fn?.name !== "string" || !fn.name) continue;
+    requiredByTool.set(
+      fn.name,
+      Array.isArray(fn.parameters?.required) ? fn.parameters.required : [],
+    );
+  }
+
+  const invalidIds = new Set<string>();
+  const isValidCall = (call: any): boolean => {
+    const name = call?.function?.name;
+    if (typeof name !== "string" || !requiredByTool.has(name)) return true;
+    const raw = typeof call.function.arguments === "string"
+      ? call.function.arguments
+      : "{}";
+    let args: any = null;
+    try {
+      args = JSON.parse(raw);
+    } catch {
+      try {
+        args = JSON.parse(repairJsonEscapes(raw));
+      } catch {
+        return false;
+      }
+    }
+    if (!args || typeof args !== "object" || Array.isArray(args)) return false;
+    return requiredByTool.get(name)!.every((key) => args[key] !== undefined);
+  };
+
+  for (const message of messages) {
+    if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) {
+      continue;
+    }
+    for (const call of message.tool_calls) {
+      if (typeof call?.id === "string" && call.id && !isValidCall(call)) {
+        invalidIds.add(call.id);
+      }
+    }
+  }
+  if (invalidIds.size === 0) return messages;
+
+  const out: any[] = [];
+  for (const message of messages) {
+    if (
+      message?.role === "tool" && typeof message.tool_call_id === "string" &&
+      invalidIds.has(message.tool_call_id)
+    ) {
+      continue;
+    }
+    if (message?.role === "assistant" && Array.isArray(message.tool_calls)) {
+      const validCalls = message.tool_calls.filter((call: any) =>
+        !invalidIds.has(call?.id)
+      );
+      const content = message.content ?? "";
+      if (validCalls.length === 0 && String(content).trim() === "") continue;
+      out.push(
+        validCalls.length === message.tool_calls.length
+          ? message
+          : { ...message, tool_calls: validCalls },
+      );
+      continue;
+    }
+    out.push(message);
+  }
+  return out;
+}
+
 // ── 「学到的头部」：把 11128 自愈从「先挨一次 400 再整包重发」变成「首包就避开」──
 //
 // 2026-10-22 生产日志实测：2573 轮里 1198 轮撞 11128，而被拒的头部**只有两个
@@ -2417,7 +2494,10 @@ export const cnbPreNeutraliseLogState = {
 // 而不是静默回落）只能对着这个函数的输出来测。它不发网络，纯构造请求体。
 export function cnbBuildUpstream(openaiBody: any) {
   const model = openaiBody.model || "deepseek-v4.1-flash";
-  const rawMsgs = openaiBody.messages || [];
+  const rawMsgs = cnbSanitiseToolCallHistory(
+    openaiBody.messages || [],
+    openaiBody.tools,
+  );
   if (!rawMsgs.length) throw new Error("messages is required");
 
   // ★ 历史里的图片按**累计字节**保留，超预算的更早图片换成占位文字。
@@ -5279,6 +5359,8 @@ export async function maybeCompactCnb(
       ? { ...m, content: cnbCleanAssistantHistory(m.content, body.tools) }
       : m
   );
+  messages = body.messages;
+  body.messages = cnbSanitiseToolCallHistory(messages, body.tools);
   messages = body.messages;
 
   // ★ 摘要调用自己绝不能再被压缩一次。
