@@ -214,7 +214,7 @@ async function cnbEnsure() {
 
 // 允许模型偷懒省略 |XYML| 前缀，两种都匹配
 // 前缀宽容：两侧竖线都可能被模型丢掉一根（|XYML| / XYML| / |XYML / XYML）
-const P = String.raw`(?:\|?(?:XYML|QNML)\|?)?`;
+const P = String.raw`(?:\|?(?:XYML|QNML)\|?|\|)?`;
 // invoke 开标签：name 关键字可省略（invoke="grep"）、支持 "x"/'x'/等号空格
 const XYML_INVOKE_OPEN = new RegExp(
   `<${P}invoke\\s*(?:name)?\\s*=?\\s*(?:"([^"]+)"|'([^']+)'|([^\\s>]+))?[^>]*>`,
@@ -1670,7 +1670,7 @@ function stripBareToolJson(text: string, tools?: any[]): string {
  * `<... calls>`；而**宽容匹配是必要的**——模型在斜杠后、标签名前都可能插空格。
  */
 const TOOL_TAG_REMNANT_RE =
-  /<\s*\/?\s*(?:[｜|]{0,2}\s*(?:DSML|XYML|QNML)\s*[｜|]{0,2})?\s*(?:tool[_ ]?calls?|calls?|invoke|parameter)\b/i;
+  /<\s*\/?\s*(?:[｜|]{0,2}\s*(?:DSML|XYML|QNML)\s*[｜|]{0,2})?\s*(?:tool[_ ]?calls?|calls?|invoke|parameter)\b|<\s*\/?\s*\|\s*(?:invoke|parameter)\b|<\s*\/?\s*[｜|]{0,2}\s*(?:DSML|XYML|QNML)\s*[｜|]{0,2}\s*[^>\s][^>]*>/i;
 
 /**
  * 「正文里存在**空壳**工具调用」的探测器：`{"name":"read","arguments":}`。
@@ -2069,6 +2069,17 @@ export function cnbParseToolCalls(
     // 判据留档：新增清理正则前，先确认它匹配的形态**有没有在上游被归一化掉**。
     // DSML 残骸（混合协议时模型的串台闭合标签）
     clean = clean.replace(/<\/?[｜|]{2}DSML[｜|]{2}\s*\w*[^>]*>/gi, "");
+    // Degraded XYML can lose its semantic tag entirely: `</|XYML>` or
+    // `<|XYML|max_output_tokens>`. These are always protocol residue.
+    clean = clean.replace(
+      /<\/?\s*[｜|]{0,2}\s*(?:XYML|QNML|DSML)\s*[｜|]{0,2}\s*[^>]*>/gi,
+      "",
+    );
+    clean = clean.replace(/<\s*\/?\s*\|\s*(?:invoke|parameter)\b[^>]*>/gi, "");
+    clean = clean.replace(
+      /\|XYML\|(?:parameter|invoke|max_output_tokens|cmd)[^>\n]{0,120}>/gi,
+      "",
+    );
     // ★ BUG FIX（2026-10-16，用户第三次截图报「乱码」）：剥掉**裸 JSON 参数体**。
     //
     // 实测泄漏原文（session line 7481，provider=ai-proxy-cnb）：

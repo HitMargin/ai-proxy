@@ -2456,6 +2456,23 @@ Deno.test("cnb: a malformed mixed tool-call shell never reaches the user", () =>
   assertEquals(r.clean.trim(), "Run it.\n\nThen degraded.");
 });
 
+Deno.test("cnb: degraded XYML residue is stripped even in JSON mode", () => {
+  const r = cnbParseToolCalls(
+    `正文开头。
+</|XYML>
+</|XYML>
+<|invoke name="exec_command">
+Get-Content tools/A.cs | Select-Object -Skip 720 -First 260|XYML|parameter>
+<|XYML|max_output_tokens>24000
+</|XYML>`,
+    EXEC_TOOLS,
+    { notes: false, history: true },
+  );
+  assert(!r.clean.includes("XYML"), "residue must not leak");
+  assert(!r.clean.includes("<|invoke"), "broken invoke tags must not leak");
+  assert(r.clean.startsWith("正文开头。"), "prose must survive");
+});
+
 Deno.test("cnb: XYML history replay uses the same dialect as the prompt", () => {
   const previous = Deno.env.get("CNB_TOOL_PROTOCOL");
   Deno.env.set("CNB_TOOL_PROTOCOL", "xyml");
