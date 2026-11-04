@@ -94,7 +94,10 @@ Deno.test("toAnthropicBody collects system into system and maps tools", () => {
   assertEquals(body.stream, true);
   const messages = body.messages as Array<Record<string, unknown>>;
   assertEquals(messages.length, 3);
-  assertEquals((messages[1].content as Array<Record<string, unknown>>)[0].type, "tool_use");
+  assertEquals(
+    (messages[1].content as Array<Record<string, unknown>>)[0].type,
+    "tool_use",
+  );
   const toolResult = (messages[2].content as Array<Record<string, unknown>>)[0];
   assertEquals(toolResult.type, "tool_result");
   assertEquals(toolResult.tool_use_id, "call_1");
@@ -111,7 +114,11 @@ Deno.test("toAnthropicBody collects system into system and maps tools", () => {
 Deno.test("toAnthropicBody clamps max_tokens and defaults it", () => {
   const noMax = toAnthropicBody({ messages: [] }, null, "s");
   assertEquals(noMax.max_tokens, 8192);
-  const huge = toAnthropicBody({ messages: [], max_tokens: 99999999 }, null, "s");
+  const huge = toAnthropicBody(
+    { messages: [], max_tokens: 99999999 },
+    null,
+    "s",
+  );
   assertEquals(huge.max_tokens, 128000);
 });
 
@@ -145,12 +152,14 @@ Deno.test("anthropicSseToOpenAiChunks maps text, thinking and usage", async () =
     }),
   ]);
   const chunks: Array<Record<string, unknown>> = [];
-  for await (const line of anthropicSseToOpenAiChunks(
-    streamOf(sse),
-    "glm-5.3-flash",
-    1,
-    "req",
-  )) {
+  for await (
+    const line of anthropicSseToOpenAiChunks(
+      streamOf(sse),
+      "glm-5.3-flash",
+      1,
+      "req",
+    )
+  ) {
     chunks.push(JSON.parse(line));
   }
   assertEquals(chunks.length, 4);
@@ -192,17 +201,22 @@ Deno.test("anthropicSseToOpenAiChunks maps tool_use blocks into tool_calls delta
     }),
   ]);
   const chunks: Array<Record<string, unknown>> = [];
-  for await (const line of anthropicSseToOpenAiChunks(
-    streamOf(sse),
-    "glm-5.3-flash",
-    1,
-    "req",
-  )) {
+  for await (
+    const line of anthropicSseToOpenAiChunks(
+      streamOf(sse),
+      "glm-5.3-flash",
+      1,
+      "req",
+    )
+  ) {
     chunks.push(JSON.parse(line));
   }
   const start = (chunks[0].choices as Array<Record<string, unknown>>)[0];
   const delta = start.delta as {
-    tool_calls: Array<{ function: { name: string; arguments: string } } & Record<string, unknown>>;
+    tool_calls: Array<
+      & { function: { name: string; arguments: string } }
+      & Record<string, unknown>
+    >;
   };
   assertEquals(delta.tool_calls[0].id, "tu_1");
   assertEquals(delta.tool_calls[0].function.name, "read_file");
@@ -221,12 +235,14 @@ Deno.test("anthropicSseToOpenAiChunks emits an error frame without finish_reason
     JSON.stringify({ type: "error", error: { message: "boom" } }),
   ]);
   const lines: string[] = [];
-  for await (const line of anthropicSseToOpenAiChunks(
-    streamOf(sse),
-    "glm-5.3-flash",
-    1,
-    "req",
-  )) {
+  for await (
+    const line of anthropicSseToOpenAiChunks(
+      streamOf(sse),
+      "glm-5.3-flash",
+      1,
+      "req",
+    )
+  ) {
     lines.push(line);
   }
   assertEquals(lines.length, 1);
@@ -243,12 +259,14 @@ Deno.test("anthropicSseToOpenAiChunks reports stream_cut instead of claiming fin
     }),
   ]);
   const lines: string[] = [];
-  for await (const line of anthropicSseToOpenAiChunks(
-    streamOf(sse),
-    "glm-5.3-flash",
-    1,
-    "req",
-  )) {
+  for await (
+    const line of anthropicSseToOpenAiChunks(
+      streamOf(sse),
+      "glm-5.3-flash",
+      1,
+      "req",
+    )
+  ) {
     lines.push(line);
   }
   const last = JSON.parse(lines[lines.length - 1]);

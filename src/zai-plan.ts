@@ -39,7 +39,10 @@ function credentialSecret(): string {
   return `zcode-credential-fallback:${platform}:${home}:${username}`;
 }
 
-export async function decryptZCodeValue(value: string, secret?: string): Promise<string> {
+export async function decryptZCodeValue(
+  value: string,
+  secret?: string,
+): Promise<string> {
   const prefix = "enc:v1:";
   if (!value.startsWith(prefix)) return value;
   const parts = value.slice(prefix.length).split(".");
@@ -126,7 +129,11 @@ export async function upstreamRequest(
   return {
     status: resp.status,
     contentType: resp.headers.get("content-type") ?? "",
-    body: resp.body ?? new ReadableStream<Uint8Array>({ start(c) { c.close(); } }),
+    body: resp.body ?? new ReadableStream<Uint8Array>({
+      start(c) {
+        c.close();
+      },
+    }),
   };
 }
 
@@ -200,7 +207,10 @@ export function toAnthropicBody(
       });
     }
     if (blocks.length) {
-      out.push({ role: m.role === "assistant" ? "assistant" : "user", content: blocks });
+      out.push({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: blocks,
+      });
     }
   }
   const tools = (body.tools ?? [])
@@ -224,7 +234,9 @@ export function toAnthropicBody(
     ...(systemParts.length ? { system: systemParts.join("\n\n") } : {}),
     ...(tools.length ? { tools } : {}),
     ...(Object.keys(metadata).length ? { metadata } : {}),
-    ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
+    ...(body.temperature !== undefined
+      ? { temperature: body.temperature }
+      : {}),
     messages: out,
   };
 }
@@ -310,12 +322,22 @@ export async function* anthropicSseToOpenAiChunks(
             | Record<string, number>
             | undefined;
           if (u) {
-            usage = { prompt_tokens: u.input_tokens ?? 0, completion_tokens: 0 };
+            usage = {
+              prompt_tokens: u.input_tokens ?? 0,
+              completion_tokens: 0,
+            };
           }
-          yield chunkJson(requestId, model, created, {
-            role: "assistant",
-            content: "",
-          }, null, usage);
+          yield chunkJson(
+            requestId,
+            model,
+            created,
+            {
+              role: "assistant",
+              content: "",
+            },
+            null,
+            usage,
+          );
           continue;
         }
         if (type === "content_block_start") {
@@ -326,42 +348,69 @@ export async function* anthropicSseToOpenAiChunks(
               id: String(block.id ?? ""),
               name: String(block.name ?? ""),
             });
-            yield chunkJson(requestId, model, created, {
-              tool_calls: [{
-                index: toolIndex,
-                id: String(block.id ?? ""),
-                type: "function",
-                function: { name: String(block.name ?? ""), arguments: "" },
-              }],
-            }, null, null);
+            yield chunkJson(
+              requestId,
+              model,
+              created,
+              {
+                tool_calls: [{
+                  index: toolIndex,
+                  id: String(block.id ?? ""),
+                  type: "function",
+                  function: { name: String(block.name ?? ""), arguments: "" },
+                }],
+              },
+              null,
+              null,
+            );
             toolIndex++;
           }
           continue;
         }
         if (type === "content_block_delta") {
           const delta = ev.delta as Record<string, unknown>;
-          const index = ev.index as number;
           if (delta?.type === "text_delta" && typeof delta.text === "string") {
-            yield chunkJson(requestId, model, created, {
-              content: delta.text,
-            }, null, null);
+            yield chunkJson(
+              requestId,
+              model,
+              created,
+              {
+                content: delta.text,
+              },
+              null,
+              null,
+            );
           } else if (
             delta?.type === "thinking_delta" &&
             typeof delta.thinking === "string"
           ) {
-            yield chunkJson(requestId, model, created, {
-              reasoning_content: delta.thinking,
-            }, null, null);
+            yield chunkJson(
+              requestId,
+              model,
+              created,
+              {
+                reasoning_content: delta.thinking,
+              },
+              null,
+              null,
+            );
           } else if (
             delta?.type === "input_json_delta" &&
             typeof delta.partial_json === "string"
           ) {
-            yield chunkJson(requestId, model, created, {
-              tool_calls: [{
-                index: toolIndex - 1,
-                function: { arguments: delta.partial_json },
-              }],
-            }, null, null);
+            yield chunkJson(
+              requestId,
+              model,
+              created,
+              {
+                tool_calls: [{
+                  index: toolIndex - 1,
+                  function: { arguments: delta.partial_json },
+                }],
+              },
+              null,
+              null,
+            );
           }
           continue;
         }
@@ -380,7 +429,9 @@ export async function* anthropicSseToOpenAiChunks(
           const err = ev.error as Record<string, unknown> | undefined;
           yield JSON.stringify({
             error: {
-              message: `zai-plan upstream: ${err?.message ?? JSON.stringify(ev)}`,
+              message: `zai-plan upstream: ${
+                err?.message ?? JSON.stringify(ev)
+              }`,
               code: "UPSTREAM_ERROR",
             },
           });
@@ -456,16 +507,24 @@ export async function aggregateChunks(
       if (typeof delta.reasoning_content === "string") {
         reasoning += delta.reasoning_content;
       }
-      for (const tc of (delta.tool_calls as Array<Record<string, unknown>>) ?? []) {
+      for (
+        const tc of (delta.tool_calls as Array<Record<string, unknown>>) ?? []
+      ) {
         const index = Number(tc.index ?? 0);
         while (toolCalls.length <= index) {
-          toolCalls.push({ id: "", type: "function", function: { name: "", arguments: "" } });
+          toolCalls.push({
+            id: "",
+            type: "function",
+            function: { name: "", arguments: "" },
+          });
         }
         const slot = toolCalls[index];
         if (typeof tc.id === "string" && tc.id) slot.id = tc.id;
         const fn = tc.function as Record<string, unknown> | undefined;
         if (fn) {
-          if (typeof fn.name === "string" && fn.name) slot.function.name = fn.name;
+          if (typeof fn.name === "string" && fn.name) {
+            slot.function.name = fn.name;
+          }
           if (typeof fn.arguments === "string") {
             slot.function.arguments += fn.arguments;
           }
@@ -516,15 +575,18 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-
-
-export async function handleZaiPlan(path: string, request: Request): Promise<Response> {
+export async function handleZaiPlan(
+  path: string,
+  request: Request,
+): Promise<Response> {
   if (path.endsWith("/models")) {
     return jsonResponse({ object: "list", data: KNOWN_MODELS });
   }
   if (!path.endsWith("/chat/completions") || request.method !== "POST") {
     return jsonResponse(
-      { error: "unsupported zai-plan path (only /models and /chat/completions)" },
+      {
+        error: "unsupported zai-plan path (only /models and /chat/completions)",
+      },
       404,
     );
   }
@@ -566,7 +628,8 @@ export async function handleZaiPlan(path: string, request: Request): Promise<Res
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return jsonResponse({
-      error: `zai-plan transport failed: ${message}（检查 ZAI_PLAN_PROXY 是否可达）`,
+      error:
+        `zai-plan transport failed: ${message}（检查 ZAI_PLAN_PROXY 是否可达）`,
     }, 502);
   }
   if (upstream.status !== 200) {
@@ -579,7 +642,9 @@ export async function handleZaiPlan(path: string, request: Request): Promise<Res
       ? "额度未生效或已用尽（每日额度 09:00 重置；领取后延迟生效）"
       : "";
     return jsonResponse({
-      error: `zai-plan upstream ${upstream.status}: ${text.slice(0, 300)}${hint ? " —— " + hint : ""}`,
+      error: `zai-plan upstream ${upstream.status}: ${text.slice(0, 300)}${
+        hint ? " —— " + hint : ""
+      }`,
     }, upstream.status === 401 ? 401 : upstream.status === 429 ? 429 : 502);
   }
 
@@ -603,7 +668,9 @@ export async function handleZaiPlan(path: string, request: Request): Promise<Res
       ? "WAF 拦截 —— 出口 IP 被区别对待，检查 ZAI_PLAN_PROXY"
       : "";
     return jsonResponse({
-      error: `zai-plan upstream ${upstream.status}${code ? ` code=${code}` : ""}: ${msg}${hint ? " —— " + hint : ""}`,
+      error: `zai-plan upstream ${upstream.status}${
+        code ? ` code=${code}` : ""
+      }: ${msg}${hint ? " —— " + hint : ""}`,
     }, 502);
   }
 
@@ -638,7 +705,9 @@ export async function handleZaiPlan(path: string, request: Request): Promise<Res
         const message = error instanceof Error ? error.message : String(error);
         controller.enqueue(
           encoder.encode(
-            `data: ${JSON.stringify({ error: { message, code: "UPSTREAM_ERROR" } })}\n\n`,
+            `data: ${
+              JSON.stringify({ error: { message, code: "UPSTREAM_ERROR" } })
+            }\n\n`,
           ),
         );
         controller.close();
