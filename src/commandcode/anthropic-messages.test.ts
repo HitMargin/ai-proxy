@@ -105,6 +105,41 @@ Deno.test("Anthropic tool_result keeps its call id", () => {
   equal(tools[1].content, "matches");
 });
 
+Deno.test("Anthropic tool_result marks explicit errors", () => {
+  const result = anthropicMessagesToChat({
+    model: "deepseek/test",
+    max_tokens: 64,
+    messages: [
+      { role: "user", content: "look" },
+      {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "call_error",
+          name: "read",
+          input: {},
+        }],
+      },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "call_error",
+          content: "permission denied",
+          is_error: true,
+        }],
+      },
+    ],
+  });
+  assert(result.ok, "valid Messages request was rejected");
+  const messages = result.body.messages as Record<string, unknown>[];
+  equal(messages.at(-1), {
+    role: "tool",
+    tool_call_id: "call_error",
+    content: "[tool error]\npermission denied",
+  });
+});
+
 Deno.test("Anthropic Messages request rejects unsupported stateless fields", () => {
   const missingTokens = anthropicMessagesToChat({
     model: "deepseek/test",

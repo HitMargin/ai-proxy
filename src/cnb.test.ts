@@ -2329,6 +2329,50 @@ Deno.test("cnb: the appended tool prompt is preprocessed too", () => {
   assert(first.includes("DSH Web GUI"), "the description must survive renamed");
 });
 
+Deno.test("cnb: tool_choice directives reach the tool prompt", () => {
+  const request = (toolChoice: unknown) =>
+    cnbBuildUpstream({
+      model: "deepseek-v4.1-flash",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{
+        type: "function",
+        function: {
+          name: "read",
+          description: "read a file",
+          parameters: { type: "object", properties: {} },
+        },
+      }],
+      ...(toolChoice === undefined ? {} : { tool_choice: toolChoice }),
+    });
+  const system = (built: any) =>
+    String(built.upstream.messages[0]?.content ?? "");
+
+  const required = request("required");
+  assertEquals(required.hasTools, true);
+  assert(
+    system(required).includes(
+      "TOOL CHOICE: You MUST call a tool in this turn",
+    ),
+  );
+
+  const specific = request({
+    type: "function",
+    function: { name: "read" },
+  });
+  assert(
+    system(specific).includes(
+      'TOOL CHOICE: You MUST call the "read" tool in this turn',
+    ),
+  );
+
+  const auto = request("auto");
+  assert(!system(auto).includes("TOOL CHOICE:"));
+
+  const none = request("none");
+  assertEquals(none.hasTools, false);
+  assert(!system(none).includes("TOOL CALL PROTOCOL"));
+});
+
 Deno.test("cnb: a remembered head is stripped before the first upload", () => {
   cnbForgetRejectedHeads();
   const HEAD = "You are an AI agent powered by DeepSeek Harness.";

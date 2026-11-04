@@ -670,6 +670,25 @@ RULES:
 }
 
 /**
+ * CNB has no native tool_choice, so the directive has to live beside the tool
+ * protocol. `none` is handled before the prompt is injected at all; the other
+ * choices are instructions, not hard protocol enforcement.
+ */
+function cnbToolChoiceDirective(toolChoice: unknown): string | null {
+  if (typeof toolChoice === "string") {
+    if (toolChoice === "required") {
+      return "TOOL CHOICE: You MUST call a tool in this turn instead of giving a final answer.";
+    }
+    return null;
+  }
+  if (!toolChoice || typeof toolChoice !== "object") return null;
+  const choice = toolChoice as Record<string, any>;
+  const name = choice.type === "function" ? choice.function?.name : choice.name;
+  if (typeof name !== "string" || !name) return null;
+  return `TOOL CHOICE: You MUST call the "${name}" tool in this turn instead of giving a final answer.`;
+}
+
+/**
  * Replay an assistant tool call in the exact JSON dialect the system prompt
  * teaches. Invalid serialized arguments are passed through as a JSON string
  * instead of being silently replaced with `{}`, otherwise the next upstream
@@ -2555,12 +2574,19 @@ export function cnbBuildUpstream(openaiBody: any) {
 
   // 注入工具定义（XYML schema）
   const tools = openaiBody.tools || [];
-  const hasTools = tools.length > 0;
+  const toolChoice = openaiBody.tool_choice;
+  const toolChoiceDisabled = toolChoice === "none" ||
+    (toolChoice?.type === "none");
+  const hasTools = tools.length > 0 && !toolChoiceDisabled;
   if (hasTools) {
+    const choiceDirective = cnbToolChoiceDirective(toolChoice);
+    const basePrompt = cnbBuildToolPrompt(tools);
     // 工具说明由客户端的 tools 定义拼成，描述里同样可能出现品牌词组合——
     // 它是在消息映射**之后**追加的，必须在这里再处理一次，否则会把刚剥掉的
     // 标记词从工具描述里带回来。
-    const prompt = cnbNeutraliseChannelMarkers(cnbBuildToolPrompt(tools));
+    const prompt = cnbNeutraliseChannelMarkers(
+      choiceDirective ? `${basePrompt}\n\n${choiceDirective}` : basePrompt,
+    );
     if (nudgedMsgs[0] && nudgedMsgs[0].role === "system") {
       // ★ 多模态守卫：system 的 content 可能是数组（含图片），不能直接字符串拼接，
       // 否则会变成 "[object Object]\n\n..."，既丢图又污染系统提示词。
@@ -3473,6 +3499,7 @@ function responsesToChat(rb: any) {
   if (rb.max_output_tokens) chat.max_tokens = rb.max_output_tokens;
   if (rb.temperature != null) chat.temperature = rb.temperature;
   if (rb.top_p != null) chat.top_p = rb.top_p;
+  if (rb.tool_choice !== undefined) chat.tool_choice = rb.tool_choice;
   // Responses 的扁平 tools（type/name/parameters 同级）→ chat 的嵌套格式
   if (Array.isArray(rb.tools) && rb.tools.length) {
     chat.tools = rb.tools

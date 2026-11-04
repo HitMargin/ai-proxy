@@ -171,9 +171,13 @@ export function anthropicMessagesToChat(input: unknown):
         if (typeof block.tool_use_id !== "string") {
           return { ok: false, message: "tool_result requires tool_use_id" };
         }
+        let content = toolResultText(block.content);
+        if (block.is_error === true) {
+          content = `[tool error]\n${content}`;
+        }
         toolResults.push({
           id: block.tool_use_id,
-          content: toolResultText(block.content),
+          content,
         });
       }
     }
