@@ -4382,6 +4382,84 @@ Deno.test("cnb: an unnamed tool result recovers the tool name from its call", ()
   );
 });
 
+Deno.test("cnb: leaked XYML blocks in assistant history are not replayed", () => {
+  const up = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    messages: [
+      { role: "user", content: "read files" },
+      {
+        role: "assistant",
+        content: "Reading the bridge now.\n<|XYML|tool_call>\n" +
+          '{"name":"exec_command","arguments":{"cmd":"Get-Item AGENT.md"}}' +
+          "\n</|XYML|tool_call>\n<|XYML|tool_call>\n" +
+          '{"name":"exec_command","arguments":{"cmd":"Get-Item Pages.Ugui.cs"}}' +
+          "\n</|XYML|tool_call>",
+      },
+      {
+        role: "tool",
+        tool_call_id: "call_history",
+        name: "exec_command",
+        content: "ok",
+      },
+    ],
+    tools: EXEC_TOOLS,
+  }).upstream;
+  const assistant = up.messages.find((m: any) => m.role === "assistant");
+  assert(
+    String(assistant.content).startsWith("Reading the bridge now."),
+    "historical prose must survive: " + assistant.content,
+  );
+  assert(
+    !String(assistant.content).includes("XYML"),
+    "leaked protocol wrappers must not be replayed: " + assistant.content,
+  );
+  assert(
+    !String(assistant.content).includes("Get-Item"),
+    "leaked tool payloads must not be replayed: " + assistant.content,
+  );
+});
+
+Deno.test("cnb: assistant history JSON is not mistaken for a tool leak", () => {
+  const payload = '配置如下：{"name":"pipeline","arguments":{"threshold":3}}';
+  const up = cnbBuildUpstream({
+    model: "deepseek-v4.1-flash",
+    messages: [
+      { role: "user", content: "show config" },
+      { role: "assistant", content: payload },
+    ],
+  }).upstream;
+  const assistant = up.messages.find((m: any) => m.role === "assistant");
+  assertEquals(assistant.content, payload);
+});
+
+Deno.test("cnb: compaction does not preserve leaked XYML history", async () => {
+  resetCompactionStates();
+  const body: any = {
+    model: "deepseek-v4.1-flash",
+    messages: [
+      { role: "system", content: "sys" },
+      { role: "user", content: "TASK：继续迁移。" },
+      {
+        role: "assistant",
+        content: "Reading.\n<|XYML|tool_call>\n" +
+          '{"name":"exec_command","arguments":{"cmd":"Get-Item AGENT.md"}}' +
+          "\n</|XYML|tool_call>",
+      },
+      { role: "user", content: "最新一轮" },
+    ],
+  };
+  await maybeCompactCnb(
+    body,
+    "history-leak-session",
+    async () => "## Objective\n- continue",
+  );
+  const assistant = body.messages.find((m: any) => m.role === "assistant");
+  assert(
+    !String(assistant.content).includes("XYML"),
+    "compaction must clean leaked wrappers: " + assistant.content,
+  );
+});
+
 Deno.test("a Windows path with raw backslashes parses instead of hitting the junk gate", () => {
   resetJunkStreak();
   cnbEscapeRepairState.n = 0;

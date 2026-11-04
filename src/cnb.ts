@@ -1292,7 +1292,7 @@ export async function cnbRepairToolCallRound(
       model: input.model,
       messages: [
         ...(Array.isArray(input.messages) ? input.messages : []),
-        { role: "assistant", content: assistantRaw },
+        { role: "assistant", content: assistantRaw, cnbKeepRaw: true },
         { role: "user", content: input.repairNote },
       ],
       tools: input.tools,
@@ -1687,7 +1687,7 @@ const EMPTY_CALL_SHELL_RE =
 export function cnbParseToolCalls(
   text: string,
   tools?: any[],
-  opts?: { notes?: boolean },
+  opts?: { notes?: boolean; history?: boolean },
 ): {
   clean: string;
   calls: any[];
@@ -1998,14 +1998,16 @@ export function cnbParseToolCalls(
       // 留给下一轮：harness 重试时会重发同一个请求体，那时 prompt 里没有任何
       // 「你上次写错了」的信息，模型会写出同样的坏语法。这条诊断由
       // cnbBuildUpstream 读出来补进 system 消息（见那里的长注释）。
-      cnbJunkLastDiagnosis.text = junkDiagnosis;
-      // 拒收时记录原始形态（stderr + 落盘），下次能确诊而不是盲猜。
-      // 落盘是必需的：stderr 只进插件 200 行内存日志，长会话里几秒就被冲掉
-      // （实测：连续拒收时 warn 存活时间以秒计，日志文件里一行都没留下）。
-      const raw = "[junk] unparseable tool syntax, raw (500 chars): " +
-        text.replace(/\s+/g, " ").slice(0, 500);
-      console.warn(raw);
-      cnbJournalJunk(raw + "\n  diagnosis: " + junkDiagnosis + "\n");
+      if (!opts?.history) {
+        cnbJunkLastDiagnosis.text = junkDiagnosis;
+        // 拒收时记录原始形态（stderr + 落盘），下次能确诊而不是盲猜。
+        // 落盘是必需的：stderr 只进插件 200 行内存日志，长会话里几秒就被冲掉
+        // （实测：连续拒收时 warn 存活时间以秒计，日志文件里一行都没留下）。
+        const raw = "[junk] unparseable tool syntax, raw (500 chars): " +
+          text.replace(/\s+/g, " ").slice(0, 500);
+        console.warn(raw);
+        cnbJournalJunk(raw + "\n  diagnosis: " + junkDiagnosis + "\n");
+      }
       text = text.replace(JUNK, "");
       text = text.replace(
         /<\/?[｜|]{0,2}(?:XYML|QNML)[｜|]{0,2}\s*\w*\s*>/gi,
@@ -2348,6 +2350,20 @@ export function cnbNeutraliseHead(body: any): any | null {
   return cutMessages > 0 ? { ...body, messages: next } : null;
 }
 
+/**
+ * Historical assistant messages may contain tool-protocol text that leaked
+ * through an older proxy version. If we replay it verbatim, the model treats it
+ * as a preferred output shape and leaks again. Clean only obvious protocol
+ * residue; ordinary JSON in prose stays untouched.
+ */
+function cnbCleanAssistantHistory(body: string, tools?: any[]): string {
+  if (!TOOL_TAG_REMNANT_RE.test(body)) return body;
+  return cnbParseToolCalls(body, tools, {
+    notes: false,
+    history: true,
+  }).clean;
+}
+
 // ── 「学到的头部」：把 11128 自愈从「先挨一次 400 再整包重发」变成「首包就避开」──
 //
 // 2026-10-22 生产日志实测：2573 轮里 1198 轮撞 11128，而被拒的头部**只有两个
@@ -2681,6 +2697,11 @@ export function cnbBuildUpstream(openaiBody: any) {
           /\n?\n\[proxy\] (?:Your previous tool call used an invalid syntax|Still the same invalid tool syntax|A tool call was rejected)[\s\S]*$/,
           "",
         );
+      }
+      // 2026-11-04：旧版本泄漏进客户端历史里的 raw tool 块必须清洗。否则
+      // 模型每轮都会把这些块当成“上轮就是这么写的”，继续输出同样形状。
+      if (typeof body === "string" && m.cnbKeepRaw !== true) {
+        body = cnbCleanAssistantHistory(body, openaiBody.tools);
       }
       if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
         // JSON 协议：历史回放与提示词同构，模型看自己的历史就是正确示范
@@ -5240,7 +5261,7 @@ export async function maybeCompactCnb(
     maxTokens: number,
   ) => Promise<string>,
 ): Promise<string> {
-  const messages = body?.messages;
+  let messages = body?.messages;
   // 返回「这次压缩做了什么」，而不是 void。
   //
   // ★ 2026-10-19 第五次修：旧签名返回 void，调用方只能通过模块级的
@@ -5249,6 +5270,16 @@ export async function maybeCompactCnb(
   // 不可区分性掩盖了形态 B 的静默失败：body 一个字节没改，日志一行没有。
   if (!Array.isArray(messages) || messages.length === 0) return "";
   if (Deno.env.get("CNB_COMPACTION") === "off") return "";
+
+  // 2026-11-04：在压缩/摘要看到历史之前先清掉旧版本泄漏的 raw 工具块。
+  // 否则 summary/recent 状态会继续保存坏示例，下一轮又把它带给模型。
+  body.messages = messages.map((m: any) =>
+    m?.role === "assistant" && typeof m.content === "string" &&
+      m.cnbKeepRaw !== true
+      ? { ...m, content: cnbCleanAssistantHistory(m.content, body.tools) }
+      : m
+  );
+  messages = body.messages;
 
   // ★ 摘要调用自己绝不能再被压缩一次。
   //
