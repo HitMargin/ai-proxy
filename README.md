@@ -1098,6 +1098,7 @@ cnb 会拦「非官方客户端」：`400 {"code":11128,"msg":"Illegal API invoc
 - **可用模型**：只发布 `deepseek-v4.1-flash`——上游把**所有**模型名都路由到同一个后端（响应里一律回 `"model":"deepseek-v4.1-flash"`），`deepseek-v4-flash` / `-pro` 只是会被静默重定向的旧名，留着它们会在选择器里造出一个假的等级；
 - **视觉**：`user` / `system` 消息中的 `image_url` 块会被保留为多模态数组，而不是被折叠成纯文本（`src/cnb.ts` 中保留了这次修复的注释）；
 - **图片去重**：完全相同的 inline data URL 只保留最新一次出现；更早的重复图换成可解释占位符，避免附件在客户端历史里每轮重复上传；
+- **压缩保留更多近期上下文（2026-11-04）**：CNB 尾部默认按 `CNB_COMPACTION_KEEP_TOKENS=20000` 保留，摘要里的非 reminder 用户消息默认截到 `CNB_COMPACTION_USER_MSG_CHARS=8000` 字符；若尾部起点落在 tool result 上，会先回退到配对的 assistant `tool_calls`。这是针对长会话摘要后忘事的保守调优，字节预算仍兜底。
 - **隐藏接口边界（2026-11-04 审计）**：前端页面配置只声明 `deepseek-v4.1-flash`；候选的 `/ai/models`、会话/历史、上传和图片生成路径实测都是 Next.js `Page not found`。唯一确认的 AI API 仍是 `/ai/chat/completions`，直接传 OpenAI `tools` 会被上游拒绝（`403 Agent calls are not allowed in this scenario`）；
 - **思考强度**：`enable_thinking` 默认 `true`；客户端要 `off` / `none` 时**关掉思考**（`enable_thinking:false` 且**不**发 `reasoning_effort`——上游把 `reasoning_effort:"off"` 判成非法档位，回 `400 code 11150`）；其余档位 `minimal` / `low` / `medium` / `high` / `max` / `xhigh` 逐个真调过，默认 `high`，未知值报错而不是静默回落；
 - **输出上限**：客户端不给 `max_tokens` 时默认 `120000`——**不按模型名分档**（上游只会路由到同一个后端，见上面「可用模型」）；预算含思考 token（completion = reasoning + 正文），实测思考最多吃掉约一半，所以默认值调得远高于预期正文长度；

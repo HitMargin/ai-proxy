@@ -4539,6 +4539,25 @@ async function handleCnbMessages(request: Request): Promise<Response> {
  */
 export const CNB_BODY_BUDGET_BYTES = 992 * 1024;
 
+/**
+ * A byte/token tail split must not begin on a tool result. Move it back to the
+ * assistant message carrying the matching tool_calls; otherwise the kept tail
+ * starts with an orphaned tool output and the model loses the call/result pair.
+ */
+export function cnbAlignTailSplitToToolBoundary(
+  messages: any[],
+  split: number,
+): number {
+  let aligned = Math.min(Math.max(split, 0), messages.length);
+  while (
+    aligned > 0 && aligned < messages.length &&
+    messages[aligned]?.role === "tool"
+  ) {
+    aligned -= 1;
+  }
+  return aligned;
+}
+
 function cnbIntSetting(name: string, fallback: number): number {
   const raw = Number(Deno.env.get(name));
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
@@ -5211,7 +5230,10 @@ export async function maybeCompactCnb(
   // 这也正是 bytes→token 除不出一个正确常数的原因：同样 907,264 字节，
   // 纯 ASCII 约 22.7 万 token、纯中文约 30.2 万，固定除数只能对一半；
   // 而“取下标较大值”让两个单位各自在自己的尺子上判定，压根不用换算。
-  const keepTokens = cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 8000);
+  // 2026-11-04：参考 AiCode 的策略，把可阅读尾部从 8k 提到 20k token。
+  // 这是降低「多轮后忘事」的主要杠杆；字节上限仍然兜底，工具/body 太大时
+  // byteSplit 会先成为硬约束。
+  const keepTokens = cnbIntSetting("CNB_COMPACTION_KEEP_TOKENS", 20000);
   const tailPercent = Math.min(
     90,
     Math.max(10, cnbIntSetting("CNB_COMPACTION_TAIL_PERCENT", 45)),
@@ -5228,12 +5250,13 @@ export async function maybeCompactCnb(
   );
   const tokenSplit = selectTail(serialized, keepTokens)?.split ?? 0;
   const headSplit = Math.max(byteSplit, tokenSplit);
+  const alignedHeadSplit = cnbAlignTailSplitToToolBoundary(messages, headSplit);
   // ★ 2026-10-24：任务消息的单条截断上限放宽到 2000 字符——任务描述经常
   // 超过 600 字符（贴需求、贴报错），600 一刀切会把「要干什么」截掉半截。
   // `<system-reminder>` 开头的是 harness 每轮重新注入的元数据，不算任务。
-  const userMsgChars = cnbIntSetting("CNB_COMPACTION_USER_MSG_CHARS", 2000);
+  const userMsgChars = cnbIntSetting("CNB_COMPACTION_USER_MSG_CHARS", 8000);
   const forSummary = messages.map((m: any, i: number) => {
-    if (i >= headSplit || !m || typeof m !== "object") return m;
+    if (i >= alignedHeadSplit || !m || typeof m !== "object") return m;
     const isTask = m.role === "user" &&
       !(
         typeof m.content === "string" &&
@@ -5308,7 +5331,7 @@ export async function maybeCompactCnb(
       return derived === "" ? "" : `cnb:${derived}`;
     })(),
     // 字节口径的尾部起点，见上面的 tailBytes。
-    tailSplit: headSplit,
+    tailSplit: alignedHeadSplit,
     config: {
       keepTokens,
       buffer: cnbIntSetting("CNB_COMPACTION_BUFFER", 20000),

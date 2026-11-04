@@ -13,6 +13,7 @@ import { assert, assertEquals } from "jsr:@std/assert@1";
 import {
   CNB_BODY_BUDGET_BYTES,
   CNB_MODELS,
+  cnbAlignTailSplitToToolBoundary,
   cnbAnswerBuriedInThinking,
   cnbBuildUpstream,
   cnbBuriedAnswerRescueBody,
@@ -2779,6 +2780,28 @@ Deno.test("cnb: the kept tail follows keepTokens, not the byte budget", async ()
     body.messages.length < 60,
     "too many messages kept verbatim: " + body.messages.length,
   );
+});
+
+Deno.test("cnb: a tool result in the tail keeps its paired tool call", () => {
+  const messages = [
+    { role: "user", content: "read it" },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: "call_tail",
+        type: "function",
+        function: { name: "read", arguments: "{}" },
+      }],
+    },
+    { role: "tool", tool_call_id: "call_tail", content: "file body" },
+    { role: "user", content: "now continue" },
+  ];
+  // byte/token packing can naturally put split on the tool result (index 2);
+  // that would keep the result while leaving the call in the summarised head.
+  assertEquals(cnbAlignTailSplitToToolBoundary(messages, 2), 1);
+  assertEquals(cnbAlignTailSplitToToolBoundary(messages, 3), 3);
+  assertEquals(cnbAlignTailSplitToToolBoundary(messages, 0), 0);
 });
 
 Deno.test("cnb: skipping compaction is reported, not silent", async () => {
