@@ -2409,6 +2409,34 @@ Deno.test("cnb: a prefixed singular XYML tool_call parses in mixed output", () =
   assertEquals(r.clean.trim(), "First.\n\nMixed.");
 });
 
+Deno.test("cnb: unquoted XYML parameter names still become tool calls", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    `<|XYML|tool_calls>
+<|XYML|invoke name=exec_command>
+<|XYML|parameter name=cmd>rg -n "^" SpectreReplay/A.cs | Select-Object -Skip 1 -First 620</|XYML|parameter>
+<|XYML|parameter name=max_output_tokens>60000</|XYML|parameter>
+<|XYML|parameter name=prefix_rule>[]</|XYML|parameter>
+<|XYML|parameter name=workdir>D:/Projects/SpectreReplay</|XYML|parameter>
+<|XYML|parameter name=yield_time_ms>10000</|XYML|parameter>
+</|XYML|invoke>
+</|XYML|tool_calls>`,
+    EXEC_TOOLS,
+    { notes: false },
+  );
+  assertEquals(r.calls.length, 1);
+  const args = JSON.parse(r.calls[0].function.arguments);
+  assertEquals(
+    args.cmd,
+    'rg -n "^" SpectreReplay/A.cs | Select-Object -Skip 1 -First 620',
+  );
+  assertEquals(args.max_output_tokens, 60000);
+  assertEquals(args.prefix_rule, []);
+  assertEquals(args.workdir, "D:/Projects/SpectreReplay");
+  assertEquals(args.yield_time_ms, 10000);
+  assertEquals(r.clean, "");
+});
+
 Deno.test("cnb: a malformed mixed tool-call shell never reaches the user", () => {
   resetJunkState();
   const r = cnbParseToolCalls(

@@ -1098,7 +1098,7 @@ cnb 会拦「非官方客户端」：`400 {"code":11128,"msg":"Illegal API invoc
 - **可用模型**：只发布 `deepseek-v4.1-flash`——上游把**所有**模型名都路由到同一个后端（响应里一律回 `"model":"deepseek-v4.1-flash"`），`deepseek-v4-flash` / `-pro` 只是会被静默重定向的旧名，留着它们会在选择器里造出一个假的等级；
 - **视觉**：`user` / `system` 消息中的 `image_url` 块会被保留为多模态数组，而不是被折叠成纯文本（`src/cnb.ts` 中保留了这次修复的注释）；
 - **图片去重**：完全相同的 inline data URL 只保留最新一次出现；更早的重复图换成可解释占位符，避免附件在客户端历史里每轮重复上传；
-- **工具调用去重与 XYML 实验开关（2026-11-04）**：同一轮里 `name + arguments` 相同的工具调用只保留第一个，避免 reasoning 复读导致重复执行。默认工具提示词仍是 JSON；设置 `CNB_TOOL_PROTOCOL=xyml` 可实验性切换为 AiCode 式 XYML 协议（解析器仍同时接受 JSON/XYML/QNML/DSML）。XYML 模式下历史回放也用 XYML；模型混出的 `<|XYML|tool_call>` 单数块会归一化解析，流式阶段同样扣住。
+- **工具调用去重与 XYML 实验开关（2026-11-04）**：同一轮里 `name + arguments` 相同的工具调用只保留第一个，避免 reasoning 复读导致重复执行。默认工具提示词仍是 JSON；设置 `CNB_TOOL_PROTOCOL=xyml` 可实验性切换为 AiCode 式 XYML 协议（解析器仍同时接受 JSON/XYML/QNML/DSML，且支持模型退化出的 `name=cmd` 无引号属性）。XYML 模式下历史回放也用 XYML；模型混出的 `<|XYML|tool_call>` 单数块会归一化解析，流式阶段同样扣住。
 - **历史泄漏不回放（2026-11-04）**：旧版本泄漏进客户端 transcript 的 assistant raw 工具块会在出站前清洗，避免模型把它当“正确格式”继续复读；普通 JSON 正文不受影响。
 - **必失败工具调用不回放（2026-11-04）**：缺少 schema required 参数的历史调用（例如 `exec_command({"arguments":""})`）和配对的 `missing field` 错误结果会在 CNB 出站前移除，避免模型研究自己的死胡同后复读计划。
 - **压缩保留更多近期上下文（2026-11-04）**：CNB 尾部默认按 `CNB_COMPACTION_KEEP_TOKENS=20000` 保留，摘要里的非 reminder 用户消息默认截到 `CNB_COMPACTION_USER_MSG_CHARS=8000` 字符；若尾部起点落在 tool result 上，会先回退到配对的 assistant `tool_calls`。这是针对长会话摘要后忘事的保守调优，字节预算仍兜底。

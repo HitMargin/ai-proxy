@@ -217,7 +217,7 @@ async function cnbEnsure() {
 const P = String.raw`(?:\|?(?:XYML|QNML)\|?)?`;
 // invoke 开标签：name 关键字可省略（invoke="grep"）、支持 "x"/'x'/等号空格
 const XYML_INVOKE_OPEN = new RegExp(
-  `<${P}invoke\\s*(?:name)?\\s*=?\\s*["']([^"']+)["'][^>]*>`,
+  `<${P}invoke\\s*(?:name)?\\s*=?\\s*(?:"([^"]+)"|'([^']+)'|([^\\s>]+))?[^>]*>`,
   "gi",
 );
 const XYML_INVOKE_CLOSE = new RegExp(`</${P}invoke\\s*>`, "gi");
@@ -235,8 +235,13 @@ const XYML_PARAM_CLOSE = new RegExp(
 function parseTagAttrs(s: string): Record<string, string> {
   const out: Record<string, string> = {};
   let m: RegExpExecArray | null;
-  const re = /([a-zA-Z_][\w-]*)\s*=\s*("([^"]*)"|'([^']*)')/g;
-  while ((m = re.exec(s)) !== null) out[m[1]] = m[3] ?? m[4] ?? "";
+  // Models degrade from name="cmd" to name=cmd. Unquoted values are common in
+  // hand-written XML-ish output; without this the parser loses every parameter
+  // name and the cleanup layer leaves bare values in prose.
+  const re = /([a-zA-Z_][\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g;
+  while ((m = re.exec(s)) !== null) {
+    out[m[1]] = m[2] ?? m[3] ?? m[4] ?? "";
+  }
   return out;
 }
 
@@ -1737,7 +1742,7 @@ export function cnbParseToolCalls(
   XYML_INVOKE_OPEN.lastIndex = 0;
   while ((om = XYML_INVOKE_OPEN.exec(text)) !== null) {
     opens.push({
-      name: om[1],
+      name: om[1] ?? om[2] ?? om[3],
       start: om.index,
       bodyStart: om.index + om[0].length,
     });
