@@ -157,6 +157,60 @@ export interface OpenAiMessage {
   tool_call_id?: string;
 }
 
+/** OpenAI 的 data-URL 图片 part → Anthropic base64 图片块；非 data URL 忽略。 */
+export function imageBlockOf(
+  part: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const image_url = part.image_url as { url?: string } | undefined;
+  const url = image_url?.url ?? "";
+  const m = /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/.exec(
+    url,
+  );
+  if (!m) return null;
+  return {
+    type: "image",
+    source: { type: "base64", media_type: m[1], data: m[2] },
+  };
+}
+
+/**
+ * 把一条消息的 content 规整为块序列：文本 + 图片（data URL）按原顺序交错。
+ * 字符串内容视为单个文本块。
+ */
+function contentBlocksOf(m: OpenAiMessage): {
+  text: string;
+  blocks: Array<Record<string, unknown>>;
+} {
+  if (typeof m.content === "string") {
+    return {
+      text: m.content,
+      blocks: m.content ? [{ type: "text", text: m.content }] : [],
+    };
+  }
+  const parts = Array.isArray(m.content) ? m.content : [];
+  const blocks: Array<Record<string, unknown>> = [];
+  let text = "";
+  for (const part of parts) {
+    if (typeof part === "string") {
+      blocks.push({ type: "text", text: part });
+      text += part;
+      continue;
+    }
+    const p = part as Record<string, unknown>;
+    if (p.type === "text" && typeof p.text === "string") {
+      blocks.push({ type: "text", text: p.text });
+      text += p.text;
+      continue;
+    }
+    if (p.type === "image_url") {
+      const img = imageBlockOf(p);
+      if (img) blocks.push(img);
+    }
+    // 其余 part 类型（视频/PDF 等）v1 不携带，静默跳过
+  }
+  return { text, blocks };
+}
+
 /** OpenAI messages → Anthropic system + messages（含工具双向映射）。 */
 export function toAnthropicBody(
   body: {
@@ -165,6 +219,7 @@ export function toAnthropicBody(
     max_tokens?: number;
     temperature?: number;
     tools?: OpenAiTool[];
+    reasoning_effort?: string;
   },
   deviceMid: string | null,
   sessionId: string,
@@ -173,27 +228,30 @@ export function toAnthropicBody(
   const systemParts: string[] = [];
   const out: Array<Record<string, unknown>> = [];
   for (const m of messages) {
-    const text = typeof m.content === "string"
-      ? m.content
-      : textOfContent(m.content);
     if (m.role === "system" || m.role === "developer") {
+      const text = typeof m.content === "string"
+        ? m.content
+        : textOfContent(m.content);
       if (text) systemParts.push(text);
       continue;
     }
     if (m.role === "tool") {
       // 工具结果 → user 消息里的 tool_result 块
+      const toolText = typeof m.content === "string"
+        ? m.content
+        : textOfContent(m.content);
       out.push({
         role: "user",
         content: [{
           type: "tool_result",
           tool_use_id: m.tool_call_id ?? "",
-          content: [{ type: "text", text: text ?? "" }],
+          content: [{ type: "text", text: toolText ?? "" }],
         }],
       });
       continue;
     }
-    const blocks: Array<Record<string, unknown>> = [];
-    if (text) blocks.push({ type: "text", text });
+    // 文本与图片（data URL）按原顺序交错成块
+    const { text, blocks } = contentBlocksOf(m);
     for (const call of m.tool_calls ?? []) {
       let input: unknown = {};
       try {
@@ -227,10 +285,19 @@ export function toAnthropicBody(
       session_id: sessionId,
     }),
   };
+  // ★ 2026-11-05 实测（桥上逐档验证）：GLM-5.3-Flash 是常思模型，思考开关
+  // 不可关（1210 报错原文：不支持关闭思考）；档位走 output_config.effort =
+  // low / high / max（thinking 深度随档位递增）。桌面真实请求同款形状。
+  const effort = typeof body.reasoning_effort === "string" &&
+      ["low", "high", "max"].includes(body.reasoning_effort)
+    ? body.reasoning_effort
+    : undefined;
   return {
     model: "glm-5.3-flash",
     max_tokens: clampMaxTokens(body.max_tokens),
     stream: true,
+    thinking: { type: "enabled" },
+    ...(effort ? { output_config: { effort } } : {}),
     ...(systemParts.length ? { system: systemParts.join("\n\n") } : {}),
     ...(tools.length ? { tools } : {}),
     ...(Object.keys(metadata).length ? { metadata } : {}),
@@ -565,6 +632,15 @@ const KNOWN_MODELS = [
     owned_by: "zai-start-plan",
     context_window: 1000000,
     max_output_tokens: 128000,
+    // ★ 阶梯与默认档来自上游自己的校验器（1210 报错原文列出 low/high/max）与
+    // 桌面真实请求（output_config.effort=max）；常思模型，没有 off 档。
+    reasoning_efforts: [
+      { id: "low", name: "Low" },
+      { id: "high", name: "High" },
+      { id: "max", name: "Max" },
+    ],
+    default_reasoning_effort: "max",
+    input_modalities: ["text", "image"],
   },
 ];
 

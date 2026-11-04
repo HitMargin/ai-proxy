@@ -2,6 +2,7 @@ import {
   aggregateChunks,
   anthropicSseToOpenAiChunks,
   decryptZCodeValue,
+  imageBlockOf,
   toAnthropicBody,
 } from "./zai-plan.ts";
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
@@ -323,3 +324,47 @@ function streamOf(gen: AsyncGenerator<Uint8Array>): ReadableStream<Uint8Array> {
 }
 
 // ---------- dechunk ----------
+
+Deno.test("toAnthropicBody maps data-URL images into Anthropic image blocks", () => {
+  const body = toAnthropicBody(
+    {
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "这是什么颜色？" },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,AAAA" },
+          },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/x.png" },
+          },
+        ],
+      }],
+    },
+    null,
+    "s",
+  );
+  const messages = body.messages as Array<Record<string, unknown>>;
+  const content = messages[0].content as Array<Record<string, unknown>>;
+  assertEquals(content.length, 2); // http URL 图片被忽略，data URL 被映射
+  assertEquals(content[0].type, "text");
+  assertEquals(content[1].type, "image");
+  assertEquals(
+    (content[1].source as Record<string, string>).media_type,
+    "image/png",
+  );
+  assertEquals(
+    (content[1].source as Record<string, string>).data,
+    "AAAA",
+  );
+});
+
+Deno.test("imageBlockOf rejects non-data URLs", () => {
+  assertEquals(
+    imageBlockOf({ type: "image_url", image_url: { url: "https://x/y.png" } }),
+    null,
+  );
+  assertEquals(imageBlockOf({ type: "text" }), null);
+});
