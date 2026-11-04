@@ -484,6 +484,11 @@ function parseToolCallPayload(payload: string): any[] {
   let s = payload.trim();
   s = s.replace(/^```[a-zA-Z]*\s*/i, "").replace(/```\s*$/, "").trim();
   if (!s) return [];
+  // `{"name":"x","arguments":}` must not be "repaired" into a valid zero-arg
+  // call. The truncation fixer can drop the broken key/value tail; that is fine
+  // for an unclosed payload, but the shell explicitly promised an arguments
+  // value, so rejecting it is the only safe outcome.
+  if (/"arguments"\s*:\s*(?:,|\}|$)/i.test(s)) return [];
   const o = tryParseJsonLenient(s);
   if (!o || typeof o !== "object") return [];
 
@@ -794,7 +799,50 @@ function cnbToolChoiceDirective(toolChoice: unknown): string | null {
  * instead of being silently replaced with `{}`, otherwise the next upstream
  * round sees a syntactically valid call whose required parameters vanished.
  */
+function cnbXmlAttr(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function cnbReplayXymlToolCall(tc: any): string {
+  const fn = tc?.function || {};
+  const name = String(fn.name || "unknown");
+  let args: any = fn.arguments ?? {};
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args || "{}");
+    } catch {
+      // Keep malformed historical evidence instead of inventing `{}`.
+      args = { arguments: args || "" };
+    }
+  }
+  if (!args || typeof args !== "object" || Array.isArray(args)) args = {};
+
+  const parameters = Object.entries(args).map(([key, value]) => {
+    let text: string;
+    if (value == null) text = "";
+    else if (typeof value === "string") text = value;
+    else if (typeof value === "object") text = JSON.stringify(value);
+    else text = String(value);
+    if (/[<>&]/.test(text)) text = `<![CDATA[${text}]]>`;
+    return `    <|XYML|parameter name="${
+      cnbXmlAttr(key)
+    }">${text}</|XYML|parameter>`;
+  }).join("\n");
+
+  return `<|XYML|tool_calls>\n  <|XYML|invoke name="${cnbXmlAttr(name)}">\n${
+    parameters ? parameters + "\n" : ""
+  }  </|XYML|invoke>\n</|XYML|tool_calls>`;
+}
+
+/**
+ * Replay an assistant tool call in the exact dialect the system prompt teaches.
+ * Invalid serialized arguments are passed through instead of being silently
+ * replaced with `{}`, otherwise the next upstream round sees a syntactically
+ * valid call whose required parameters vanished.
+ */
 function cnbReplayToolCall(tc: any): string {
+  if (cnbToolProtocol() === "xyml") return cnbReplayXymlToolCall(tc);
   const fn = tc?.function || {};
   const name = String(fn.name || "unknown");
   let args: any = fn.arguments ?? {};
@@ -1661,6 +1709,14 @@ export function cnbParseToolCalls(
   }
   // DeepSeek 原生 DSML 标记 → XYML 归一化（含 invoke 混淆形式修正）
   text = normalizeDsml(normalizeInvokeConfusion(text));
+  // 2026-11-04：模型在 XYML 提示词下会把“tool_call 的 JSON 载荷”写成
+  // `<|XYML|tool_call>`（单数）。这和复数 wrapper 是两种合法历史形态；先归一化
+  // 掉前缀，后面的 TAG_CALL 才能和普通 `<tool_call>` 走同一条解析路径。
+  text = text.replace(
+    /<(\/?)\|?(?:XYML|QNML)\|?\s*tool[_ ]call\b([^>]*)>/gi,
+    (_m, slash: string, attrs: string) =>
+      slash ? `</tool_call${attrs}>` : `<tool_call${attrs}>`,
+  );
   // 注意：模型漏写必需参数时保持原样缺失，不再填充占位值——
   // 让工具端报"缺少参数"驱动模型重试（占位值曾导致下游拿假参数执行）
   // 按工具 schema 类型修正字符串化的数字/布尔（CDATA、引号导致的）
@@ -1816,45 +1872,46 @@ export function cnbParseToolCalls(
     });
   };
 
+  // 2026-11-04：不只在“还没有 invoke 调用”时才解析 tool_call。XYML 提示词和旧
+  // JSON 历史/模型先验混用后，一条响应里完全可能先有 invoke 再有 tool_call；
+  // 如果只在 calls.length===0 时进这里，第二个块会残留成正文。重复的同参调用
+  // 由 cnbDedupeToolCalls 收敛。
+  TAG_CALL.lastIndex = 0;
+  let tm;
+  while ((tm = TAG_CALL.exec(text)) !== null) {
+    const before = calls.length;
+    for (const o of parseToolCallPayload(tm[2])) {
+      o._tagName = tm[1] || "";
+      pushJsonCall(o);
+    }
+    if (calls.length > before) {
+      spans.push([tm.index, tm.index + tm[0].length]);
+    }
+  }
+
+  // 漏写 </tool_call>（或闭合串台成旧协议标签）：每个开标签取到下一个开标签/文末
   if (!calls.length) {
-    TAG_CALL.lastIndex = 0;
-    let tm;
-    while ((tm = TAG_CALL.exec(text)) !== null) {
+    const OPEN_RE = /<tool[_ ]call(\s[^>]*)?>/gi;
+    const opens: Array<{ tagStart: number; start: number; attrs: string }> = [];
+    let t2;
+    while ((t2 = OPEN_RE.exec(text)) !== null) {
+      opens.push({
+        tagStart: t2.index,
+        start: t2.index + t2[0].length,
+        attrs: t2[1] || "",
+      });
+    }
+    for (let j = 0; j < opens.length; j++) {
+      const end = j + 1 < opens.length ? opens[j + 1].tagStart : text.length;
+      let seg = text.slice(opens[j].start, end);
+      const cut = seg.lastIndexOf("</tool_call>");
+      if (cut >= 0) seg = seg.slice(0, cut);
       const before = calls.length;
-      for (const o of parseToolCallPayload(tm[2])) {
-        o._tagName = tm[1] || "";
+      for (const o of parseToolCallPayload(seg)) {
+        o._tagName = opens[j].attrs;
         pushJsonCall(o);
       }
-      if (calls.length > before) {
-        spans.push([tm.index, tm.index + tm[0].length]);
-      }
-    }
-
-    // 漏写 </tool_call>（或闭合串台成旧协议标签）：每个开标签取到下一个开标签/文末
-    if (!calls.length) {
-      const OPEN_RE = /<tool[_ ]call(\s[^>]*)?>/gi;
-      const opens: Array<{ tagStart: number; start: number; attrs: string }> =
-        [];
-      let t2;
-      while ((t2 = OPEN_RE.exec(text)) !== null) {
-        opens.push({
-          tagStart: t2.index,
-          start: t2.index + t2[0].length,
-          attrs: t2[1] || "",
-        });
-      }
-      for (let j = 0; j < opens.length; j++) {
-        const end = j + 1 < opens.length ? opens[j + 1].tagStart : text.length;
-        let seg = text.slice(opens[j].start, end);
-        const cut = seg.lastIndexOf("</tool_call>");
-        if (cut >= 0) seg = seg.slice(0, cut);
-        const before = calls.length;
-        for (const o of parseToolCallPayload(seg)) {
-          o._tagName = opens[j].attrs;
-          pushJsonCall(o);
-        }
-        if (calls.length > before) spans.push([opens[j].tagStart, end]);
-      }
+      if (calls.length > before) spans.push([opens[j].tagStart, end]);
     }
   }
 
@@ -2055,14 +2112,18 @@ export function cnbParseToolCalls(
 // 就锁定该通道，后续全部缓冲，流结束后交给 cnbParseToolCalls 统一解析
 const TOOL_OPENERS = [
   "<|xyml|tool_calls",
+  "<|xyml|tool_call",
   "<|qnml|tool_calls",
+  "<|qnml|tool_call",
   "<|xyml|invoke",
   "<|qnml|invoke",
   "<invoke",
   "<|xyml|parameter",
   "<|qnml|parameter",
   "<xyml|tool_calls",
+  "<xyml|tool_call",
   "<qnml|tool_calls",
+  "<qnml|tool_call",
   "<xyml|invoke",
   "<qnml|invoke",
   "<xyml|parameter",

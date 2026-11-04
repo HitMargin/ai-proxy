@@ -2388,6 +2388,81 @@ Deno.test("cnb: CNB_TOOL_PROTOCOL=xyml switches the tool prompt", () => {
   }
 });
 
+Deno.test("cnb: a prefixed singular XYML tool_call parses in mixed output", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    "First.\n" + OPEN + "\n" +
+      '{"name":"pwsh","arguments":{"command":"ls"}}' + "\n" + CLOSE +
+      "\nMixed.\n<|XYML|tool_call>\n" +
+      '{"name":"pwsh","arguments":{"command":"pwd"}}' +
+      "\n</|XYML|tool_call>",
+    TOOLS,
+    { notes: false },
+  );
+  assertEquals(r.calls.length, 2);
+  assertEquals(
+    JSON.parse(r.calls[1].function.arguments).command,
+    "pwd",
+  );
+  assert(!r.clean.includes("XYML"), "no protocol markup may leak");
+  assert(!r.clean.includes("command"), "no duplicate JSON may leak");
+  assertEquals(r.clean.trim(), "First.\n\nMixed.");
+});
+
+Deno.test("cnb: a malformed mixed tool-call shell never reaches the user", () => {
+  resetJunkState();
+  const r = cnbParseToolCalls(
+    "Run it.\n" + OPEN + "\n" +
+      '{"name":"pwsh","arguments":{"command":"ls"}}' + "\n" + CLOSE +
+      "\nThen degraded.\n<|XYML|tool_call>\n" +
+      '{"name":"pwsh","arguments":}' + "\n</|XYML|tool_call>",
+    TOOLS,
+    { notes: false },
+  );
+  assertEquals(r.calls.length, 1);
+  assert(!r.clean.includes("XYML"), "no protocol markup may leak");
+  assert(
+    !r.clean.includes('"arguments"'),
+    "a malformed shell must not leak: " + r.clean,
+  );
+  assertEquals(r.clean.trim(), "Run it.\n\nThen degraded.");
+});
+
+Deno.test("cnb: XYML history replay uses the same dialect as the prompt", () => {
+  const previous = Deno.env.get("CNB_TOOL_PROTOCOL");
+  Deno.env.set("CNB_TOOL_PROTOCOL", "xyml");
+  try {
+    const up = cnbBuildUpstream({
+      model: "deepseek-v4.1-flash",
+      messages: [
+        { role: "user", content: "run it" },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [{
+            id: "call_xyml",
+            type: "function",
+            function: {
+              name: "pwsh",
+              arguments: '{"command":"Get-Item .","description":"Inspect"}',
+            },
+          }],
+        },
+        { role: "tool", tool_call_id: "call_xyml", content: "ok" },
+      ],
+      tools: TOOLS,
+    }).upstream;
+    const assistant = up.messages.find((m: any) => m.role === "assistant");
+    assert(assistant.content.includes("<|XYML|tool_calls>"));
+    assert(assistant.content.includes('name="pwsh"'));
+    assert(assistant.content.includes("Get-Item ."));
+    assert(!assistant.content.includes("<tool_call>"));
+  } finally {
+    if (previous === undefined) Deno.env.delete("CNB_TOOL_PROTOCOL");
+    else Deno.env.set("CNB_TOOL_PROTOCOL", previous);
+  }
+});
+
 Deno.test("cnb: tool_choice directives reach the tool prompt", () => {
   const request = (toolChoice: unknown) =>
     cnbBuildUpstream({
@@ -5570,6 +5645,48 @@ Deno.test("cnb: a DSML tool block emitted by the rescue round becomes a tool_cal
   } finally {
     globalThis.fetch = realFetch;
     Deno.env.delete("CNB_11128_DUMP");
+  }
+});
+
+Deno.test("cnb: a prefixed singular XYML tool_call is buffered in stream", async () => {
+  resetJunkStreak();
+  cnbForgetRejectedHeads();
+  const realFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  globalThis.fetch = stubCnbUpstream(
+    bodies,
+    () =>
+      sseChat(
+        "Before.\n<|XYML|tool_call>\n" +
+          '{"name":"pwsh","arguments":{"command":"ls"}}' +
+          "\n</|XYML|tool_call>",
+      ),
+  );
+  try {
+    const resp = await postRepair(repairRequestBody(true));
+    assertEquals(resp.status, 200);
+    const chunks = await collectSse(resp);
+    const content = chunks
+      .map((c) => c.choices?.[0]?.delta?.content ?? "")
+      .join("");
+    assert(
+      !content.includes("XYML"),
+      "the marker must be buffered: " + content,
+    );
+    assert(
+      !content.includes('"name"'),
+      "the JSON payload must be buffered: " + content,
+    );
+    const call = chunks.find(
+      (c) => c.choices?.[0]?.delta?.tool_calls?.[0]?.function?.name,
+    );
+    assertEquals(call?.choices[0].delta.tool_calls[0].function.name, "pwsh");
+    assertEquals(
+      chunks.at(-1)?.choices[0].finish_reason,
+      "tool_calls",
+    );
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });
 
