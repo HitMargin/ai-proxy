@@ -18,6 +18,7 @@ import {
   cnbBuildUpstream,
   cnbBuriedAnswerRescueBody,
   cnbCallUpstream,
+  cnbDedupeToolCalls,
   cnbDiagnoseJunkSyntax,
   cnbEscapeRepairState,
   cnbFinishMeansIncomplete,
@@ -2328,6 +2329,63 @@ Deno.test("cnb: the appended tool prompt is preprocessed too", () => {
     "tool descriptions are appended after the message map and must not reintroduce the brand",
   );
   assert(first.includes("DSH Web GUI"), "the description must survive renamed");
+});
+
+Deno.test("cnb: identical tool calls from reasoning and content are deduped", () => {
+  const payload = JSON.stringify({
+    name: "pwsh",
+    arguments: { command: "Get-Item .", description: "Inspect" },
+  });
+  const text = "Thinking first.\n" + OPEN + "\n" + payload + "\n" + CLOSE +
+    "\nThen repeating it.\n" + OPEN + "\n" + payload + "\n" + CLOSE;
+  const parsed = cnbParseToolCalls(text, TOOLS, { notes: false });
+  assertEquals(parsed.calls.length, 1);
+
+  const merged = cnbDedupeToolCalls([
+    ...parsed.calls,
+    {
+      id: "call_duplicate",
+      type: "function",
+      function: {
+        name: "pwsh",
+        arguments: '{"description":"Inspect","command":"Get-Item ."}',
+      },
+    },
+  ]);
+  assertEquals(merged.length, 1);
+});
+
+Deno.test("cnb: CNB_TOOL_PROTOCOL=xyml switches the tool prompt", () => {
+  const previous = Deno.env.get("CNB_TOOL_PROTOCOL");
+  Deno.env.set("CNB_TOOL_PROTOCOL", "xyml");
+  try {
+    const built = cnbBuildUpstream({
+      model: "deepseek-v4.1-flash",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{
+        type: "function",
+        function: {
+          name: "read",
+          description: "read a file",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "absolute path" },
+            },
+            required: ["path"],
+          },
+        },
+      }],
+    });
+    const prompt = String(built.upstream.messages[0].content);
+    assert(prompt.includes("=== XYML TOOL CALL PROTOCOL ==="));
+    assert(prompt.includes("<|XYML|tool_calls>"));
+    assert(prompt.includes('"absolute path"'));
+    assert(!prompt.includes("=== TOOL CALL PROTOCOL (JSON) ==="));
+  } finally {
+    if (previous === undefined) Deno.env.delete("CNB_TOOL_PROTOCOL");
+    else Deno.env.set("CNB_TOOL_PROTOCOL", previous);
+  }
 });
 
 Deno.test("cnb: tool_choice directives reach the tool prompt", () => {

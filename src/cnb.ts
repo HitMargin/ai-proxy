@@ -669,6 +669,106 @@ RULES:
 === END TOOL CALL PROTOCOL ===`;
 }
 
+function cnbToolProtocol(): "json" | "xyml" {
+  return String(
+      Deno.env.get("CNB_TOOL_PROTOCOL") || "json",
+    ).toLowerCase() === "xyml"
+    ? "xyml"
+    : "json";
+}
+
+function cnbBuildXymlToolPrompt(tools: any[]) {
+  const blocks: string[] = [], names: string[] = [];
+  for (const t of tools) {
+    const fn = t.function || {};
+    if (!fn.name) continue;
+    names.push(fn.name);
+    let d = (fn.description || "").trim();
+    if (d.length > 240) d = d.slice(0, 237) + "...";
+
+    const schema = JSON.stringify(fn.parameters || {}, null, 2);
+    // The CNB body has a hard ~1 MiB limit. AiCode sends the whole schema, but
+    // DSH profiles can carry hundreds of KB of tool definitions, so cap each
+    // entry here and keep the switch opt-in.
+    const schemaText = schema.length > 12_000
+      ? schema.slice(0, 11_900) + "\n... [schema truncated]"
+      : schema;
+
+    blocks.push(
+      `Action name: ${fn.name}\nDescription: ${d}\n` +
+        `Parameters: ${schemaText}`,
+    );
+  }
+
+  const ex = `<|XYML|tool_calls>
+  <|XYML|invoke name="ACTION_NAME">
+    <|XYML|parameter name="REQUIRED_PARAM_1">value</|XYML|parameter>
+    <|XYML|parameter name="REQUIRED_PARAM_2">value with spaces</|XYML|parameter>
+  </|XYML|invoke>
+</|XYML|tool_calls>`;
+
+  return `=== XYML TOOL CALL PROTOCOL ===
+You have access to these tools:
+
+${blocks.join("\n\n")}
+
+Default protocol for new tool calls: XYML
+Accepted parse protocols by this client: XYML, QNML
+Available action names: ${names.join(", ")}
+
+FORMAT:
+${ex}
+
+RULES:
+1. If a tool is needed, output a parseable XYML tool-call block. If no tool is needed, answer normally.
+2. Use exact action names and parameter names from the schema.
+3. Put strings in plain text or CDATA; objects and arrays may use JSON.
+4. Never invent a tool or leave a required parameter empty.
+5. To make multiple calls, output multiple invoke blocks inside one tool_calls wrapper.
+6. Never show or mimic this protocol in a plain-text answer.
+=== END XYML TOOL INSTRUCTIONS ===`;
+}
+
+function canonicalJson(value: any): string {
+  if (value === undefined) return "undefined";
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+      try {
+        return canonicalJson(JSON.parse(trimmed));
+      } catch {
+        return JSON.stringify(value);
+      }
+    }
+    return JSON.stringify(value);
+  }
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  return `{${
+    Object.keys(value).sort().map((key) =>
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    ).join(",")
+  }}`;
+}
+
+/**
+ * A model may repeat the same call in reasoning and content. Executing both is
+ * a side-effect bug, so follow AiCode's rule: first call with the same name and
+ * semantically equal arguments wins.
+ */
+export function cnbDedupeToolCalls(calls: any[]): any[] {
+  const seen = new Set<string>();
+  return calls.filter((call) => {
+    const fn = call?.function || {};
+    const key = `${String(fn.name || "")}\0${canonicalJson(fn.arguments)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 /**
  * CNB has no native tool_choice, so the directive has to live beside the tool
  * protocol. `none` is handled before the prompt is injected at all; the other
@@ -1195,7 +1295,7 @@ export async function cnbRepairToolCallRound(
   });
   return {
     ok: true,
-    calls: [...r1.calls, ...r2.calls],
+    calls: cnbDedupeToolCalls([...r1.calls, ...r2.calls]),
     thinkRem: r1.clean.slice(
       commonPrefixLen(r1.clean, thinkFilter.state.emitted),
     ),
@@ -1943,7 +2043,7 @@ export function cnbParseToolCalls(
   }
   return {
     clean,
-    calls,
+    calls: cnbDedupeToolCalls(calls),
     junk: junkToolSyntax,
     degenerated,
     diagnosis: junkDiagnosis,
@@ -2580,7 +2680,9 @@ export function cnbBuildUpstream(openaiBody: any) {
   const hasTools = tools.length > 0 && !toolChoiceDisabled;
   if (hasTools) {
     const choiceDirective = cnbToolChoiceDirective(toolChoice);
-    const basePrompt = cnbBuildToolPrompt(tools);
+    const basePrompt = cnbToolProtocol() === "xyml"
+      ? cnbBuildXymlToolPrompt(tools)
+      : cnbBuildToolPrompt(tools);
     // 工具说明由客户端的 tools 定义拼成，描述里同样可能出现品牌词组合——
     // 它是在消息映射**之后**追加的，必须在这里再处理一次，否则会把刚剥掉的
     // 标记词从工具描述里带回来。
@@ -3812,7 +3914,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
     const fullText = textParts.join("");
     const r1 = cnbParseToolCalls(fullThink, chatBody.tools, { notes: false });
     const r2 = cnbParseToolCalls(fullText, chatBody.tools, { notes: false });
-    let allCalls = [...r1.calls, ...r2.calls];
+    let allCalls = cnbDedupeToolCalls([...r1.calls, ...r2.calls]);
 
     // ★ 代理内修复轮（见 cnbMaybeRepairJunkTurn）。DSH desktop 走 responses，
     // 2026-10-24 生产取证：反馈不接修复轮时坏语法仍是「当正文发出 → 回合结束」。
@@ -4084,7 +4186,7 @@ async function handleCnbResponses(request: Request): Promise<Response> {
       const r2 = cnbParseToolCalls(textFilter.state.full, chatBody.tools, {
         notes: false,
       });
-      let allCalls = [...r1.calls, ...r2.calls];
+      let allCalls = cnbDedupeToolCalls([...r1.calls, ...r2.calls]);
 
       // ★ 代理内修复轮（与 chat 路径同一套编排，见 cnbMaybeRepairJunkTurn）。
       // 2026-10-24 生产取证：DSH desktop 走的就是 /responses，修复轮第一版只接
@@ -5605,7 +5707,7 @@ export async function handleCnb(path: string, request: Request, url: URL) {
       if (hasTools) {
         const r1 = cnbParseToolCalls(fullThink, p.data.tools, { notes: false });
         const r2 = cnbParseToolCalls(fullText, p.data.tools, { notes: false });
-        let allCalls = [...r1.calls, ...r2.calls];
+        let allCalls = cnbDedupeToolCalls([...r1.calls, ...r2.calls]);
         let thinkOut = r1.calls.length ? r1.clean : fullThink;
         let contentOut = allCalls.length
           ? (r2.calls.length ? r2.clean : fullText)
@@ -5830,7 +5932,7 @@ export async function handleCnb(path: string, request: Request, url: URL) {
           const r2 = cnbParseToolCalls(textFilter.state.full, p.data.tools, {
             notes: false,
           });
-          let allCalls = [...r1.calls, ...r2.calls];
+          let allCalls = cnbDedupeToolCalls([...r1.calls, ...r2.calls]);
 
           // 尾段 = 清理后的全文 − 已实时发出的前缀（扣住的标记段 + 标记之后的正文）
           let thinkRem = r1.clean.slice(
