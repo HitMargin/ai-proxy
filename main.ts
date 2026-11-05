@@ -1486,6 +1486,25 @@ async function v1FetchMemberModels(): Promise<Record<string, any[]>> {
       }
       return;
     }
+    if (key === "zaiPlan") {
+      // Asked of this proxy rather than of zcode.z.ai: the static advertised
+      // list is metadata, while the full internal catalog remains forwardable
+      // and the upstream plan is the entitlement authority. The generic
+      // fallback below would fetch
+      // `baseUrl + /models` straight at zcode.z.ai - a route the gateway does
+      // not serve, failing the member every cycle and quietly dropping the
+      // channel from the aggregate (which is exactly what the picker reads).
+      const models = await v1FetchOwnListing("zai-plan");
+      out[key] = models;
+      if (models.length > 0) {
+        catalog.ok(key, models.length, models.length, now);
+      } else {
+        const reason = "zai-plan listed no models (zcode-bridge down?)";
+        catalog.failed(key, reason, now);
+        warnChannelOnce(key, reason);
+      }
+      return;
+    }
     if (key === "custom") {
       // Asked of this proxy rather than of the vendor: src/custom-handler.ts is
       // where the per-vendor fan-out and the id prefixing live, and there is no

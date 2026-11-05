@@ -2,8 +2,10 @@ import {
   aggregateChunks,
   anthropicSseToOpenAiChunks,
   decryptZCodeValue,
+  handleZaiPlan,
   imageBlockOf,
   toAnthropicBody,
+  ZAI_PLAN_MODELS,
 } from "./zai-plan.ts";
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 
@@ -56,6 +58,32 @@ Deno.test("decryptZCodeValue rejects a truncated ciphertext", async () => {
     threw = true;
   }
   assertEquals(threw, true);
+});
+
+Deno.test("zai-plan keeps the pinned catalog and fixed advertised subset", async () => {
+  assertEquals(ZAI_PLAN_MODELS.map((model) => model.id), [
+    "glm-5.3",
+    "glm-5.3-flash",
+    "glm-5.2",
+    "glm-5.1",
+    "glm-5",
+    "glm-5-turbo",
+    "glm-5v-turbo",
+    "glm-4.7",
+    "glm-4.6",
+    "glm-4.6v",
+    "glm-4.5-air",
+  ]);
+
+  const response = await handleZaiPlan(
+    "/zai-plan/v1/models",
+    new Request("http://proxy/zai-plan/v1/models"),
+  );
+  const body = await response.json() as { data: Array<{ id: string }> };
+  assertEquals(body.data.map((model) => model.id), [
+    "glm-5.3",
+    "glm-5.3-flash",
+  ]);
 });
 
 // ---------- OpenAI → Anthropic ----------
@@ -164,6 +192,18 @@ Deno.test("toAnthropicBody merges consecutive user messages", () => {
     blocks.map((b) => b.text).join(""),
     "第一句第二句",
   );
+});
+
+Deno.test("toAnthropicBody forwards a model outside the advertised subset", () => {
+  const body = toAnthropicBody(
+    {
+      model: "glm-5.2",
+      messages: [{ role: "user", content: "转发我" }],
+    },
+    null,
+    "session",
+  );
+  assertEquals(body.model, "glm-5.2");
 });
 
 Deno.test("toAnthropicBody clamps max_tokens and defaults it", () => {
@@ -345,8 +385,9 @@ Deno.test("aggregateChunks rebuilds a non-stream completion", async () => {
       usage: { prompt_tokens: 3, completion_tokens: 2 },
     });
   }
-  const completion = await aggregateChunks(chunks());
+  const completion = await aggregateChunks(chunks(), "glm-5.2");
   assertEquals(completion.id, "r1");
+  assertEquals(completion.model, "glm-5.2");
   const choice = (completion.choices as Array<Record<string, unknown>>)[0];
   const message = choice.message as Record<string, unknown>;
   assertEquals(message.content, "收到");

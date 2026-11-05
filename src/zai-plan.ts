@@ -25,6 +25,89 @@
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+const DEFAULT_MODEL_ID = "glm-5.3-flash";
+
+/**
+ * Static catalog for the GLM models accepted by this channel. The names and
+ * specifications mirror zcode-api's pinned ZCode catalog. They are metadata
+ * only: requests are not whitelisted here, so the upstream plan remains the
+ * final authority on whether a model is entitled.
+ */
+export const ZAI_PLAN_MODELS = [
+  {
+    id: "glm-5.3",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    reasoning: true,
+  },
+  {
+    id: "glm-5.3-flash",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    reasoning: true,
+    vision: true,
+  },
+  {
+    id: "glm-5.2",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    reasoning: true,
+  },
+  {
+    id: "glm-5.1",
+    contextWindow: 200_000,
+    maxOutputTokens: 64_000,
+    reasoning: true,
+  },
+  {
+    id: "glm-5",
+    contextWindow: 200_000,
+    maxOutputTokens: 64_000,
+    reasoning: true,
+  },
+  {
+    id: "glm-5-turbo",
+    contextWindow: 200_000,
+    maxOutputTokens: 64_000,
+    reasoning: true,
+  },
+  {
+    id: "glm-5v-turbo",
+    contextWindow: 200_000,
+    maxOutputTokens: 131_072,
+    vision: true,
+  },
+  {
+    id: "glm-4.7",
+    contextWindow: 200_000,
+    maxOutputTokens: 131_072,
+    reasoning: true,
+  },
+  {
+    id: "glm-4.6",
+    contextWindow: 200_000,
+    maxOutputTokens: 131_072,
+    reasoning: true,
+  },
+  {
+    id: "glm-4.6v",
+    contextWindow: 131_072,
+    maxOutputTokens: 32_768,
+    vision: true,
+  },
+  {
+    id: "glm-4.5-air",
+    contextWindow: 131_072,
+    maxOutputTokens: 98_304,
+    reasoning: true,
+  },
+] as const;
+
+const ADVERTISED_MODEL_IDS = new Set([
+  "glm-5.3",
+  "glm-5.3-flash",
+]);
+
 function credentialSecret(): string {
   const override = Deno.env.get("ZCODE_CREDENTIAL_SECRET");
   if (override) return override;
@@ -321,7 +404,7 @@ export function toAnthropicBody(
     ? body.reasoning_effort
     : undefined;
   return {
-    model: "glm-5.3-flash",
+    model: body.model || DEFAULT_MODEL_ID,
     max_tokens: clampMaxTokens(body.max_tokens),
     stream: true,
     thinking: { type: "enabled" },
@@ -577,6 +660,7 @@ function chunkJson(
 /** 非流式聚合：把 chunk 流收成一份完整的 chat.completion。 */
 export async function aggregateChunks(
   chunkStream: AsyncGenerator<string>,
+  model: string = DEFAULT_MODEL_ID,
 ): Promise<Record<string, unknown>> {
   let content = "";
   let reasoning = "";
@@ -652,7 +736,7 @@ export async function aggregateChunks(
     id: firstId || `zai-plan-${Date.now()}`,
     object: "chat.completion",
     created: created || Math.floor(Date.now() / 1000),
-    model: "glm-5.3-flash",
+    model,
     choices: [{ index: 0, message, finish_reason: finish }],
     ...(usage ? { usage } : {}),
   };
@@ -662,25 +746,32 @@ export async function aggregateChunks(
 // handler
 // ---------------------------------------------------------------------------
 
-const KNOWN_MODELS = [
-  {
-    id: "glm-5.3-flash",
+const KNOWN_MODELS = ZAI_PLAN_MODELS
+  .filter((model) => ADVERTISED_MODEL_IDS.has(model.id))
+  .map((model) => ({
+    id: model.id,
     object: "model",
     created: 0,
     owned_by: "zai-start-plan",
-    context_window: 1000000,
-    max_output_tokens: 128000,
-    // ★ 阶梯与默认档来自上游自己的校验器（1210 报错原文列出 low/high/max）与
-    // 桌面真实请求（output_config.effort=max）；常思模型，没有 off 档。
-    reasoning_efforts: [
-      { id: "low", name: "Low" },
-      { id: "high", name: "High" },
-      { id: "max", name: "Max" },
-    ],
-    default_reasoning_effort: "max",
-    input_modalities: ["text", "image"],
-  },
-];
+    context_window: model.contextWindow,
+    max_output_tokens: model.maxOutputTokens,
+    ...(model.id === "glm-5.3-flash"
+      ? {
+        // This ladder and its default were validated against the live gateway:
+        // 1210 reports low/high/max and the desktop request uses max. The model
+        // is always-thinking, so there is no off level.
+        reasoning_efforts: [
+          { id: "low", name: "Low" },
+          { id: "high", name: "High" },
+          { id: "max", name: "Max" },
+        ],
+        default_reasoning_effort: "max",
+      }
+      : {}),
+    input_modalities: "vision" in model && model.vision
+      ? ["text", "image"]
+      : ["text"],
+  }));
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -716,6 +807,10 @@ export async function handleZaiPlan(
     null,
     sessionId,
   );
+  const responseModel = typeof anthropicBody.model === "string" &&
+      anthropicBody.model.length > 0
+    ? anthropicBody.model
+    : DEFAULT_MODEL_ID;
   const headers: Record<string, string> = {
     "content-type": "application/json",
     "anthropic-version": "2023-06-01",
@@ -793,13 +888,13 @@ export async function handleZaiPlan(
   const requestId = `zai-plan-${sessionId}`;
   const chunkStream = anthropicSseToOpenAiChunks(
     upstream.body,
-    "glm-5.3-flash",
+    responseModel,
     created,
     requestId,
   );
   if (!wantsStream) {
     try {
-      const completion = await aggregateChunks(chunkStream);
+      const completion = await aggregateChunks(chunkStream, responseModel);
       return jsonResponse(completion);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
