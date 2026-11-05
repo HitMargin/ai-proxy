@@ -112,6 +112,60 @@ Deno.test("toAnthropicBody collects system into system and maps tools", () => {
   assertEquals(metadata.session_id, "sess-1");
 });
 
+Deno.test("toAnthropicBody merges parallel tool results into one user message", () => {
+  const body = toAnthropicBody(
+    {
+      messages: [
+        { role: "user", content: "跑两个工具" },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            { id: "call_a", function: { name: "f1", arguments: "{}" } },
+            { id: "call_b", function: { name: "f2", arguments: "{}" } },
+          ],
+        },
+        { role: "tool", tool_call_id: "call_a", content: "结果A" },
+        { role: "tool", tool_call_id: "call_b", content: "结果B" },
+      ],
+    },
+    null,
+    "s",
+  );
+  const messages = body.messages as Array<Record<string, unknown>>;
+  // user → assistant(tool_use×2) → user(tool_result×2 合并一条)
+  assertEquals(messages.length, 3);
+  assertEquals(messages[2].role, "user");
+  const blocks = messages[2].content as Array<Record<string, unknown>>;
+  assertEquals(blocks.length, 2);
+  assertEquals(blocks[0].type, "tool_result");
+  assertEquals(blocks[0].tool_use_id, "call_a");
+  assertEquals(blocks[1].tool_use_id, "call_b");
+});
+
+Deno.test("toAnthropicBody merges consecutive user messages", () => {
+  const body = toAnthropicBody(
+    {
+      messages: [
+        { role: "user", content: "第一句" },
+        { role: "user", content: "第二句" },
+        { role: "assistant", content: "答" },
+      ],
+    },
+    null,
+    "s",
+  );
+  const messages = body.messages as Array<Record<string, unknown>>;
+  assertEquals(messages.length, 2);
+  assertEquals(messages[0].role, "user");
+  assertEquals(messages[1].role, "assistant");
+  const blocks = messages[0].content as Array<Record<string, unknown>>;
+  assertEquals(
+    blocks.map((b) => b.text).join(""),
+    "第一句第二句",
+  );
+});
+
 Deno.test("toAnthropicBody clamps max_tokens and defaults it", () => {
   const noMax = toAnthropicBody({ messages: [] }, null, "s");
   assertEquals(noMax.max_tokens, 8192);

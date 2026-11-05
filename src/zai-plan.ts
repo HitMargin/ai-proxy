@@ -235,19 +235,32 @@ export function toAnthropicBody(
       if (text) systemParts.push(text);
       continue;
     }
+    // ★ 2026-11-05 修：Anthropic 要求 user/assistant 严格交替，而 DSH 的
+    // 并行工具调用会发 N 条连续的 tool 消息 —— 逐条转换会产出连续的 user
+    // 消息（roles must alternate 400）。连续 tool 结果必须合并进**一条**
+    // user 消息（多个 tool_result 块），这是 Anthropic 的官方形状。
     if (m.role === "tool") {
-      // 工具结果 → user 消息里的 tool_result 块
       const toolText = typeof m.content === "string"
         ? m.content
         : textOfContent(m.content);
-      out.push({
-        role: "user",
-        content: [{
-          type: "tool_result",
-          tool_use_id: m.tool_call_id ?? "",
-          content: [{ type: "text", text: toolText ?? "" }],
-        }],
-      });
+      const block: Record<string, unknown> = {
+        type: "tool_result",
+        tool_use_id: m.tool_call_id ?? "",
+        content: [{ type: "text", text: toolText ?? "" }],
+      };
+      const prev = out[out.length - 1];
+      if (
+        prev && prev.role === "user" &&
+        Array.isArray(prev.content) &&
+        (prev.content as Array<Record<string, unknown>>).every(
+          (b) => b.type === "tool_result",
+        )
+      ) {
+        // 上一段就是纯 tool_result 的 user 消息：并入，不开新消息
+        (prev.content as Array<Record<string, unknown>>).push(block);
+      } else {
+        out.push({ role: "user", content: [block] });
+      }
       continue;
     }
     // 文本与图片（data URL）按原顺序交错成块
@@ -269,6 +282,21 @@ export function toAnthropicBody(
         role: m.role === "assistant" ? "assistant" : "user",
         content: blocks,
       });
+    }
+  }
+  // ★ 兜底：OpenAI 允许连续同角色消息，Anthropic 要求 user/assistant 严格
+  // 交替。把相邻同角色的消息合并（块数组直接拼接），任何历史形态都不会
+  // 触发 roles-must-alternate 400。
+  const merged: Array<Record<string, unknown>> = [];
+  for (const msg of out) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === msg.role) {
+      prev.content = [
+        ...(prev.content as Array<Record<string, unknown>>),
+        ...(msg.content as Array<Record<string, unknown>>),
+      ];
+    } else {
+      merged.push(msg);
     }
   }
   const tools = (body.tools ?? [])
@@ -304,7 +332,7 @@ export function toAnthropicBody(
     ...(body.temperature !== undefined
       ? { temperature: body.temperature }
       : {}),
-    messages: out,
+    messages: merged,
   };
 }
 
