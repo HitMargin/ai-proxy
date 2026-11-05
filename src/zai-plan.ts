@@ -512,11 +512,21 @@ export async function* anthropicSseToOpenAiChunks(
         if (type === "message_delta") {
           const delta = ev.delta as Record<string, unknown> | undefined;
           const u = ev.usage as Record<string, number> | undefined;
-          if (u && usage) usage.completion_tokens = u.output_tokens ?? 0;
+          if (u && usage) {
+            usage.completion_tokens = u.output_tokens ?? 0;
+            // GLM 网关在 message_start 报 0/0，真实 input_tokens 随 message_delta
+            // 才到（/v1/messages 在桥里是原样透传，0 是上游行为不是桥的）。
+            if (typeof u.input_tokens === "number" && u.input_tokens > 0) {
+              usage.prompt_tokens = u.input_tokens;
+            }
+          }
           const reason = finishReasonOf(delta?.stop_reason);
           if (reason) {
             finished = true;
-            yield chunkJson(requestId, model, created, {}, reason, usage);
+            // 「未知」优先于「0」：整个流都没拿到 prompt_tokens 就不发 usage，
+            // 让 DSH 显示未知而不是假 0%（AGENTS.md 同款纪律）。
+            const reported = usage && usage.prompt_tokens > 0 ? usage : null;
+            yield chunkJson(requestId, model, created, {}, reason, reported);
           }
           continue;
         }
