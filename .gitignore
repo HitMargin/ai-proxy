@@ -5,6 +5,8 @@ deepseek-auth.txt
 deepseek-headers.json
 deepseek-web-cooldown.json
 commandcode-accounts.json
+data/accounts.json
+tools/zcode-bridge/data/accounts.json
 trae-auth.json
 workbuddy-auth.json
 session.json

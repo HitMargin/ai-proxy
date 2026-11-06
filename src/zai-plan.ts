@@ -9,14 +9,19 @@
  *   TLS 指纹无关（curl/Schannel 走代理同样 200），所以手写 CONNECT 隧道即可，
  *   不需要任何 sidecar。
  *
- * 协议：上游是 Anthropic Messages；对客户端暴露 OpenAI chat/completions，
- * 与其它渠道一致由本模块做双向转换（含工具调用）。
+ * 协议：上游是 Anthropic Messages；对客户端暴露 Chat Completions、
+ * Responses 与 Anthropic Messages 三种入口（含工具调用）。
  *
  * 判据（AGENTS.md 同款纪律）：
  *   - 凭据文件按 mtime 热加载 —— ZCode 桌面刷新 token 后我们自动跟随；
  *   - 上游永远 stream:true（网关流式优先），非流式请求在网关侧聚合；
  *   - 错误轮不许声称 finish_reason:"stop"（错误帧 finish 一律 null）。
  */
+
+import {
+  handleDeepseekResponses,
+  readJsonBodyLimited,
+} from "./deepseek-responses.ts";
 
 // ---------------------------------------------------------------------------
 // 凭据
@@ -107,6 +112,82 @@ const ADVERTISED_MODEL_IDS = new Set([
   "glm-5.3",
   "glm-5.3-flash",
 ]);
+
+const REASONING_EFFORT_MODEL_IDS = new Set([
+  "glm-5.3",
+  "glm-5.3-flash",
+]);
+
+const SESSION_HEADERS = [
+  "x-session-id",
+  "x-conversation-id",
+  "x-session-affinity",
+  "prompt_cache_key",
+  "session_id",
+] as const;
+
+function firstSessionValue(
+  values: Array<string | undefined | null>,
+): string | undefined {
+  for (const value of values) {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    if (trimmed) return trimmed.slice(0, 256);
+  }
+  return undefined;
+}
+
+function sessionIdFromMetadata(metadata: unknown): string | undefined {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return undefined;
+  }
+  const value = metadata as Record<string, unknown>;
+  const direct = firstSessionValue([
+    value.session_id as string | undefined,
+    value.sessionId as string | undefined,
+    value.conversation_id as string | undefined,
+    value.conversationId as string | undefined,
+  ]);
+  if (direct) return direct;
+  if (typeof value.user_id !== "string") return undefined;
+  try {
+    const parsed = JSON.parse(value.user_id) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    return firstSessionValue([
+      (parsed as Record<string, unknown>).session_id as string | undefined,
+      (parsed as Record<string, unknown>).sessionId as string | undefined,
+    ]);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve one stable upstream session for all three protocol entrances.
+ *
+ * Explicit client identity wins because DSH and SDK callers already provide it.
+ * Without one, a fresh UUID is safer than fusing unrelated one-shot requests:
+ * this channel stays stateless and does not maintain a cross-restart lineage
+ * table.
+ */
+export function resolveZaiPlanSession(
+  request: Request,
+  body: Record<string, unknown>,
+): string {
+  const header = firstSessionValue(
+    SESSION_HEADERS.map((name) => request.headers.get(name)),
+  );
+  if (header) return header;
+  const bodySession = firstSessionValue([
+    body.session_id as string | undefined,
+    body.sessionId as string | undefined,
+    body.conversation_id as string | undefined,
+    body.conversationId as string | undefined,
+    sessionIdFromMetadata(body.metadata),
+  ]);
+  return bodySession ?? crypto.randomUUID();
+}
 
 function credentialSecret(): string {
   const override = Deno.env.get("ZCODE_CREDENTIAL_SECRET");
@@ -347,7 +428,7 @@ export function toAnthropicBody(
       continue;
     }
     // 文本与图片（data URL）按原顺序交错成块
-    const { text, blocks } = contentBlocksOf(m);
+    const { blocks } = contentBlocksOf(m);
     for (const call of m.tool_calls ?? []) {
       let input: unknown = {};
       try {
@@ -755,11 +836,11 @@ const KNOWN_MODELS = ZAI_PLAN_MODELS
     owned_by: "zai-start-plan",
     context_window: model.contextWindow,
     max_output_tokens: model.maxOutputTokens,
-    ...(model.id === "glm-5.3-flash"
+    ...(REASONING_EFFORT_MODEL_IDS.has(model.id)
       ? {
-        // This ladder and its default were validated against the live gateway:
-        // 1210 reports low/high/max and the desktop request uses max. The model
-        // is always-thinking, so there is no off level.
+        // Both advertised GLM 5.3 models publish this ladder; 1210 reports
+        // low/high/max and the desktop request uses max. Neither model exposes
+        // an off level through this gateway.
         reasoning_efforts: [
           { id: "low", name: "Low" },
           { id: "high", name: "High" },
@@ -780,38 +861,14 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-export async function handleZaiPlan(
-  path: string,
-  request: Request,
-): Promise<Response> {
-  if (path.endsWith("/models")) {
-    return jsonResponse({ object: "list", data: KNOWN_MODELS });
-  }
-  if (!path.endsWith("/chat/completions") || request.method !== "POST") {
-    return jsonResponse(
-      {
-        error: "unsupported zai-plan path (only /models and /chat/completions)",
-      },
-      404,
-    );
-  }
-  let openai: Record<string, unknown>;
-  try {
-    openai = await request.json();
-  } catch {
-    return jsonResponse({ error: "invalid JSON body" }, 400);
-  }
-  const sessionId = crypto.randomUUID();
-  const anthropicBody = toAnthropicBody(
-    openai as Parameters<typeof toAnthropicBody>[0],
-    null,
-    sessionId,
-  );
-  const responseModel = typeof anthropicBody.model === "string" &&
-      anthropicBody.model.length > 0
-    ? anthropicBody.model
-    : DEFAULT_MODEL_ID;
-  const headers: Record<string, string> = {
+type ZaiPlanSender = typeof upstreamRequest;
+
+type UpstreamOutcome =
+  | { ok: true; upstream: UpstreamResponse }
+  | { ok: false; response: Response };
+
+function zaiPlanUpstreamHeaders(sessionId: string): Record<string, string> {
+  return {
     "content-type": "application/json",
     "anthropic-version": "2023-06-01",
     "accept": "text/event-stream",
@@ -825,22 +882,32 @@ export async function handleZaiPlan(
     "http-referer": "https://zcode.z.ai",
     "accept-encoding": "identity",
   };
+}
 
+async function sendZaiPlan(
+  body: Record<string, unknown>,
+  sessionId: string,
+  sender: ZaiPlanSender,
+): Promise<UpstreamOutcome> {
   let upstream: UpstreamResponse;
   try {
-    upstream = await upstreamRequest({
+    upstream = await sender({
       method: "POST",
       path: MESSAGES_PATH,
-      headers,
-      body: JSON.stringify(anthropicBody),
+      headers: zaiPlanUpstreamHeaders(sessionId),
+      body: JSON.stringify(body),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return jsonResponse({
-      error:
-        `zai-plan transport failed: ${message}（检查 ZAI_PLAN_PROXY 是否可达）`,
-    }, 502);
+    return {
+      ok: false,
+      response: jsonResponse({
+        error:
+          `zai-plan transport failed: ${message}（检查 ZAI_PLAN_PROXY 是否可达）`,
+      }, 502),
+    };
   }
+
   if (upstream.status !== 200) {
     const text = await new Response(upstream.body).text();
     const hint = upstream.status === 405 || text.includes("3012")
@@ -850,59 +917,88 @@ export async function handleZaiPlan(
       : text.includes("1005") || text.includes("quota")
       ? "额度未生效或已用尽（每日额度 09:00 重置；领取后延迟生效）"
       : "";
-    return jsonResponse({
-      error: `zai-plan upstream ${upstream.status}: ${text.slice(0, 300)}${
-        hint ? " —— " + hint : ""
-      }`,
-    }, upstream.status === 401 ? 401 : upstream.status === 429 ? 429 : 502);
+    return {
+      ok: false,
+      response: jsonResponse({
+        error: `zai-plan upstream ${upstream.status}: ${text.slice(0, 300)}${
+          hint ? " —— " + hint : ""
+        }`,
+      }, upstream.status === 401 ? 401 : upstream.status === 429 ? 429 : 502),
+    };
   }
 
-  // ★ 2026-11-04：网关把业务错包成 HTTP 200 + JSON（实测 `{"code":1005,...}`），
-  // 而 SSE 成功响应的 content-type 是 text/event-stream。先按 content-type 分流，
-  // 否则一个 1005 会走进 SSE 转换器变成含糊的 "stream cut"。
   if (!upstream.contentType.includes("text/event-stream")) {
     const text = await new Response(upstream.body).text();
     let code: unknown = null;
-    let msg = "";
+    let message = "";
     try {
-      const j = JSON.parse(text);
-      code = j?.code;
-      msg = String(j?.msg ?? j?.error?.message ?? text.slice(0, 300));
+      const payload = JSON.parse(text) as Record<string, unknown>;
+      code = payload.code;
+      const payloadError = payload.error && typeof payload.error === "object" &&
+          !Array.isArray(payload.error)
+        ? payload.error as Record<string, unknown>
+        : undefined;
+      message = String(
+        payload.msg ?? payloadError?.message ?? text.slice(0, 300),
+      );
     } catch {
-      msg = text.slice(0, 300);
+      message = text.slice(0, 300);
     }
-    const hint = code === 1005 || /quota/i.test(msg)
+    const hint = code === 1005 || /quota/i.test(message)
       ? "额度未生效或已用尽（每日额度 09:00 重置；新领份额延迟生效，实测领取后约 3.5 小时）"
-      : /3012|unusual activity/i.test(msg)
+      : /3012|unusual activity/i.test(message)
       ? "WAF 拦截 —— 出口 IP 被区别对待，检查 ZAI_PLAN_PROXY"
       : "";
-    return jsonResponse({
-      error: `zai-plan upstream ${upstream.status}${
-        code ? ` code=${code}` : ""
-      }: ${msg}${hint ? " —— " + hint : ""}`,
-    }, 502);
+    return {
+      ok: false,
+      response: jsonResponse({
+        error: `zai-plan upstream ${upstream.status}${
+          code ? ` code=${code}` : ""
+        }: ${message}${hint ? " —— " + hint : ""}`,
+      }, 502),
+    };
   }
 
-  const wantsStream = (openai as { stream?: boolean }).stream === true;
-  const created = Math.floor(Date.now() / 1000);
-  const requestId = `zai-plan-${sessionId}`;
+  return { ok: true, upstream };
+}
+
+async function runZaiPlanChat(
+  openai: Record<string, unknown>,
+  sessionId: string,
+  sender: ZaiPlanSender,
+): Promise<Response> {
+  const anthropicBody = toAnthropicBody(
+    openai as Parameters<typeof toAnthropicBody>[0],
+    null,
+    sessionId,
+  );
+  const outcome = await sendZaiPlan(anthropicBody, sessionId, sender);
+  if (!outcome.ok) return outcome.response;
+
+  const responseModel = typeof anthropicBody.model === "string" &&
+      anthropicBody.model.length > 0
+    ? anthropicBody.model
+    : DEFAULT_MODEL_ID;
+  const wantsStream = openai.stream === true;
   const chunkStream = anthropicSseToOpenAiChunks(
-    upstream.body,
+    outcome.upstream.body,
     responseModel,
-    created,
-    requestId,
+    Math.floor(Date.now() / 1000),
+    `zai-plan-${sessionId}`,
   );
   if (!wantsStream) {
     try {
-      const completion = await aggregateChunks(chunkStream, responseModel);
-      return jsonResponse(completion);
+      return jsonResponse(
+        await aggregateChunks(chunkStream, responseModel),
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return jsonResponse({ error: message }, 502);
     }
   }
+
   const encoder = new TextEncoder();
-  const sse = new ReadableStream<Uint8Array>({
+  const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         for await (const line of chunkStream) {
@@ -923,12 +1019,416 @@ export async function handleZaiPlan(
       }
     },
   });
-  return new Response(sse, {
-    status: 200,
+  return new Response(stream, {
     headers: {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache",
       "connection": "keep-alive",
     },
   });
+}
+
+async function* anthropicSseEvents(
+  stream: ReadableStream<Uint8Array>,
+): AsyncGenerator<Record<string, unknown>> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const emit = function* (
+    chunk: string,
+  ): Generator<Record<string, unknown>> {
+    let index: number;
+    while ((index = chunk.indexOf("\n")) >= 0) {
+      const line = chunk.slice(0, index).replace(/\r$/, "");
+      chunk = chunk.slice(index + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(payload) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          yield parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Ignore malformed keepalive/comment payloads; protocol events below
+        // still determine whether the stream completed.
+      }
+    }
+    buffer = chunk;
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      yield* emit(buffer);
+    }
+    buffer += decoder.decode();
+    yield* emit(buffer);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function mergeAnthropicUsage(
+  target: Record<string, number>,
+  source: unknown,
+): void {
+  if (!source || typeof source !== "object" || Array.isArray(source)) return;
+  for (const [key, value] of Object.entries(source)) {
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    if (key.endsWith("_tokens")) target[key] = value;
+  }
+}
+
+export async function aggregateAnthropicMessages(
+  stream: ReadableStream<Uint8Array>,
+  requestedModel: string,
+): Promise<Record<string, unknown>> {
+  let id = "";
+  let model = requestedModel;
+  let stopReason: string | null = null;
+  let sawStop = false;
+  const usage: Record<string, number> = {
+    input_tokens: 0,
+    output_tokens: 0,
+  };
+  const content: Array<Record<string, unknown>> = [];
+  const partialJson = new Map<number, string>();
+
+  for await (const event of anthropicSseEvents(stream)) {
+    const type = String(event.type ?? "");
+    if (type === "message_start") {
+      const message = event.message as Record<string, unknown> | undefined;
+      if (message) {
+        id = String(message.id ?? id);
+        model = typeof message.model === "string" && message.model
+          ? message.model
+          : model;
+        mergeAnthropicUsage(usage, message.usage);
+      }
+      continue;
+    }
+    if (type === "content_block_start") {
+      const block = event.content_block;
+      if (block && typeof block === "object" && !Array.isArray(block)) {
+        content.push({ ...(block as Record<string, unknown>) });
+      }
+      continue;
+    }
+    if (type === "content_block_delta") {
+      const index = Number(event.index);
+      const block = content[index];
+      const delta = event.delta as Record<string, unknown> | undefined;
+      if (!block || !delta) continue;
+      if (delta.type === "text_delta" && typeof delta.text === "string") {
+        block.text = `${String(block.text ?? "")}${delta.text}`;
+      } else if (
+        delta.type === "thinking_delta" && typeof delta.thinking === "string"
+      ) {
+        block.thinking = `${String(block.thinking ?? "")}${delta.thinking}`;
+      } else if (
+        delta.type === "signature_delta" && typeof delta.signature === "string"
+      ) {
+        block.signature = `${String(block.signature ?? "")}${delta.signature}`;
+      } else if (
+        delta.type === "input_json_delta" &&
+        typeof delta.partial_json === "string"
+      ) {
+        partialJson.set(
+          index,
+          `${partialJson.get(index) ?? ""}${delta.partial_json}`,
+        );
+      }
+      continue;
+    }
+    if (type === "message_delta") {
+      const delta = event.delta as Record<string, unknown> | undefined;
+      if (delta && typeof delta.stop_reason === "string") {
+        stopReason = delta.stop_reason;
+      }
+      mergeAnthropicUsage(usage, event.usage);
+      continue;
+    }
+    if (type === "message_stop") {
+      sawStop = true;
+      continue;
+    }
+    if (type === "error") {
+      const error = event.error as Record<string, unknown> | undefined;
+      throw new Error(String(error?.message ?? "zai-plan upstream error"));
+    }
+  }
+
+  if (!sawStop) {
+    throw new Error("zai-plan upstream stream cut");
+  }
+  for (const [index, raw] of partialJson) {
+    const block = content[index];
+    if (!block || block.type !== "tool_use") continue;
+    try {
+      block.input = raw ? JSON.parse(raw) : {};
+    } catch {
+      throw new Error("zai-plan upstream returned invalid tool arguments");
+    }
+  }
+  return {
+    id: id || `msg_${crypto.randomUUID().replace(/-/g, "")}`,
+    type: "message",
+    role: "assistant",
+    model,
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage,
+  };
+}
+
+function withZaiPlanSessionMetadata(
+  body: Record<string, unknown>,
+  sessionId: string,
+): Record<string, unknown> {
+  const metadata = body.metadata &&
+      typeof body.metadata === "object" &&
+      !Array.isArray(body.metadata)
+    ? { ...(body.metadata as Record<string, unknown>) }
+    : {};
+  let userId: Record<string, unknown> = {};
+  if (typeof metadata.user_id === "string") {
+    try {
+      const parsed = JSON.parse(metadata.user_id) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        userId = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // The session is carried by the x-session-id header as well, so an
+      // unexpected non-JSON user_id does not need to block this request.
+    }
+  }
+  metadata.user_id = JSON.stringify({
+    ...userId,
+    device_id: typeof userId.device_id === "string" ? userId.device_id : "",
+    account_uuid: typeof userId.account_uuid === "string"
+      ? userId.account_uuid
+      : "",
+    session_id: sessionId,
+  });
+  return { ...body, metadata };
+}
+
+function guardAnthropicMessagesStream(
+  source: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const reader = source.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let terminal = false;
+  let sawError = false;
+  let cancelled = false;
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const emitError = (message: string) => {
+        if (terminal || sawError || cancelled) return;
+        sawError = true;
+        controller.enqueue(
+          encoder.encode(
+            `event: error\ndata: ${
+              JSON.stringify({
+                type: "error",
+                error: { type: "api_error", message },
+              })
+            }\n\n`,
+          ),
+        );
+      };
+      const scan = (chunk: string) => {
+        let index: number;
+        while ((index = chunk.indexOf("\n")) >= 0) {
+          const line = chunk.slice(0, index).replace(/\r$/, "");
+          chunk = chunk.slice(index + 1);
+          if (!line.startsWith("data:")) continue;
+          try {
+            const parsed = JSON.parse(line.slice(5).trim()) as Record<
+              string,
+              unknown
+            >;
+            if (parsed.type === "message_stop") terminal = true;
+            if (parsed.type === "error") sawError = true;
+          } catch {
+            // Keepalive/comment payloads are not protocol terminal events.
+          }
+        }
+        buffer = chunk;
+      };
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (!cancelled) controller.enqueue(value);
+          buffer += decoder.decode(value, { stream: true });
+          scan(buffer);
+        }
+        buffer += decoder.decode();
+        scan(buffer);
+        if (!terminal && !sawError) emitError("zai-plan upstream stream cut");
+      } catch (error) {
+        emitError(error instanceof Error ? error.message : String(error));
+      } finally {
+        try {
+          controller.close();
+        } catch {
+          // The client may already have cancelled the stream.
+        }
+      }
+    },
+    cancel() {
+      cancelled = true;
+      void reader.cancel().catch(() => undefined);
+    },
+  });
+}
+
+async function runZaiPlanMessages(
+  input: Record<string, unknown>,
+  sessionId: string,
+  sender: ZaiPlanSender,
+): Promise<Response> {
+  if (typeof input.model !== "string" || !input.model.trim()) {
+    return jsonResponse(
+      {
+        type: "error",
+        error: { type: "invalid_request_error", message: "model is required" },
+      },
+      400,
+    );
+  }
+  if (
+    !Number.isSafeInteger(input.max_tokens) || Number(input.max_tokens) < 1
+  ) {
+    return jsonResponse(
+      {
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: "max_tokens must be a positive integer",
+        },
+      },
+      400,
+    );
+  }
+  if (!Array.isArray(input.messages) || input.messages.length === 0) {
+    return jsonResponse(
+      {
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          message: "messages must be a non-empty array",
+        },
+      },
+      400,
+    );
+  }
+
+  const upstreamBody = withZaiPlanSessionMetadata(
+    { ...input, stream: true },
+    sessionId,
+  );
+  const outcome = await sendZaiPlan(upstreamBody, sessionId, sender);
+  if (!outcome.ok) return outcome.response;
+  if (input.stream === true) {
+    return new Response(guardAnthropicMessagesStream(outcome.upstream.body), {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache",
+        "connection": "keep-alive",
+        "x-session-id": sessionId,
+      },
+    });
+  }
+  try {
+    return jsonResponse(
+      await aggregateAnthropicMessages(
+        outcome.upstream.body,
+        input.model,
+      ),
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return jsonResponse(
+      { type: "error", error: { type: "api_error", message } },
+      502,
+    );
+  }
+}
+
+export async function handleZaiPlan(
+  path: string,
+  request: Request,
+  sender: ZaiPlanSender = upstreamRequest,
+): Promise<Response> {
+  if (path.endsWith("/models")) {
+    return jsonResponse({ object: "list", data: KNOWN_MODELS });
+  }
+  if (request.method !== "POST") {
+    return jsonResponse(
+      {
+        error:
+          "GET is supported only for /models; inference endpoints require POST",
+      },
+      404,
+    );
+  }
+
+  if (path.endsWith("/responses")) {
+    return await handleDeepseekResponses(
+      request,
+      async (chatBody) => {
+        const sessionId = resolveZaiPlanSession(request, chatBody);
+        return await runZaiPlanChat(chatBody, sessionId, sender);
+      },
+      12 * 1024 * 1024,
+      true,
+    );
+  }
+
+  const parsed = await readJsonBodyLimited(request, 12 * 1024 * 1024);
+  if (!parsed.ok) {
+    return jsonResponse(
+      {
+        error: {
+          message: parsed.message,
+          type: parsed.status === 413
+            ? "payload_too_large"
+            : "invalid_request_error",
+        },
+      },
+      parsed.status,
+    );
+  }
+  if (
+    !parsed.value || typeof parsed.value !== "object" ||
+    Array.isArray(parsed.value)
+  ) {
+    return jsonResponse(
+      { error: { message: "Request body must be a JSON object" } },
+      400,
+    );
+  }
+  const body = parsed.value as Record<string, unknown>;
+  const sessionId = resolveZaiPlanSession(request, body);
+
+  if (path.endsWith("/chat/completions")) {
+    return await runZaiPlanChat(body, sessionId, sender);
+  }
+  if (path.endsWith("/messages")) {
+    return await runZaiPlanMessages(body, sessionId, sender);
+  }
+  return jsonResponse(
+    {
+      error:
+        "unsupported zai-plan path (use /chat/completions, /responses, or /messages)",
+    },
+    404,
+  );
 }

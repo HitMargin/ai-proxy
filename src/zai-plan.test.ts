@@ -1,13 +1,19 @@
 import {
+  aggregateAnthropicMessages,
   aggregateChunks,
   anthropicSseToOpenAiChunks,
   decryptZCodeValue,
   handleZaiPlan,
   imageBlockOf,
+  resolveZaiPlanSession,
   toAnthropicBody,
   ZAI_PLAN_MODELS,
 } from "./zai-plan.ts";
-import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
+import {
+  assertEquals,
+  assertRejects,
+  assertStringIncludes,
+} from "jsr:@std/assert@1";
 
 // ---------- 凭据解密 ----------
 
@@ -84,6 +90,220 @@ Deno.test("zai-plan keeps the pinned catalog and fixed advertised subset", async
     "glm-5.3",
     "glm-5.3-flash",
   ]);
+  const flash = body.data.find((model) => model.id === "glm-5.3-flash") as
+    & { id: string }
+    & Record<string, unknown>;
+  assertEquals(flash?.context_window, 1000000);
+  assertEquals(flash?.max_output_tokens, 128000);
+  assertEquals(flash?.input_modalities, ["text", "image"]);
+  assertEquals(
+    (flash.reasoning_efforts as Array<{ id: string }> | undefined)
+      ?.map((effort) => effort.id),
+    ["low", "high", "max"],
+  );
+  assertEquals(
+    flash.default_reasoning_effort,
+    "max",
+  );
+  const glm53 = body.data.find((model) => model.id === "glm-5.3") as
+    & { id: string }
+    & Record<string, unknown>;
+  assertEquals(glm53.context_window, 1000000);
+  assertEquals(glm53.max_output_tokens, 128000);
+  assertEquals(glm53.input_modalities, ["text"]);
+  assertEquals(
+    (glm53.reasoning_efforts as Array<{ id: string }> | undefined)
+      ?.map((effort) => effort.id),
+    ["low", "high", "max"],
+  );
+  assertEquals(glm53.default_reasoning_effort, "max");
+});
+
+Deno.test("zai-plan session headers win over per-request random ids", () => {
+  const request = new Request("http://proxy/zai-plan/v1/chat/completions", {
+    method: "POST",
+    headers: { "x-session-id": "dsh-session-42" },
+  });
+  assertEquals(
+    resolveZaiPlanSession(request, { metadata: { session_id: "body" } }),
+    "dsh-session-42",
+  );
+});
+
+function anthropicEventStream(
+  events: Array<Record<string, unknown>>,
+): ReadableStream<Uint8Array> {
+  const bytes = new TextEncoder().encode(
+    events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
+  );
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+function successfulAnthropicEvents(): Array<Record<string, unknown>> {
+  return [
+    {
+      type: "message_start",
+      message: {
+        id: "msg_upstream",
+        model: "glm-5.3-flash",
+        usage: { input_tokens: 7 },
+      },
+    },
+    {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    },
+    {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: "收到" },
+    },
+    { type: "content_block_stop", index: 0 },
+    {
+      type: "message_delta",
+      delta: { stop_reason: "end_turn" },
+      usage: { input_tokens: 9, output_tokens: 3 },
+    },
+    { type: "message_stop" },
+  ];
+}
+
+Deno.test("aggregateAnthropicMessages rebuilds a non-streaming message", async () => {
+  const message = await aggregateAnthropicMessages(
+    anthropicEventStream(successfulAnthropicEvents()),
+    "glm-5.3-flash",
+  );
+  assertEquals(message.id, "msg_upstream");
+  assertEquals(message.model, "glm-5.3-flash");
+  assertEquals(message.stop_reason, "end_turn");
+  assertEquals(message.usage, { input_tokens: 9, output_tokens: 3 });
+  const content = message.content as Array<Record<string, unknown>>;
+  assertEquals(content[0], { type: "text", text: "收到" });
+});
+
+Deno.test("aggregateAnthropicMessages rejects a stream without message_stop", async () => {
+  const events = successfulAnthropicEvents().filter((event) =>
+    event.type !== "message_stop"
+  );
+  await assertRejects(
+    () =>
+      aggregateAnthropicMessages(
+        anthropicEventStream(events),
+        "glm-5.3-flash",
+      ),
+    Error,
+    "stream cut",
+  );
+});
+
+Deno.test("zai-plan /messages preserves history metadata and forwards the session", async () => {
+  let sent: { headers: Record<string, string>; body?: string } | undefined;
+  const sender = async (options: {
+    headers: Record<string, string>;
+    body?: string;
+  }) => {
+    sent = options;
+    return {
+      status: 200,
+      contentType: "text/event-stream",
+      body: anthropicEventStream(successfulAnthropicEvents()),
+    };
+  };
+  const request = new Request("http://proxy/zai-plan/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-session-id": "stable-session",
+    },
+    body: JSON.stringify({
+      model: "glm-5.3-flash",
+      max_tokens: 100,
+      messages: [
+        { role: "user", content: "第一轮" },
+        { role: "assistant", content: "第一轮回答" },
+        { role: "user", content: "第二轮" },
+      ],
+      stream: false,
+    }),
+  });
+  const response = await handleZaiPlan(
+    "/zai-plan/v1/messages",
+    request,
+    sender,
+  );
+  assertEquals(response.status, 200);
+  assertEquals(sent?.headers["x-session-id"], "stable-session");
+  const upstream = JSON.parse(String(sent?.body)) as Record<string, unknown>;
+  assertEquals(upstream.stream, true);
+  assertEquals(
+    (upstream.messages as Array<Record<string, unknown>>).length,
+    3,
+  );
+  const metadata = upstream.metadata as Record<string, unknown>;
+  const userId = JSON.parse(String(metadata.user_id)) as Record<
+    string,
+    unknown
+  >;
+  assertEquals(userId.session_id, "stable-session");
+  const message = await response.json() as Record<string, unknown>;
+  assertEquals(message.type, "message");
+  assertEquals(message.stop_reason, "end_turn");
+});
+
+Deno.test("zai-plan /responses converts input into a Responses result", async () => {
+  let sent: { headers: Record<string, string>; body?: string } | undefined;
+  const sender = async (options: {
+    headers: Record<string, string>;
+    body?: string;
+  }) => {
+    sent = options;
+    return {
+      status: 200,
+      contentType: "text/event-stream",
+      body: anthropicEventStream(successfulAnthropicEvents()),
+    };
+  };
+  const request = new Request("http://proxy/zai-plan/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-session-id": "stable-session",
+    },
+    body: JSON.stringify({
+      model: "glm-5.3-flash",
+      input: [
+        { role: "user", content: "第一轮" },
+        { role: "assistant", content: "第一轮回答" },
+        { role: "user", content: "第二轮" },
+      ],
+      stream: false,
+    }),
+  });
+  const response = await handleZaiPlan(
+    "/zai-plan/v1/responses",
+    request,
+    sender,
+  );
+  assertEquals(response.status, 200);
+  assertEquals(sent?.headers["x-session-id"], "stable-session");
+  const chatBody = JSON.parse(String(sent?.body)) as Record<string, unknown>;
+  assertEquals(
+    (chatBody.messages as Array<Record<string, unknown>>).length,
+    3,
+  );
+  const result = await response.json() as Record<string, unknown>;
+  assertEquals(result.object, "response");
+  assertEquals(result.status, "completed");
+  assertEquals(result.output_text, "收到");
+  const usage = result.usage as Record<string, unknown>;
+  assertEquals(usage.input_tokens, 9);
+  assertEquals(usage.output_tokens, 3);
 });
 
 // ---------- OpenAI → Anthropic ----------

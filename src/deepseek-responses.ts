@@ -747,7 +747,7 @@ export async function handleDeepseekResponses(
       JSON.stringify({
         error: {
           message:
-            "CommandCode stateless proxy does not support previous_response_id, conversation, background, store, non-default truncation/include, structured text format, or invalid input/tools",
+            "This stateless proxy does not support previous_response_id, conversation, background, store, non-default truncation/include, structured text format, or invalid input/tools",
           type: "invalid_request_error",
         },
       }),

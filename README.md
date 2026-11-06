@@ -7,9 +7,9 @@
 1. **标准 OpenAI 兼容上游**（透传）：kilo.ai、opencode.ai/zen、openrouter.ai、tokenharbor.ai、zlkpro.tech
 2. **网页端私有接口**：chat.deepseek.com（PoW + Cookie 会话）、api.trae.cn（协议翻译 + 签到）、cnb.cool（会话自举 + 提示词协议模拟），分别包装成标准 Chat Completions / Responses
 3. **私有 CLI 网关**：CommandCode Go（移植 `dsh-cmdgo-provider` 的模型筛选、网关协议、多账号池与额度读取）与 WorkBuddy 中国版（文件凭据 + 自动续期 + 流内内容拦截）
-4. **Anthropic Messages**：`/commandcode/v1/messages` 做 OpenAI ⇄ Messages 双向转换（原先的 `/anthropic/v1` 与 `/gemini/v1` 已下线，见下方说明）
+4. **Anthropic Messages**：`/commandcode/v1/messages` 做 OpenAI ⇄ Messages 双向转换；`/zai-plan/v1/messages` 原生转发（原先的 `/anthropic/v1` 与 `/gemini/v1` 已下线，见下方说明）
 5. **任意自填的 OpenAI 兼容上游**：面板里填名字 + 地址 + key 即可，**不用改代码、不用重启**
-6. **Z.ai Start Plan**：`/zai-plan/v1` 把 ZCode 桌面端每日 300M tokens 的 GLM-5.3-Flash 额度接进来——凭据走官方 device-flow 登录（本地 `zcode-bridge` 网关自持 plan JWT），协议转换在 `src/zai-plan.ts`；出口必须经用户的代理（WAF 按出口 IP 与客户端形态区别对待，见 AGENTS.md「Z.ai Start Plan 渠道」）
+6. **Z.ai Start Plan**：`/zai-plan/v1` 把 ZCode 桌面端的套餐额度接进来，支持 Chat Completions、Responses 与 Anthropic Messages——凭据走官方 device-flow 登录（本地 `zcode-bridge` 网关自持 plan JWT），协议转换在 `src/zai-plan.ts`；出口必须经用户的代理（WAF 按出口 IP 与客户端形态区别对待，见 AGENTS.md「Z.ai Start Plan 渠道」）。登录必须在 `tools\zcode-bridge` 工作目录执行，否则新 JWT 会写到仓库根目录的 `data\accounts.json`，而常驻 bridge 读取的是 `tools\zcode-bridge\data\accounts.json`。
 
 > 同一份 `main.ts` 可以跑在 **Deno Deploy**、**本地 Deno**、**Cloudflare Workers** 三种环境。
 
@@ -98,7 +98,7 @@ src/zen-compaction.ts      Zen 会话压缩
 src/zen-egress.ts          Zen 出口代理轮换
 src/custom.ts              自定义供应商：来源合并、校验、出站头、路由解析
 src/custom-handler.ts      /custom/v1 的列表聚合与推理转发
-src/zai-plan.ts            Z.ai Start Plan：ZCode 凭据解密、本地 zcode-bridge 网关对接、OpenAI↔Anthropic 转换（含思考与工具）
+src/zai-plan.ts            Z.ai Start Plan：稳定会话、Chat/Responses/Messages 三入口、本地 zcode-bridge 网关对接与协议转换
 src/commandcode/           CommandCode Go 模型、协议、账号池、OAuth、额度、Messages 转换与路由
 tools/zai-plan-relay/      Start Plan 侦察工具链：CDP 监听、netlog/tracing 捕获、捕获转发代理、探针（.mjs/.go）
 tools/zcode-bridge/        第三方 zcode-bridge 网关（azrinaldi/zcode-bridge）的本地安装位（二进制不入库）
@@ -584,6 +584,8 @@ Zen 的 `GET /models` 只返回 `{ id, object, created, owned_by }`，没有上�
 
 **模型选择器按渠道分组。** 插件向 Host 注册**两个层面**：一个可配置的 `ai-proxy` Provider（地址在设置页里改），以及 9 个 `ai-proxy-<渠道>` 的只读 adapter（`ai-proxy-commandcode` / `-cnb` / `-deepseek-web` / `-kilo` / `-tokenharbor` / `-trae` / `-workbuddy` / `-zen` / `-zlkpro`，见 `dsh-plugin/index.js` 的 `CHANNEL_GROUPS`），每个 adapter 只列自己渠道的模型并带上中文标题。全部 adapter 共用同一个 `ProjectAdapter` 实例——Host 的 `registerAdapter` 一次接收一个列表，所以同一个对象按 provider id 各自收窄列表即可。
 
+模型元数据变化也会发布到 Host：插件按 provider 保存归一化目录签名，只有 `contextWindow`、输出上限、输入模态或思考档位等字段变化时才发 `llm/models-updated`，让已打开的选择器重拉目录。这个监听逻辑本身要重启一次 DSH Host 才会装载；之后代理重启或面板轮询发现变化，就不再要求重启 Host。
+
 三处必须照做的约束：
 
 - **id 必须带 `ai-proxy-` 前缀**。用户的 `cordis.patch.yml` 里已经注册过 `commandcode` / `deepseek-web` 同名 provider，宿主的 `prepareRoutes` 遇重名抛 `DUPLICATE_ADAPTER`，**整个插件条目都不激活**（炸过两次桌面端）。选择器里显示的名字来自 `providerInfo().name`，与 id 无关。
@@ -707,6 +709,7 @@ curl http://localhost:8000/commandcode/v1/chat/completions \
 | `/zlkpro/v1` | zlkpro.tech | 透传（标准 OpenAI 契约：流式、工具调用、带斜杠的模型 id 均原样可用） |
 | `/custom/v1` | **用户自填的任意 OpenAI 兼容上游** | 按 `自定义供应商/<名字>/<模型>` 路由；凭据按供应商各自配置，只发我们自己的 key，**不转发入站 authorization** |
 | `/cnb/v1` | cnb.cool | **自定义处理器**（见下节） |
+| `/zai-plan/v1` | zcode.z.ai Start Plan 网关 | Chat Completions、Responses 与 Anthropic Messages；优先复用 `x-session-id` / `x-conversation-id`，无状态响应依赖请求内完整历史 |
 | `/health` | 本地代理 | 返回最近一次模型健康探测汇总；不会在请求时自动发起探测 |
 
 `GET /` 会返回所有可用 provider 列表。`GET /health` 返回各 provider 最近一次健康探测的状态（`available` / `degraded` / `unavailable` / `unknown`）；没有探测记录时显示 `unknown`，不会因为一次网络失败把模型清单清空。

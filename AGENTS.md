@@ -471,6 +471,43 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   x-api-key/oauth token/apiKeyId 三种凭据 × bearer/x-api-key 两种形状 ×
   全套 attribution 头 + 双 cookie 罐 + 四种传输栈。**
 
+  **★ 2026-11-06：协议入口与会话身份补齐（单测覆盖，未做真实上游 smoke）**：
+  `handleZaiPlan` 现在支持 `/chat/completions`、`/responses` 与原生
+  `/messages`；Responses 复用 `deepseek-responses.ts` 的无状态转换，明确拒绝
+  `previous_response_id` / `store:true`，上下文必须完整放在 `input`。三条入口
+  共用 `resolveZaiPlanSession()`：优先读 `x-session-id` /
+  `x-conversation-id` / `x-session-affinity` / `prompt_cache_key` /
+  `session_id`，其次读 body metadata，最后才生成随机 UUID；出站
+  `x-session-id` 与 Anthropic `metadata.user_id.session_id` 使用同一个值。
+  这修掉旧实现每轮 `crypto.randomUUID()` 导致同一 DSH 对话被上游视为新会话、
+  缓存亲和反复丢失的问题。`/messages` 原生保留完整 `messages` 与工具历史，
+  非流式由 Anthropic SSE 聚合，流式检查 `message_stop`，缺失时报
+  `stream_cut`。判据：无状态代理的上下文由请求体负责，稳定 session 只负责
+  上游会话/缓存亲和；没有客户端会话头时不做跨请求谱系猜测，宁可隔离
+  one-shot 请求，也不把相同首条消息的不同对话融合。
+  模型目录中 `glm-5.3` 与 `glm-5.3-flash` 都发布 `low/high/max` 三档、
+  默认 `max`；插件自检同时断言两行的 context/output/modalities/efforts，
+  防止只同步 Flash 而让基础 GLM 5.3 再次显示“不支持”。
+
+- **ZCode bridge 登录目录坑（2026-11-06 实测）**：`zcode-bridge.exe login`
+  按进程 cwd 写 `data/accounts.json`。从仓库根目录运行会写
+  `D:\Projects\ai-proxy\data\accounts.json`，而由 `tools/zcode-bridge` 启动的
+  常驻 bridge 读取 `tools/zcode-bridge/data/accounts.json`；两份文件不一致时，
+  bridge 仍报 `plan jwt: MISSING`，即使新授权已经成功。登录命令必须先
+  `Set-Location tools\zcode-bridge`，或登录后把根目录账户文件同步到
+  `tools/zcode-bridge/data/accounts.json`。2026-11-06 已用最小
+  `/v1/messages` 和 ai-proxy `/zai-plan/v1/chat/completions` 请求验证恢复，
+  两条链路均 HTTP 200。
+
+- **DSH 模型元数据同步（2026-11-06 修）**：`AiProxyAdapter` 现在按 provider
+  保存归一化目录签名（id、context、maxTokens、modalities、efforts/default
+  全部参与），只在签名变化时通过 `onCatalogChange` 发
+  `llm/models-updated`；自检用 `zaiPlan/glm-5.3-flash` 先建立初始签名，再只改
+  `contextWindow`，断言事件确实发出。Host 的目录是 generation-scoped，代理
+  重启后若没有这个事件，旧的上下文/思考档位会一直显示到 DSH Host 重启。监听器
+  本身仍受插件热重载边界限制：`listModels`/`listProjectModels` 的新实现首次
+  装载需要重启 DSH Host，之后的元数据变化由事件刷新。
+
 - **可用通道**：`/v1` 聚合入口的 kilo 系模型（**2026-10-05
   复核**：`kilo/stepfun/step-3.7-flash:free` 实测正常出流；同一天
   `kilo/deepseek/deepseek-v4-flash-0731:free` 已下架，上游回

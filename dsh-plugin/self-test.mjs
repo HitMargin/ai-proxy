@@ -35,6 +35,7 @@ const { apply, AiProxyAdapter, CatalogGate, ProxyRuntime, TunnelRuntime, healthI
 process.env.TEST_BRIDGE_KEY = 'local-test-key';
 const originalFetch = globalThis.fetch;
 let modelCalls = 0;
+let zaiPlanContextWindow = 1000000;
 let loginCalls = 0;
 // The TRAE account routes. A counter per call is what makes the assertions
 // falsifiable: "the button posts once and the status read is not a POST" cannot
@@ -320,6 +321,35 @@ globalThis.fetch = async (input, init = {}) => {
             default_reasoning_effort: 'off',
           },
           {
+            // Z.ai Start Plan advertises the same metadata shape through the
+            // aggregate. The row must survive normalization with its context,
+            // output ceiling, vision flag, and published effort ladder intact.
+            id: 'zaiPlan/glm-5.3',
+            name: 'GLM 5.3',
+            context_window: zaiPlanContextWindow,
+            max_output_tokens: 128000,
+            input_modalities: ['text'],
+            reasoning_efforts: [
+              { id: 'low', name: 'Low' },
+              { id: 'high', name: 'High' },
+              { id: 'max', name: 'Max' },
+            ],
+            default_reasoning_effort: 'max',
+          },
+          {
+            id: 'zaiPlan/glm-5.3-flash',
+            name: 'GLM 5.3 Flash',
+            context_window: zaiPlanContextWindow,
+            max_output_tokens: 128000,
+            input_modalities: ['text', 'image'],
+            reasoning_efforts: [
+              { id: 'low', name: 'Low' },
+              { id: 'high', name: 'High' },
+              { id: 'max', name: 'Max' },
+            ],
+            default_reasoning_effort: 'max',
+          },
+          {
             // No modality list at all: the `modality` shorthand is the only
             // signal, so it has to be parsed rather than defaulted to text.
             id: 'kilo/shorthand-only',
@@ -538,6 +568,10 @@ try {
   let registeredRoutes;
   const ctx = {
     fiber: { entry: { options: { id: 'bridge-test' } } },
+    modelEvents: [],
+    emit(event, provider) {
+      this.modelEvents.push({ event, provider });
+    },
     llm: {
       registerAdapter(routes, value) { registeredRoutes = routes; adapter = value; return { dispose() {} }; },
       registerConfigurableProviders() {},
@@ -703,6 +737,56 @@ try {
     models.find((model) => model.id === 'commandcode/deepseek/deepseek-v4-flash').name,
     'DeepSeek V4 Flash (latest)',
   );
+
+  // The Z.ai row is the regression case for metadata-only catalog changes.
+  // The first read establishes the signature silently (registration already
+  // announced the adapter); changing only contextWindow must emit the Host
+  // event that makes the browser directory reload without a DSH restart.
+  const zaiRow = models.find((model) => model.id === 'zaiPlan/glm-5.3-flash');
+  assert.ok(zaiRow, 'the Z.ai Start Plan row must reach the panel listing');
+  assert.equal(zaiRow.contextWindow, 1000000);
+  assert.equal(zaiRow.maxTokens, 128000);
+  assert.deepEqual(zaiRow.inputModalities, ['text', 'image']);
+  assert.deepEqual(
+    zaiRow.reasoningEfforts.map((effort) => effort.id),
+    ['low', 'high', 'max'],
+  );
+  assert.equal(zaiRow.defaultReasoningEffort, 'max');
+  const zaiBaseRow = models.find((model) => model.id === 'zaiPlan/glm-5.3');
+  assert.ok(zaiBaseRow, 'GLM 5.3 must reach the panel listing');
+  assert.equal(zaiBaseRow.contextWindow, 1000000);
+  assert.equal(zaiBaseRow.maxTokens, 128000);
+  assert.deepEqual(zaiBaseRow.inputModalities, ['text']);
+  assert.deepEqual(
+    zaiBaseRow.reasoningEfforts.map((effort) => effort.id),
+    ['low', 'high', 'max'],
+  );
+  assert.equal(zaiBaseRow.defaultReasoningEffort, 'max');
+  // Prime the group's signature before changing metadata. The initial read is
+  // deliberately silent because adapter registration already published the
+  // topology event; only a later metadata-only difference should refresh.
+  await adapter.listModels('ai-proxy-zaiPlan');
+  const eventsBeforeMetadataChange = ctx.modelEvents.length;
+  zaiPlanContextWindow = 999999;
+  const changedZaiRows = await adapter.listProjectModels({
+    provider: 'ai-proxy-zaiPlan',
+    force: true,
+  });
+  const changedZaiRow = changedZaiRows.find((model) =>
+    model.id === 'zaiPlan/glm-5.3-flash'
+  );
+  assert.equal(changedZaiRow.contextWindow, 999999);
+  assert.ok(
+    ctx.modelEvents.length > eventsBeforeMetadataChange,
+    'a metadata-only model change must publish llm/models-updated',
+  );
+  assert.ok(
+    ctx.modelEvents.slice(eventsBeforeMetadataChange).some((entry) =>
+      entry.event === 'llm/models-updated'
+    ),
+    'the refresh event must be the one the Host directory listens for',
+  );
+  zaiPlanContextWindow = 1000000;
   const blockedEvents = [];
   const blockedResolved = await adapter.resolveModel('ai-proxy', 'openrouter/paid/model');
   for await (const event of adapter.stream({

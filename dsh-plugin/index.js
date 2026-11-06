@@ -740,6 +740,19 @@ function publishedEfforts(row) {
   }
   return sources.length > 0 ? sources.flat() : undefined;
 }
+
+/**
+ * Stable signature for one normalized provider listing.
+ *
+ * The Host builds its browser catalog once per generation. A proxy restart can
+ * change model metadata without changing ids, so an id-only roster would leave
+ * stale context windows and reasoning ladders in the selector. The signature is
+ * computed from the normalized fields that reach `resolveModel`, and is kept
+ * per provider so one group cannot suppress another group's change.
+ */
+function modelCatalogSignature(provider, rows) {
+  return JSON.stringify([provider, rows]);
+}
 function isRecord(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -2595,6 +2608,11 @@ export class AiProxyAdapter {
     // One gate per per-channel route. A single shared cache would answer one
     // channel's request with another channel's rows.
     this.routeGates = new Map();
+    this.onCatalogChange = typeof options.onCatalogChange === 'function'
+      ? options.onCatalogChange
+      : null;
+    this.catalogSignatures = new Map();
+    this.projectCatalogSignatures = new Map();
   }
 
   /** The gate for one channel's own listing, created on first use. */
@@ -2609,6 +2627,28 @@ export class AiProxyAdapter {
 
   get baseUrl() {
     return this.runtime.serviceUrl(this.basePath);
+  }
+
+  /**
+   * Publish a catalog change only after the first observed listing.
+   *
+   * Registration already publishes `llm/adapters-updated`; emitting on the
+   * first read would make the initial catalog build refresh itself. A later
+   * metadata-only change (same ids, new context/efforts) is exactly what needs
+   * an event, because the browser directory otherwise keeps its Host-generation
+   * snapshot until the next restart.
+   */
+  notifyCatalogChange(provider, rows, signatures = this.catalogSignatures) {
+    const signature = modelCatalogSignature(provider, rows);
+    const previous = signatures.get(provider);
+    signatures.set(provider, signature);
+    if (previous === undefined || previous === signature) return;
+    try {
+      this.onCatalogChange?.(provider, rows);
+    } catch {
+      // A refresh notification must never turn a successful listing into a
+      // failed catalog read; the next poll can retry the notification.
+    }
   }
 
   headers() {
@@ -2779,7 +2819,7 @@ export class AiProxyAdapter {
     // panel asks on a ten-second poll. Uncached, a catalog build alone asked the
     // proxy 186 times for 93 models.
     if (options.force) this.gateFor(provider).refresh();
-    return this.gateFor(provider).read(async () => {
+    const rows = await this.gateFor(provider).read(async () => {
       const response = await this.request('/models');
       const payload = await response.json();
       const rows = Array.isArray(payload?.data) ? payload.data : [];
@@ -2800,6 +2840,8 @@ export class AiProxyAdapter {
       // once per model. The next read after that window tries again.
       return normalized.length === 0 ? undefined : normalized;
     });
+    this.notifyCatalogChange(provider, rows);
+    return rows;
   }
 
   async listProjectModels(options = {}) {
@@ -2934,6 +2976,7 @@ export class AiProxyAdapter {
       }
     }
     this.lastRoster = models.map((model) => model.id);
+    this.notifyCatalogChange(provider, models, this.projectCatalogSignatures);
     return models;
   }
 
@@ -4371,6 +4414,16 @@ export function apply(ctx, config = {}) {
     resolveImage,
     // The roster carries each group id together with its heading.
     channelGroups: CHANNEL_GROUPS,
+    // Host directories are generation-scoped. A proxy restart or metadata-only
+    // model change has to announce itself, otherwise the browser keeps the old
+    // context/effort projection until the next DSH restart.
+    onCatalogChange: (provider) => {
+      try {
+        ctx.emit?.('llm/models-updated', provider);
+      } catch {
+        // Event delivery is advisory; the next panel poll still refreshes.
+      }
+    },
   });
   const entryId = ctx.fiber?.entry?.options?.id ?? name;
   const groupProviders = Object.keys(CHANNEL_GROUPS);
