@@ -227,8 +227,13 @@ const XYML_BOUNDARY = new RegExp(`<\\/?${P}tool_calls\\s*>|<${P}invoke`, "gi");
 // 长字符串参数（old_string/new_string 等）最容易漏写闭合导致整参被丢；
 // 闭合标签还容忍丢 </ 前缀的 |XYML|parameter> 变体
 const XYML_PARAM_OPEN = new RegExp(`<${P}parameter\\s+([^>]*)>`, "gi");
+// Models can drop the semantic suffix too: `</|XYML>` closes the preceding
+// parameter before the next parameter/invoke tag. Only treat it as a boundary
+// when it is actually adjacent to one; otherwise it may be quoted source text.
 const XYML_PARAM_CLOSE = new RegExp(
-  `<\\/?${P}parameter\\s*>|\\|(?:XYML|QNML)\\|parameter\\s*>`,
+  `<\\/?${P}parameter\\s*>|\\|(?:XYML|QNML)\\|parameter\\s*>` +
+    `|<\\/\\s*[|｜]{0,2}\\s*(?:XYML|QNML|DSML)\\s*[|｜]{0,2}\\s*>` +
+    `(?=\\s*(?:<|$))`,
   "gi",
 );
 

@@ -2437,6 +2437,77 @@ Deno.test("cnb: unquoted XYML parameter names still become tool calls", () => {
   assertEquals(r.clean, "");
 });
 
+Deno.test("cnb: degraded short XYML closes do not pollute parameter values", () => {
+  resetJunkState();
+  const typedTools = [{
+    type: "function",
+    function: {
+      name: "exec_command",
+      description: "Run a shell command",
+      parameters: {
+        type: "object",
+        properties: {
+          cmd: { type: "string" },
+          tty: { type: "boolean" },
+          workdir: { type: "string" },
+          yield_time_ms: { type: "integer" },
+        },
+        required: ["cmd"],
+      },
+    },
+  }];
+  const r = cnbParseToolCalls(
+    `<|XYML|tool_calls>
+<|XYML|invoke name=exec_command>
+<|XYML|parameter name=cmd>rg -n "XYML" SpectreReplay/A.cs</|XYML|parameter>
+<|XYML|parameter name=tty>true</|XYML>
+<|XYML|parameter name=workdir>D:/Projects/SpectreReplay</|XYML>
+<|XYML|parameter name=yield_time_ms>10000</|XYML>
+</|XYML|invoke>
+</|XYML|tool_calls>`,
+    typedTools,
+    { notes: false },
+  );
+  assertEquals(r.calls.length, 1);
+  const args = JSON.parse(r.calls[0].function.arguments);
+  assertEquals(args.cmd, 'rg -n "XYML" SpectreReplay/A.cs');
+  assertEquals(args.tty, true);
+  assertEquals(args.workdir, "D:/Projects/SpectreReplay");
+  assertEquals(args.yield_time_ms, 10000);
+  assertEquals(r.clean, "");
+});
+
+Deno.test("cnb: a short XYML close inside parameter prose is preserved", () => {
+  resetJunkState();
+  const typedTools = [{
+    type: "function",
+    function: {
+      name: "exec_command",
+      description: "Run a shell command",
+      parameters: {
+        type: "object",
+        properties: { cmd: { type: "string" } },
+        required: ["cmd"],
+      },
+    },
+  }];
+  const r = cnbParseToolCalls(
+    `<|XYML|tool_calls>
+<|XYML|invoke name=exec_command>
+<|XYML|parameter name=cmd>echo '</|XYML>' then continue</|XYML|parameter>
+</|XYML|invoke>
+</|XYML|tool_calls>`,
+    typedTools,
+    { notes: false },
+  );
+  assertEquals(r.calls.length, 1);
+  assertEquals(
+    JSON.parse(r.calls[0].function.arguments).cmd,
+    "echo '</|XYML>' then continue",
+  );
+  assertEquals(r.clean, "");
+});
+
 Deno.test("cnb: a malformed mixed tool-call shell never reaches the user", () => {
   resetJunkState();
   const r = cnbParseToolCalls(
