@@ -46,11 +46,20 @@ export const IDE_VERSION_CODE = "20260811";
  * - solo_agent：模型最多（约 66 条）且配置最全（倍率、折扣、思考档位）。
  * - solo_work_lite：glm-5-turbo/sagitta 只在这里可用。
  * - solo_agent_remote：补上 agent 专有模型（glm-5.1/qwen-3.5）。
+ * - chat_v3 / solo_agent_lite / solo_coder（2026-11-07 补，读 magpie trae 插件
+ *   源码 packages/trae/index.mjs 的 functions 表拿到的名单）：`functions` 是
+ *   batch_get_detail_param 的**请求参数**，没要上游就不给——`solo_coder` 名册
+ *   独有 glm-5v-turbo / kimi-k2.5 / minimax-m2.7 / qwen-3.6-plus，其他 function
+ *   都不列。新通道追加在尾部：既有模型的通道选择不受影响（优先级 tie-break
+ *   仍是 solo_agent 先赢），只新增它们独占的模型。
  */
 export const TRAE_CHANNELS: readonly string[] = [
   "solo_agent",
   "solo_work_lite",
   "solo_agent_remote",
+  "chat_v3",
+  "solo_agent_lite",
+  "solo_coder",
 ];
 
 /**
@@ -208,6 +217,42 @@ function declaresReasoning(model: TraeModel): boolean {
   if (config.supportThinking === false) return false;
   return config.options.length > 0;
 }
+
+/**
+ * 内部机械件名单：目录里 usage=chat_completion、switch=true，但不是给人
+ * 对话的模型——IDE 子代理（浏览器/计算机操作/搜索）、自动路由别名、
+ * advisor 管道。2026-11-07 实测名单（全量 78 个 config_name 逐个核对）。
+ */
+const TRAE_INTERNAL_ENTRY = new RegExp(
+  [
+    "_subagent$", // browser_use_subagent / computer_use_subagent
+    "(^|_)sub_agent(_|$)", // explore_sub_agent_v2
+    "^search_agent_", // search_agent_qwen_fast(-0710)
+    "^file_search_agent$", // 文件检索代理，同属内部件
+    "_advisor(_|$)", // glm-5.1_advisor / glm-5.2_advisor_default / glm-5.2_advisor_doubao
+    "^doubao-for-auto$", // 自动路由别名，本体已单独成条
+  ].join("|"),
+);
+
+/**
+ * 实测哑弹（2026-11-07，对 a0ai/mchost 同一份目录逐个打 llm_utils_chat 取证，
+ * 共 50 个候选全量过验）：200 + **零 output 帧** + finish=stop（或整流挂起），
+ * 换 function、换可见性都一样——上游当前就是哑的。列名单而不是删代码：
+ * 上游哪天修好，重验方法＝打一发看 output 帧数，出字就从这里移除。
+ *   - Doubao_1_6        两个 function 都整流挂起（35s 连 metadata 都没有）
+ *   - kimi-k3.1-pro     三个 function 全部 out=0 finish=stop（10-02 时可用，现已哑）
+ *   - kimi-k3.1-pro-auto 唯一条目（隐藏）out=0
+ *   - sagitta           唯一 function out=0
+ * 留着的代价是选择器里一个「发消息永远得不到回复」的陷阱——正是本项目
+ * 反复在删的「完整结束但什么都没吐」。
+ */
+const TRAE_DEAD_MODEL = new Set([
+  "Doubao_1_6",
+  "kimi-k3.1-pro",
+  "kimi-k3.1-pro-auto",
+  "sagitta",
+]);
+
 function parseConfigEntry(
   entry: Record<string, unknown>,
   channel: string,
@@ -221,10 +266,19 @@ function parseConfigEntry(
     ? displayRaw as Record<string, unknown>
     : undefined;
 
-  // ⚠️ 三条硬性过滤在**解析期**执行，不设外部开关。
-  // 第 3 条实测代价很大：不滤会有 34 条 is_invisible_to_user 的隐藏模型混进目录
-  //（含 glm-5.1 / glm-5-turbo / sagitta），它们在 IDE 里对用户不可见。
-  if (readBoolean(entry, "is_invisible_to_user") === true) return undefined;
+  // ⚠️ 硬性过滤在**解析期**执行，不设外部开关。
+  //
+  // 2026-11-07 判据更新：is_invisible_to_user **不再**作为过滤依据。旧判据
+  // 「IDE 里不可见 = 不该暴露」被实测推翻——glm-5.1 / kimi-k2.6 / minimax-m2.1 /
+  // DeepSeek-V4-Flash-Official 四个隐藏条目用同一凭据打 llm_utils_chat 全部
+  // 200 + 出字 + finish=stop。隐藏只是上游的展示位选择（灰度/AB），不是
+  // 可用性信号；真正的判据只有上游校验器本身。
+  //
+  // 但目录里混着**内部机械件**：IDE 自己的子代理（浏览器/计算机操作/搜索）、
+  // 自动路由别名、advisor 管道。它们 usage=chat_completion、switch=true，
+  // 会通过下面的通用过滤，必须按名字拦掉——否则目录塞满不可对话的名字。
+  if (TRAE_INTERNAL_ENTRY.test(id)) return undefined;
+  if (TRAE_DEAD_MODEL.has(id)) return undefined;
   // config_switch === false = 上游已停用。
   if (readBoolean(entry, "config_switch") === false) return undefined;
   // usage 非 chat_completion 的条目是 summary / fast_apply / 标题生成等，

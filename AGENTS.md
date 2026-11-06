@@ -1217,6 +1217,65 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   （src/trae.ts:1094）把它丢了——面板、harness、任何客户端都只能看到能力字段。
   **判据：内部结构里有的字段不等于对外 API 有——「面板上为什么看不到 X」
   先查序列化函数丢没丢。**
+- **「VSCode 里的 TRAE 插件」反代：不用建——插件池与 IDE 池是同一个，目录已扩到 45 个模型（2026-11-07 全链路实测）**：
+  用户问「VSCode 里的 Trae 插件（`marscode.marscode-extension`，displayName 已是
+  "TRAE AI: Coding Assistant"）里的内置模型怎么反代」。取证链：扩展日志
+  （`%APPDATA%/Code/logs/<session>/window*/exthost/output_logging_*/3-TRAE AI.log`
+  的 `getClientInfo`）给出整套 boot 配置 → 聊天走 `agent.domain = https://a0ai.marscode.cn`
+  （原生 `ai-agent.exe`，Rust + TTNet/sscronet，二进制字符串里协议路径与 IDE 同族）→
+  netstat + mihomo API 实锤连接。**决定性实验：IDE 的 Cloud-IDE-JWT（trae-auth.json）
+  直接打 `a0ai.marscode.cn/api/agent/v3/llm_utils_chat` → 200 + 全流 SSE + 出字 +
+  finish=stop**，无需任何新凭据。`batch_get_detail_param` 在两个主机上返回**逐字节相同**
+  的 1.47MB 目录（18 → 全量 78 个去重 config_name），插件的 UI 名单（GLM-5.1/GLM-5/
+  Kimi-K2.6/MiniMax-M2.7…）全部在其中——插件只是挑了个展示子集。
+  由此**扩了目录**：`parseConfigEntry` 去掉 `is_invisible_to_user` 硬过滤（18 → 50），
+  逐个对上游校验器全量验收（45 通过），18 → **45 个模型**（新增 glm-5.1/glm-5/glm-5.2/
+  glm-4.6/glm-4.7/kimi-k2.6/kimi-k2.7-code/kimi-k2.8-preview/kimi-k2-0905/minimax-m2(.1)
+  及 -auto 变体/qwen-3.5/qwen-3.7-plus/Doubao-Seed-2.0-Code/aquila/seed-code-pro-0430…）。
+  **三条新判据**：
+  ①**`is_invisible_to_user` 是展示位选择（灰度/AB），不是可用性信号**——glm-5.1/
+  kimi-k2.6/minimax-m2.1/DeepSeek-V4-Flash-Official 四个隐藏条目实测全部出字，
+  推翻 10-02 的「隐藏即滤掉」；拦的只剩**内部机械件**（`TRAE_INTERNAL_ENTRY`：
+  *_subagent / sub_agent / search_agent_ / file_search_agent / _advisor / doubao-for-auto）。
+  ②**哑弹要实测要记录**：50 个候选里 5 个 FAIL——`kimi-k3.1-pro` 三个 function 全部
+  200 + **零 output 帧** + finish=stop（10-02 时可用，现已哑，且**三个条目全可见**，
+  与隐藏无关）、`kimi-k3.1-pro-auto`（唯一隐藏条目 out=0）、`sagitta`（唯一 function
+  out=0）、`Doubao_1_6`（两个 function 整流挂起 35s 无 metadata）、`file_search_agent`
+  （内部件漏网）。前四者进 `TRAE_DEAD_MODEL` 死弹名单（带日期与重验方法），留名单
+  不删代码——上游修好后打一发出字即可移除。**「200+finish=stop 但零 output 帧」
+  是上游自己的哑弹，不是我们的解析问题**——漏进目录就是一个「永远得不到回复」的
+  陷阱。③**黑名单正则先跑真实名单再定稿**：`_advisor$` 漏了 `glm-5.2_advisor_doubao`
+  （advisor 在中段），测试当场抓住——名单类正则必须对全量名单跑一遍再落锚点。
+  **计费对拍**：IDE 凭据打 a0ai 扣的是**同一个积分池**（99.96→99.95，两次小聊天
+  -0.01；45 连发 -0.06），倍率与 IDE 目录一致（Doubao-Seed-2.1-Turbo 0.2 等）。
+  「插件免费」的用户体感**未获证实**——插件原生 JWT（auth0 clientId `368953x60ky286`
+  + clientSecret 在 getClientInfo 里明文）是否映射独立免费权益**待测**（方法：插件连
+  发数条后拍 `fetchTraeBalance` 快照）；`x-app-id` 单换会被流内 `param is invalid` 拒。
+  验收路径：`PORT=8001 deno run -A main.ts` 临时实例 → `/trae/v1/models` 45 行 →
+  `/trae/v1/chat/completions` model=`glm-5.1` → reasoning 386 字符 + 正文 "ok" +
+  finish=stop。生产 :8000 重启后才生效（不信 `/restart`，比对 deno 进程启动时间）。
+  测试：36/36 trae、全套件 1104 绿。
+  **`-auto` 变体 = 同名模型 × 独立低价计费通道（2026-11-07 实测）**：`extra_info.model`
+  回传实际落点——`kimi-k3-auto`→`kimi-k3`、`glm-4.6-auto`→`glm-4.6`、
+  `Doubao-Seed-2.1-Turbo-auto`→火山 `ep-2026…` 部署号，闲聊/代码两类任务六发全部
+  直落同名本体，**不是降级路由**；但实扣 -0.01/次 vs 基础款同一句话 -1.04/次
+  （56 倍），便宜在计费不在模型（条目带 `model_entitlement_usage_cost:1`，疑似按
+  次数/权益计，机制黑盒，实扣为准）。判据：**「名义倍率 ≠ 实扣」，唯一可信的是
+  前后拍 `fetchTraeBalance` 余额**；magpie 的 trae 反代照抄目录倍率展示
+  （kimi-k3-auto 0.08× 与我们实测一致），但其目录含我们没有的条目
+  （Kimi-K2.5/MiniMax-M2.7/Qwen3.6-Plus/GLM-5V-Turbo——不在 batch_get_detail_param
+  的 78 个 config_name 里，疑似读 /v3/config 或 custom_models 展开），两边目录
+  并不同源。——**当日追案：同源，且我们少要了两个名册**。magpie trae 插件源码
+  （packages/trae/index.mjs:72-77）给出 functions 全表：`chat_v3`/`solo_work_lite`/
+  `solo_agent`/`solo_agent_lite`/**`solo_coder`**——`functions` 是 batch_get_detail_param
+  的**请求参数**，没要上游就不给；`solo_coder` 名册独有 glm-5v-turbo(0.51)/
+  kimi-k2.5(0.48)/minimax-m2.7(0.27)/qwen-3.6-plus(0.26)，`chat_v3` 另有 kimi-k2(0.48)/
+  qwen3-coder(0.26)。TRAE_CHANNELS 补齐三个通道（追加尾部不动既有优先级），目录
+  45 → **51**，6 个新模型逐个过验全出字；magpie 截图里的倍率与我们目录逐位一致，
+  所谓「不同源」其实是同一份目录的子集展示。其余可借鉴的 magpie 实测注记：
+  X-Ide-Version 是模型准入（「四月 IDE 拿不到 deepseek-v4.1-flash」）；trae-global
+  站把 auto 通道标 is_invisible_to_user 而 CN「lists are served whole」；其身份
+  ideVersion 3.3.65/clientVersion 0.1.69（比我们 0.1.52 新，模型的可见面可能更宽）。
 - **SOLO 的正文字段叫 `response`，不是 `content`（2026-10-02
   抓包）**：`event:output` 的真实形状是
   `{"response":"正文增量","reasoning_content":"思考增量","tool_calls":null,"multimodal_contents":null,"phase":null}`——**没有

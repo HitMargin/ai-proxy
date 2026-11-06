@@ -48,8 +48,10 @@ function entry(
 }
 // ── 目录 ──
 
-Deno.test("hidden entries never reach the catalog", () => {
-  // 实测：不滤会有 34 条 is_invisible_to_user 的模型混进来。
+Deno.test("hidden entries reach the catalog, internal plumbing never does", () => {
+  // 2026-11-07 判据更新：is_invisible_to_user 只是上游的展示位选择（灰度/AB），
+  // 不是可用性信号——glm-5.1 / kimi-k2.6 / minimax-m2.1 / DeepSeek-V4-Flash-Official
+  // 四个隐藏条目实测全部出字。被拦的只剩内部机械件。
   const models = parseTraeBatchModelList({
     function_configs: [
       {
@@ -57,11 +59,19 @@ Deno.test("hidden entries never reach the catalog", () => {
         config_info_list: [
           entry({ config_name: "visible" }),
           entry({ config_name: "ghost", is_invisible_to_user: true }),
+          entry({ config_name: "browser_use_subagent" }),
+          entry({ config_name: "explore_sub_agent_v2" }),
+          entry({ config_name: "search_agent_qwen_fast" }),
+          entry({ config_name: "file_search_agent" }),
+          entry({ config_name: "glm-5.2_advisor_doubao" }),
+          entry({ config_name: "doubao-for-auto" }),
+          // 2026-11-07 实测哑弹：200 + 零 output 帧 + finish=stop
+          entry({ config_name: "kimi-k3.1-pro" }),
         ],
       },
     ],
   });
-  equal(models.map((m) => m.id), ["visible"]);
+  equal(models.map((m) => m.id).sort(), ["ghost", "visible"]);
 });
 
 Deno.test("a disabled entry and a non-chat entry are both dropped", () => {
