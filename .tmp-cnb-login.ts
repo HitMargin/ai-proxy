@@ -141,10 +141,10 @@ async function waitForSessionCookie(
       cookies = await context.cookies(CNB_ORIGIN);
     } catch { /* 浏览器还在起 */ }
 
-    // CNBSESSION 是实测看到的会话 cookie 名。不写死唯一名字：万一上游改名，
-    // 退回到「拿全部 cnb.cool cookie」，宁可多带也不能因为改了个名字就抓不到。
+    // CNBSESSION 是实测看到的会话 cookie 名。不要退回到「任何 token/auth」：
+    // 匿名首页也会先发 csrftoken，把它当登录态会让浏览器还没来得及登录就被关掉。
     const session = cookies.filter((c) =>
-      /cnbsession|session|token|auth/i.test(c.name) && c.value
+      /^cnbsession$/i.test(c.name) && c.value
     );
     lastNames = cookies.map((c) => c.name).sort();
     const hasSession = session.length > 0;
