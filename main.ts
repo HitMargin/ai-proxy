@@ -34,11 +34,7 @@ import {
   chatResponseToAnthropic,
   openAiStreamToAnthropic,
 } from "./src/commandcode/anthropic-messages.ts";
-import {
-  kiloLoginManager,
-  kiloStatusSummary,
-  kiloToken,
-} from "./src/kilo.ts";
+import { kiloLoginManager, kiloStatusSummary, kiloToken } from "./src/kilo.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
 import { fetchZenModels, handleZen } from "./src/zen.ts";
 import {
@@ -573,7 +569,10 @@ async function handleTrae(path: string, request: Request): Promise<Response> {
  * and short code the user must open in a browser; the poll loop runs in the
  * background and persists the JWT to kilo-auth.json on approval.
  */
-async function handleKiloLogin(path: string, request: Request): Promise<Response> {
+async function handleKiloLogin(
+  path: string,
+  request: Request,
+): Promise<Response> {
   if (path.endsWith("/login/cancel") && request.method === "POST") {
     await kiloLoginManager.stop("user cancelled");
     return jsonResponse({ ok: true, status: kiloLoginManager.status });
@@ -582,20 +581,30 @@ async function handleKiloLogin(path: string, request: Request): Promise<Response
     try {
       const started = await kiloLoginManager.start();
       if (!kiloLoginPersistence && kiloLoginManager.isWaiting()) {
-        kiloLoginPersistence = kiloLoginManager.waitForApproval().then((state) => {
-          console.info(
-            `[kilo] OAuth login succeeded${state.userEmail ? ` for ${state.userEmail}` : ""}`,
-          );
-        }).finally(() => {
+        kiloLoginPersistence = kiloLoginManager.waitForApproval().then(
+          (state) => {
+            console.info(
+              `[kilo] OAuth login succeeded${
+                state.userEmail ? ` for ${state.userEmail}` : ""
+              }`,
+            );
+          },
+        ).finally(() => {
           kiloLoginPersistence = undefined;
         });
         kiloLoginPersistence.catch((error) =>
           console.warn(
-            `[kilo] OAuth login failed: ${error instanceof Error ? error.message : String(error)}`,
+            `[kilo] OAuth login failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
           )
         );
       }
-      return jsonResponse({ ok: true, ...started, status: kiloLoginManager.status });
+      return jsonResponse({
+        ok: true,
+        ...started,
+        status: kiloLoginManager.status,
+      });
     } catch (error) {
       return jsonResponse({
         error: {

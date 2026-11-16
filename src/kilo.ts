@@ -46,7 +46,13 @@ export interface KiloAuthState {
 
 export type KiloLoginStatus =
   | { status: "idle" }
-  | { status: "waiting"; verificationUrl: string; code: string; startedAt: number; expiresIn: number }
+  | {
+    status: "waiting";
+    verificationUrl: string;
+    code: string;
+    startedAt: number;
+    expiresIn: number;
+  }
   | { status: "success"; userEmail?: string; at: number }
   | { status: "error"; message: string; at: number };
 
@@ -92,8 +98,12 @@ export async function loadKiloAuth(): Promise<KiloAuthState | undefined> {
     if (typeof parsed.token === "string" && parsed.token.length > 10) {
       authState = {
         token: parsed.token,
-        ...(typeof parsed.userEmail === "string" ? { userEmail: parsed.userEmail } : {}),
-        acquiredAt: typeof parsed.acquiredAt === "number" ? parsed.acquiredAt : Date.now(),
+        ...(typeof parsed.userEmail === "string"
+          ? { userEmail: parsed.userEmail }
+          : {}),
+        acquiredAt: typeof parsed.acquiredAt === "number"
+          ? parsed.acquiredAt
+          : Date.now(),
       };
     }
   } catch {
@@ -127,19 +137,27 @@ async function initiateDeviceAuth(): Promise<KiloDeviceAuthCode> {
   });
   if (!response.ok) {
     if (response.status === 429) {
-      throw new Error("Too many pending authorization requests. Please try again later.");
+      throw new Error(
+        "Too many pending authorization requests. Please try again later.",
+      );
     }
-    throw new Error(`Failed to initiate device authorization: ${response.status}`);
+    throw new Error(
+      `Failed to initiate device authorization: ${response.status}`,
+    );
   }
   const data = await response.json() as KiloDeviceAuthCode;
   if (!data?.code || !data?.verificationUrl) {
-    throw new Error("Device authorization response missing code or verificationUrl");
+    throw new Error(
+      "Device authorization response missing code or verificationUrl",
+    );
   }
   return data;
 }
 
 async function pollDeviceAuth(code: string): Promise<KiloDeviceAuthPoll> {
-  const response = await fetch(`${KILO_API_BASE}/api/device-auth/codes/${encodeURIComponent(code)}`);
+  const response = await fetch(
+    `${KILO_API_BASE}/api/device-auth/codes/${encodeURIComponent(code)}`,
+  );
   if (response.status === 202) return { status: "pending" };
   if (response.status === 403) return { status: "denied" };
   if (response.status === 410) return { status: "expired" };
@@ -181,12 +199,20 @@ export class KiloLoginManager {
     return Boolean(this.pending && this.deviceCode);
   }
 
-  async start(): Promise<{ verificationUrl: string; code: string; expiresIn: number }> {
+  async start(): Promise<
+    { verificationUrl: string; code: string; expiresIn: number }
+  > {
     if (this.isWaiting() && this.verificationUrl && this.deviceCode) {
-      return { verificationUrl: this.verificationUrl, code: this.deviceCode, expiresIn: this.expiresIn };
+      return {
+        verificationUrl: this.verificationUrl,
+        code: this.deviceCode,
+        expiresIn: this.expiresIn,
+      };
     }
     if (runningOnDenoDeploy()) {
-      throw new Error("Kilo device login is unavailable on Deno Deploy (no browser interaction)");
+      throw new Error(
+        "Kilo device login is unavailable on Deno Deploy (no browser interaction)",
+      );
     }
     await this.stop("new login requested");
     const initiated = await initiateDeviceAuth();
@@ -199,14 +225,22 @@ export class KiloLoginManager {
       this.pending = { resolve, reject };
     });
     this.timer = setTimeout(() => {
-      this.finish({ status: "error", message: "Kilo device login timed out", at: Date.now() });
+      this.finish({
+        status: "error",
+        message: "Kilo device login timed out",
+        at: Date.now(),
+      });
     }, LOGIN_TIMEOUT_MS);
     this.pollLoop(promise).catch(() => {});
 
     this.log(
       `[kilo] device auth initiated; open ${initiated.verificationUrl} and enter code ${initiated.code}`,
     );
-    return { verificationUrl: initiated.verificationUrl, code: initiated.code, expiresIn: initiated.expiresIn };
+    return {
+      verificationUrl: initiated.verificationUrl,
+      code: initiated.code,
+      expiresIn: initiated.expiresIn,
+    };
   }
 
   waitForApproval(): Promise<KiloAuthState> {
@@ -218,12 +252,18 @@ export class KiloLoginManager {
 
   private waitForApprovalInner(): Promise<KiloAuthState> {
     const existing = this.pending;
-    if (!existing) return Promise.reject(new Error("Kilo login was not started"));
+    if (!existing) {
+      return Promise.reject(new Error("Kilo login was not started"));
+    }
     return new Promise((resolve, reject) => {
       const originalResolve = existing.resolve;
       const originalReject = existing.reject;
-      existing.resolve = (state) => { resolve(state); };
-      existing.reject = (error) => { reject(error); };
+      existing.resolve = (state) => {
+        resolve(state);
+      };
+      existing.reject = (error) => {
+        reject(error);
+      };
       void originalResolve;
       void originalReject;
     });
@@ -277,27 +317,47 @@ export class KiloLoginManager {
         if (poll.status === "approved" && poll.token) {
           const state: KiloAuthState = {
             token: poll.token,
-            ...(poll.userEmail !== undefined ? { userEmail: poll.userEmail } : {}),
+            ...(poll.userEmail !== undefined
+              ? { userEmail: poll.userEmail }
+              : {}),
             acquiredAt: Date.now(),
           };
           await saveKiloAuth(state);
           this.log(
-            `[kilo] device auth approved${poll.userEmail ? ` for ${poll.userEmail}` : ""}`,
+            `[kilo] device auth approved${
+              poll.userEmail ? ` for ${poll.userEmail}` : ""
+            }`,
           );
-          this.finish({ status: "success", ...(poll.userEmail !== undefined ? { userEmail: poll.userEmail } : {}), at: Date.now() }, state);
+          this.finish({
+            status: "success",
+            ...(poll.userEmail !== undefined
+              ? { userEmail: poll.userEmail }
+              : {}),
+            at: Date.now(),
+          }, state);
           return;
         }
         if (poll.status === "denied") {
-          this.finish({ status: "error", message: "User denied the Kilo authorization", at: Date.now() });
+          this.finish({
+            status: "error",
+            message: "User denied the Kilo authorization",
+            at: Date.now(),
+          });
           return;
         }
         if (poll.status === "expired") {
-          this.finish({ status: "error", message: "Kilo device code expired; run login again", at: Date.now() });
+          this.finish({
+            status: "error",
+            message: "Kilo device code expired; run login again",
+            at: Date.now(),
+          });
           return;
         }
       } catch (error) {
         this.log(
-          `[kilo] poll error: ${error instanceof Error ? error.message : String(error)}`,
+          `[kilo] poll error: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
         );
       }
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
@@ -305,7 +365,9 @@ export class KiloLoginManager {
   }
 }
 
-export const kiloLoginManager = new KiloLoginManager((message) => console.info(message));
+export const kiloLoginManager = new KiloLoginManager((message) =>
+  console.info(message)
+);
 
 export async function kiloStatusSummary(): Promise<{
   configured: boolean;
