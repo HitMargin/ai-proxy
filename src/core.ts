@@ -4,6 +4,7 @@ import {
   type ProbeSample,
   type ProviderHealthSnapshot,
 } from "./runtime/health.ts";
+import { kiloGatewayBaseUrl } from "./kilo.ts";
 
 // ============================================
 // 可扩展 AI API 代理框架（Deno Deploy 版）
@@ -148,11 +149,16 @@ const adapters: Record<string, any> = {
   },
 };
 
-// ---------- Providers 配置 ----------
+// Kilo uses the authenticated AI Gateway once a device-flow JWT is present;
+// without it we fall back to the legacy anonymous endpoint (rate limited by IP).
+// The baseUrl is evaluated per request via a function so `kiloGatewayBaseUrl()`
+// is always the current value (login may happen after process start).
 export const providers: Record<string, any> = {
   kilo: {
     prefix: "/kilo/v1",
-    baseUrl: "https://api.kilo.ai/api/gateway",
+    get baseUrl(): string {
+      return kiloGatewayBaseUrl();
+    },
     auth: { type: "none" },
     pathRewrite: (path: string) => path.replace(/^\/kilo\/v1/, ""),
     endpoints: { models: "/models", chat: "/chat/completions" },

@@ -34,6 +34,11 @@ import {
   chatResponseToAnthropic,
   openAiStreamToAnthropic,
 } from "./src/commandcode/anthropic-messages.ts";
+import {
+  kiloLoginManager,
+  kiloStatusSummary,
+  kiloToken,
+} from "./src/kilo.ts";
 import { handleDeepseekWeb } from "./src/deepseek-web.ts";
 import { fetchZenModels, handleZen } from "./src/zen.ts";
 import {
@@ -562,6 +567,53 @@ async function handleTrae(path: string, request: Request): Promise<Response> {
 
   return jsonResponse({ error: "Unknown TRAE route" }, 404);
 }
+
+/**
+ * Kilo Device Flow login (RFC 8628). The response carries the verification URL
+ * and short code the user must open in a browser; the poll loop runs in the
+ * background and persists the JWT to kilo-auth.json on approval.
+ */
+async function handleKiloLogin(path: string, request: Request): Promise<Response> {
+  if (path.endsWith("/login/cancel") && request.method === "POST") {
+    await kiloLoginManager.stop("user cancelled");
+    return jsonResponse({ ok: true, status: kiloLoginManager.status });
+  }
+  if (path.endsWith("/login") && request.method === "POST") {
+    try {
+      const started = await kiloLoginManager.start();
+      if (!kiloLoginPersistence && kiloLoginManager.isWaiting()) {
+        kiloLoginPersistence = kiloLoginManager.waitForApproval().then((state) => {
+          console.info(
+            `[kilo] OAuth login succeeded${state.userEmail ? ` for ${state.userEmail}` : ""}`,
+          );
+        }).finally(() => {
+          kiloLoginPersistence = undefined;
+        });
+        kiloLoginPersistence.catch((error) =>
+          console.warn(
+            `[kilo] OAuth login failed: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        );
+      }
+      return jsonResponse({ ok: true, ...started, status: kiloLoginManager.status });
+    } catch (error) {
+      return jsonResponse({
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+          type: "login_unavailable",
+        },
+      }, 501);
+    }
+  }
+  if (path.endsWith("/login/status") && request.method === "GET") {
+    const summary = await kiloStatusSummary();
+    return jsonResponse({ login: kiloLoginManager.status, ...summary });
+  }
+  return jsonResponse({ error: "Unknown Kilo login route" }, 404);
+}
+
+let kiloLoginPersistence: Promise<void> | undefined;
+
 // ---------- WorkBuddy（中国版） ----------
 
 /**
@@ -2167,6 +2219,9 @@ export async function handler(request: Request): Promise<Response> {
     if (provider.customHandler === "zai-plan") {
       return await handleZaiPlan(path, request);
     }
+    if (providerKey === "kilo" && path.startsWith("/kilo/v1/login")) {
+      return await handleKiloLogin(path, request);
+    }
 
     const baseUrl = provider.baseUrl;
     const endpoints = provider.endpoints;
@@ -2193,6 +2248,8 @@ export async function handler(request: Request): Promise<Response> {
       if (provider.pathRewrite) modelsPath = provider.pathRewrite(path);
       const targetUrl = baseUrl + modelsPath + url.search;
       const headers = cloneHeadersForUpstream(request, provider, ENV);
+      const kiloBearer = await kiloToken();
+      if (kiloBearer) headers.set("Authorization", `Bearer ${kiloBearer}`);
       if (provider.extraHeaders) {
         for (const [k, v] of Object.entries(provider.extraHeaders)) {
           headers.set(k, v as string);
@@ -2338,6 +2395,8 @@ export async function handler(request: Request): Promise<Response> {
       if (provider.pathRewrite) chatPath = provider.pathRewrite(path);
       const targetUrl = baseUrl + chatPath + url.search;
       const headers = cloneHeadersForUpstream(request, provider, ENV);
+      const kiloBearer = await kiloToken();
+      if (kiloBearer) headers.set("Authorization", `Bearer ${kiloBearer}`);
       if (provider.extraHeaders) {
         for (const [k, v] of Object.entries(provider.extraHeaders)) {
           headers.set(k, v as string);

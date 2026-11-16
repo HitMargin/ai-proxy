@@ -369,6 +369,23 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   可作单账号兜底，OAuth key 存入已忽略的
   `commandcode-accounts.json`。公开模型目录实测 51 个 Go 模型（31
   个图像模型）；尚未用真实 CommandCode 凭据验证推理，需有 key 后实测。
+- **Kilo Device Flow OAuth（2026-11-16 新增）**：`/kilo/v1` 现在支持 RFC 8628
+  Device Flow 登录，官方端点与响应形状完全照搬 Kilo CLI 源码
+  （`packages/kilo-gateway/src/auth/device.ts`）：
+  `POST /kilo/v1/login` 返回 `verificationUrl`（浏览器打开）与短码，
+  `GET /kilo/v1/login/status` 查询等待/成功/失败状态，
+  `POST /kilo/v1/login/cancel` 放弃。轮询每 3 秒打
+  `api.kilo.ai/api/device-auth/codes/{code}`，202=pending、403=denied、
+  410=expired、200=approved+token。拿到 JWT 写入 `kilo-auth.json`
+  （gitignore，`git check-ignore` 验证过），下次请求自动加载，无需重启。
+  **关键结论（实测确认）**：`api.kilo.ai/api/gateway` 匿名路径按出口 IP
+  限流（Vercel edge 层），响应头不暴露 `x-ratelimit-*`；登录后走
+  `ai-gateway.kilo.ai/api/v1`（Kilo 官方 CLI 的新端点），按账号计量，
+  同 IP 多账号可各自独立用量。改请求头（Referer/X-Title/UA）都无效，
+  差异只在有没有 JWT。`src/core.ts` 的 Kilo provider `baseUrl` 用 getter
+  动态指向 `kiloGatewayBaseUrl()`，登录前是旧匿名端点、登录后自动切换；
+  `main.ts` 在 `cloneHeadersForUpstream` 之后单独为 kilo 注入
+  `Authorization: Bearer <JWT>`，不走通用 auth 链。
 - **Z.ai Start Plan 渠道（2026-11-04 深夜侦察，未完成——差一个认证头）**：用户 ZCode
   桌面端自带的 Start Plan（ZCODE GLOBAL BUILD）每天发 300M tokens 的
   GLM-5.3-Flash（09:00 重置，面板余额接口
@@ -1276,6 +1293,16 @@ Worker 远端链。 为 dsh 提供免费模型入口。
   X-Ide-Version 是模型准入（「四月 IDE 拿不到 deepseek-v4.1-flash」）；trae-global
   站把 auto 通道标 is_invisible_to_user 而 CN「lists are served whole」；其身份
   ideVersion 3.3.65/clientVersion 0.1.69（比我们 0.1.52 新，模型的可见面可能更宽）。
+  **积分基价与 agent 会话烧账实测（2026-11-07 深夜；基价已按 10K token 定长实验修正）**：
+  双模型对照（Doubao 934 tok 扣 0.06、kimi-k3-auto 1094 tok 扣 0.03）校准出
+  **积分 ≈ tokens × 0.00033 × 倍率**（首版 0.000208 是小样本舍入低估，用户质疑后
+  定长重测修正）——**同时证明 -auto 通道真按名义 0.08 计费而非路由落点的 1.83**
+  （若按 1.83 该扣 0.66 实扣 0.03）。0.08 档每 1 万 token ≈ 0.26 积分，小聊无感；但
+  用户一场 kimi-k3-auto agent 会话烧 ~19.5 积分， peak -0.52/15s。**计费数的是
+  Σ(每一轮的完整上下文)，不是最终上下文**——50K 上下文 × 20 轮 ≈ 13 积分。
+  **判据：倍率省的是单价，agent 会话的形状（上下文体量 × 轮数）决定总量**——
+  同场会话在基础款 kimi-k3（1.83）上是 23 倍；余额异常先前后拍 `fetchTraeBalance`
+  定烧速，再对时间线归因，别把异步落账和自己实验的消耗混进同一笔账。
 - **SOLO 的正文字段叫 `response`，不是 `content`（2026-10-02
   抓包）**：`event:output` 的真实形状是
   `{"response":"正文增量","reasoning_content":"思考增量","tool_calls":null,"multimodal_contents":null,"phase":null}`——**没有
