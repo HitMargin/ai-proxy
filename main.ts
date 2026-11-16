@@ -2513,6 +2513,62 @@ export async function handler(request: Request): Promise<Response> {
       });
     }
 
+    // /responses and /messages: the Kilo gateway natively serves all three
+    // wire shapes (OpenAI chat, OpenAI Responses, Anthropic Messages - see the
+    // gateway's own "Invalid path" message listing them). The generic branches
+    // above only cover models and chat, so a POST on either of these fell
+    // through to the 404 at the end even though the upstream answers 200.
+    // Pure passthrough for both, same JWT injection as chat.
+    if (
+      providerKey === "kilo" &&
+      (path.endsWith("/responses") || path.endsWith("/messages")) &&
+      request.method === "POST"
+    ) {
+      let bodyText = "";
+      try {
+        bodyText = await request.text();
+      } catch (e: any) {
+        return new Response(
+          JSON.stringify({
+            error: "Failed to read request body",
+            detail: e.message,
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      const responsesPath = provider.pathRewrite
+        ? provider.pathRewrite(path)
+        : path;
+      const targetUrl = baseUrl + responsesPath + url.search;
+      const headers = cloneHeadersForUpstream(request, provider, ENV);
+      const kiloBearer = await kiloToken();
+      if (kiloBearer) headers.set("Authorization", `Bearer ${kiloBearer}`);
+      try {
+        const upstream = await fetch(targetUrl, {
+          method: "POST",
+          headers,
+          body: bodyText,
+          redirect: "follow",
+        });
+        return new Response(upstream.body, {
+          status: upstream.status,
+          headers: {
+            "Content-Type": upstream.headers.get("content-type") ||
+              "application/json",
+            "Access-Control-Allow-Origin": "*",
+          },
+        });
+      } catch (e: any) {
+        return new Response(
+          JSON.stringify({
+            error: "Proxy error",
+            detail: e.message,
+          }),
+          { status: 502, headers: { "Content-Type": "application/json" } },
+        );
+      }
+    }
+
     return new Response(JSON.stringify({ error: "Not found" }), {
       status: 404,
       headers: {
